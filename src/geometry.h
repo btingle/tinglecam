@@ -11,6 +11,7 @@ namespace wave {
 
 using Clipper2Lib::Path64;
 using Clipper2Lib::Paths64;
+using Clipper2Lib::Point64;
 using Clipper2Lib::Rect64;
 
 constexpr double kIntegerScale = 1000.0;
@@ -31,6 +32,7 @@ struct WaveResult {
   Paths64 subject;
   Path64 stock_boundary;
   std::vector<Paths64> generations;
+  std::vector<Paths64> reached_generations;
   StopReason stop_reason = StopReason::Empty;
 };
 
@@ -49,4 +51,3 @@ std::int64_t to_integer(double value);
 const char* stop_reason_name(StopReason reason);
 
 }  // namespace wave
-

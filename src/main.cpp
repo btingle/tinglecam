@@ -1,4 +1,5 @@
 #include "geometry.h"
+#include "topology.h"
 
 #include <SDL.h>
 #include <SDL_opengl.h>
@@ -29,12 +30,16 @@ struct ViewState {
 struct AppState {
   wave::SvgGeometry svg;
   wave::WaveResult result;
+  wave::FrontLineage lineage;
   float allowance = 150.0f;
   float engagement = 80.0f;
-  int selected_iteration = 0;
+  int selected_iteration = -1;
   bool show_all_iterations = true;
   bool show_subject = true;
   bool show_stock = true;
+  bool show_leading_fronts = true;
+  bool show_parent_links = true;
+  bool show_event_markers = true;
   bool animate = false;
   float animation_speed = 4.0f;
   ViewState view;
@@ -52,12 +57,36 @@ ImU32 iteration_color(int index, int count, int alpha = 225) {
       alpha / 255.0f));
 }
 
+ImU32 event_color(wave::LineageEventKind kind, int alpha = 255) {
+  switch (kind) {
+    case wave::LineageEventKind::Split: return IM_COL32(255, 91, 177, alpha);
+    case wave::LineageEventKind::Merge: return IM_COL32(72, 229, 139, alpha);
+    case wave::LineageEventKind::Termination: return IM_COL32(255, 92, 73, alpha);
+    case wave::LineageEventKind::Birth: return IM_COL32(255, 205, 74, alpha);
+  }
+  return IM_COL32(255, 255, 255, alpha);
+}
+
+const char* event_short_name(wave::LineageEventKind kind) {
+  switch (kind) {
+    case wave::LineageEventKind::Split: return "S";
+    case wave::LineageEventKind::Merge: return "M";
+    case wave::LineageEventKind::Termination: return "T";
+    case wave::LineageEventKind::Birth: return "B";
+  }
+  return "?";
+}
+
 void recompute(AppState& app) {
   try {
     app.result = wave::build_wavefront(app.svg.paths, app.allowance, app.engagement);
-    app.selected_iteration = std::clamp(
-        app.selected_iteration, 0,
-        std::max(0, static_cast<int>(app.result.generations.size()) - 1));
+    app.lineage = wave::build_front_lineage(app.result, app.engagement);
+    if (app.selected_iteration < 0 && !app.lineage.events.empty())
+      app.selected_iteration = static_cast<int>(app.lineage.events.front().generation);
+    else
+      app.selected_iteration = std::clamp(
+          app.selected_iteration, 0,
+          std::max(0, static_cast<int>(app.result.generations.size()) - 1));
     app.error.clear();
   } catch (const std::exception& error) {
     app.error = error.what();
@@ -88,6 +117,22 @@ void draw_paths(ImDrawList* draw_list, const Paths64& paths,
 void draw_path(ImDrawList* draw_list, const Path64& path,
                const CanvasTransform& transform, ImU32 color, float width) {
   draw_paths(draw_list, Paths64{path}, transform, color, width);
+}
+
+void draw_front(ImDrawList* draw_list, const wave::LeadingFront& front,
+                const CanvasTransform& transform, ImU32 color, float width) {
+  if (front.path.size() < 2) return;
+  const std::size_t segment_count = front.closed ? front.path.size()
+                                                  : front.path.size() - 1;
+  for (std::size_t i = 0; i < segment_count; ++i) {
+    draw_list->AddLine(transform.point(front.path[i]),
+                       transform.point(front.path[(i + 1) % front.path.size()]),
+                       color, width);
+  }
+  if (!front.closed) {
+    draw_list->AddCircleFilled(transform.point(front.path.front()), width + 1.5f, color);
+    draw_list->AddCircleFilled(transform.point(front.path.back()), width + 1.5f, color);
+  }
 }
 
 void fit_view(AppState& app, ImVec2 canvas_size) {
@@ -173,6 +218,48 @@ void draw_canvas(AppState& app) {
   if (app.show_subject)
     draw_paths(draw_list, app.result.subject, transform, IM_COL32(252, 226, 89, 255), 3.0f);
 
+  if (app.show_leading_fronts &&
+      app.selected_iteration < static_cast<int>(app.lineage.generations.size())) {
+    const std::size_t generation = static_cast<std::size_t>(app.selected_iteration);
+    if (generation > 0) {
+      const auto& previous = app.lineage.generations[generation - 1].fronts;
+      for (const auto& front : previous)
+        draw_front(draw_list, front, transform, IM_COL32(183, 112, 255, 210), 3.0f);
+    }
+    const auto& current = app.lineage.generations[generation].fronts;
+    for (const auto& front : current)
+      draw_front(draw_list, front, transform, IM_COL32(90, 245, 174, 255), 4.0f);
+
+    if (app.show_parent_links && generation > 0) {
+      const auto& previous = app.lineage.generations[generation - 1].fronts;
+      for (std::size_t child = 0; child < current.size(); ++child) {
+        const ImVec2 child_position = transform.point(wave::representative_point(current[child]));
+        for (const auto parent : current[child].parents) {
+          if (parent >= previous.size()) continue;
+          const ImVec2 parent_position =
+              transform.point(wave::representative_point(previous[parent]));
+          draw_list->AddLine(parent_position, child_position,
+                             IM_COL32(232, 236, 241, 155), 1.5f);
+          draw_list->AddCircleFilled(parent_position, 4.0f,
+                                     IM_COL32(183, 112, 255, 255));
+          draw_list->AddCircleFilled(child_position, 4.0f,
+                                     IM_COL32(90, 245, 174, 255));
+        }
+      }
+    }
+  }
+
+  if (app.show_event_markers) {
+    for (const auto& event : app.lineage.events) {
+      const ImVec2 position = transform.point(event.position);
+      const ImU32 color = event_color(event.kind);
+      draw_list->AddCircleFilled(position, 9.0f, IM_COL32(14, 18, 24, 235));
+      draw_list->AddCircle(position, 9.0f, color, 0, 3.0f);
+      draw_list->AddText({position.x - 3.5f, position.y - 7.0f}, color,
+                         event_short_name(event.kind));
+    }
+  }
+
   draw_list->PopClipRect();
   ImGui::EndChild();
 }
@@ -205,6 +292,10 @@ void controls(AppState& app, const std::filesystem::path& input) {
   ImGui::Checkbox("Show all generations", &app.show_all_iterations);
   ImGui::Checkbox("Show subject", &app.show_subject);
   ImGui::Checkbox("Show allowance box", &app.show_stock);
+  ImGui::Checkbox("Show leading fronts", &app.show_leading_fronts);
+  if (app.show_leading_fronts)
+    ImGui::Checkbox("Show parent links", &app.show_parent_links);
+  ImGui::Checkbox("Show event markers", &app.show_event_markers);
   ImGui::Checkbox("Animate", &app.animate);
   if (app.animate) ImGui::SliderFloat("Speed", &app.animation_speed, 0.25f, 20.0f, "%.2f gen/s");
 
@@ -217,6 +308,38 @@ void controls(AppState& app, const std::filesystem::path& input) {
     ImGui::Text("Selected contours: %zu",
                 app.result.generations[app.selected_iteration].size());
 
+  ImGui::SeparatorText("Front lineage");
+  if (app.selected_iteration < static_cast<int>(app.lineage.generations.size())) {
+    const std::size_t generation = static_cast<std::size_t>(app.selected_iteration);
+    const auto& current = app.lineage.generations[generation].fronts;
+    const std::size_t previous_count = generation == 0
+                                           ? 0
+                                           : app.lineage.generations[generation - 1].fronts.size();
+    ImGui::Text("Transition: %zu -> %zu leading fronts", previous_count,
+                current.size());
+    for (std::size_t child = 0; child < current.size(); ++child) {
+      ImGui::Text("Current %zu: %s, %.1f units, %zu parent%s", child,
+                  current[child].closed ? "closed" : "open",
+                  wave::front_length(current[child]), current[child].parents.size(),
+                  current[child].parents.size() == 1 ? "" : "s");
+    }
+  }
+  if (ImGui::TreeNode("Detected events")) {
+    for (std::size_t i = 0; i < app.lineage.events.size(); ++i) {
+      const auto& event = app.lineage.events[i];
+      ImGui::PushID(static_cast<int>(i));
+      if (ImGui::SmallButton("Go"))
+        app.selected_iteration = static_cast<int>(event.generation);
+      ImGui::SameLine();
+      ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(event_color(event.kind)),
+                         "generation %zu: %s (%zu -> %zu)", event.generation,
+                         wave::lineage_event_kind_name(event.kind),
+                         event.previous_fronts.size(), event.current_fronts.size());
+      ImGui::PopID();
+    }
+    ImGui::TreePop();
+  }
+
   ImGui::Spacing();
   ImGui::TextColored(ImVec4(0.99f, 0.89f, 0.35f, 1.0f), "Subject");
   ImGui::SameLine();
@@ -227,6 +350,9 @@ void controls(AppState& app, const std::filesystem::path& input) {
       "Engagement, is clipped to the box, and then has the subject removed. Each "
       "colored generation is only the newly reached area; subject boundaries never "
       "act as wave sources.");
+  ImGui::TextWrapped(
+      "Selected leading fronts: violet = previous, green = current. White links "
+      "show parentage. Event markers: S split, M merge, T termination, B unexpected birth.");
 }
 
 std::filesystem::path resolve_input(int argc, char** argv) {

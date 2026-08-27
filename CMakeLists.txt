@@ -34,6 +34,7 @@ find_package(OpenGL REQUIRED)
 
 add_library(wave_geometry
   src/geometry.cpp
+  src/topology.cpp
 )
 target_include_directories(wave_geometry PUBLIC src)
 target_link_libraries(wave_geometry PUBLIC Clipper2)
@@ -73,4 +74,3 @@ add_executable(wave_geometry_tests tests/geometry_tests.cpp)
 target_link_libraries(wave_geometry_tests PRIVATE wave_geometry)
 add_test(NAME wave_geometry_tests
          COMMAND wave_geometry_tests ${CMAKE_CURRENT_SOURCE_DIR}/wavetest.svg)
-

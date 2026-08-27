@@ -363,6 +363,7 @@ WaveResult build_wavefront(const Paths64& raw_subject,
   reached = Difference(reached, result.subject, FillRule::NonZero);
   reached = Union(reached, FillRule::NonZero);
   result.generations.push_back(reached);
+  result.reached_generations.push_back(reached);
 
   const double delta = static_cast<double>(
       std::max<std::int64_t>(1, to_integer(engagement)));
@@ -392,6 +393,7 @@ WaveResult build_wavefront(const Paths64& raw_subject,
     }
     result.generations.push_back(std::move(wave));
     reached = std::move(next);
+    result.reached_generations.push_back(reached);
   }
 
   result.stop_reason = StopReason::IterationLimit;
