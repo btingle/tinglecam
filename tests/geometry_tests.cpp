@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <stdexcept>
+#include <utility>
 
 namespace {
 
@@ -39,6 +40,63 @@ wave::WaveResult two_band_sweep(bool notched) {
       Clipper2Lib::Union(wave::Paths64{first, second},
                          Clipper2Lib::FillRule::NonZero)};
   return wave_result;
+}
+
+// Two disconnected cuts can each meet the air outside the stock within the
+// planner's clearance tolerance. The finite box used to represent that
+// unbounded air is not itself a machining contour and must not become a long
+// at-depth detour between them.
+std::pair<wave::WaveResult, wave::FrontLineage> outer_box_detour_case() {
+  wave::WaveResult wave_result;
+  const wave::Path64 left_stock{
+      {0, 0}, {10000, 0}, {10000, 10000}, {0, 10000}};
+  const wave::Path64 right_stock{
+      {20000, 0}, {30000, 0}, {30000, 10000}, {20000, 10000}};
+  const wave::Path64 left_band{{0, 0}, {1500, 0}, {1500, 10000}, {0, 10000}};
+  const wave::Path64 right_band{
+      {28500, 0}, {30000, 0}, {30000, 10000}, {28500, 10000}};
+  wave_result.stock = {left_stock, right_stock};
+  wave_result.stock_boundary = left_stock;
+  wave_result.stepover = 1.5;
+  wave_result.softening = 0.0;
+  wave_result.generations = {wave::Paths64{left_band, right_band}};
+  wave_result.reached_generations = wave_result.generations;
+
+  wave::FrontLineage lineage;
+  lineage.generations.push_back({
+      {
+          {{{1500, 1000}, {1500, 9000}}, false, 0, {}, {}},
+          {{{28500, 1000}, {28500, 9000}}, false, 1, {}, {}},
+      },
+      {wave::Paths64{left_band}, wave::Paths64{right_band}},
+  });
+  return {std::move(wave_result), std::move(lineage)};
+}
+
+// The contour route around the right wall is valid but slightly longer than
+// lifting to the cleared exterior and approaching the second cut from there.
+// This distinguishes direct candidate comparison from the former multiplier.
+std::pair<wave::WaveResult, wave::FrontLineage> shorter_rapid_case() {
+  wave::WaveResult wave_result;
+  const wave::Path64 stock{{0, 0}, {10000, 0}, {10000, 10000}, {0, 10000}};
+  const wave::Path64 top_band{{0, 0}, {10000, 0}, {10000, 1500}, {0, 1500}};
+  const wave::Path64 bottom_band{
+      {0, 8500}, {10000, 8500}, {10000, 10000}, {0, 10000}};
+  wave_result.stock = {stock};
+  wave_result.stock_boundary = stock;
+  wave_result.stepover = 1.5;
+  wave_result.generations = {wave::Paths64{top_band, bottom_band}};
+  wave_result.reached_generations = wave_result.generations;
+
+  wave::FrontLineage lineage;
+  lineage.generations.push_back({
+      {
+          {{{1000, 1500}, {9000, 1500}}, false, 0, {}, {}},
+          {{{1000, 8500}, {9000, 8500}}, false, 1, {}, {}},
+      },
+      {wave::Paths64{top_band}, wave::Paths64{bottom_band}},
+  });
+  return {std::move(wave_result), std::move(lineage)};
 }
 
 // Total length of toolpath motion that runs inside the subject. The subject is
@@ -154,6 +212,25 @@ int main(int argc, char** argv) {
               "the feed in from the air beside the stock cuts nothing");
     }
 
+    {
+      auto [outer_wave, outer_lineage] = outer_box_detour_case();
+      const auto outer_path = wave::build_toolpath(outer_wave, outer_lineage);
+      require(outer_path.stats.retract_count == 2,
+              "the artificial outer box must not replace a required rapid");
+      for (const auto& move : outer_path.moves)
+        require(move.kind != wave::MoveKind::Step || move.length < 5.0,
+                "a step must not follow the artificial outer box");
+    }
+
+    {
+      auto [choice_wave, choice_lineage] = shorter_rapid_case();
+      const auto choice_path = wave::build_toolpath(choice_wave, choice_lineage);
+      require(choice_path.stats.retract_count == 2,
+              "a shorter rapid must beat a longer valid detour");
+      require(choice_path.stats.detour_count == 0,
+              "distance selection must reject the longer detour");
+    }
+
     const auto toolpath = wave::build_toolpath(result, lineage);
     std::size_t front_count = 0;
     for (const auto& generation : lineage.generations)
@@ -169,8 +246,8 @@ int main(int argc, char** argv) {
     // means a blocked segment stopped being routed around.
     require(toolpath.stats.entry_count == 0,
             "no descent on wavetest should have to ramp into solid material");
-    require(toolpath.stats.retract_count == 1,
-            "the opening plunge is the only lift wavetest needs");
+    require(toolpath.stats.retract_count == 2,
+            "distance comparison should choose the shorter lift on wavetest");
     require(toolpath.stats.lifts_over_subject == 0,
             "a lift must not pass over the subject where a way round exists");
     require(toolpath.stats.retract_count + toolpath.stats.entry_count <=

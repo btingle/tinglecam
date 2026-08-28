@@ -230,18 +230,28 @@ Path64 shorten(const Path64& path, const Paths64& forbidden, double tolerance) {
 
 // Routes from `from` to `to` around whatever blocks the straight segment, by
 // following the boundary of the region the tool may travel through. Returns
-// nothing when no ring carries both ends or every walk exceeds `budget`.
+// nothing when no ring carries both ends.
 std::optional<Path64> route_around(const Point64& from, const Point64& to,
                                    const Paths64& travel, const Paths64& forbidden,
-                                   double tolerance, double budget) {
+                                   const Rect64& world, double tolerance) {
   // `tolerance` is in integer units because it is compared against clipper
   // output, while the walk is measured in world units; the shortcut spacing has
   // to be converted or it swallows the whole contour.
   const double world_spacing = to_world(static_cast<std::int64_t>(tolerance)) * 4.0;
   std::optional<Path64> best;
-  double best_length = budget;
+  double best_length = std::numeric_limits<double>::infinity();
   for (const auto& ring : travel) {
     if (ring.size() < 3) continue;
+    // `travel` is clipped to a finite box so Clipper can represent the air
+    // outside the stock. Its outer ring is an implementation boundary, not a
+    // physical contour. Following it makes otherwise local transitions run to
+    // arbitrary box corners, and whether that route exists can change with a
+    // tiny variation in slice geometry. Real detours follow stock or obstacle
+    // boundaries (the inner rings), never this synthetic perimeter.
+    const Rect64 bounds = GetBounds(ring);
+    if (bounds.left == world.left && bounds.top == world.top &&
+        bounds.right == world.right && bounds.bottom == world.bottom)
+      continue;
     const RingProjection start = project_onto_ring(ring, from);
     const RingProjection finish = project_onto_ring(ring, to);
     const auto cumulative = ring_arc_lengths(ring);
@@ -309,8 +319,7 @@ struct Node {
 
 }  // namespace
 
-Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage,
-                        const ToolpathOptions& options) {
+Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage) {
   Toolpath toolpath;
   if (lineage.generations.empty()) return toolpath;
   if (lineage.generations.size() != wave.generations.size())
@@ -405,18 +414,23 @@ Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage,
   Point64 position;
   bool has_position = false;
 
-  // The XY path a lift takes to get from `origin` to `target`.
+  struct LiftPlan {
+    Path64 path;
+    bool crosses_subject = false;
+  };
+
+  // The XY path a lift takes to get from `origin` to `target`. Planning a
+  // candidate has no statistics side effects because it may lose the distance
+  // comparison to an at-depth detour.
   const auto plan_lift = [&](const Point64& origin, const Point64& target) {
     if (segment_avoids(origin, target, free_forbidden, tolerance))
-      return Path64{origin, target};
+      return LiftPlan{Path64{origin, target}, false};
     if (const auto route = route_around(origin, target, free_space, free_forbidden,
-                                        tolerance,
-                                        std::numeric_limits<double>::infinity()))
-      return *route;
+                                        world, tolerance))
+      return LiftPlan{*route, false};
     // The free space around the part is in two pieces here, so there is no way
     // across that stays off it.
-    ++toolpath.stats.lifts_over_subject;
-    return Path64{origin, target};
+    return LiftPlan{Path64{origin, target}, true};
   };
 
   while (!ready.empty()) {
@@ -501,31 +515,64 @@ Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage,
           emit(Path64{position, entry}, false);
         } else if (segment_avoids(position, entry, travel_forbidden, tolerance)) {
           emit(Path64{position, entry}, true);
-        } else if (const auto route = route_around(
-                       position, entry, travel, travel_forbidden, tolerance,
-                       std::max(options.detour_limit * distance_world(position, entry),
-                                2.0 * wave.stepover))) {
-          // Following a contour around the obstruction beats lifting over it.
-          emit(*route, !stays_clear(*route, cleared_forbidden, tolerance));
-          ++toolpath.stats.detour_count;
-        } else if (const auto plunge = find_plunge_point(cleared, entry, plunge_clearance);
-                   plunge && stays_clear(Path64{*plunge, entry}, travel_forbidden, tolerance)) {
-          // Set down where material is already gone, then cut in from there, so
-          // the descent itself never has to remove anything.
-          const Path64 rapid = plan_lift(position, *plunge);
-          const double length = path_length_world(rapid);
-          toolpath.moves.push_back({MoveKind::Retract, rapid, {}, length});
-          ++toolpath.stats.retract_count;
-          toolpath.stats.retract_length += length;
-          if (*plunge != entry)
-            emit(Path64{*plunge, entry},
-                 !stays_clear(Path64{*plunge, entry}, cleared_forbidden, tolerance));
         } else {
-          const Path64 rapid = plan_lift(position, entry);
-          const double length = path_length_world(rapid);
-          toolpath.moves.push_back({MoveKind::Entry, rapid, {}, length});
-          ++toolpath.stats.entry_count;
-          toolpath.stats.entry_length += length;
+          // A multiplier against the blocked straight line is not a meaningful
+          // cost: it can admit arbitrarily shaped detours and change decisions
+          // when a slice moves by a fraction of a unit. Build both realizable
+          // alternatives and compare all of the XY motion each one requires.
+          const auto detour = route_around(position, entry, travel,
+                                           travel_forbidden, world, tolerance);
+          const double detour_distance =
+              detour ? path_length_world(*detour)
+                     : std::numeric_limits<double>::infinity();
+
+          std::optional<Point64> plunge =
+              find_plunge_point(cleared, entry, plunge_clearance);
+          Path64 approach;
+          std::optional<LiftPlan> lift;
+          double lift_distance = std::numeric_limits<double>::infinity();
+          if (plunge) {
+            approach = Path64{*plunge, entry};
+            if (!stays_clear(approach, travel_forbidden, tolerance)) {
+              plunge.reset();
+              approach.clear();
+            } else {
+              lift = plan_lift(position, *plunge);
+              lift_distance = path_length_world(lift->path) +
+                              path_length_world(approach);
+            }
+          }
+
+          if (detour && detour_distance < lift_distance) {
+            emit(*detour, !stays_clear(*detour, cleared_forbidden, tolerance));
+            ++toolpath.stats.detour_count;
+          } else if (plunge && lift) {
+            // Set down where material is already gone, then cut in from there,
+            // so the descent itself never has to remove anything.
+            const double rapid_length = path_length_world(lift->path);
+            toolpath.moves.push_back(
+                {MoveKind::Retract, std::move(lift->path), {}, rapid_length});
+            ++toolpath.stats.retract_count;
+            toolpath.stats.retract_length += rapid_length;
+            if (lift->crosses_subject) ++toolpath.stats.lifts_over_subject;
+            if (*plunge != entry) {
+              const bool engaged =
+                  !stays_clear(approach, cleared_forbidden, tolerance);
+              emit(std::move(approach), engaged);
+            }
+          } else if (detour) {
+            // No cleared landing exists, so the valid at-depth route avoids an
+            // entry into solid material even when it is long.
+            emit(*detour, !stays_clear(*detour, cleared_forbidden, tolerance));
+            ++toolpath.stats.detour_count;
+          } else {
+            const LiftPlan rapid = plan_lift(position, entry);
+            const double length = path_length_world(rapid.path);
+            toolpath.moves.push_back({MoveKind::Entry, rapid.path, {}, length});
+            ++toolpath.stats.entry_count;
+            toolpath.stats.entry_length += length;
+            if (rapid.crosses_subject) ++toolpath.stats.lifts_over_subject;
+          }
         }
       }
 

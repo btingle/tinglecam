@@ -75,7 +75,6 @@ struct AppState {
   bool toolpath_play = true;
   // World units per second, and how far the tool has travelled along the path.
   float toolpath_speed = 40.0f;
-  float detour_limit = 6.0f;
   float toolpath_progress = 0.0f;
   bool show_parent_links = true;
   bool show_event_markers = true;
@@ -166,9 +165,7 @@ void recompute(AppState& app) {
         std::min<double>(app.stepover * app.softening_percent * 0.01, app.stepover);
     app.result = wave::build_wavefront(subject, stock, app.stepover, softening);
     app.lineage = wave::build_front_lineage(app.result);
-    wave::ToolpathOptions toolpath_options;
-    toolpath_options.detour_limit = app.detour_limit;
-    app.toolpath = wave::build_toolpath(app.result, app.lineage, toolpath_options);
+    app.toolpath = wave::build_toolpath(app.result, app.lineage);
     app.toolpath_progress = 0.0f;
     if (app.selected_iteration < 0 && !app.lineage.events.empty())
       app.selected_iteration = static_cast<int>(app.lineage.events.front().generation);
@@ -768,8 +765,6 @@ void controls(AppState& app, const std::filesystem::path& input) {
   changed |= ImGui::DragFloat("Stock inflation", &app.stock_inflation, 0.1f,
                               -100000.0f, 100000.0f, "%+.3f");
   changed |= ImGui::DragFloat("Stepover", &app.stepover, 1.0f, 0.001f, 100000.0f, "%.3f");
-  changed |= ImGui::DragFloat("Link detour limit", &app.detour_limit, 0.05f, 1.0f,
-                              50.0f, "%.2fx");
   changed |= ImGui::SliderFloat("Wave softening", &app.softening_percent,
                                 0.0f, 100.0f, "%.1f%%");
   if (changed) {

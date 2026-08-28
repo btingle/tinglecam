@@ -41,13 +41,6 @@ struct ToolpathMove {
   double length = 0.0;
 };
 
-struct ToolpathOptions {
-  // A detour through cleared material is taken in place of a retract when it is
-  // no longer than this multiple of the straight-line distance. Raising it
-  // trades cycle time for fewer lifts.
-  double detour_limit = 6.0;
-};
-
 struct ToolpathStats {
   double cut_length = 0.0;
   double step_length = 0.0;
@@ -80,15 +73,14 @@ struct Toolpath {
 // by a retract otherwise. A link that only crosses the band its target front
 // bounds is reported as a step: engaged, but no deeper than one stepover.
 //
-// When the straight segment is blocked, the move is routed along the boundary
-// of the region it may travel through before a lift is considered, so the tool
-// follows a contour around an obstruction rather than rapiding over it. A lift
-// that does happen sets down in cleared material; only where no cleared landing
-// exists is an entry emitted, and that one has to be ramped. The rapid itself
-// is kept out of the subject as well, since a single slice says nothing about
-// how far the part rises above it.
-Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage,
-                        const ToolpathOptions& options = {});
+// When the straight segment is blocked, both a detour through the travelable
+// region and a retract/rapid/approach are planned. Their complete represented
+// XY distances are compared and the shorter move is emitted. A lift sets down
+// in cleared material; only where no cleared landing exists is an entry
+// emitted, and that one has to be ramped. The rapid itself is kept out of the
+// subject as well, since a single slice says nothing about how far the part
+// rises above it.
+Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage);
 
 // Where the tool is after travelling a given distance along the whole path.
 struct ToolpathCursor {

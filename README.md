@@ -109,8 +109,6 @@ and boundary offsets.
   applied after slicing, so changing them does not rebuild or query the BVH.
 - Drag **Allowance** (when no stock model is loaded) or **Stepover** to
   recompute immediately.
-- Drag **Link detour limit** to set how far a transition may travel around an
-  obstruction before the tool lifts over it instead.
 - Use **Generation** to inspect a pass, or animate through passes.
 - Toggle the subject, allowance box, or complete generation overlay.
 - Toggle **Show leading fronts** to display the previous front in violet and
@@ -200,16 +198,19 @@ classification is:
   near the front yet. The tool has to ramp or helix into solid material, and the
   first move of any toolpath is one of these.
 
-Before a lift is considered, a blocked segment is routed along the boundary of
-the region it may travel through, walked in both directions and then pulled
-straight wherever a shortcut stays clear. The detour is taken when it is no more
-than `detour_limit` times the direct distance, so the tool follows a contour
-around an obstruction instead of rapiding over it. Pulling straight is only an
-optimisation: dropping vertices along a contour that hugs an obstacle leaves
-chords cutting through it, so the shortened walk is kept only when it survives
-the clearance test and the contour itself is used otherwise. Neither is trusted
-without checking -- a walk taken from a region's own boundary can still carry a
-stretch the tool may not follow.
+For a blocked segment, the planner constructs both an at-depth detour and a
+retract/rapid/approach. It compares their complete represented XY distances and
+takes the shorter candidate. This is deliberately a distance comparison rather
+than a guessed detour multiplier. The slice does not provide a clearance height,
+vertical motion, or separate feed and rapid rates; a postprocessor with those
+values can replace the distance cost with elapsed time. The detour is walked in
+both directions around travelable-region boundaries and then pulled straight
+wherever a shortcut stays clear. Pulling straight is only an optimisation:
+dropping vertices along a contour that hugs an obstacle leaves chords cutting
+through it, so the shortened walk is kept only when it survives the clearance
+test and the contour itself is used otherwise. Neither is trusted without
+checking -- a walk taken from a region's own boundary can still carry a stretch
+the tool may not follow.
 
 A lift is planned the same way. The slice says nothing about how far the part
 rises above it, so a rapid is routed through the free space around the subject
