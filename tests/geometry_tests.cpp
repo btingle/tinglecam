@@ -181,6 +181,32 @@ int main(int argc, char** argv) {
     require(gouge_length(toolpath, result.subject, 500.0) == 0.0,
             "no cutting or linking move may pass through the subject");
 
+    // The playback cursor has to walk the path monotonically and land exactly on
+    // both ends, or the animated tool will jump or stop short of the last cut.
+    const double total = wave::toolpath_length(toolpath);
+    require(total > 0.0, "the toolpath should have positive length");
+    require(wave::toolpath_at(toolpath, 0.0).move == 0,
+            "the cursor starts on the opening move");
+    require(wave::toolpath_at(toolpath, -50.0).move == 0,
+            "a negative distance clamps to the start");
+    const auto finish = wave::toolpath_at(toolpath, total * 2.0);
+    require(finish.move + 1 == toolpath.moves.size(),
+            "a distance past the end clamps to the final move");
+    require(finish.position == toolpath.moves.back().path.back(),
+            "the cursor should finish on the last point of the last move");
+    std::size_t previous_move = 0;
+    for (int sample = 0; sample <= 400; ++sample) {
+      const auto cursor = wave::toolpath_at(toolpath, total * sample / 400.0);
+      require(cursor.move >= previous_move, "the cursor must not walk backwards");
+      require(cursor.move < toolpath.moves.size(), "the cursor must stay in range");
+      const auto& move = toolpath.moves[cursor.move];
+      require(cursor.move_distance >= 0.0 && cursor.move_distance <= move.length + 1e-6,
+              "the cursor must sit within the move it reports");
+      previous_move = cursor.move;
+    }
+    require(previous_move + 1 == toolpath.moves.size(),
+            "sampling the whole length should reach the final move");
+
     std::cout << "Loaded " << svg.source_path_count << " paths and generated "
               << result.generations.size() << " non-empty wavefronts and "
               << lineage.events.size() << " lineage events.\n";

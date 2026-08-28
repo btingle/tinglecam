@@ -116,6 +116,12 @@ and boundary offsets.
 - Toggle **Show parent links** to display the ancestry between consecutive
   leading-front components.
 - Use **Detected events** to jump directly to splits, merges, and termination.
+- Toggle **Show toolpath** to overlay the sequenced tool motion, and use
+  **Play**, the step buttons, and **Progress** to drive a tool marker along it.
+  The marker is coloured by what the tool is doing, cuts already made are drawn
+  in white, and transitions stay visible ahead of the tool so a stepover, an
+  in-material link, and a retract can be told apart at a glance. Cuts still to
+  come are left out, since the generation contours already draw them.
 - Right-drag the plan canvas to pan; use its mouse wheel to zoom.
 - Inspect BVH build/prune, candidate-query, and CPU polygon-union timings in
   the sidebar.

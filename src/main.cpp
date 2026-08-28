@@ -67,7 +67,10 @@ struct AppState {
   bool show_stock = true;
   bool show_leading_fronts = true;
   bool show_toolpath = true;
-  bool toolpath_up_to_selection = false;
+  bool toolpath_play = true;
+  // World units per second, and how far the tool has travelled along the path.
+  float toolpath_speed = 40.0f;
+  float toolpath_progress = 0.0f;
   bool show_parent_links = true;
   bool show_event_markers = true;
   bool animate = false;
@@ -155,6 +158,7 @@ void recompute(AppState& app) {
     app.result = wave::build_wavefront(subject, stock, app.stepover, softening);
     app.lineage = wave::build_front_lineage(app.result);
     app.toolpath = wave::build_toolpath(app.result, app.lineage);
+    app.toolpath_progress = 0.0f;
     if (app.selected_iteration < 0 && !app.lineage.events.empty())
       app.selected_iteration = static_cast<int>(app.lineage.events.front().generation);
     else
@@ -170,6 +174,7 @@ void recompute(AppState& app) {
     app.result = {};
     app.lineage = {};
     app.toolpath = {};
+    app.toolpath_progress = 0.0f;
     app.selected_iteration = -1;
   }
 }
@@ -279,9 +284,37 @@ void draw_polyline(ImDrawList* draw_list, const Path64& path,
                        color, width);
 }
 
+// Draws only the first `limit` world units of a polyline, so a move in progress
+// stops at the tool rather than running ahead of it.
+void draw_polyline_to(ImDrawList* draw_list, const Path64& path,
+                      const CanvasTransform& transform, ImU32 color, float width,
+                      double limit) {
+  double remaining = limit;
+  for (std::size_t i = 1; i < path.size() && remaining > 0.0; ++i) {
+    const double segment = std::hypot(wave::to_world(path[i].x - path[i - 1].x),
+                                      wave::to_world(path[i].y - path[i - 1].y));
+    const ImVec2 from = transform.point(path[i - 1]);
+    ImVec2 to = transform.point(path[i]);
+    if (segment > remaining) {
+      const float t = static_cast<float>(remaining / segment);
+      to = {from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t};
+    }
+    draw_list->AddLine(from, to, color, width);
+    remaining -= segment;
+  }
+}
+
+ImU32 fade(ImU32 color, float alpha) {
+  const ImU32 scaled = static_cast<ImU32>(((color >> IM_COL32_A_SHIFT) & 0xFF) * alpha);
+  return (color & ~IM_COL32_A_MASK) | (scaled << IM_COL32_A_SHIFT);
+}
+
 ImU32 move_color(wave::MoveKind kind) {
   switch (kind) {
-    case wave::MoveKind::Cut: return IM_COL32(90, 245, 174, 235);
+    // White rather than another green: the cut runs along a leading front, which
+    // the generation contours already draw in the cyan ramp, and the overlay is
+    // only legible if it does not land in the same colour family.
+    case wave::MoveKind::Cut: return IM_COL32(246, 249, 253, 240);
     case wave::MoveKind::Step: return IM_COL32(255, 196, 61, 255);
     case wave::MoveKind::Link: return IM_COL32(96, 190, 255, 255);
     case wave::MoveKind::Retract: return IM_COL32(255, 92, 118, 255);
@@ -428,32 +461,48 @@ void draw_canvas(AppState& app) {
     }
   }
 
-  if (app.show_toolpath) {
-    // Retracts are drawn last and connecting moves before the cuts they serve,
-    // so a transition stays visible where it overlaps the front it leaves.
-    const int limit = app.toolpath_up_to_selection && app.selected_iteration >= 0
-                          ? app.selected_iteration
-                          : -1;
-    std::vector<const wave::ToolpathMove*> retracts;
-    for (const auto& move : app.toolpath.moves) {
-      if (move.kind == wave::MoveKind::Cut && limit >= 0 &&
-          move.front.generation > static_cast<std::size_t>(limit))
-        break;
-      if (move.kind == wave::MoveKind::Retract) {
-        retracts.push_back(&move);
-        continue;
+  if (app.show_toolpath && !app.toolpath.moves.empty()) {
+    const auto cursor = wave::toolpath_at(app.toolpath, app.toolpath_progress);
+    // Everything is laid down faded first and the finished portion painted over
+    // it, so the whole path stays legible while the completed part reads clearly
+    // against it. Retracts go last within each pass so a lift stays visible
+    // where it overlaps the front it leaves.
+    for (int pass = 0; pass < 2; ++pass) {
+      const bool done = pass == 1;
+      std::vector<const wave::ToolpathMove*> retracts;
+      for (std::size_t i = 0; i < app.toolpath.moves.size(); ++i) {
+        const auto& move = app.toolpath.moves[i];
+        if (done && i > cursor.move) break;
+        // Cuts that have not happened yet are left out: they follow leading
+        // fronts, which are already on screen. Transitions have nothing else
+        // drawing them, so those stay visible ahead of the tool.
+        if (!done && move.kind == wave::MoveKind::Cut) continue;
+        const ImU32 color = done ? move_color(move.kind) : fade(move_color(move.kind), 0.30f);
+        if (move.kind == wave::MoveKind::Retract) {
+          retracts.push_back(&move);
+          continue;
+        }
+        const float width = move.kind == wave::MoveKind::Cut ? 2.5f : 3.5f;
+        if (done && i == cursor.move)
+          draw_polyline_to(draw_list, move.path, transform, color, width,
+                           cursor.move_distance);
+        else
+          draw_polyline(draw_list, move.path, transform, color, width);
       }
-      const bool is_cut = move.kind == wave::MoveKind::Cut;
-      draw_polyline(draw_list, move.path, transform, move_color(move.kind),
-                    is_cut ? 2.0f : 3.5f);
+      for (const auto* move : retracts) {
+        if (move->path.size() < 2) continue;
+        const ImU32 color = done ? move_color(move->kind) : fade(move_color(move->kind), 0.30f);
+        const ImVec2 from = transform.point(move->path.front());
+        const ImVec2 to = transform.point(move->path.back());
+        draw_list->AddLine(from, to, color, 2.0f);
+        draw_list->AddCircle(to, 6.0f, color, 0, 2.0f);
+      }
     }
-    for (const auto* move : retracts) {
-      if (move->path.size() < 2) continue;
-      const ImVec2 from = transform.point(move->path.front());
-      const ImVec2 to = transform.point(move->path.back());
-      draw_list->AddLine(from, to, move_color(move->kind), 2.0f);
-      draw_list->AddCircle(to, 6.0f, move_color(move->kind), 0, 2.0f);
-    }
+
+    const ImVec2 tool = transform.point(cursor.position);
+    draw_list->AddCircleFilled(tool, 8.0f, IM_COL32(14, 18, 24, 245));
+    draw_list->AddCircleFilled(tool, 5.5f, move_color(cursor.kind));
+    draw_list->AddCircle(tool, 9.5f, IM_COL32(240, 244, 250, 220), 0, 1.75f);
   }
 
   if (app.show_event_markers) {
@@ -737,9 +786,49 @@ void controls(AppState& app, const std::filesystem::path& input) {
 
   ImGui::SeparatorText("Toolpath");
   ImGui::Checkbox("Show toolpath", &app.show_toolpath);
-  ImGui::SameLine();
-  ImGui::Checkbox("Up to selection", &app.toolpath_up_to_selection);
   {
+    const double total = wave::toolpath_length(app.toolpath);
+    const auto cursor = wave::toolpath_at(app.toolpath, app.toolpath_progress);
+    const bool have_path = !app.toolpath.moves.empty();
+
+    ImGui::BeginDisabled(!have_path);
+    if (ImGui::Button(app.toolpath_play ? "Pause" : "Play"))
+      app.toolpath_play = !app.toolpath_play;
+    ImGui::SameLine();
+    // Stepping lands on the start of the neighbouring move, which is what you
+    // want when a single transition looks wrong and you need to sit on it.
+    if (ImGui::Button("|<") && cursor.move > 0) {
+      app.toolpath_progress =
+          static_cast<float>(wave::toolpath_move_start(app.toolpath, cursor.move - 1));
+      app.toolpath_play = false;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(">|")) {
+      app.toolpath_progress = static_cast<float>(
+          wave::toolpath_move_start(app.toolpath, cursor.move + 1));
+      app.toolpath_play = false;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Rewind")) app.toolpath_progress = 0.0f;
+    ImGui::SliderFloat("Speed##toolpath", &app.toolpath_speed, 1.0f, 400.0f,
+                       "%.0f units/s", ImGuiSliderFlags_Logarithmic);
+    if (ImGui::SliderFloat("Progress", &app.toolpath_progress, 0.0f,
+                           static_cast<float>(total), "%.1f units"))
+      app.toolpath_play = false;
+    ImGui::EndDisabled();
+
+    if (have_path) {
+      ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(move_color(cursor.kind)),
+                         "Move %zu/%zu: %s", cursor.move + 1,
+                         app.toolpath.moves.size(),
+                         wave::move_kind_name(cursor.kind));
+      if (app.toolpath.moves[cursor.move].kind == wave::MoveKind::Cut) {
+        const auto& front = app.toolpath.moves[cursor.move].front;
+        ImGui::SameLine();
+        ImGui::Text("(generation %zu, front %zu)", front.generation, front.index);
+      }
+    }
+
     const auto& stats = app.toolpath.stats;
     ImGui::Text("Cut:     %8.1f units in %zu moves", stats.cut_length, stats.cut_count);
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(move_color(wave::MoveKind::Step)),
@@ -1015,6 +1104,11 @@ int main(int argc, char** argv) {
       const auto now = std::chrono::steady_clock::now();
       const double elapsed = std::chrono::duration<double>(now - previous_time).count();
       previous_time = now;
+      if (app.toolpath_play && !app.toolpath.moves.empty()) {
+        const double total = wave::toolpath_length(app.toolpath);
+        app.toolpath_progress += static_cast<float>(elapsed * app.toolpath_speed);
+        if (app.toolpath_progress > total) app.toolpath_progress = 0.0f;
+      }
       if (app.animate && !app.result.generations.empty()) {
         animation_accumulator += elapsed * app.animation_speed;
         while (animation_accumulator >= 1.0) {

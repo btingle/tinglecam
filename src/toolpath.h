@@ -62,6 +62,24 @@ struct Toolpath {
 // bounds is reported as a step: engaged, but no deeper than one stepover.
 Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage);
 
+// Where the tool is after travelling a given distance along the whole path.
+struct ToolpathCursor {
+  std::size_t move = 0;
+  Point64 position;
+  MoveKind kind = MoveKind::Cut;
+  // How far into `move` the cursor sits, so a partially finished move can be
+  // drawn up to the tool and no further.
+  double move_distance = 0.0;
+};
+
+double toolpath_length(const Toolpath& toolpath);
+
+// Distance from the start of the path to where `move` begins.
+double toolpath_move_start(const Toolpath& toolpath, std::size_t move);
+
+// Clamps to the path: a distance past the end returns the final point.
+ToolpathCursor toolpath_at(const Toolpath& toolpath, double distance);
+
 const char* move_kind_name(MoveKind kind);
 
 }  // namespace wave

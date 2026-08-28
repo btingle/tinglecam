@@ -43,6 +43,27 @@ double nearest_vertex_distance(const Path64& path, const Point64& point) {
   return distance_world(path[nearest_vertex(path, point)], point);
 }
 
+Point64 lerp_point(const Point64& a, const Point64& b, double t) {
+  return Point64(
+      static_cast<std::int64_t>(std::llround(a.x + (b.x - a.x) * t)),
+      static_cast<std::int64_t>(std::llround(a.y + (b.y - a.y) * t)));
+}
+
+// The point `distance` world units along an open polyline.
+Point64 point_along(const Path64& path, double distance) {
+  if (path.empty()) return Point64();
+  double remaining = std::max(0.0, distance);
+  for (std::size_t i = 1; i < path.size(); ++i) {
+    const double segment = distance_world(path[i - 1], path[i]);
+    if (remaining <= segment || i + 1 == path.size()) {
+      const double t = segment > 0.0 ? std::clamp(remaining / segment, 0.0, 1.0) : 0.0;
+      return lerp_point(path[i - 1], path[i], t);
+    }
+    remaining -= segment;
+  }
+  return path.back();
+}
+
 // Restates a closed ring as an explicit loop that starts and ends at `start`.
 Path64 close_ring_from(const Path64& ring, std::size_t start) {
   Path64 path;
@@ -260,6 +281,40 @@ Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage) {
   for (const auto& node : nodes)
     if (!node.cut) ++toolpath.stats.unreachable_fronts;
   return toolpath;
+}
+
+double toolpath_length(const Toolpath& toolpath) {
+  double total = 0.0;
+  for (const auto& move : toolpath.moves) total += move.length;
+  return total;
+}
+
+double toolpath_move_start(const Toolpath& toolpath, std::size_t move) {
+  double total = 0.0;
+  for (std::size_t i = 0; i < move && i < toolpath.moves.size(); ++i)
+    total += toolpath.moves[i].length;
+  return total;
+}
+
+ToolpathCursor toolpath_at(const Toolpath& toolpath, double distance) {
+  ToolpathCursor cursor;
+  if (toolpath.moves.empty()) return cursor;
+  distance = std::max(0.0, distance);
+  double travelled = 0.0;
+  for (std::size_t i = 0; i < toolpath.moves.size(); ++i) {
+    const auto& move = toolpath.moves[i];
+    const bool last = i + 1 == toolpath.moves.size();
+    if (distance <= travelled + move.length || last) {
+      cursor.move = i;
+      cursor.kind = move.kind;
+      cursor.move_distance = std::clamp(distance - travelled, 0.0, move.length);
+      cursor.position = move.path.empty() ? Point64()
+                                          : point_along(move.path, cursor.move_distance);
+      return cursor;
+    }
+    travelled += move.length;
+  }
+  return cursor;
 }
 
 const char* move_kind_name(MoveKind kind) {
