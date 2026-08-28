@@ -58,6 +58,44 @@ area is canonically identical to the previous pass, becomes empty, or reaches
 the 2000-generation safety limit. Every non-empty wave band is retained for
 visualization.
 
+### Leading in from the air
+
+Seeded on the stock wall, the first contour is a full stepover inside it and the
+cutter arrives at full width: whatever the lead-in, a pass whose every side is
+solid takes a slot. So the wave is instead seeded a whole number of stepovers
+out in the open air, and the first few generations produce contours that stand
+clear of the stock. Following them, the tool takes up its bite over the run-in
+rather than at first contact. `build_wavefront` takes the lead-in as a distance
+and rounds it up to whole steps, so a front lands exactly on the wall rather
+than a fraction of a step short of it; the demo asks for one tool radius, which
+is what it takes a cutter to go from just touching the wall to fully across it.
+
+The approach region is grown from the wall the wave actually starts on, not from
+the stock solid:
+
+```text
+Wall     = ((K - InflatePaths(K, -1)) - S)
+Approach = InflatePaths(Wall, n*e) - S
+D        = K union Approach
+R0       = (D - InflatePaths(D, -1)) - InflatePaths(S, 2)
+R(n+1)   = (InflatePaths(Rn, e) intersect D) - S
+```
+
+Only boundary the wave starts from gets a run-in, so stock the subject occludes
+contributes none; growing the solid instead would have manufactured a lead-in
+running along the face of the part. `R0` is cut back by a hair more than the
+seed ring is thick, because an approach region is carved out of open air and
+leaves the part exposed alongside the outer edge that is meant to be the only
+source -- inside the stock the subject covers that boundary and subtracting it
+is enough, but in the air it is not, and the part would become a wave source in
+its own right.
+
+`WaveResult` carries the domain `D`, and the lineage bounds fronts with it
+rather than with the stock. Bounding them with the stock would leave every
+run-in band with nothing unreached ahead of it and no front to hand on, and
+would call the stock wall a static boundary at the very point the wave is meant
+to cross it. With no lead-in the two regions are the same and nothing changes.
+
 ## Build and run
 
 SDL2 and OpenGL development packages are required. On Ubuntu/Debian they are
@@ -111,6 +149,10 @@ and boundary offsets.
   applied after slicing, so changing them does not rebuild or query the BVH.
 - Drag **Allowance** (when no stock model is loaded) or **Stepover** to
   recompute immediately.
+- Toggle **Lead in from the air** to seed the wave one tool radius outside the
+  stock, so the opening passes stand clear of it and take up their bite over the
+  run-in. Turning it off starts the wave on the stock wall, where the first pass
+  arrives at full width.
 - Use **Generation** to inspect a pass, or animate through passes.
 - Toggle the subject, allowance box, or complete generation overlay.
 - Toggle **Show leading fronts** to display the previous front in violet and
@@ -124,9 +166,12 @@ and boundary offsets.
   in white, and transitions stay visible ahead of the tool so a stepover, an
   in-material link, and a retract can be told apart at a glance. Cuts still to
   come are left out, since the generation contours already draw them.
-- Adjust **Tool radius** and **Simulation stock inflation** independently of
-  the planner, then toggle **Show material simulation** to watch the raw stock
-  slice be subtracted as the tool advances. The dashed cyan contour is the
+- Adjust **Tool radius** to resize the cutter. It is a planning figure as well
+  as a simulation one -- the lead-in and every plunge clearance are sized from
+  it -- so moving it rebuilds the toolpath. **Simulation stock inflation** is
+  the simulation's alone and only re-sweeps the existing path. Toggle **Show
+  material simulation** to watch the raw stock slice be subtracted as the tool
+  advances. The dashed cyan contour is the
   initial simulation stock and the solid cyan contour is what remains.
 - Toggle **Color completed path by cutter load** to replace move colors with a
   blue/green/red engagement scale. Magenta sections have removed final-subject
@@ -176,6 +221,16 @@ solid material, and later transitions may run round the outside of the stock
 instead of lifting over the part. That space is held off the stock wall by the
 same slack the clearance tests allow, or a move grazing along the wall would
 read as free travel when it is in fact cutting.
+
+What a descent sweeps is a disc of the tool's radius, so that radius is how far
+inside cleared material a plunge has to land, and `build_toolpath` takes it for
+that reason. Half a stepover is the floor rather than the figure -- it puts the
+landing along the middle of the band the parent front opened rather than against
+an edge -- and it is what this used to use outright, back when the radius was
+known only to the simulation and every plan came out the same for every cutter.
+A landing that already stands clear is used as it is, instead of being projected
+onto the nearest edge of the clearance zone and then fed across to a place the
+tool could have descended straight onto.
 
 
 The lineage is ordered into a single tool motion by `build_toolpath`. A front may
@@ -255,7 +310,10 @@ keeps their physical and planning roles separate:
 - final-subject gouges are tested against the raw subject slice with no
   inflation; and
 - `--tool-radius` controls the circular cutter footprint. It defaults to half
-  the initial stepover.
+  the initial stepover, and unlike the offsets above it is not simulation-only:
+  the planner sizes the lead-in and every plunge clearance from it, so changing
+  it rebuilds the toolpath. `--no-lead-in` seeds the wave on the stock wall
+  instead of out in the air.
 
 `Cut`, `Step`, and `Link` polylines run at depth. Each is subdivided to roughly
 one tool radius of travel per sample, inflated with round ends by the tool

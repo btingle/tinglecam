@@ -132,6 +132,98 @@ double gouge_length(const wave::Toolpath& toolpath, const wave::Paths64& subject
   return total;
 }
 
+wave::Path64 test_box(double x0, double y0, double x1, double y1) {
+  return wave::Path64{{wave::to_integer(x0), wave::to_integer(y0)},
+                      {wave::to_integer(x1), wave::to_integer(y0)},
+                      {wave::to_integer(x1), wave::to_integer(y1)},
+                      {wave::to_integer(x0), wave::to_integer(y1)}};
+}
+
+bool region_covers(const wave::Paths64& region, double x, double y) {
+  const wave::Paths64 probe{test_box(x - 0.05, y - 0.05, x + 0.05, y + 0.05)};
+  return !Clipper2Lib::Intersect(probe, region, Clipper2Lib::FillRule::NonZero)
+              .empty();
+}
+
+// A square part centred in square stock, so every stock face is open, against
+// the same part pushed out to meet the right face, so that face is occluded.
+void check_lead_in() {
+  const wave::Paths64 stock{test_box(-50, -50, 50, 50)};
+  const wave::Paths64 centred{test_box(-20, -20, 20, 20)};
+  const double stepover = 5.0;
+
+  const auto plain = wave::build_wavefront(centred, stock, stepover, stepover);
+  require(plain.lead_in_generations == 0, "no lead-in was asked for");
+  require(plain.lead_in == 0.0, "no lead-in was asked for");
+  require(!region_covers(plain.domain, -52.0, 0.0),
+          "without a lead-in the wave must not run outside the stock");
+
+  // Ten units of lead-in at a five unit stepover is two whole generations, and
+  // each one is a generation the plain wave does not have.
+  const auto led = wave::build_wavefront(centred, stock, stepover, stepover, 10.0);
+  require(led.lead_in_generations == 2, "ten units of lead-in is two stepovers");
+  require(std::abs(led.lead_in - 10.0) < 1e-9, "lead-in should round to whole steps");
+  require(led.generations.size() == plain.generations.size() + 2,
+          "a two generation lead-in should add two generations");
+  require(region_covers(led.domain, -52.0, 0.0),
+          "the lead-in should open the air in front of an exposed stock face");
+  require(!region_covers(led.domain, -62.0, 0.0),
+          "the lead-in should reach no further than it was asked to");
+
+  // Every front the lead-in adds stands clear of the stock, which is the whole
+  // point of it: the cutter takes up its bite over those passes instead of
+  // arriving at full width on the first one.
+  const auto lineage = wave::build_front_lineage(led);
+  bool saw_outside = false;
+  for (std::size_t generation = 0; generation < led.lead_in_generations; ++generation)
+    for (const auto& front : lineage.generations[generation].fronts)
+      if (!front.path.empty()) {
+        require(!region_covers(stock,
+                               wave::to_world(wave::representative_point(front).x),
+                               wave::to_world(wave::representative_point(front).y)),
+                "a lead-in front must not lie in the stock");
+        saw_outside = true;
+      }
+  require(saw_outside, "a lead-in should produce fronts of its own");
+
+  // The subject reaches the right face, so that face has no wavefront on it and
+  // must get no run-in. The left face is untouched and must still get one.
+  const wave::Paths64 flush{test_box(-20, -20, 50, 20)};
+  const auto occluded = wave::build_wavefront(flush, stock, stepover, stepover, 10.0);
+  require(region_covers(occluded.domain, -52.0, 0.0),
+          "an exposed face should still lead in");
+  require(!region_covers(occluded.domain, 52.0, 0.0),
+          "stock the subject occludes must not be led into");
+}
+
+// A plunge lands in material that is already gone, so it has to stand at least
+// one tool radius clear of everything that is not. Before the radius reached
+// the planner this was half a stepover regardless of the cutter, which put the
+// opening descent inside the stock for any tool wider than the step.
+void check_plunge_clearance() {
+  const wave::Paths64 stock{test_box(-50, -50, 50, 50)};
+  const wave::Paths64 subject{test_box(-20, -20, 20, 20)};
+  const double stepover = 5.0;
+  const double tool_radius = 12.0;
+  const auto wave_result = wave::build_wavefront(subject, stock, stepover, stepover);
+  const auto lineage = wave::build_front_lineage(wave_result);
+  const auto toolpath = wave::build_toolpath(wave_result, lineage, tool_radius);
+
+  const wave::Paths64 swept = Clipper2Lib::InflatePaths(
+      stock, static_cast<double>(wave::to_integer(tool_radius)),
+      Clipper2Lib::JoinType::Round, Clipper2Lib::EndType::Polygon);
+  bool checked = false;
+  for (const auto& move : toolpath.moves) {
+    if (move.kind != wave::MoveKind::Retract || move.path.empty()) continue;
+    const wave::Point64& landing = move.path.back();
+    require(!region_covers(swept, wave::to_world(landing.x), wave::to_world(landing.y)),
+            "the opening plunge must clear the stock by a whole tool radius");
+    checked = true;
+    break;
+  }
+  require(checked, "the opening move should be a plunge in free air");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -171,6 +263,9 @@ int main(int argc, char** argv) {
             "canonical comparison should ignore starting vertex");
     require(wave::paths_equal_canonical({square}, {reversed}),
             "canonical comparison should ignore winding");
+
+    check_lead_in();
+    check_plunge_clearance();
 
     const auto lineage = wave::build_front_lineage(result);
     require(lineage.generations.size() == result.generations.size(),

@@ -80,7 +80,13 @@ struct Toolpath {
 // emitted, and that one has to be ramped. The rapid itself is kept out of the
 // subject as well, since a single slice says nothing about how far the part
 // rises above it.
-Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage);
+//
+// `tool_radius` sizes the clearance a descent needs: the tool cuts everything
+// within a radius of its centre, so that is how far inside cleared material a
+// plunge has to land. Zero or negative falls back to half the stepover, which
+// is what the planner assumed before the radius was available to it.
+Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage,
+                        double tool_radius = 0.0);
 
 // Where the tool is after travelling a given distance along the whole path.
 struct ToolpathCursor {

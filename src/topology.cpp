@@ -259,9 +259,15 @@ FrontLineage build_front_lineage(const WaveResult& wave) {
   if (wave.generations.empty()) return result;
 
   const Paths64 stock = wave.stock.empty() ? Paths64{wave.stock_boundary} : wave.stock;
-  const Paths64 free_space = Difference(stock, wave.subject, FillRule::NonZero);
+  // The wave runs through the domain, which a lead-in extends past the stock
+  // wall into open air. Bounding fronts by the stock instead would leave every
+  // run-in band with nothing unreached ahead of it and no front to hand on, and
+  // would call the stock wall a static boundary when the wave is meant to cross
+  // it. Without a lead-in the two are the same region.
+  const Paths64& region = wave.domain.empty() ? stock : wave.domain;
+  const Paths64 free_space = Difference(region, wave.subject, FillRule::NonZero);
   Paths64 static_boundaries = wave.subject;
-  static_boundaries.insert(static_boundaries.end(), stock.begin(), stock.end());
+  static_boundaries.insert(static_boundaries.end(), region.begin(), region.end());
   result.generations.reserve(wave.generations.size());
 
   for (std::size_t generation = 0; generation < wave.generations.size(); ++generation) {

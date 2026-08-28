@@ -287,6 +287,20 @@ std::optional<Path64> route_around(const Point64& from, const Point64& to,
   return best;
 }
 
+// Non-zero containment across a whole set of rings, so a point sitting in a
+// hole reads as outside the way the fills everywhere else in this file do.
+bool inside_paths(const Paths64& paths, const Point64& point) {
+  int winding = 0;
+  for (const auto& ring : paths) {
+    if (ring.size() < 3) continue;
+    const PointInPolygonResult result = PointInPolygon(point, ring);
+    if (result == PointInPolygonResult::IsOn) return true;
+    if (result == PointInPolygonResult::IsInside)
+      winding += Area(ring) >= 0.0 ? 1 : -1;
+  }
+  return winding != 0;
+}
+
 // A point at least `clearance` inside cleared material, as close to `target` as
 // one can be found. This is where a lift may set the tool back down without the
 // descent itself having to cut.
@@ -295,6 +309,12 @@ std::optional<Point64> find_plunge_point(const Paths64& cleared, const Point64& 
   for (const double scale : {1.0, 0.5, 0.25}) {
     const Paths64 zone = InflatePaths(cleared, -integer_clearance * scale,
                                       JoinType::Round, EndType::Polygon);
+    // Somewhere the tool already stands clear needs no landing of its own.
+    // Projecting onto the boundary regardless would set it down on the nearest
+    // edge of the clearance zone and then feed it across to a spot it could
+    // have descended straight onto, which is the stray approach that made the
+    // opening move of a lead-in path cut anything at all.
+    if (scale == 1.0 && inside_paths(zone, target)) return target;
     std::optional<Point64> best;
     double best_distance = std::numeric_limits<double>::max();
     for (const auto& ring : zone) {
@@ -319,7 +339,8 @@ struct Node {
 
 }  // namespace
 
-Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage) {
+Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage,
+                        double tool_radius) {
   Toolpath toolpath;
   if (lineage.generations.empty()) return toolpath;
   if (lineage.generations.size() != wave.generations.size())
@@ -335,13 +356,21 @@ Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage) {
   // genuine pocket-to-pocket jumps stay retracts across the whole range -- so
   // this sits mid-plateau and scales with the stepover it must never let a link
   // cross.
-  // How far inside cleared material a lift must set the tool down. Half a
-  // stepover puts the plunge along the middle of the band the parent front
-  // opened rather than against either of its edges.
-  const double plunge_clearance =
-      static_cast<double>(to_integer(wave.stepover)) * 0.5;
   const double tolerance = std::clamp(
       static_cast<double>(to_integer(wave.stepover)) * 0.05, 32.0, 500.0);
+  // How far inside cleared material a lift must set the tool down. What the
+  // descent sweeps is a disc of the tool's radius, so that radius is the
+  // clearance, and anything less is a plunge that cuts on the way in. Half a
+  // stepover is the floor rather than the figure: it puts the landing along the
+  // middle of the band the parent front opened rather than against an edge, and
+  // it is what this used to use outright, back when the radius was not known
+  // here and every plan came out the same for every cutter.
+  const double plunge_clearance =
+      std::max(static_cast<double>(
+                   to_integer(tool_radius > 0.0 ? tool_radius
+                                                : wave.stepover * 0.5)),
+               static_cast<double>(to_integer(wave.stepover)) * 0.5) +
+      tolerance;
 
   std::vector<std::size_t> generation_offset(lineage.generations.size() + 1, 0);
   std::vector<Node> nodes;
@@ -369,9 +398,15 @@ Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage) {
   for (std::size_t node = 0; node < nodes.size(); ++node)
     if (nodes[node].pending_parents == 0) ready.push_back(node);
 
+  // Wide enough to hold the fronts, which a lead-in puts outside the stock, and
+  // then the travel space around them. The air outside the stock is bounded by
+  // this box, so it also has to leave a frame that survives being eroded by the
+  // plunge clearance from both sides -- otherwise a wide cutter finds no landing
+  // beside the stock and settles for one of the relaxed fallbacks instead.
   Rect64 world = GetBounds(wave.stock);
   const std::int64_t margin = std::max<std::int64_t>(
-      16, to_integer(wave.stepover) * 4);
+      16, to_integer(wave.stepover) * 4 + to_integer(wave.lead_in) +
+              static_cast<std::int64_t>(plunge_clearance * 2.0 + tolerance * 2.0));
   world.left -= margin;
   world.top -= margin;
   world.right += margin;

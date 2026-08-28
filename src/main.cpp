@@ -69,6 +69,7 @@ struct AppState {
   float stock_inflation = 0.0f;
   float simulation_stock_inflation = 0.0f;
   float tool_radius = 40.0f;
+  bool lead_in = true;
   int selected_iteration = -1;
   bool show_all_iterations = true;
   bool show_subject = true;
@@ -184,9 +185,13 @@ void recompute(AppState& app) {
     stock = offset_boundaries(stock, app.stock_inflation, "Stock");
     const double softening =
         std::min<double>(app.stepover * app.softening_percent * 0.01, app.stepover);
-    app.result = wave::build_wavefront(subject, stock, app.stepover, softening);
+    // One radius of lead-in is what it takes a cutter to go from standing clear
+    // of the stock wall to fully across it, so that is the distance over which
+    // the first passes have to take up their bite.
+    const double lead_in = app.lead_in ? app.tool_radius : 0.0;
+    app.result = wave::build_wavefront(subject, stock, app.stepover, softening, lead_in);
     app.lineage = wave::build_front_lineage(app.result);
-    app.toolpath = wave::build_toolpath(app.result, app.lineage);
+    app.toolpath = wave::build_toolpath(app.result, app.lineage, app.tool_radius);
     recompute_simulation(app);
     app.toolpath_progress = 0.0f;
     if (app.selected_iteration < 0 && !app.lineage.events.empty())
@@ -889,6 +894,7 @@ void controls(AppState& app, const std::filesystem::path& input) {
   changed |= ImGui::DragFloat("Stepover", &app.stepover, 1.0f, 0.001f, 100000.0f, "%.3f");
   changed |= ImGui::SliderFloat("Wave softening", &app.softening_percent,
                                 0.0f, 100.0f, "%.1f%%");
+  changed |= ImGui::Checkbox("Lead in from the air", &app.lead_in);
   if (changed) {
     app.view.needs_fit = true;
     recompute(app);
@@ -1025,13 +1031,17 @@ void controls(AppState& app, const std::filesystem::path& input) {
   }
 
   ImGui::SeparatorText("Material simulation");
-  bool simulation_changed = false;
-  simulation_changed |= ImGui::DragFloat(
-      "Tool radius", &app.tool_radius, 0.1f, 0.001f, 100000.0f, "%.3f");
-  simulation_changed |= ImGui::DragFloat(
-      "Simulation stock inflation", &app.simulation_stock_inflation, 0.1f,
-      -100000.0f, 100000.0f, "%+.3f");
-  if (simulation_changed) recompute_simulation(app);
+  // The radius is no longer a simulation figure alone. The planner sizes the
+  // lead-in and every plunge clearance from it, so moving it has to rebuild the
+  // toolpath rather than sweep a differently sized tool along the old one.
+  if (ImGui::DragFloat("Tool radius", &app.tool_radius, 0.1f, 0.001f, 100000.0f,
+                       "%.3f")) {
+    recompute(app);
+  }
+  if (ImGui::DragFloat("Simulation stock inflation", &app.simulation_stock_inflation,
+                       0.1f, -100000.0f, 100000.0f, "%+.3f")) {
+    recompute_simulation(app);
+  }
   ImGui::Checkbox("Show material simulation", &app.show_simulation);
   ImGui::Checkbox("Color completed path by cutter load", &app.show_load);
   ImGui::Checkbox("Show gouges", &app.show_gouges);
@@ -1161,6 +1171,7 @@ struct StartupInputs {
   std::optional<float> stock_inflation;
   std::optional<float> simulation_stock_inflation;
   std::optional<float> tool_radius;
+  std::optional<bool> lead_in;
   std::optional<float> allowance;
   std::optional<float> stepover;
   std::optional<float> softening_percent;
@@ -1213,6 +1224,8 @@ StartupInputs resolve_inputs(int argc, char** argv) {
     else if (argument == "--simulation-stock-inflate")
       result.simulation_stock_inflation = float_after(argument);
     else if (argument == "--tool-radius") result.tool_radius = float_after(argument);
+    else if (argument == "--lead-in") result.lead_in = true;
+    else if (argument == "--no-lead-in") result.lead_in = false;
     else if (argument == "--allowance") result.allowance = float_after(argument);
     else if (argument == "--stepover") result.stepover = float_after(argument);
     else if (argument == "--softening-percent") result.softening_percent = float_after(argument);
@@ -1247,7 +1260,10 @@ void print_help(const char* executable) {
       << "  --stock-inflate VALUE   Signed stock boundary offset (default: 0)\n"
       << "  --simulation-stock-inflate VALUE\n"
       << "                           Signed simulation-only stock offset (default: 0)\n"
-      << "  --tool-radius VALUE     Simulation cutter radius (default: half stepover)\n"
+      << "  --tool-radius VALUE     Cutter radius, for lead-in and plunge clearance\n"
+      << "                           and for the simulation (default: half stepover)\n"
+      << "  --lead-in, --no-lead-in Seed the wave one tool radius out in the air,\n"
+      << "                           so the first passes engage gradually (default: on)\n"
       << "  --allowance VALUE       Fallback stock allowance when no stock mesh is loaded\n"
       << "  --stepover VALUE        Wave propagation distance per generation\n"
       << "  --softening-percent P   Rounded fraction of each step, 0..100 (default: 100)\n\n"
@@ -1307,6 +1323,7 @@ int main(int argc, char** argv) {
         throw std::runtime_error("--query-grid must be between 1 and 256");
       app.query_grid = *inputs.query_grid;
     }
+    if (inputs.lead_in) app.lead_in = *inputs.lead_in;
     if (inputs.slice_z) app.slice_z = *inputs.slice_z;
     if (inputs.subject_inflation) app.subject_inflation = *inputs.subject_inflation;
     if (inputs.stock_inflation) app.stock_inflation = *inputs.stock_inflation;

@@ -36,6 +36,18 @@ struct WaveResult {
   // First outer stock path, retained for source compatibility with the
   // original rectangular-stock demo.
   Path64 stock_boundary;
+  // How far outside the stock the propagation was seeded, and how many whole
+  // generations that occupies. Fronts below `lead_in_generations` stand in the
+  // air in front of the stock, so a cutter following them takes up its bite
+  // over the run-in instead of at first contact. Zero leaves the wave seeded on
+  // the stock wall.
+  double lead_in = 0.0;
+  std::size_t lead_in_generations = 0;
+  // Everything the wave propagates through: the stock, plus the air in front of
+  // it a lead-in opens up. With no lead-in this is the stock exactly. Downstream
+  // stages bound the wave with this rather than with the stock, or the run-in
+  // has nothing ahead of it to lead into and no outer wall to start from.
+  Paths64 domain;
   std::vector<Paths64> generations;
   std::vector<Paths64> reached_generations;
   StopReason stop_reason = StopReason::Empty;
@@ -45,16 +57,22 @@ struct WaveResult {
 // transforms found on their ancestor groups and on the path itself.
 SvgGeometry load_svg_closed_paths(const std::filesystem::path& filename);
 
+// `lead_in` is rounded up to a whole number of stepovers and used to seed the
+// wave that far in front of the stock. It is grown from the stock wall the
+// wave actually starts at rather than from the stock solid, so no lead-in is
+// manufactured across boundary the subject occludes.
 WaveResult build_wavefront(const Paths64& raw_subject,
                            double allowance,
                            double stepover,
                            double softening = 0.0,
+                           double lead_in = 0.0,
                            std::size_t max_iterations = 2000);
 
 WaveResult build_wavefront(const Paths64& raw_subject,
                            const Paths64& raw_stock,
                            double stepover,
                            double softening = 0.0,
+                           double lead_in = 0.0,
                            std::size_t max_iterations = 2000);
 
 bool paths_equal_canonical(const Paths64& lhs, const Paths64& rhs);

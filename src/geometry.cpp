@@ -347,6 +347,7 @@ WaveResult build_wavefront(const Paths64& raw_subject,
                            double allowance,
                            double stepover,
                            double softening,
+                           double lead_in,
                            std::size_t max_iterations) {
   if (raw_subject.empty()) throw std::invalid_argument("Subject is empty");
   if (!(allowance > 0.0)) throw std::invalid_argument("Allowance must be positive");
@@ -360,19 +361,21 @@ WaveResult build_wavefront(const Paths64& raw_subject,
       Point64(bounds.left - margin, bounds.bottom + margin),
   };
   return build_wavefront(subject, Paths64{stock_boundary}, stepover,
-                         softening, max_iterations);
+                         softening, lead_in, max_iterations);
 }
 
 WaveResult build_wavefront(const Paths64& raw_subject,
                            const Paths64& raw_stock,
                            double stepover,
                            double softening,
+                           double lead_in,
                            std::size_t max_iterations) {
   if (raw_subject.empty()) throw std::invalid_argument("Subject is empty");
   if (raw_stock.empty()) throw std::invalid_argument("Stock is empty");
   if (!(stepover > 0.0)) throw std::invalid_argument("Stepover must be positive");
   if (softening < 0.0 || softening > stepover)
     throw std::invalid_argument("Softening must be between zero and stepover");
+  if (lead_in < 0.0) throw std::invalid_argument("Lead-in must not be negative");
   if (max_iterations == 0) throw std::invalid_argument("Iteration limit must be positive");
 
   WaveResult result;
@@ -383,27 +386,68 @@ WaveResult build_wavefront(const Paths64& raw_subject,
   if (result.stock.empty()) throw std::invalid_argument("Stock union is empty");
   result.stock_boundary = result.stock.front();
 
-  // Seed propagation with a one-integer-unit ring at the stock boundary. The
-  // subject is deliberately not part of this seed, so its boundaries can never
-  // become independent wave sources.
-  const Paths64 stock_inner = InflatePaths(result.stock, -1.0, JoinType::Miter,
-                                           EndType::Polygon);
-  Paths64 reached = Difference(result.stock, stock_inner, FillRule::NonZero);
-  reached = Difference(reached, result.subject, FillRule::NonZero);
-  reached = Union(reached, FillRule::NonZero);
-  result.generations.push_back(reached);
-  result.reached_generations.push_back(reached);
-
   const double delta = static_cast<double>(
       std::max<std::int64_t>(1, to_integer(stepover)));
   const double softening_delta = static_cast<double>(
       std::clamp<std::int64_t>(to_integer(softening), 0,
                                static_cast<std::int64_t>(delta)));
+
+  // The stock wall the wave starts from: a one-integer-unit ring at the stock
+  // boundary. The subject is deliberately not part of it, so its boundaries can
+  // never become independent wave sources.
+  const Paths64 stock_inner = InflatePaths(result.stock, -1.0, JoinType::Miter,
+                                           EndType::Polygon);
+  Paths64 wall = Difference(result.stock, stock_inner, FillRule::NonZero);
+  wall = Difference(wall, result.subject, FillRule::NonZero);
+  wall = Union(wall, FillRule::NonZero);
+
+  // Whole generations only, so that a front lands exactly on the stock wall
+  // rather than a fraction of a step short of it.
+  result.lead_in_generations =
+      lead_in > 0.0 ? static_cast<std::size_t>(std::ceil(lead_in / stepover)) : 0;
+  result.lead_in = static_cast<double>(result.lead_in_generations) * stepover;
+
+  // Propagation runs through the stock and, where there is a lead-in, through
+  // the air in front of it as well. That approach region is grown from the wall
+  // rather than from the stock solid: only boundary the wave actually starts
+  // from gets a run-in, so stock the subject occludes contributes none. Growing
+  // the solid instead would have manufactured a lead-in running along the part.
+  Paths64 domain = result.stock;
+  if (result.lead_in_generations > 0 && !wall.empty()) {
+    Paths64 approach = InflatePaths(
+        wall, delta * static_cast<double>(result.lead_in_generations),
+        JoinType::Round, EndType::Polygon);
+    approach = Difference(approach, result.subject, FillRule::NonZero);
+    domain = Union(domain, approach, FillRule::NonZero);
+  }
+  result.domain = domain;
+
+  // Seed on the boundary of whatever the domain turned out to be, which is the
+  // outer edge of the approach where there is one and the stock wall elsewhere.
+  //
+  // Where the domain runs along the subject the boundary has to be dropped, or
+  // the part becomes a wave source in its own right and the material is cleared
+  // outward from it as well as inward from the wall. Inside the stock the
+  // subject covers that boundary and removing it is enough, but an approach
+  // region is carved out of open air and leaves the face of the part exposed
+  // alongside the outer edge that is meant to be the only source. So the seed
+  // is cut back by a hair more than the ring is thick.
+  const Paths64 domain_inner = InflatePaths(domain, -1.0, JoinType::Miter,
+                                            EndType::Polygon);
+  const Paths64 subject_face = InflatePaths(result.subject, 2.0, JoinType::Miter,
+                                            EndType::Polygon);
+  Paths64 reached = Difference(domain, domain_inner, FillRule::NonZero);
+  reached = Difference(reached, subject_face, FillRule::NonZero);
+  reached = Union(reached, FillRule::NonZero);
+  result.generations.push_back(reached);
+  result.reached_generations.push_back(reached);
+
   for (std::size_t iteration = 0; iteration < max_iterations; ++iteration) {
-    // Expand only geometry already reached from the box. Clipping to stock keeps
-    // the expansion inward; subtracting the subject blocks colliding wavefronts.
+    // Expand only geometry already reached from the box. Clipping to the domain
+    // keeps the expansion inward; subtracting the subject blocks colliding
+    // wavefronts.
     Paths64 next = inflate_with_softening(reached, delta, softening_delta);
-    next = Intersect(next, result.stock, FillRule::NonZero);
+    next = Intersect(next, domain, FillRule::NonZero);
     next = Difference(next, result.subject, FillRule::NonZero);
     next = Union(next, FillRule::NonZero);
 
