@@ -14,6 +14,8 @@ came out the way it did.
 ./build/tinglecam --part part.obj --stock stock.obj \
   --tool 6mm-3f-alu --machine makera-z1 --material aluminium-6082 \
   --stepdown 1.0 --stepover 0.4 --gcode part.nc
+
+./build/tinglecam --part part.obj --stock stock.obj --view result --screenshot result.ppm
 ```
 
 Millimetres everywhere internally; inches exist only where a machine profile
@@ -93,6 +95,32 @@ but it means outside corners are fed more gently than they need to be. And the
 engagement figure legitimately exceeds 1 at direction changes, because a swept
 disc overcounts at a corner; `load_ceiling` clamps that rather than fixing the
 sampling.
+
+### Watching it happen
+
+Two views over a planned job.
+
+**Pass** draws one depth of cut. The remaining stock is filled rather than
+outlined, because the outline of a pocket and the outline of an island look
+identical until one of them is solid, and that is the whole reason for
+simulating. The cutter is drawn at its true diameter, the path behind it bright
+and the path ahead faint, and the toolpath can be coloured by feed rate,
+limiting reason, engagement or move type. Playback runs along the pass and falls
+into the next one, so a whole job can be watched without touching the slider.
+
+**Stacked result** extrudes each pass's remaining stock between its floor and
+the floor above and stacks the prisms. That is as close to the finished part as
+a set of two-and-a-half-dimensional passes can describe, and the steps between
+levels are the thing worth looking at. It shows the finished part by default;
+turned to follow the cutter it shows how far the job has got, with passes above
+the cutter finished, the one it is in part way through, and the ones below it
+untouched. Orthographic and painter-sorted onto the draw list, the same way the
+wave demo shows its slice.
+
+The remaining stock at a point in a pass comes from `simulation_stock_at`, which
+replays only the current move against a snapshot taken after the previous one,
+so scrubbing costs one move's worth of boolean operations rather than the whole
+pass. It is recomputed only when the playback actually moves.
 
 ### Posting
 

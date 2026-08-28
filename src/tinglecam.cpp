@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -120,11 +121,30 @@ class Planner {
 // ---------------------------------------------------------------------------
 
 enum class Colouring { Feed, Limit, Load, Move };
+enum class ViewMode { Plan, Result };
 
 struct View {
   ImVec2 pan{0.0f, 0.0f};
   float zoom = 4.0f;
   bool needs_fit = true;
+};
+
+// The stacked result view. Orthographic, painter-sorted onto the draw list, the
+// same way the wave demo shows its slice, because a depth buffer and shaders
+// would be a lot of machinery for a dozen extruded outlines.
+struct Orbit {
+  float yaw = 0.85f;
+  float pitch = 0.62f;
+  float zoom = 1.0f;
+};
+
+// Playback along one pass. The distance is measured along that pass's toolpath,
+// which is what the simulation snapshots are indexed by.
+struct Playback {
+  bool playing = false;
+  double distance = 0.0;
+  double speed = 40.0;  // mm of toolpath per second of wall clock
+  bool follow = true;   // keep the whole job's passes advancing, not just one
 };
 
 struct App {
@@ -147,10 +167,27 @@ struct App {
   int selected_level = 0;
   int selected_plan_operation = 0;
   Colouring colouring = Colouring::Feed;
+  ViewMode mode = ViewMode::Plan;
+  // Set from the command line so a screenshot can be told which view to take.
+  int force_tab = -1;
   bool show_stock = true;
   bool show_part = true;
   bool show_rapids = true;
+  bool show_material = true;
+  bool show_toolpath = true;
+  // The stacked view shows the finished part unless it is asked to follow the
+  // cutter, which is the more useful default: most of the time the question is
+  // what comes off the machine, not what it looks like part way through.
+  bool stack_follows_playback = false;
   View view;
+  Orbit orbit;
+  Playback playback;
+  // Remaining stock for the pass being watched, recomputed only when the
+  // playback distance actually moves.
+  Paths64 material;
+  double material_distance = -1.0;
+  int material_level = -1;
+  int material_operation = -1;
 
   // Tool Builder
   bool builder_open = false;
@@ -192,6 +229,46 @@ void draw_paths(ImDrawList* list, const Paths64& paths, const Transform& to_scre
     for (std::size_t i = 0; i < ring.size(); ++i)
       list->AddLine(to_screen(ring[i]), to_screen(ring[(i + 1) % ring.size()]), colour,
                     width);
+  }
+}
+
+// Ring vertices that are distinguishable on screen. Offset output carries
+// hundreds of vertices within a pixel of each other, and the triangulator that
+// fills a concave outline is quadratic in how many it is handed.
+std::vector<ImVec2> screen_ring(const Clipper2Lib::Path64& ring,
+                                const Transform& to_screen, float spacing = 1.5f) {
+  std::vector<ImVec2> points;
+  points.reserve(ring.size());
+  for (const auto& vertex : ring) {
+    const ImVec2 point = to_screen(vertex);
+    if (!points.empty()) {
+      const float dx = point.x - points.back().x;
+      const float dy = point.y - points.back().y;
+      if (dx * dx + dy * dy < spacing * spacing) continue;
+    }
+    points.push_back(point);
+  }
+  return points;
+}
+
+// Solid material, holes and all. Clipper orients its output so the sign of a
+// ring's area says whether it bounds material or a void, and the rings nest, so
+// painting the outers and then the voids over them gives the right picture
+// against a flat ground.
+void fill_paths(ImDrawList* list, const Paths64& paths, const Transform& to_screen,
+                ImU32 solid, ImU32 void_colour) {
+  std::vector<const Clipper2Lib::Path64*> ordered;
+  for (const auto& ring : paths)
+    if (ring.size() >= 3) ordered.push_back(&ring);
+  std::sort(ordered.begin(), ordered.end(),
+            [](const Clipper2Lib::Path64* a, const Clipper2Lib::Path64* b) {
+              return std::abs(Clipper2Lib::Area(*a)) > std::abs(Clipper2Lib::Area(*b));
+            });
+  for (const auto* ring : ordered) {
+    std::vector<ImVec2> points = screen_ring(*ring, to_screen);
+    if (points.size() < 3) continue;
+    list->AddConcavePolyFilled(points.data(), static_cast<int>(points.size()),
+                               Clipper2Lib::Area(*ring) < 0.0 ? void_colour : solid);
   }
 }
 
@@ -244,6 +321,74 @@ const cam::LevelPlan* current_level(const App& app) {
   if (app.selected_level < 0 || app.selected_level >= static_cast<int>(levels.size()))
     return nullptr;
   return &levels[app.selected_level];
+}
+
+double level_length(const cam::LevelPlan* level) {
+  return level ? wave::toolpath_length(level->toolpath) : 0.0;
+}
+
+// The remaining stock for the pass being watched. Recomputed only when the
+// playback has actually moved, since each call redoes the current move's
+// booleans and there is no sense doing that for a still frame.
+void refresh_material(App& app) {
+  const cam::LevelPlan* level = current_level(app);
+  if (!level || level->nothing_to_cut) {
+    app.material.clear();
+    app.material_distance = -1.0;
+    return;
+  }
+  if (app.material_operation == app.selected_plan_operation &&
+      app.material_level == app.selected_level &&
+      std::abs(app.material_distance - app.playback.distance) < 1e-9)
+    return;
+  try {
+    app.material = wave::simulation_stock_at(level->simulation, level->toolpath,
+                                             app.playback.distance);
+  } catch (const std::exception&) {
+    app.material = level->simulation.remaining_stock;
+  }
+  app.material_distance = app.playback.distance;
+  app.material_level = app.selected_level;
+  app.material_operation = app.selected_plan_operation;
+}
+
+// Playback runs along one pass and then falls into the next, so the whole job
+// can be watched without driving the slider by hand.
+void advance_playback(App& app, double seconds) {
+  if (!app.playback.playing || !app.has_plan) return;
+  const cam::LevelPlan* level = current_level(app);
+  if (!level) {
+    app.playback.playing = false;
+    return;
+  }
+  app.playback.distance += seconds * app.playback.speed;
+  const double total = level_length(level);
+  if (app.playback.distance < total) return;
+
+  if (!app.playback.follow) {
+    app.playback.distance = 0.0;
+    return;
+  }
+  const auto& levels = app.plan.operations[app.selected_plan_operation].levels;
+  int next = app.selected_level + 1;
+  while (next < static_cast<int>(levels.size()) && levels[next].nothing_to_cut) ++next;
+  if (next < static_cast<int>(levels.size())) {
+    app.selected_level = next;
+    app.playback.distance = 0.0;
+    return;
+  }
+  int operation = app.selected_plan_operation + 1;
+  while (operation < static_cast<int>(app.plan.operations.size()) &&
+         app.plan.operations[operation].levels.empty())
+    ++operation;
+  if (operation < static_cast<int>(app.plan.operations.size())) {
+    app.selected_plan_operation = operation;
+    app.selected_level = 0;
+    app.playback.distance = 0.0;
+    return;
+  }
+  app.playback.distance = total;
+  app.playback.playing = false;
 }
 
 void fit_view(App& app, ImVec2 canvas) {
@@ -306,6 +451,12 @@ void draw_canvas(App& app) {
 
   const cam::LevelPlan* level = current_level(app);
   if (level) {
+    // What is left of the stock, drawn as the solid it is rather than as an
+    // outline. This is the whole point of simulating: the outline of a pocket
+    // and the outline of an island look the same until one of them is filled.
+    if (app.show_material && !app.material.empty())
+      fill_paths(list, app.material, to_screen, IM_COL32(52, 78, 104, 255),
+                 IM_COL32(16, 19, 25, 255));
     if (app.show_stock)
       draw_paths(list, level->stock_slice, to_screen, IM_COL32(70, 130, 165, 200), 1.6f);
     if (app.show_part)
@@ -320,8 +471,17 @@ void draw_canvas(App& app) {
     }
     const double span = std::max(highest - lowest, 1e-6);
 
+    // Where the cutter has got to, in the same units the segments carry.
+    const double travelled = app.playback.distance;
+    double walked = 0.0;
     for (const auto& segment : level->feeds.segments) {
+      if (!app.show_toolpath) break;
+      const double segment_start = walked;
+      walked += segment.length;
       if (segment.rapid && !app.show_rapids) continue;
+      // Anything still ahead of the cutter is drawn faintly, so the part of the
+      // pass that has happened reads apart from the part that has not.
+      const bool done = segment_start < travelled;
       ImU32 colour = IM_COL32(150, 150, 150, 255);
       float width = 1.7f;
       switch (app.colouring) {
@@ -346,7 +506,32 @@ void draw_canvas(App& app) {
       }
       if (segment.rapid) width = 1.0f;
       if (segment.below_minimum_chip) width = 2.6f;
+      if (!done) {
+        ImVec4 faded = ImGui::ColorConvertU32ToFloat4(colour);
+        faded.w = 0.22f;
+        colour = ImGui::ColorConvertFloat4ToU32(faded);
+      }
       list->AddLine(to_screen(segment.from), to_screen(segment.to), colour, width);
+    }
+
+    // The cutter itself, at its true diameter, so an engagement that looks
+    // reasonable as a line can be seen for what it is.
+    const cam::Tool* tool = nullptr;
+    for (const auto& operation : app.job.operations)
+      if (operation.name ==
+          app.plan.operations[app.selected_plan_operation].operation_name)
+        tool = app.tools.find(operation.tool_id);
+    if (tool && app.show_toolpath) {
+      const wave::ToolpathCursor cursor =
+          wave::toolpath_at(level->toolpath, app.playback.distance);
+      const ImVec2 centre = to_screen(cursor.position);
+      const float radius =
+          static_cast<float>(tool->diameter * 0.5) * app.view.zoom;
+      list->AddCircleFilled(centre, std::max(radius, 2.0f),
+                            IM_COL32(255, 255, 255, 40));
+      list->AddCircle(centre, std::max(radius, 2.0f), IM_COL32(255, 255, 255, 210), 0,
+                      1.6f);
+      list->AddCircleFilled(centre, 2.5f, IM_COL32(255, 255, 255, 235));
     }
   } else {
     const char* text = app.has_plan ? "This level has nothing to cut"
@@ -356,6 +541,272 @@ void draw_canvas(App& app) {
                    top_left.y + (size.y - extent.y) * 0.5f},
                   IM_COL32(120, 130, 145, 255), text);
   }
+
+  list->PopClipRect();
+  ImGui::EndChild();
+}
+
+// ---------------------------------------------------------------------------
+// The stacked result
+// ---------------------------------------------------------------------------
+
+struct Vec3 {
+  float x = 0.0f;
+  float y = 0.0f;
+  float z = 0.0f;
+};
+
+struct Projection {
+  ImVec2 centre;
+  Vec3 model_centre;
+  Vec3 right;
+  Vec3 up;
+  Vec3 toward;  // from the model toward the eye, so larger depth is nearer
+  float scale = 1.0f;
+
+  ImVec2 point(const Vec3& value) const {
+    const Vec3 r{value.x - model_centre.x, value.y - model_centre.y,
+                 value.z - model_centre.z};
+    return {centre.x + (r.x * right.x + r.y * right.y + r.z * right.z) * scale,
+            centre.y - (r.x * up.x + r.y * up.y + r.z * up.z) * scale};
+  }
+  float depth(const Vec3& value) const {
+    const Vec3 r{value.x - model_centre.x, value.y - model_centre.y,
+                 value.z - model_centre.z};
+    return r.x * toward.x + r.y * toward.y + r.z * toward.z;
+  }
+};
+
+struct Facet {
+  std::vector<ImVec2> points;
+  float depth = 0.0f;
+  ImU32 fill = 0;
+  ImU32 edge = 0;
+};
+
+// Vertices far enough apart in the model to be worth extruding. A ring straight
+// out of an offset carries a vertex every few hundredths of a millimetre and
+// every one of them would become a quad.
+std::vector<Clipper2Lib::Point64> thinned(const Clipper2Lib::Path64& ring,
+                                          double spacing) {
+  std::vector<Clipper2Lib::Point64> points;
+  points.reserve(ring.size());
+  for (const auto& vertex : ring) {
+    if (!points.empty()) {
+      const double dx = wave::to_world(vertex.x - points.back().x);
+      const double dy = wave::to_world(vertex.y - points.back().y);
+      if (dx * dx + dy * dy < spacing * spacing) continue;
+    }
+    points.push_back(vertex);
+  }
+  return points;
+}
+
+// One pass's remaining stock, as the slab of material it stands for. Every pass
+// is drawn as its own prism and the prisms stack, which is as close to the
+// finished part as a set of two-and-a-half-dimensional passes can describe.
+void append_slab(std::vector<Facet>& facets, const Paths64& remaining, double bottom,
+                 double top, const Projection& projection, double spacing,
+                 ImU32 face, ImU32 wall, ImU32 edge) {
+  for (const auto& ring : remaining) {
+    if (ring.size() < 3) continue;
+    const bool is_void = Clipper2Lib::Area(ring) < 0.0;
+    const std::vector<Clipper2Lib::Point64> points = thinned(ring, spacing);
+    if (points.size() < 3) continue;
+
+    // Walls first: the sides of the prism, one quad per retained edge. A void's
+    // walls face inward and are shaded the same, since without a light model
+    // there is nothing to tell them apart by.
+    for (std::size_t i = 0; i < points.size(); ++i) {
+      const auto& a = points[i];
+      const auto& b = points[(i + 1) % points.size()];
+      const Vec3 a_top{static_cast<float>(wave::to_world(a.x)),
+                       static_cast<float>(wave::to_world(a.y)),
+                       static_cast<float>(top)};
+      const Vec3 b_top{static_cast<float>(wave::to_world(b.x)),
+                       static_cast<float>(wave::to_world(b.y)),
+                       static_cast<float>(top)};
+      const Vec3 a_bottom{a_top.x, a_top.y, static_cast<float>(bottom)};
+      const Vec3 b_bottom{b_top.x, b_top.y, static_cast<float>(bottom)};
+      Facet quad;
+      quad.points = {projection.point(a_top), projection.point(b_top),
+                     projection.point(b_bottom), projection.point(a_bottom)};
+      quad.depth = (projection.depth(a_top) + projection.depth(b_top) +
+                    projection.depth(a_bottom) + projection.depth(b_bottom)) *
+                   0.25f;
+      quad.fill = wall;
+      quad.edge = 0;
+      facets.push_back(std::move(quad));
+    }
+
+    Facet lid;
+    lid.points.reserve(points.size());
+    float depth = 0.0f;
+    for (const auto& vertex : points) {
+      const Vec3 at{static_cast<float>(wave::to_world(vertex.x)),
+                    static_cast<float>(wave::to_world(vertex.y)),
+                    static_cast<float>(top)};
+      lid.points.push_back(projection.point(at));
+      depth += projection.depth(at);
+    }
+    lid.depth = depth / static_cast<float>(points.size()) + 0.001f;
+    lid.fill = is_void ? 0 : face;
+    lid.edge = edge;
+    facets.push_back(std::move(lid));
+  }
+}
+
+void draw_result(App& app) {
+  ImGui::BeginChild("result", ImVec2(0, 0), ImGuiChildFlags_Borders,
+                    ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+  const ImVec2 top_left = ImGui::GetCursorScreenPos();
+  ImVec2 size = ImGui::GetContentRegionAvail();
+  size.x = std::max(size.x, 50.0f);
+  size.y = std::max(size.y, 50.0f);
+  ImGui::InvisibleButton("stack", size, ImGuiButtonFlags_MouseButtonLeft);
+  const bool hovered = ImGui::IsItemHovered();
+  ImDrawList* list = ImGui::GetWindowDrawList();
+  list->AddRectFilled(top_left, ImVec2(top_left.x + size.x, top_left.y + size.y),
+                      IM_COL32(14, 17, 22, 255));
+  list->PushClipRect(top_left, ImVec2(top_left.x + size.x, top_left.y + size.y), true);
+
+  if (hovered && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+    app.orbit.yaw += ImGui::GetIO().MouseDelta.x * 0.009f;
+    app.orbit.pitch = std::clamp(app.orbit.pitch - ImGui::GetIO().MouseDelta.y * 0.009f,
+                                 0.06f, 1.5f);
+  }
+  if (hovered && ImGui::GetIO().MouseWheel != 0.0f)
+    app.orbit.zoom = std::clamp(app.orbit.zoom * std::pow(1.12f, ImGui::GetIO().MouseWheel),
+                                0.1f, 40.0f);
+
+  const auto finish = [&](const char* message) {
+    const ImVec2 extent = ImGui::CalcTextSize(message);
+    list->AddText({top_left.x + (size.x - extent.x) * 0.5f,
+                   top_left.y + (size.y - extent.y) * 0.5f},
+                  IM_COL32(120, 130, 145, 255), message);
+    list->PopClipRect();
+    ImGui::EndChild();
+  };
+
+  if (!app.has_plan || app.plan.operations.empty()) {
+    finish("Plan the job to see the result");
+    return;
+  }
+  const auto& levels = app.plan.operations[app.selected_plan_operation].levels;
+  if (levels.empty()) {
+    finish("This operation has no passes");
+    return;
+  }
+
+  // Bounds over every pass, so orbiting does not change the framing.
+  Clipper2Lib::Rect64 extent_2d;
+  bool any = false;
+  double lowest = 0.0;
+  double highest = 0.0;
+  for (const auto& level : levels) {
+    if (level.stock_slice.empty()) continue;
+    const auto bounds = Clipper2Lib::GetBounds(level.stock_slice);
+    if (!any) {
+      extent_2d = bounds;
+      lowest = level.floor_z;
+      highest = level.floor_z + level.axial_depth;
+      any = true;
+    } else {
+      extent_2d.left = std::min(extent_2d.left, bounds.left);
+      extent_2d.right = std::max(extent_2d.right, bounds.right);
+      extent_2d.top = std::min(extent_2d.top, bounds.top);
+      extent_2d.bottom = std::max(extent_2d.bottom, bounds.bottom);
+      lowest = std::min(lowest, level.floor_z);
+      highest = std::max(highest, level.floor_z + level.axial_depth);
+    }
+  }
+  if (!any) {
+    finish("Nothing was cut in this operation");
+    return;
+  }
+
+  const double width = wave::to_world(extent_2d.right - extent_2d.left);
+  const double height = wave::to_world(extent_2d.bottom - extent_2d.top);
+  const double span = std::max({width, height, highest - lowest, 1e-3});
+  const Vec3 centre{
+      static_cast<float>(wave::to_world(extent_2d.left + extent_2d.right) * 0.5),
+      static_cast<float>(wave::to_world(extent_2d.top + extent_2d.bottom) * 0.5),
+      static_cast<float>((lowest + highest) * 0.5)};
+
+  const float cy = std::cos(app.orbit.yaw);
+  const float sy = std::sin(app.orbit.yaw);
+  const float cp = std::cos(app.orbit.pitch);
+  const float sp = std::sin(app.orbit.pitch);
+  const Projection projection{
+      {top_left.x + size.x * 0.5f, top_left.y + size.y * 0.5f},
+      centre,
+      {-sy, cy, 0.0f},
+      {-sp * cy, -sp * sy, cp},
+      {cp * cy, cp * sy, sp},
+      static_cast<float>(std::min(size.x, size.y) * 0.72 / span) * app.orbit.zoom};
+
+  // One vertex every thousandth of the part is plenty at any sane zoom, and it
+  // keeps the number of quads in the hundreds rather than the tens of thousands.
+  const double spacing = std::max(span / 400.0, 0.05);
+
+  std::vector<Facet> facets;
+  for (std::size_t i = 0; i < levels.size(); ++i) {
+    const cam::LevelPlan& level = levels[i];
+    if (level.stock_slice.empty()) continue;
+
+    // Passes above the cutter are finished, the one it is in is part way
+    // through, and the ones below it have not been touched.
+    const Paths64* remaining = &level.simulation.remaining_stock;
+    if (level.nothing_to_cut) {
+      remaining = &level.stock_slice;
+    } else if (app.stack_follows_playback) {
+      if (static_cast<int>(i) > app.selected_level) remaining = &level.stock_slice;
+      else if (static_cast<int>(i) == app.selected_level && !app.material.empty())
+        remaining = &app.material;
+    }
+    if (remaining->empty()) continue;
+
+    // Shaded by depth so the steps read apart, and the pass being watched is
+    // picked out from the rest.
+    const float t = levels.size() < 2
+                        ? 0.0f
+                        : static_cast<float>(i) / (levels.size() - 1);
+    const bool active =
+        app.stack_follows_playback && static_cast<int>(i) == app.selected_level;
+    const int base = static_cast<int>(96 - 34 * t);
+    const ImU32 face = active ? IM_COL32(96, 150, 190, 255)
+                              : IM_COL32(base, base + 22, base + 42, 255);
+    const ImU32 wall = active ? IM_COL32(64, 104, 136, 255)
+                              : IM_COL32(base - 22, base - 6, base + 12, 255);
+    const ImU32 edge = active ? IM_COL32(150, 205, 240, 190)
+                              : IM_COL32(base + 40, base + 62, base + 84, 120);
+    append_slab(facets, *remaining, level.floor_z, level.floor_z + level.axial_depth,
+                projection, spacing, face, wall, edge);
+  }
+
+  std::sort(facets.begin(), facets.end(),
+            [](const Facet& a, const Facet& b) { return a.depth < b.depth; });
+  for (const Facet& facet : facets) {
+    if (facet.points.size() < 3) continue;
+    if (facet.fill != 0) {
+      if (facet.points.size() == 4)
+        list->AddQuadFilled(facet.points[0], facet.points[1], facet.points[2],
+                            facet.points[3], facet.fill);
+      else
+        list->AddConcavePolyFilled(facet.points.data(),
+                                   static_cast<int>(facet.points.size()), facet.fill);
+    }
+    if (facet.edge != 0)
+      list->AddPolyline(facet.points.data(), static_cast<int>(facet.points.size()),
+                        facet.edge, ImDrawFlags_Closed, 1.0f);
+  }
+
+  char caption[160];
+  std::snprintf(caption, sizeof caption,
+                "%zu passes stacked, Z %.2f to %.2f mm   Left-drag: orbit   Wheel: zoom",
+                levels.size(), lowest, highest);
+  list->AddText({top_left.x + 12.0f, top_left.y + 10.0f}, IM_COL32(130, 142, 158, 255),
+                caption);
 
   list->PopClipRect();
   ImGui::EndChild();
@@ -969,6 +1420,51 @@ void view_panel(App& app) {
   ImGui::Checkbox("Part", &app.show_part);
   ImGui::SameLine();
   ImGui::Checkbox("Travel", &app.show_rapids);
+  ImGui::Checkbox("Material", &app.show_material);
+  ImGui::SameLine();
+  ImGui::Checkbox("Toolpath", &app.show_toolpath);
+  ImGui::Checkbox("Stack follows the cutter", &app.stack_follows_playback);
+  ImGui::SetItemTooltip(
+      "Off, the stacked view shows the finished part. On, it shows how far the "
+      "job has got: passes above the cutter finished, the one it is in part way "
+      "through, and the ones below it untouched.");
+
+  ImGui::SeparatorText("Playback");
+  const cam::LevelPlan* level = current_level(app);
+  const double total = level_length(level);
+  if (ImGui::Button(app.playback.playing ? "Pause" : "Play"))
+    app.playback.playing = !app.playback.playing;
+  ImGui::SameLine();
+  if (ImGui::Button("Restart")) {
+    app.playback.distance = 0.0;
+    app.playback.playing = true;
+  }
+  ImGui::SameLine();
+  if (ImGui::Button("End")) {
+    app.playback.distance = total;
+    app.playback.playing = false;
+  }
+  ImGui::SameLine();
+  ImGui::Checkbox("Run on", &app.playback.follow);
+  ImGui::SetItemTooltip("Fall into the next pass instead of looping this one.");
+
+  float where = static_cast<float>(app.playback.distance);
+  ImGui::SetNextItemWidth(-90.0f);
+  if (ImGui::SliderFloat("Along pass", &where, 0.0f, static_cast<float>(total), "%.1f mm"))
+    app.playback.distance = where;
+  float speed = static_cast<float>(app.playback.speed);
+  ImGui::SetNextItemWidth(-90.0f);
+  if (ImGui::SliderFloat("Speed", &speed, 2.0f, 400.0f, "%.0f mm/s"))
+    app.playback.speed = speed;
+
+  if (level && !level->nothing_to_cut) {
+    const double area = wave::material_area(app.material);
+    const double started = level->simulation.stats.initial_stock_area;
+    ImGui::Text("Stock left %.1f mm2 of %.1f", area, started);
+    if (started > 0.0)
+      ImGui::ProgressBar(static_cast<float>(1.0 - area / started), ImVec2(-1, 12),
+                         "removed");
+  }
 }
 
 void sidebar(App& app) {
@@ -1032,6 +1528,8 @@ int main(int argc, char** argv) {
 
   std::filesystem::path screenshot;
   std::filesystem::path gcode_out;
+  std::string view_name;
+  double progress_fraction = -1.0;
   double stepdown = 0.0;
   double stepover = 0.0;
   std::string tool_id;
@@ -1047,6 +1545,9 @@ int main(int argc, char** argv) {
       if (argument == "--part") std::snprintf(app.part_path.data(), app.part_path.size(), "%s", value().c_str());
       else if (argument == "--stock") std::snprintf(app.stock_path.data(), app.stock_path.size(), "%s", value().c_str());
       else if (argument == "--screenshot") screenshot = value();
+      else if (argument == "--view") view_name = value();
+      else if (argument == "--at") progress_fraction = std::stod(value());
+      else if (argument == "--follow") app.stack_follows_playback = true;
       else if (argument == "--gcode") gcode_out = value();
       else if (argument == "--tool") tool_id = value();
       else if (argument == "--machine") machine_id = value();
@@ -1065,6 +1566,8 @@ int main(int argc, char** argv) {
             "  --stepdown MM      Axial depth per pass\n"
             "  --gcode PATH       Plan and post without opening a window, then exit\n"
             "  --screenshot PATH  Render one frame to a binary PPM and exit\n"
+            "  --view pass|result Which view a screenshot should capture\n"
+            "  --at FRACTION      How far through the pass to place the cutter, 0 to 1\n"
             "  -h, --help         Show this help and exit\n\n"
             "Tools live in %s\n"
             "Machines and materials are read from %s\n",
@@ -1191,8 +1694,10 @@ int main(int argc, char** argv) {
   bool running = true;
   bool screenshot_pending = !screenshot.empty();
   int screenshot_delay = 0;
+  auto previous_frame = std::chrono::steady_clock::now();
   if (screenshot_pending && app.geometry.has_part() && app.geometry.has_stock())
     app.planner.start(app.geometry, app.job, app.tools, app.machines, app.materials);
+  if (!view_name.empty()) app.force_tab = view_name == "result" ? 1 : 0;
   while (running) {
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
@@ -1209,9 +1714,24 @@ int main(int argc, char** argv) {
       app.selected_level = 0;
       app.selected_plan_operation = 0;
       app.view.needs_fit = true;
+      app.playback.distance = 0.0;
+      app.material.clear();
+      app.material_distance = -1.0;
+      app.material_level = -1;
+      if (progress_fraction >= 0.0) {
+        const cam::LevelPlan* level = current_level(app);
+        app.playback.distance =
+            std::clamp(progress_fraction, 0.0, 1.0) * level_length(level);
+      }
       if (!app.plan.ok()) say(app, app.plan.error, true);
       else say(app, "Planned " + std::to_string(app.plan.stats.cut_levels) + " passes");
     }
+
+    const auto now = std::chrono::steady_clock::now();
+    const double elapsed = std::chrono::duration<double>(now - previous_frame).count();
+    previous_frame = now;
+    advance_playback(app, std::min(elapsed, 0.1));
+    if (app.has_plan) refresh_material(app);
 
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplSDL2_NewFrame();
@@ -1227,7 +1747,25 @@ int main(int argc, char** argv) {
     sidebar(app);
     ImGui::EndChild();
     ImGui::SameLine();
-    draw_canvas(app);
+    ImGui::BeginChild("views", ImVec2(0, 0));
+    if (ImGui::BeginTabBar("view-tabs")) {
+      const ImGuiTabItemFlags plan_flag =
+          app.force_tab == 0 ? ImGuiTabItemFlags_SetSelected : 0;
+      const ImGuiTabItemFlags result_flag =
+          app.force_tab == 1 ? ImGuiTabItemFlags_SetSelected : 0;
+      if (ImGui::BeginTabItem("Pass", nullptr, plan_flag)) {
+        app.mode = ViewMode::Plan;
+        draw_canvas(app);
+        ImGui::EndTabItem();
+      }
+      if (ImGui::BeginTabItem("Stacked result", nullptr, result_flag)) {
+        app.mode = ViewMode::Result;
+        draw_result(app);
+        ImGui::EndTabItem();
+      }
+      ImGui::EndTabBar();
+    }
+    ImGui::EndChild();
     ImGui::End();
     tool_builder(app);
 
