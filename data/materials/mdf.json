@@ -1,0 +1,14 @@
+{
+  "id": "mdf",
+  "name": "MDF",
+  "group": "wood",
+  "hardness": "n/a",
+  "notes": "Very little force, but abrasive: the resin binder wears an edge far faster than the density suggests. Feeds are set by the machine and by dust extraction rather than by the material.",
+  "specific_cutting_energy": 0.06,
+  "kienzle_kc11": 0.0,
+  "kienzle_mc": 0.0,
+  "vc_multiplier": 1.0,
+  "fz_multiplier": 1.0,
+  "chip_class": "abrasive",
+  "work_hardening": false
+}

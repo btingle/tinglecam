@@ -1,0 +1,14 @@
+{
+  "id": "aluminium-6082",
+  "name": "Aluminium 6082-T6",
+  "group": "aluminium",
+  "hardness": "HB 95",
+  "notes": "The general-purpose structural aluminium. Cuts freely but welds itself to an edge if the chip gets thin, so the minimum chip thickness matters more here than the power limit.",
+  "specific_cutting_energy": 0.7,
+  "kienzle_kc11": 700.0,
+  "kienzle_mc": 0.23,
+  "vc_multiplier": 1.0,
+  "fz_multiplier": 1.0,
+  "chip_class": "gummy",
+  "work_hardening": false
+}

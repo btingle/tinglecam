@@ -1,0 +1,56 @@
+{
+  "id": "grbl-router",
+  "name": "GRBL gantry router",
+  "specifications_unverified": true,
+  "notes": "A generic hobby gantry router on GRBL with a trim-router spindle. GRBL has no tool changer and no length offsets, so the post pauses for a manual change. The low block rate is what makes short segments the binding limit on machines like this.",
+  "controller": "grbl",
+
+  "x": { "min": 0.0, "max": 750.0, "max_rapid_feed": 4000.0, "max_acceleration": 400.0, "backlash": 0.05 },
+  "y": { "min": 0.0, "max": 750.0, "max_rapid_feed": 4000.0, "max_acceleration": 400.0, "backlash": 0.05 },
+  "z": { "min": -80.0, "max": 0.0, "max_rapid_feed": 1500.0, "max_acceleration": 300.0, "backlash": 0.05 },
+  "max_cutting_feed": 3000.0,
+  "block_rate": 60.0,
+  "lookahead_blocks": 16,
+  "junction_deviation": 0.1,
+  "min_segment_length": 0.05,
+  "repeatability": 0.1,
+
+  "min_rpm": 10000.0,
+  "max_rpm": 30000.0,
+  "power_curve": [
+    { "rpm": 10000.0, "kw": 0.4 },
+    { "rpm": 20000.0, "kw": 0.8 },
+    { "rpm": 30000.0, "kw": 1.0 }
+  ],
+  "base_speed_rpm": 20000.0,
+  "drivetrain_efficiency": 0.8,
+  "spindle_type": "router",
+  "spindle_spinup_seconds": 4.0,
+  "rpm_resolution": 1000.0,
+  "supports_reverse": false,
+
+  "max_cutting_force": 80.0,
+  "max_mrr": 25.0,
+  "rigidity": "gantry-router",
+
+  "tool_change": "manual",
+  "tool_pockets": 0,
+  "tool_change_x": 0.0,
+  "tool_change_y": 0.0,
+  "tool_change_z": 0.0,
+  "length_offset_mode": "none",
+  "coolant_flood": false,
+  "coolant_mist": false,
+  "coolant_air": true,
+  "probe_support": true,
+
+  "output_inches": false,
+  "arc_support": "centre-offset",
+  "decimals": 3,
+  "work_offsets": ["G54"],
+  "line_numbers": false,
+  "line_number_increment": 10,
+  "program_header": "",
+  "program_footer": "",
+  "path_blending": ""
+}

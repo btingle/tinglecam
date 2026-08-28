@@ -1,4 +1,109 @@
-# GPU mesh slicer and Clipper2 contour-wave demo
+# TingleCAM and the Clipper2 contour-wave engine
+
+Two programs over one engine. `tinglecam` is the CAM application: tool, machine
+and material libraries, multi-level roughing, feeds driven by what the material
+simulation says is actually being removed, and G-code out.
+`clipper2_wave_demo` is the original instrument for looking at a wavefront
+generation by generation, kept because it is the only place to see why a plan
+came out the way it did.
+
+## TingleCAM
+
+```
+./build/tinglecam --part part.obj --stock stock.obj
+./build/tinglecam --part part.obj --stock stock.obj \
+  --tool 6mm-3f-alu --machine makera-z1 --material aluminium-6082 \
+  --stepdown 1.0 --stepover 0.4 --gcode part.nc
+```
+
+Millimetres everywhere internally; inches exist only where a machine profile
+asks for them on the way out.
+
+### Libraries
+
+Machines and materials are shipped as one JSON file each under `data/`, so
+adding one is dropping a file in. Tools are the user's own and live in
+`~/.config/tinglecam/tools.json`, seeded on first run from `data/starter-tools.json`.
+
+**The supplied `makera-z1` profile carries placeholder limits.** Travel, rapids,
+acceleration, spindle range and spindle power are plausible desktop-class
+guesses rather than figures from Makera, and all of them drive the feeds this
+program plans. The profile is flagged `specifications_unverified`, which puts a
+warning on the operation panel and a comment in every posted file. Correct them
+before running anything it produces.
+
+### Depth
+
+The slicer returns the downward envelope: a slice at *Z* is the projection of
+everything at or above it. That is exactly the silhouette which must survive a
+pass at that depth, and it grows monotonically as the tool goes deeper, so each
+level's clearing region is nested inside the one above and no separate rest
+model is needed for roughing. Levels are cut from `top_z` down in `stepdown`
+steps, the last trimmed to land on the floor rather than overshoot it.
+
+### Feeds
+
+Twelve stages, in order, each recording whether it was the one that bound. That
+attribution is the point: "why is it crawling here" is the first question anyone
+asks of a plan, and the answer is free if the stages record it and guesswork
+afterwards if they do not.
+
+| | Stage | Model |
+|---|---|---|
+| 1 | Engagement | `r = min(load, ceiling)`, straight from the simulation |
+| 2 | Book chip load | `h0 = fz(tool, material) x derate` |
+| 3 | Radial chip thinning | `1 / (2 sqrt(r(1-r)))` for `r <= 1/2` |
+| 4 | Spindle speed | `n = clamp(1000 Vc / pi D)` |
+| 5 | Base feed | `F = h0 x CTF x z x n` |
+| 6 | Corner compensation | `F x= R / (R + r_tool)` |
+| 7 | Spindle power | `a_p a_e F kc <= eta P(n) margin` |
+| 8 | Cutting force | `Ft = kc a_p fz z r / pi <= F_max` |
+| 9 | Deflection | `d = Ft L^3 / 3EI`, `I = pi d^4 / 64` |
+| 10 | Reachable feed | `v <= sqrt(a L_run)` and `v <= L x blocks/s` |
+| 11 | Chip floor | reported, never enforced upward |
+| 12 | Lookahead and slew | minimum over the window, then rate limited |
+
+The simulation's `load` is already `a_e/D`: removed area over step length is the
+mean radial width of cut, and dividing by the diameter is engagement as a
+fraction of it. Stage 1 is a read, not an analysis.
+
+Stages 7 to 9 depend on a chip thickness that depends on the feed they are
+computing, which with a chip-thickness-dependent cutting energy is genuinely
+circular. The block is run four times over, each pass recomputing the energy at
+the feed the last one arrived at; the limits only lower, so it settles from
+above, and with a constant energy the second pass changes nothing.
+
+Stage 11 is deliberately one-way. The chip floor is the only figure here that
+wants the feed higher, and where a physical limit has already put it lower there
+is nothing safe to do from the feed: the fix is fewer revolutions or less depth.
+So those segments are marked, the speed that would resolve it is reported, and
+the feed is left where the machine can sustain it.
+
+Before any of that, consecutive pieces going the same way are merged while the
+straight line between their ends stays within `path_tolerance` of the sampled
+path, taking the worst engagement and the slowest feed of the group. Offset
+contours arrive carrying vertices every few hundredths of a millimetre, and a
+controller metered in blocks per second cannot run those at any useful feed --
+on the sample part this is the difference between a 235 minute plan and a 3
+minute one.
+
+Two known limitations. Corner compensation only ever slows down: which side the
+material lies on is not known at that stage, and the safe error is to be slow,
+but it means outside corners are fed more gently than they need to be. And the
+engagement figure legitimately exceeds 1 at direction changes, because a swept
+disc overcounts at a corner; `load_ceiling` clamps that rather than fixing the
+sampling.
+
+### Posting
+
+Linear motion throughout. Arc output changes the size of the file rather than
+what it cuts and is worth adding once the rest is trusted. Travel the simulation
+found removes nothing is emitted at the machine's cutting-feed ceiling rather
+than as a rapid, because it still happens at depth; only a planned retract lifts
+to the clearance plane. Retract and clearance planes are raised above the top of
+the cut if the job named ones inside it, and the operator is told.
+
+## GPU mesh slicer and Clipper2 contour-wave demo
 
 This desktop demo combines an NVIDIA cuBQL-accelerated downward-prism mesh
 slicer with the existing Clipper2 wavefront and lineage analysis. It can load

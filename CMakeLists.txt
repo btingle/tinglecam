@@ -54,6 +54,14 @@ FetchContent_Declare(
   GIT_SHALLOW TRUE
 )
 
+set(JSON_BuildTests OFF CACHE INTERNAL "")
+FetchContent_Declare(
+  nlohmann_json
+  GIT_REPOSITORY https://github.com/nlohmann/json.git
+  GIT_TAG v3.11.3
+  GIT_SHALLOW TRUE
+)
+
 if(WAVE_HAVE_CUDA)
   FetchContent_Declare(
     cubql
@@ -63,7 +71,7 @@ if(WAVE_HAVE_CUDA)
   )
 endif()
 
-FetchContent_MakeAvailable(clipper2 imgui)
+FetchContent_MakeAvailable(clipper2 imgui nlohmann_json)
 if(WAVE_HAVE_CUDA)
   FetchContent_MakeAvailable(cubql)
 endif()
@@ -108,6 +116,26 @@ target_include_directories(imgui_sdl_opengl PUBLIC
 )
 target_link_libraries(imgui_sdl_opengl PUBLIC SDL2::SDL2 OpenGL::GL)
 
+# TingleCAM: the CAM application over the same engine. The demo above stays as
+# a way of looking at a wavefront generation by generation when a plan is wrong.
+add_library(tinglecam_core
+  src/cam/config.cpp
+  src/cam/feeds.cpp
+  src/cam/job.cpp
+  src/cam/machine.cpp
+  src/cam/material.cpp
+  src/cam/post.cpp
+  src/cam/tooling.cpp
+)
+target_link_libraries(tinglecam_core PUBLIC wave_geometry nlohmann_json::nlohmann_json)
+target_include_directories(tinglecam_core PUBLIC src)
+target_compile_definitions(tinglecam_core PRIVATE
+  TINGLECAM_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+target_compile_options(tinglecam_core PRIVATE
+  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:GNU,Clang>>:-Wall;-Wextra;-Wpedantic>
+  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/W4>
+)
+
 add_executable(clipper2_wave_demo src/main.cpp)
 target_link_libraries(clipper2_wave_demo PRIVATE wave_geometry imgui_sdl_opengl)
 if(TARGET SDL2::SDL2main)
@@ -119,6 +147,14 @@ add_custom_command(TARGET clipper2_wave_demo POST_BUILD
           ${CMAKE_CURRENT_SOURCE_DIR}/wavetest.svg
           $<TARGET_FILE_DIR:clipper2_wave_demo>/wavetest.svg
 )
+
+add_executable(tinglecam src/tinglecam.cpp)
+target_link_libraries(tinglecam PRIVATE tinglecam_core imgui_sdl_opengl)
+target_compile_definitions(tinglecam PRIVATE
+  TINGLECAM_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+if(TARGET SDL2::SDL2main)
+  target_link_libraries(tinglecam PRIVATE SDL2::SDL2main)
+endif()
 
 enable_testing()
 add_executable(wave_geometry_tests tests/geometry_tests.cpp)
@@ -134,6 +170,12 @@ add_executable(simulation_tests tests/simulation_tests.cpp)
 target_link_libraries(simulation_tests PRIVATE wave_geometry)
 add_test(NAME simulation_tests
          COMMAND simulation_tests ${CMAKE_CURRENT_SOURCE_DIR}/wavetest.svg)
+
+add_executable(cam_tests tests/cam_tests.cpp)
+target_link_libraries(cam_tests PRIVATE tinglecam_core)
+add_test(NAME cam_tests COMMAND cam_tests ${CMAKE_CURRENT_SOURCE_DIR}/data)
+
+add_test(NAME tinglecam_help COMMAND tinglecam --help)
 
 add_test(NAME demo_help COMMAND clipper2_wave_demo --help)
 add_test(NAME demo_simulation_help

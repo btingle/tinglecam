@@ -1,0 +1,56 @@
+{
+  "id": "makera-z1",
+  "name": "Makera Z1",
+  "specifications_unverified": true,
+  "notes": "PLACEHOLDER LIMITS. Every number below is a plausible desktop-class guess, not a figure taken from Makera's documentation, and all of them drive the feeds this application plans. Confirm travel, rapid rates, acceleration, spindle range and spindle power against the machine before running anything this profile produced. The controller is set to Smoothieware, which is the family Makera builds on; the tool changer is set to automatic on the assumption the Z1 carries one, and posting will emit T/M6 accordingly.",
+  "controller": "smoothieware",
+
+  "x": { "min": 0.0, "max": 300.0, "max_rapid_feed": 3000.0, "max_acceleration": 800.0, "backlash": 0.0 },
+  "y": { "min": 0.0, "max": 200.0, "max_rapid_feed": 3000.0, "max_acceleration": 800.0, "backlash": 0.0 },
+  "z": { "min": -100.0, "max": 0.0, "max_rapid_feed": 2000.0, "max_acceleration": 600.0, "backlash": 0.0 },
+  "max_cutting_feed": 3000.0,
+  "block_rate": 100.0,
+  "lookahead_blocks": 32,
+  "junction_deviation": 0.05,
+  "min_segment_length": 0.02,
+  "repeatability": 0.02,
+
+  "min_rpm": 6000.0,
+  "max_rpm": 15000.0,
+  "power_curve": [
+    { "rpm": 6000.0, "kw": 0.12 },
+    { "rpm": 10000.0, "kw": 0.2 },
+    { "rpm": 15000.0, "kw": 0.3 }
+  ],
+  "base_speed_rpm": 10000.0,
+  "drivetrain_efficiency": 0.9,
+  "spindle_type": "vfd",
+  "spindle_spinup_seconds": 3.0,
+  "rpm_resolution": 100.0,
+  "supports_reverse": false,
+
+  "max_cutting_force": 120.0,
+  "max_mrr": 30.0,
+  "rigidity": "desktop-enclosed",
+
+  "tool_change": "automatic",
+  "tool_pockets": 6,
+  "tool_change_x": 0.0,
+  "tool_change_y": 0.0,
+  "tool_change_z": 0.0,
+  "length_offset_mode": "none",
+  "coolant_flood": false,
+  "coolant_mist": true,
+  "coolant_air": true,
+  "probe_support": true,
+
+  "output_inches": false,
+  "arc_support": "centre-offset",
+  "decimals": 3,
+  "work_offsets": ["G54", "G55", "G56"],
+  "line_numbers": false,
+  "line_number_increment": 10,
+  "program_header": "",
+  "program_footer": "",
+  "path_blending": ""
+}
