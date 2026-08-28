@@ -162,6 +162,14 @@ within one stepover step remain below the temporal resolution of the graph.
 
 ## Toolpath sequencing
 
+The stock stands in air, so the space beside it counts as already cleared: the
+opening move plunges there and feeds in horizontally rather than ramping into
+solid material, and later transitions may run round the outside of the stock
+instead of lifting over the part. That space is held off the stock wall by the
+same slack the clearance tests allow, or a move grazing along the wall would
+read as free travel when it is in fact cutting.
+
+
 The lineage is ordered into a single tool motion by `build_toolpath`. A front may
 only be entered once every parent that opened the way to it has been cut, so
 sequencing is a topological order of the lineage graph. Among the fronts that

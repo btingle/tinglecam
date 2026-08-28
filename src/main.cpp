@@ -50,6 +50,10 @@ struct AppState {
   wave::MeshSlice stock_slice;
   wave::WaveResult result;
   wave::FrontLineage lineage;
+  // The boundaries as sliced, before inflation, so an offset can be seen
+  // against what it was applied to.
+  Paths64 raw_subject_outline;
+  Paths64 raw_stock_outline;
   std::array<char, 512> subject_mesh_path{};
   std::array<char, 512> stock_mesh_path{};
   float slice_z = 0.0f;
@@ -66,6 +70,7 @@ struct AppState {
   bool show_subject = true;
   bool show_stock = true;
   bool show_leading_fronts = true;
+  bool show_original_boundaries = true;
   bool show_toolpath = true;
   bool toolpath_play = true;
   // World units per second, and how far the tool has travelled along the path.
@@ -153,6 +158,9 @@ void recompute(AppState& app) {
       if (app.sliced_stock.empty()) throw std::runtime_error("The current stock slice is empty");
       stock = app.sliced_stock;
     }
+    app.raw_stock_outline = Clipper2Lib::Union(stock, Clipper2Lib::FillRule::NonZero);
+    app.raw_subject_outline =
+        Clipper2Lib::Union(app.subject_paths, Clipper2Lib::FillRule::NonZero);
     stock = offset_boundaries(stock, app.stock_inflation, "Stock");
     const double softening =
         std::min<double>(app.stepover * app.softening_percent * 0.01, app.stepover);
@@ -176,6 +184,8 @@ void recompute(AppState& app) {
     // geometry against indices that no longer exist.
     app.result = {};
     app.lineage = {};
+    app.raw_subject_outline.clear();
+    app.raw_stock_outline.clear();
     app.toolpath = {};
     app.toolpath_progress = 0.0f;
     app.selected_iteration = -1;
@@ -269,6 +279,37 @@ void draw_paths(ImDrawList* draw_list, const Paths64& paths,
     for (std::size_t i = 0; i < path.size(); ++i) {
       draw_list->AddLine(transform.point(path[i]),
                          transform.point(path[(i + 1) % path.size()]), color, width);
+    }
+  }
+}
+
+// Dashes are what separate a reference outline from the geometry actually in
+// play, which is drawn solid in a colour close by.
+void draw_paths_dashed(ImDrawList* draw_list, const Paths64& paths,
+                       const CanvasTransform& transform, ImU32 color, float width,
+                       float dash_px = 7.0f) {
+  for (const auto& path : paths) {
+    if (path.size() < 2) continue;
+    float phase = 0.0f;
+    for (std::size_t i = 0; i < path.size(); ++i) {
+      const ImVec2 from = transform.point(path[i]);
+      const ImVec2 to = transform.point(path[(i + 1) % path.size()]);
+      const float length = std::hypot(to.x - from.x, to.y - from.y);
+      if (!(length > 0.0f)) continue;
+      for (float at = phase; at < length; at += dash_px * 2.0f) {
+        const float start = std::max(at, 0.0f);
+        const float stop = std::min(at + dash_px, length);
+        if (stop <= start) continue;
+        const float t0 = start / length;
+        const float t1 = stop / length;
+        draw_list->AddLine({from.x + (to.x - from.x) * t0, from.y + (to.y - from.y) * t0},
+                           {from.x + (to.x - from.x) * t1, from.y + (to.y - from.y) * t1},
+                           color, width);
+      }
+      // Carry the gap across the vertex so the dashes do not restart on every
+      // segment of an offset contour, which would draw it very nearly solid.
+      phase = std::fmod(phase - length, dash_px * 2.0f);
+      if (phase < 0.0f) phase += dash_px * 2.0f;
     }
   }
 }
@@ -415,8 +456,12 @@ void draw_canvas(AppState& app) {
   for (float y = canvas_min.y + offset_y; y < canvas_max.y; y += grid_px)
     draw_list->AddLine({canvas_min.x, y}, {canvas_max.x, y}, IM_COL32(48, 57, 68, 100));
 
-  if (app.show_stock)
+  if (app.show_stock) {
     draw_paths(draw_list, app.result.stock, transform, IM_COL32(125, 138, 152, 190), 2.0f);
+    if (app.show_original_boundaries && app.stock_inflation != 0.0f)
+      draw_paths_dashed(draw_list, app.raw_stock_outline, transform,
+                        IM_COL32(125, 138, 152, 130), 1.5f);
+  }
 
   const int count = static_cast<int>(app.result.generations.size());
   if (app.show_all_iterations) {
@@ -431,8 +476,12 @@ void draw_canvas(AppState& app) {
                iteration_color(app.selected_iteration, count), 2.5f);
   }
 
-  if (app.show_subject)
+  if (app.show_subject) {
     draw_paths(draw_list, app.result.subject, transform, IM_COL32(252, 226, 89, 255), 3.0f);
+    if (app.show_original_boundaries && app.subject_inflation != 0.0f)
+      draw_paths_dashed(draw_list, app.raw_subject_outline, transform,
+                        IM_COL32(252, 226, 89, 150), 1.5f);
+  }
 
   const auto canvas_generation = selected_generation(app);
   if (app.show_leading_fronts && canvas_generation) {
@@ -747,6 +796,8 @@ void controls(AppState& app, const std::filesystem::path& input) {
   ImGui::Checkbox("Show subject", &app.show_subject);
   ImGui::Checkbox(app.stock_slicer.empty() ? "Show allowance box" : "Show stock slice",
                   &app.show_stock);
+  if (app.subject_inflation != 0.0f || app.stock_inflation != 0.0f)
+    ImGui::Checkbox("Show uninflated boundaries", &app.show_original_boundaries);
   ImGui::Checkbox("Show leading fronts", &app.show_leading_fronts);
   if (app.show_leading_fronts)
     ImGui::Checkbox("Show parent links", &app.show_parent_links);

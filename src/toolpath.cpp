@@ -368,15 +368,37 @@ Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage,
   world.right += margin;
   world.bottom += margin;
 
+  const Path64 world_box{
+      Point64(world.left, world.top), Point64(world.right, world.top),
+      Point64(world.right, world.bottom), Point64(world.left, world.bottom)};
+  const Paths64 stock_area =
+      wave.stock.empty() ? Paths64{wave.stock_boundary} : wave.stock;
+
   // Where the tool may be at all. A lift is routed through this rather than
   // straight over the subject: the slice does not say how far the part rises
-  // above it, so flying over it cannot be assumed safe.
-  const Paths64 free_space = Difference(
-      wave.stock.empty() ? Paths64{wave.stock_boundary} : wave.stock, wave.subject,
-      FillRule::NonZero);
+  // above it, so flying over it cannot be assumed safe. Everything outside the
+  // stock is air, and travelling round the outside is often shorter than
+  // crossing the part.
+  const Paths64 free_space =
+      Difference(Paths64{world_box}, wave.subject, FillRule::NonZero);
   const Paths64 free_forbidden = forbidden_region(free_space, world, tolerance);
 
-  Paths64 cleared;
+  // The stock stands in air, so the space beside it is already empty: the tool
+  // can be lowered there without cutting, and can travel there at depth. This
+  // is what gives the opening move somewhere to plunge -- it lands beside the
+  // stock and feeds in horizontally instead of ramping into solid material --
+  // and it lets later transitions run round the outside of the stock rather
+  // than lift over it.
+  // Held off the stock wall by the same slack the clearance tests allow, or a
+  // move grazing along the wall would read as travelling in the air outside it
+  // and be reported as free when it is cutting.
+  const Paths64 air = Difference(
+      Paths64{world_box},
+      InflatePaths(Union(stock_area, wave.subject, FillRule::NonZero),
+                   tolerance * 2.0, JoinType::Miter, EndType::Polygon),
+      FillRule::NonZero);
+
+  Paths64 cleared = air;
   // Rebuilt whenever `cleared` grows, which is once per front rather than once
   // per link.
   Paths64 cleared_forbidden = forbidden_region(cleared, world, tolerance);
@@ -438,11 +460,21 @@ Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage,
 
       const Point64 entry = cut.front();
       if (!has_position) {
-        // Nothing is cleared yet, so the opening descent is always into solid
-        // material and has to be ramped.
-        toolpath.moves.push_back({MoveKind::Entry, Path64{entry, entry}, {}, 0.0});
-        ++toolpath.stats.entry_count;
-      } else if (position != entry) {
+        has_position = true;
+        // The air beside the stock is always somewhere the tool can come down,
+        // so the opening move is a plunge in free space followed by an ordinary
+        // feed in. Only a part that leaves no such landing forces a ramp.
+        if (const auto plunge = find_plunge_point(cleared, entry, plunge_clearance)) {
+          position = *plunge;
+          toolpath.moves.push_back({MoveKind::Retract, Path64{position, position}, {}, 0.0});
+          ++toolpath.stats.retract_count;
+        } else {
+          position = entry;
+          toolpath.moves.push_back({MoveKind::Entry, Path64{entry, entry}, {}, 0.0});
+          ++toolpath.stats.entry_count;
+        }
+      }
+      if (position != entry) {
         const Paths64& band =
             front.band < lineage.generations[node.generation].bands.size()
                 ? lineage.generations[node.generation].bands[front.band]

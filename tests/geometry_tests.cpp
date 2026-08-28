@@ -146,10 +146,12 @@ int main(int argc, char** argv) {
               "a quantization step must not raise a split or birth event");
       const auto sweep_path = wave::build_toolpath(two_band_sweep(notched), sweep);
       require(sweep_path.stats.cut_count == 2, "both bands should be cut");
-      require(sweep_path.stats.entry_count == 1 && sweep_path.stats.retract_count == 0,
-              "two adjacent bands need only the opening ramp");
+      require(sweep_path.stats.entry_count == 0 && sweep_path.stats.retract_count == 1,
+              "the opening move plunges in the air beside the stock, not into it");
       require(sweep_path.stats.step_count == 1,
               "the move onto the second band is a stepover, not free travel");
+      require(sweep_path.stats.link_count == 1,
+              "the feed in from the air beside the stock cuts nothing");
     }
 
     const auto toolpath = wave::build_toolpath(result, lineage);
@@ -160,15 +162,15 @@ int main(int argc, char** argv) {
             "lineage precedence should leave no front unreachable");
     require(toolpath.stats.cut_count == front_count,
             "every leading front should be cut exactly once");
-    require(toolpath.moves.front().kind == wave::MoveKind::Entry,
-            "nothing is cleared at the start, so the first move ramps in");
-    // The free space around wavetest's islands is connected, so once the tool is
-    // down every transition can be reached at depth. Anything more than the one
-    // opening ramp means a blocked segment stopped being routed around.
-    require(toolpath.stats.entry_count == 1,
-            "only the opening descent should need a ramp");
-    require(toolpath.stats.retract_count == 0,
-            "no transition on wavetest should need a lift");
+    require(toolpath.moves.front().kind == wave::MoveKind::Retract,
+            "the opening move lands in the air beside the stock");
+    // The free space around wavetest's islands is connected and the stock stands
+    // in air, so every descent can land somewhere already empty. A ramp here
+    // means a blocked segment stopped being routed around.
+    require(toolpath.stats.entry_count == 0,
+            "no descent on wavetest should have to ramp into solid material");
+    require(toolpath.stats.retract_count == 1,
+            "the opening plunge is the only lift wavetest needs");
     require(toolpath.stats.lifts_over_subject == 0,
             "a lift must not pass over the subject where a way round exists");
     require(toolpath.stats.retract_count + toolpath.stats.entry_count <=
