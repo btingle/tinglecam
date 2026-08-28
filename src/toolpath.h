@@ -61,6 +61,9 @@ struct ToolpathStats {
   std::size_t entry_count = 0;
   // Retracts routed around an obstruction at depth instead of lifting.
   std::size_t detour_count = 0;
+  // Lifts whose rapid had to pass over the subject because the free space
+  // around it is disconnected. Each one assumes the tool clears the part.
+  std::size_t lifts_over_subject = 0;
   // Fronts the sequencer could not reach because their parents never were.
   std::size_t unreachable_fronts = 0;
 };
@@ -81,7 +84,9 @@ struct Toolpath {
 // of the region it may travel through before a lift is considered, so the tool
 // follows a contour around an obstruction rather than rapiding over it. A lift
 // that does happen sets down in cleared material; only where no cleared landing
-// exists is an entry emitted, and that one has to be ramped.
+// exists is an entry emitted, and that one has to be ramped. The rapid itself
+// is kept out of the subject as well, since a single slice says nothing about
+// how far the part rises above it.
 Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage,
                         const ToolpathOptions& options = {});
 

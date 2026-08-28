@@ -162,6 +162,15 @@ int main(int argc, char** argv) {
             "every leading front should be cut exactly once");
     require(toolpath.moves.front().kind == wave::MoveKind::Entry,
             "nothing is cleared at the start, so the first move ramps in");
+    // The free space around wavetest's islands is connected, so once the tool is
+    // down every transition can be reached at depth. Anything more than the one
+    // opening ramp means a blocked segment stopped being routed around.
+    require(toolpath.stats.entry_count == 1,
+            "only the opening descent should need a ramp");
+    require(toolpath.stats.retract_count == 0,
+            "no transition on wavetest should need a lift");
+    require(toolpath.stats.lifts_over_subject == 0,
+            "a lift must not pass over the subject where a way round exists");
     require(toolpath.stats.retract_count + toolpath.stats.entry_count <=
                 toolpath.stats.cut_count,
             "a lift only ever happens on the way to a cut");

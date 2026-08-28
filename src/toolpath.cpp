@@ -86,6 +86,10 @@ Paths64 forbidden_region(const Paths64& safe, const Rect64& world,
       Point64(world.left, world.top), Point64(world.right, world.top),
       Point64(world.right, world.bottom), Point64(world.left, world.bottom)};
   Paths64 forbidden = Difference(Paths64{box}, safe, FillRule::NonZero);
+  // Eroding is what lets a move graze along a wall. It has a known cost: an
+  // obstacle thinner than twice the tolerance disappears from the test, so a
+  // rib of the part narrower than that does not block a route. Widening the
+  // tolerance makes that worse, which is the reason it stays small.
   if (tolerance > 0.0)
     forbidden = InflatePaths(forbidden, -tolerance, JoinType::Miter,
                              EndType::Polygon);
@@ -97,6 +101,11 @@ Paths64 forbidden_region(const Paths64& safe, const Rect64& world,
 bool segment_avoids(const Point64& a, const Point64& b, const Paths64& forbidden,
                     double tolerance) {
   if (forbidden.empty()) return true;
+  // Clipper will not clip a zero-length open path, and a segment that goes
+  // nowhere cannot pass through anything. This matters: the connectors joining
+  // a routed walk to the ring it follows are degenerate whenever the endpoint
+  // already lies on that ring, which is the usual case.
+  if (a == b) return true;
   Clipper64 clipper;
   clipper.AddOpenSubject(Paths64{Path64{a, b}});
   clipper.AddClip(forbidden);
@@ -193,6 +202,12 @@ Path64 decimate(const Path64& path, double world_spacing, std::size_t limit) {
   return out;
 }
 
+bool stays_clear(const Path64& path, const Paths64& forbidden, double tolerance) {
+  for (std::size_t i = 1; i < path.size(); ++i)
+    if (!segment_avoids(path[i - 1], path[i], forbidden, tolerance)) return false;
+  return true;
+}
+
 // Pulls the walk straight wherever a shortcut stays clear, longest jump first.
 Path64 shorten(const Path64& path, const Paths64& forbidden, double tolerance) {
   if (path.size() <= 2) return path;
@@ -242,11 +257,16 @@ std::optional<Path64> route_around(const Point64& from, const Point64& to,
       Path64 walk = walk_ring(ring, cumulative, start, finish, forward, span);
       walk.insert(walk.begin(), from);
       walk.push_back(to);
-      walk = shorten(decimate(walk, world_spacing, 48), forbidden, tolerance);
-      bool clear = true;
-      for (std::size_t i = 1; i < walk.size() && clear; ++i)
-        clear = segment_avoids(walk[i - 1], walk[i], forbidden, tolerance);
-      if (!clear) continue;
+      // Shortcutting is an optimisation, and it can fail: dropping vertices
+      // along a contour that hugs an obstacle leaves chords cutting straight
+      // through it. Prefer the shortened walk, fall back to the contour, and
+      // check both -- a walk taken from the boundary is not clear by
+      // construction, because a ring of the region can carry a stretch that the
+      // tool may not follow.
+      const Path64 pulled =
+          shorten(decimate(walk, world_spacing, 48), forbidden, tolerance);
+      if (stays_clear(pulled, forbidden, tolerance)) walk = pulled;
+      else if (!stays_clear(walk, forbidden, tolerance)) continue;
       const double length = path_length_world(walk);
       if (length < best_length) {
         best_length = length;
@@ -348,12 +368,34 @@ Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage,
   world.right += margin;
   world.bottom += margin;
 
+  // Where the tool may be at all. A lift is routed through this rather than
+  // straight over the subject: the slice does not say how far the part rises
+  // above it, so flying over it cannot be assumed safe.
+  const Paths64 free_space = Difference(
+      wave.stock.empty() ? Paths64{wave.stock_boundary} : wave.stock, wave.subject,
+      FillRule::NonZero);
+  const Paths64 free_forbidden = forbidden_region(free_space, world, tolerance);
+
   Paths64 cleared;
   // Rebuilt whenever `cleared` grows, which is once per front rather than once
   // per link.
   Paths64 cleared_forbidden = forbidden_region(cleared, world, tolerance);
   Point64 position;
   bool has_position = false;
+
+  // The XY path a lift takes to get from `origin` to `target`.
+  const auto plan_lift = [&](const Point64& origin, const Point64& target) {
+    if (segment_avoids(origin, target, free_forbidden, tolerance))
+      return Path64{origin, target};
+    if (const auto route = route_around(origin, target, free_space, free_forbidden,
+                                        tolerance,
+                                        std::numeric_limits<double>::infinity()))
+      return *route;
+    // The free space around the part is in two pieces here, so there is no way
+    // across that stays off it.
+    ++toolpath.stats.lifts_over_subject;
+    return Path64{origin, target};
+  };
 
   while (!ready.empty()) {
     // Greedy nearest-ready. Because a front's children are the fronts closest
@@ -420,11 +462,6 @@ Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage,
           toolpath.moves.push_back(
               {engaged ? MoveKind::Step : MoveKind::Link, std::move(path), {}, length});
         };
-        const auto stays_clear = [&](const Path64& path, const Paths64& forbidden) {
-          for (std::size_t i = 1; i < path.size(); ++i)
-            if (!segment_avoids(path[i - 1], path[i], forbidden, tolerance)) return false;
-          return true;
-        };
 
         // Free travel first: a move that never leaves cleared material costs
         // nothing in engagement, so it is always preferable to an engaged step.
@@ -437,21 +474,22 @@ Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage,
                        std::max(options.detour_limit * distance_world(position, entry),
                                 2.0 * wave.stepover))) {
           // Following a contour around the obstruction beats lifting over it.
-          emit(*route, !stays_clear(*route, cleared_forbidden));
+          emit(*route, !stays_clear(*route, cleared_forbidden, tolerance));
           ++toolpath.stats.detour_count;
         } else if (const auto plunge = find_plunge_point(cleared, entry, plunge_clearance);
-                   plunge && stays_clear(Path64{*plunge, entry}, travel_forbidden)) {
+                   plunge && stays_clear(Path64{*plunge, entry}, travel_forbidden, tolerance)) {
           // Set down where material is already gone, then cut in from there, so
           // the descent itself never has to remove anything.
-          const Path64 rapid{position, *plunge};
+          const Path64 rapid = plan_lift(position, *plunge);
           const double length = path_length_world(rapid);
           toolpath.moves.push_back({MoveKind::Retract, rapid, {}, length});
           ++toolpath.stats.retract_count;
           toolpath.stats.retract_length += length;
           if (*plunge != entry)
-            emit(Path64{*plunge, entry}, !stays_clear(Path64{*plunge, entry}, cleared_forbidden));
+            emit(Path64{*plunge, entry},
+                 !stays_clear(Path64{*plunge, entry}, cleared_forbidden, tolerance));
         } else {
-          const Path64 rapid{position, entry};
+          const Path64 rapid = plan_lift(position, entry);
           const double length = path_length_world(rapid);
           toolpath.moves.push_back({MoveKind::Entry, rapid, {}, length});
           ++toolpath.stats.entry_count;

@@ -196,7 +196,25 @@ Before a lift is considered, a blocked segment is routed along the boundary of
 the region it may travel through, walked in both directions and then pulled
 straight wherever a shortcut stays clear. The detour is taken when it is no more
 than `detour_limit` times the direct distance, so the tool follows a contour
-around an obstruction instead of rapiding over it.
+around an obstruction instead of rapiding over it. Pulling straight is only an
+optimisation: dropping vertices along a contour that hugs an obstacle leaves
+chords cutting through it, so the shortened walk is kept only when it survives
+the clearance test and the contour itself is used otherwise. Neither is trusted
+without checking -- a walk taken from a region's own boundary can still carry a
+stretch the tool may not follow.
+
+A lift is planned the same way. The slice says nothing about how far the part
+rises above it, so a rapid is routed through the free space around the subject
+rather than straight over it. Where the free space is in two pieces there is no
+such route, the rapid crosses the part, and `lifts_over_subject` counts it.
+
+The clearance test erodes the forbidden region so that a move may graze along a
+wall, and that has a cost worth stating: an obstacle thinner than twice the
+tolerance vanishes from the test entirely, and a route may then be planned
+straight through a rib of the part narrower than that. Measured over the sample
+meshes this affects a small minority of lifts. Restoring the thin material by
+morphological opening was tried and made matters worse, because it also blocks
+the ordinary transitions that slide along a wall.
 
 The test is stated as avoiding the forbidden region -- everything not yet
 cleared, which covers uncut material, the subject, and the space beyond the
