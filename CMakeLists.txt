@@ -74,6 +74,7 @@ find_package(OpenGL REQUIRED)
 add_library(wave_geometry
   src/geometry.cpp
   src/mesh_slicer.cpp
+  src/simulation.cpp
   src/topology.cpp
   src/toolpath.cpp
 )
@@ -128,4 +129,13 @@ add_test(NAME wave_geometry_tests
 add_executable(mesh_slicer_tests tests/mesh_slicer_tests.cpp)
 target_link_libraries(mesh_slicer_tests PRIVATE wave_geometry)
 add_test(NAME mesh_slicer_tests COMMAND mesh_slicer_tests)
+
+add_executable(simulation_tests tests/simulation_tests.cpp)
+target_link_libraries(simulation_tests PRIVATE wave_geometry)
+add_test(NAME simulation_tests
+         COMMAND simulation_tests ${CMAKE_CURRENT_SOURCE_DIR}/wavetest.svg)
+
 add_test(NAME demo_help COMMAND clipper2_wave_demo --help)
+add_test(NAME demo_simulation_help
+         COMMAND clipper2_wave_demo --help --tool-radius 2
+                 --simulation-stock-inflate 1)

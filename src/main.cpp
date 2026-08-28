@@ -1,5 +1,6 @@
 #include "geometry.h"
 #include "mesh_slicer.h"
+#include "simulation.h"
 #include "toolpath.h"
 #include "topology.h"
 
@@ -17,6 +18,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -65,6 +67,8 @@ struct AppState {
   float softening_percent = 100.0f;
   float subject_inflation = 0.0f;
   float stock_inflation = 0.0f;
+  float simulation_stock_inflation = 0.0f;
+  float tool_radius = 40.0f;
   int selected_iteration = -1;
   bool show_all_iterations = true;
   bool show_subject = true;
@@ -72,6 +76,9 @@ struct AppState {
   bool show_leading_fronts = true;
   bool show_original_boundaries = true;
   bool show_toolpath = true;
+  bool show_simulation = true;
+  bool show_load = false;
+  bool show_gouges = true;
   bool toolpath_play = true;
   // World units per second, and how far the tool has travelled along the path.
   float toolpath_speed = 40.0f;
@@ -80,10 +87,12 @@ struct AppState {
   bool show_event_markers = true;
   bool animate = false;
   wave::Toolpath toolpath;
+  wave::SimulationResult simulation;
   float animation_speed = 4.0f;
   ViewState view;
   OrbitState orbit;
   std::string error;
+  std::string simulation_error;
 };
 
 Paths64 offset_boundaries(const Paths64& input, float amount,
@@ -112,6 +121,18 @@ Paths64 allowance_stock(const Paths64& subject, float allowance) {
       {bounds.right + margin, bounds.bottom + margin},
       {bounds.left - margin, bounds.bottom + margin},
   }};
+}
+
+void recompute_simulation(AppState& app) {
+  try {
+    app.simulation = wave::simulate_material(
+        app.raw_stock_outline, app.raw_subject_outline, app.toolpath,
+        app.tool_radius, app.simulation_stock_inflation);
+    app.simulation_error.clear();
+  } catch (const std::exception& error) {
+    app.simulation = {};
+    app.simulation_error = error.what();
+  }
 }
 
 ImU32 iteration_color(int index, int count, int alpha = 225) {
@@ -166,6 +187,7 @@ void recompute(AppState& app) {
     app.result = wave::build_wavefront(subject, stock, app.stepover, softening);
     app.lineage = wave::build_front_lineage(app.result);
     app.toolpath = wave::build_toolpath(app.result, app.lineage);
+    recompute_simulation(app);
     app.toolpath_progress = 0.0f;
     if (app.selected_iteration < 0 && !app.lineage.events.empty())
       app.selected_iteration = static_cast<int>(app.lineage.events.front().generation);
@@ -184,6 +206,8 @@ void recompute(AppState& app) {
     app.raw_subject_outline.clear();
     app.raw_stock_outline.clear();
     app.toolpath = {};
+    app.simulation = {};
+    app.simulation_error.clear();
     app.toolpath_progress = 0.0f;
     app.selected_iteration = -1;
   }
@@ -212,7 +236,11 @@ void update_slice_range(AppState& app, bool center_height) {
   app.slice_z = std::clamp(app.slice_z, app.slice_min, app.slice_max);
 }
 
-void reslice(AppState& app) {
+// `analyze` is false while startup is still assembling its inputs. Slicing is
+// cheap and its results are needed to pick sensible defaults, but the wavefront,
+// lineage, toolpath and material simulation are not worth building for
+// parameters that the next few lines are about to overwrite.
+void reslice(AppState& app, bool analyze = true) {
   try {
     if (!app.subject_slicer.empty()) {
       app.subject_slice = app.subject_slicer.slice(app.slice_z, app.query_grid);
@@ -230,13 +258,13 @@ void reslice(AppState& app) {
     }
     app.selected_iteration = -1;
     app.view.needs_fit = true;
-    recompute(app);
+    if (analyze) recompute(app);
   } catch (const std::exception& error) {
     app.error = error.what();
   }
 }
 
-void load_mesh(AppState& app, bool stock) {
+void load_mesh(AppState& app, bool stock, bool analyze = true) {
   try {
     auto& path_buffer = stock ? app.stock_mesh_path : app.subject_mesh_path;
     if (path_buffer[0] == '\0') throw std::runtime_error("Enter an OBJ or STL path first");
@@ -250,10 +278,15 @@ void load_mesh(AppState& app, bool stock) {
       if (span > 0.0f) {
         app.allowance = span * 0.05f;
         app.stepover = span * 0.025f;
+        // The stepover just moved, so the radius derived from it has to move
+        // with it. Left behind, it keeps whatever the previous subject implied,
+        // and loading a small part after a large one leaves a tool wider than
+        // the stock it is meant to cut.
+        app.tool_radius = app.stepover * 0.5f;
       }
     }
     update_slice_range(app, true);
-    reslice(app);
+    reslice(app, analyze);
   } catch (const std::exception& error) {
     app.error = error.what();
   }
@@ -364,6 +397,48 @@ ImU32 move_color(wave::MoveKind kind) {
   return IM_COL32(232, 236, 241, 255);
 }
 
+ImU32 load_color(double load, bool gouge, int alpha = 255) {
+  if (gouge) return IM_COL32(255, 44, 108, alpha);
+  const float t = static_cast<float>(std::clamp(load, 0.0, 1.0));
+  const ImVec4 low{0.12f, 0.62f, 1.00f, alpha / 255.0f};
+  const ImVec4 middle{0.25f, 0.92f, 0.47f, alpha / 255.0f};
+  const ImVec4 high{1.00f, 0.28f, 0.08f, alpha / 255.0f};
+  if (t <= 0.5f) {
+    const float u = t * 2.0f;
+    return ImGui::ColorConvertFloat4ToU32(
+        {low.x + (middle.x - low.x) * u,
+         low.y + (middle.y - low.y) * u,
+         low.z + (middle.z - low.z) * u, low.w});
+  }
+  const float u = (t - 0.5f) * 2.0f;
+  return ImGui::ColorConvertFloat4ToU32(
+      {middle.x + (high.x - middle.x) * u,
+       middle.y + (high.y - middle.y) * u,
+       middle.z + (high.z - middle.z) * u, middle.w});
+}
+
+void draw_load_steps(ImDrawList* draw_list,
+                     const wave::SimulatedMove& move,
+                     const CanvasTransform& transform, double limit,
+                     float width) {
+  for (const auto& step : move.steps) {
+    if (limit <= step.move_distance_begin) break;
+    const ImVec2 from = transform.point(step.from);
+    ImVec2 to = transform.point(step.to);
+    if (limit < step.move_distance_end) {
+      const double span = step.move_distance_end - step.move_distance_begin;
+      const float ratio = span > 0.0
+                              ? static_cast<float>((limit - step.move_distance_begin) / span)
+                              : 0.0f;
+      to = {from.x + (to.x - from.x) * ratio,
+            from.y + (to.y - from.y) * ratio};
+    }
+    draw_list->AddLine(from, to,
+                       load_color(step.load, step.gouge_area > 0.0), width);
+    if (limit < step.move_distance_end) break;
+  }
+}
+
 void draw_front(ImDrawList* draw_list, const wave::LeadingFront& front,
                 const CanvasTransform& transform, ImU32 color, float width) {
   if (front.path.size() < 2) return;
@@ -460,6 +535,27 @@ void draw_canvas(AppState& app) {
                         IM_COL32(125, 138, 152, 130), 1.5f);
   }
 
+  Paths64 simulated_stock_now;
+  Paths64 gouges_now;
+  if (app.show_simulation && !app.simulation.initial_stock.empty()) {
+    simulated_stock_now = wave::simulation_stock_at(
+        app.simulation, app.toolpath, app.toolpath_progress);
+    draw_paths_dashed(draw_list, app.simulation.initial_stock, transform,
+                      IM_COL32(83, 210, 230, 105), 1.5f);
+    draw_paths(draw_list, simulated_stock_now, transform,
+               IM_COL32(83, 210, 230, 225), 3.0f);
+    if (app.show_gouges) {
+      const Paths64 removed_now = Clipper2Lib::Difference(
+          app.simulation.initial_stock, simulated_stock_now,
+          Clipper2Lib::FillRule::NonZero);
+      gouges_now = Clipper2Lib::Intersect(
+          removed_now, app.simulation.final_subject,
+          Clipper2Lib::FillRule::NonZero);
+      draw_paths(draw_list, gouges_now, transform,
+                 IM_COL32(255, 44, 108, 255), 5.0f);
+    }
+  }
+
   const int count = static_cast<int>(app.result.generations.size());
   if (app.show_all_iterations) {
     for (int i = 0; i < count; ++i) {
@@ -528,6 +624,15 @@ void draw_canvas(AppState& app) {
         // drawing them, so those stay visible ahead of the tool.
         if (!done && move.kind == wave::MoveKind::Cut) continue;
         const ImU32 color = done ? move_color(move.kind) : fade(move_color(move.kind), 0.30f);
+        if (done && app.show_load && i < app.simulation.moves.size() &&
+            !app.simulation.moves[i].steps.empty()) {
+          const double limit = i == cursor.move
+                                   ? cursor.move_distance
+                                   : std::numeric_limits<double>::infinity();
+          draw_load_steps(draw_list, app.simulation.moves[i], transform,
+                          limit, 4.0f);
+          continue;
+        }
         if (move.kind == wave::MoveKind::Retract || move.kind == wave::MoveKind::Entry) {
           retracts.push_back(&move);
           continue;
@@ -546,6 +651,23 @@ void draw_canvas(AppState& app) {
         const ImVec2 to = transform.point(move->path.back());
         draw_list->AddLine(from, to, color, 2.0f);
         draw_list->AddCircle(to, 6.0f, color, 0, 2.0f);
+      }
+    }
+
+    if (app.show_simulation) {
+      for (std::size_t i = 0; i < app.simulation.moves.size(); ++i) {
+        const auto& simulated = app.simulation.moves[i];
+        if (simulated.plunge_collision.empty()) continue;
+        const bool occurred = i <= cursor.move;
+        const ImU32 color = occurred ? IM_COL32(255, 52, 64, 255)
+                                     : IM_COL32(255, 52, 64, 85);
+        const ImVec2 point = transform.point(app.toolpath.moves[i].path.back());
+        draw_list->AddCircleFilled(point, 8.0f, IM_COL32(20, 12, 15, 230));
+        draw_list->AddCircle(point, 9.0f, color, 0, 3.0f);
+        draw_list->AddLine({point.x - 5.0f, point.y - 5.0f},
+                           {point.x + 5.0f, point.y + 5.0f}, color, 2.0f);
+        draw_list->AddLine({point.x + 5.0f, point.y - 5.0f},
+                           {point.x - 5.0f, point.y + 5.0f}, color, 2.0f);
       }
     }
 
@@ -902,6 +1024,84 @@ void controls(AppState& app, const std::filesystem::path& input) {
                          stats.unreachable_fronts);
   }
 
+  ImGui::SeparatorText("Material simulation");
+  bool simulation_changed = false;
+  simulation_changed |= ImGui::DragFloat(
+      "Tool radius", &app.tool_radius, 0.1f, 0.001f, 100000.0f, "%.3f");
+  simulation_changed |= ImGui::DragFloat(
+      "Simulation stock inflation", &app.simulation_stock_inflation, 0.1f,
+      -100000.0f, 100000.0f, "%+.3f");
+  if (simulation_changed) recompute_simulation(app);
+  ImGui::Checkbox("Show material simulation", &app.show_simulation);
+  ImGui::Checkbox("Color completed path by cutter load", &app.show_load);
+  ImGui::Checkbox("Show gouges", &app.show_gouges);
+
+  if (!app.simulation_error.empty()) {
+    ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 100, 100, 255));
+    ImGui::TextWrapped("Simulation: %s", app.simulation_error.c_str());
+    ImGui::PopStyleColor();
+  } else {
+    const auto& stats = app.simulation.stats;
+    ImGui::Text("Stock:    %10.2f -> %10.2f square units",
+                stats.initial_stock_area, stats.remaining_area);
+    ImGui::Text("Removed:  %10.2f square units", stats.removed_area);
+    ImGui::Text("Excess:   %10.2f square units", stats.excess_area);
+    if (stats.gouge_area > 0.0) {
+      ImGui::TextColored(ImVec4(1.0f, 0.22f, 0.42f, 1.0f),
+                         "Gouged:   %.3f square units in %zu step%s",
+                         stats.gouge_area, stats.gouging_steps,
+                         stats.gouging_steps == 1 ? "" : "s");
+    } else {
+      ImGui::TextColored(ImVec4(0.35f, 0.92f, 0.55f, 1.0f),
+                         "No final-subject gouges detected");
+    }
+    if (stats.unsafe_plunges > 0) {
+      if (stats.unsafe_plunges == 1)
+        ImGui::TextColored(ImVec4(1.0f, 0.25f, 0.25f, 1.0f),
+                           "1 retract plunge collides with remaining stock");
+      else
+        ImGui::TextColored(ImVec4(1.0f, 0.25f, 0.25f, 1.0f),
+                           "%zu retract plunges collide with remaining stock",
+                           stats.unsafe_plunges);
+    } else {
+      ImGui::TextColored(ImVec4(0.35f, 0.92f, 0.55f, 1.0f),
+                         "All retract plunges land in cleared space");
+    }
+    if (stats.unresolved_entries > 0)
+      ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.25f, 1.0f),
+                         "%zu entry move%s unresolved without Z geometry",
+                         stats.unresolved_entries,
+                         stats.unresolved_entries == 1 ? " is" : "s are");
+    ImGui::Text("Peak cutter load proxy: %.1f%% of full slot",
+                stats.maximum_load * 100.0);
+    if (!app.toolpath.moves.empty()) {
+      const auto cursor = wave::toolpath_at(app.toolpath, app.toolpath_progress);
+      if (cursor.move < app.simulation.moves.size()) {
+        for (const auto& step : app.simulation.moves[cursor.move].steps) {
+          if (cursor.move_distance < step.move_distance_begin ||
+              cursor.move_distance > step.move_distance_end)
+            continue;
+          ImGui::Text("Current load: %.1f%%, removing %.3f square units this step",
+                      step.load * 100.0, step.removed_area);
+          break;
+        }
+      }
+    }
+    if (app.show_load) {
+      ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(load_color(0.0, false)),
+                         "low");
+      ImGui::SameLine();
+      ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(load_color(0.5, false)),
+                         "medium");
+      ImGui::SameLine();
+      ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(load_color(1.0, false)),
+                         "full slot");
+      ImGui::SameLine();
+      ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(load_color(0.0, true)),
+                         "gouge");
+    }
+  }
+
   ImGui::SeparatorText("Front lineage");
   if (const auto selected = selected_generation(app)) {
     const std::size_t generation = *selected;
@@ -959,6 +1159,8 @@ struct StartupInputs {
   std::filesystem::path screenshot;
   std::optional<float> subject_inflation;
   std::optional<float> stock_inflation;
+  std::optional<float> simulation_stock_inflation;
+  std::optional<float> tool_radius;
   std::optional<float> allowance;
   std::optional<float> stepover;
   std::optional<float> softening_percent;
@@ -1008,6 +1210,9 @@ StartupInputs resolve_inputs(int argc, char** argv) {
     else if (argument == "--screenshot") result.screenshot = value_after(argument);
     else if (argument == "--subject-inflate") result.subject_inflation = float_after(argument);
     else if (argument == "--stock-inflate") result.stock_inflation = float_after(argument);
+    else if (argument == "--simulation-stock-inflate")
+      result.simulation_stock_inflation = float_after(argument);
+    else if (argument == "--tool-radius") result.tool_radius = float_after(argument);
     else if (argument == "--allowance") result.allowance = float_after(argument);
     else if (argument == "--stepover") result.stepover = float_after(argument);
     else if (argument == "--softening-percent") result.softening_percent = float_after(argument);
@@ -1040,6 +1245,9 @@ void print_help(const char* executable) {
       << "  --query-grid N          GPU query grid resolution, 1..256 (default: 32)\n"
       << "  --subject-inflate VALUE Signed subject boundary offset (default: 0)\n"
       << "  --stock-inflate VALUE   Signed stock boundary offset (default: 0)\n"
+      << "  --simulation-stock-inflate VALUE\n"
+      << "                           Signed simulation-only stock offset (default: 0)\n"
+      << "  --tool-radius VALUE     Simulation cutter radius (default: half stepover)\n"
       << "  --allowance VALUE       Fallback stock allowance when no stock mesh is loaded\n"
       << "  --stepover VALUE        Wave propagation distance per generation\n"
       << "  --softening-percent P   Rounded fraction of each step, 0..100 (default: 100)\n\n"
@@ -1079,16 +1287,20 @@ int main(int argc, char** argv) {
         wave::to_world(app.svg.bounds.bottom - app.svg.bounds.top));
     app.allowance = static_cast<float>(span * 0.05);
     app.stepover = static_cast<float>(span * 0.025);
-    recompute(app);
+    app.tool_radius = app.stepover * 0.5f;
+    // Every analysis below would be thrown away: the mesh loads redefine the
+    // subject, the command line then redefines the parameters, and the tail of
+    // this function analyses the result. So load the meshes, resolve the
+    // options, and build the wavefront exactly once, at the bottom.
     if (!inputs.subject_mesh.empty()) {
       std::snprintf(app.subject_mesh_path.data(), app.subject_mesh_path.size(), "%s",
                     inputs.subject_mesh.string().c_str());
-      load_mesh(app, false);
+      load_mesh(app, false, /*analyze=*/false);
     }
     if (!inputs.stock_mesh.empty()) {
       std::snprintf(app.stock_mesh_path.data(), app.stock_mesh_path.size(), "%s",
                     inputs.stock_mesh.string().c_str());
-      load_mesh(app, true);
+      load_mesh(app, true, /*analyze=*/false);
     }
     if (inputs.query_grid) {
       if (*inputs.query_grid < 1 || *inputs.query_grid > 256)
@@ -1098,6 +1310,8 @@ int main(int argc, char** argv) {
     if (inputs.slice_z) app.slice_z = *inputs.slice_z;
     if (inputs.subject_inflation) app.subject_inflation = *inputs.subject_inflation;
     if (inputs.stock_inflation) app.stock_inflation = *inputs.stock_inflation;
+    if (inputs.simulation_stock_inflation)
+      app.simulation_stock_inflation = *inputs.simulation_stock_inflation;
     if (inputs.allowance) {
       if (!(*inputs.allowance > 0.0f))
         throw std::runtime_error("--allowance must be positive");
@@ -1107,6 +1321,12 @@ int main(int argc, char** argv) {
       if (!(*inputs.stepover > 0.0f))
         throw std::runtime_error("--stepover must be positive");
       app.stepover = *inputs.stepover;
+      if (!inputs.tool_radius) app.tool_radius = app.stepover * 0.5f;
+    }
+    if (inputs.tool_radius) {
+      if (!(*inputs.tool_radius > 0.0f))
+        throw std::runtime_error("--tool-radius must be positive");
+      app.tool_radius = *inputs.tool_radius;
     }
     if (inputs.softening_percent) {
       if (*inputs.softening_percent < 0.0f || *inputs.softening_percent > 100.0f)

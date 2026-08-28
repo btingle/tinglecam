@@ -90,7 +90,9 @@ Models can be loaded from the sidebar or at startup:
   --subject-mesh part.obj \
   --stock-mesh stock.stl \
   --subject-inflate 0.25 \
-  --stock-inflate -0.1
+  --stock-inflate -0.1 \
+  --tool-radius 3.175 \
+  --simulation-stock-inflate 0.05
 ```
 
 For automated visual checks, `--screenshot output.ppm` renders one frame and
@@ -122,6 +124,14 @@ and boundary offsets.
   in white, and transitions stay visible ahead of the tool so a stepover, an
   in-material link, and a retract can be told apart at a glance. Cuts still to
   come are left out, since the generation contours already draw them.
+- Adjust **Tool radius** and **Simulation stock inflation** independently of
+  the planner, then toggle **Show material simulation** to watch the raw stock
+  slice be subtracted as the tool advances. The dashed cyan contour is the
+  initial simulation stock and the solid cyan contour is what remains.
+- Toggle **Color completed path by cutter load** to replace move colors with a
+  blue/green/red engagement scale. Magenta sections have removed final-subject
+  material. Red X markers identify retract destinations where the circular
+  tool footprint still overlaps stock and a rapid plunge would be unsafe.
 - Right-drag the plan canvas to pan; use its mouse wheel to zoom.
 - Inspect BVH build/prune, candidate-query, and CPU polygon-union timings in
   the sidebar.
@@ -234,3 +244,39 @@ units off the wall's true position and reads as a gouge under the direct test.
 Band pieces are grouped as an outer contour with its holes. A hole ring taken on
 its own describes the island it encloses rather than band material, which would
 otherwise credit the subject as cleared and route links straight through it.
+
+## Material subtraction simulation
+
+The simulator reuses the same raw stock and subject slices as the planner but
+keeps their physical and planning roles separate:
+
+- `--stock-inflate` and `--subject-inflate` affect wave planning only;
+- `--simulation-stock-inflate` is the only offset applied to simulation stock;
+- final-subject gouges are tested against the raw subject slice with no
+  inflation; and
+- `--tool-radius` controls the circular cutter footprint. It defaults to half
+  the initial stepover.
+
+`Cut`, `Step`, and `Link` polylines run at depth. Each is subdivided to roughly
+one tool radius of travel per sample, inflated with round ends by the tool
+radius, and subtracted from the stock left by earlier samples. Treating links
+this way is intentional: a link expected to be clear by the planner can still
+remove material when the independent simulation stock is larger.
+
+The cutter-load proxy for one sample is the newly removed area divided by
+`2 * tool_radius * sample_length`. A value of 100% corresponds approximately to
+a full-width slot. Values can exceed 100% at an initial engagement or tight
+corner because the circular end of the tool also enters new material. This is a
+2.5D area-per-distance estimate; a later G-code stage can multiply by axial
+depth and feed rate to estimate removal volume per unit time.
+
+Gouges are the portion of actual removed stock intersecting the uninflated
+final subject. For every `Retract`, the simulator also intersects the tool disk
+at the rapid destination with stock remaining at that point. A non-empty
+intersection is reported as an unsafe plunge and is not silently accepted as a
+cut.
+
+`Entry` moves remain unresolved. The current toolpath records only their XY
+transfer, while a physically meaningful entry simulation needs the ramp or
+helix and its Z motion. Retract XY motion is likewise treated as above the work;
+only its destination plunge is checked.
