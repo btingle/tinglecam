@@ -1,4 +1,5 @@
 #include "geometry.h"
+#include "mesh_slicer.h"
 #include "topology.h"
 
 #include <SDL.h>
@@ -8,13 +9,18 @@
 #include <imgui_impl_sdl2.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <vector>
 
 namespace {
 
@@ -27,12 +33,32 @@ struct ViewState {
   bool needs_fit = true;
 };
 
+struct OrbitState {
+  float yaw = 0.75f;
+  float pitch = 0.55f;
+  float zoom = 1.0f;
+};
+
 struct AppState {
   wave::SvgGeometry svg;
+  Paths64 subject_paths;
+  Paths64 sliced_stock;
+  wave::MeshSlicer subject_slicer;
+  wave::MeshSlicer stock_slicer;
+  wave::MeshSlice subject_slice;
+  wave::MeshSlice stock_slice;
   wave::WaveResult result;
   wave::FrontLineage lineage;
+  std::array<char, 512> subject_mesh_path{};
+  std::array<char, 512> stock_mesh_path{};
+  float slice_z = 0.0f;
+  float slice_min = 0.0f;
+  float slice_max = 1.0f;
+  int query_grid = 32;
   float allowance = 150.0f;
   float engagement = 80.0f;
+  float subject_inflation = 0.0f;
+  float stock_inflation = 0.0f;
   int selected_iteration = -1;
   bool show_all_iterations = true;
   bool show_subject = true;
@@ -43,8 +69,37 @@ struct AppState {
   bool animate = false;
   float animation_speed = 4.0f;
   ViewState view;
+  OrbitState orbit;
   std::string error;
 };
+
+Paths64 offset_boundaries(const Paths64& input, float amount,
+                          std::string_view description) {
+  Paths64 result = Clipper2Lib::Union(input, Clipper2Lib::FillRule::NonZero);
+  const std::int64_t delta = wave::to_integer(amount);
+  if (delta != 0) {
+    result = Clipper2Lib::InflatePaths(
+        result, static_cast<double>(delta), Clipper2Lib::JoinType::Miter,
+        Clipper2Lib::EndType::Polygon);
+    result = Clipper2Lib::Union(result, Clipper2Lib::FillRule::NonZero);
+  }
+  if (result.empty())
+    throw std::runtime_error(std::string(description) +
+                             " offset removes all geometry");
+  return result;
+}
+
+Paths64 allowance_stock(const Paths64& subject, float allowance) {
+  if (!(allowance > 0.0f)) throw std::runtime_error("Allowance must be positive");
+  const auto bounds = Clipper2Lib::GetBounds(subject);
+  const std::int64_t margin = std::max<std::int64_t>(1, wave::to_integer(allowance));
+  return Paths64{{
+      {bounds.left - margin, bounds.top - margin},
+      {bounds.right + margin, bounds.top - margin},
+      {bounds.right + margin, bounds.bottom + margin},
+      {bounds.left - margin, bounds.bottom + margin},
+  }};
+}
 
 ImU32 iteration_color(int index, int count, int alpha = 225) {
   const float t = count <= 1 ? 0.0f : static_cast<float>(index) / (count - 1);
@@ -79,7 +134,18 @@ const char* event_short_name(wave::LineageEventKind kind) {
 
 void recompute(AppState& app) {
   try {
-    app.result = wave::build_wavefront(app.svg.paths, app.allowance, app.engagement);
+    if (app.subject_paths.empty())
+      throw std::runtime_error("The current subject slice is empty");
+    const Paths64 subject = offset_boundaries(
+        app.subject_paths, app.subject_inflation, "Subject");
+    Paths64 stock;
+    if (app.stock_slicer.empty()) stock = allowance_stock(app.subject_paths, app.allowance);
+    else {
+      if (app.sliced_stock.empty()) throw std::runtime_error("The current stock slice is empty");
+      stock = app.sliced_stock;
+    }
+    stock = offset_boundaries(stock, app.stock_inflation, "Stock");
+    app.result = wave::build_wavefront(subject, stock, app.engagement);
     app.lineage = wave::build_front_lineage(app.result, app.engagement);
     if (app.selected_iteration < 0 && !app.lineage.events.empty())
       app.selected_iteration = static_cast<int>(app.lineage.events.front().generation);
@@ -88,6 +154,76 @@ void recompute(AppState& app) {
           app.selected_iteration, 0,
           std::max(0, static_cast<int>(app.result.generations.size()) - 1));
     app.error.clear();
+  } catch (const std::exception& error) {
+    app.error = error.what();
+  }
+}
+
+void update_slice_range(AppState& app, bool center_height) {
+  bool valid = false;
+  float lower = 0.0f;
+  float upper = 0.0f;
+  for (const auto* slicer : {&app.subject_slicer, &app.stock_slicer}) {
+    if (slicer->empty()) continue;
+    const auto& bounds = slicer->mesh().bounds;
+    if (!valid) {
+      lower = bounds.lower.z;
+      upper = bounds.upper.z;
+      valid = true;
+    } else {
+      lower = std::min(lower, bounds.lower.z);
+      upper = std::max(upper, bounds.upper.z);
+    }
+  }
+  if (!valid) return;
+  app.slice_min = lower;
+  app.slice_max = std::max(lower + 1e-5f, upper);
+  if (center_height) app.slice_z = (lower + upper) * 0.5f;
+  app.slice_z = std::clamp(app.slice_z, app.slice_min, app.slice_max);
+}
+
+void reslice(AppState& app) {
+  try {
+    if (!app.subject_slicer.empty()) {
+      app.subject_slice = app.subject_slicer.slice(app.slice_z, app.query_grid);
+      app.subject_paths = app.subject_slice.polygons;
+    } else {
+      app.subject_paths = app.svg.paths;
+      app.subject_slice = {};
+    }
+    if (!app.stock_slicer.empty()) {
+      app.stock_slice = app.stock_slicer.slice(app.slice_z, app.query_grid);
+      app.sliced_stock = app.stock_slice.polygons;
+    } else {
+      app.stock_slice = {};
+      app.sliced_stock.clear();
+    }
+    app.selected_iteration = -1;
+    app.view.needs_fit = true;
+    recompute(app);
+  } catch (const std::exception& error) {
+    app.error = error.what();
+  }
+}
+
+void load_mesh(AppState& app, bool stock) {
+  try {
+    auto& path_buffer = stock ? app.stock_mesh_path : app.subject_mesh_path;
+    if (path_buffer[0] == '\0') throw std::runtime_error("Enter an OBJ or STL path first");
+    wave::Mesh mesh = wave::load_triangle_mesh(path_buffer.data());
+    auto& slicer = stock ? app.stock_slicer : app.subject_slicer;
+    slicer.set_mesh(std::move(mesh));
+    if (!stock) {
+      const auto& bounds = slicer.mesh().bounds;
+      const float span = std::max(bounds.upper.x - bounds.lower.x,
+                                  bounds.upper.y - bounds.lower.y);
+      if (span > 0.0f) {
+        app.allowance = span * 0.05f;
+        app.engagement = span * 0.025f;
+      }
+    }
+    update_slice_range(app, true);
+    reslice(app);
   } catch (const std::exception& error) {
     app.error = error.what();
   }
@@ -136,7 +272,7 @@ void draw_front(ImDrawList* draw_list, const wave::LeadingFront& front,
 }
 
 void fit_view(AppState& app, ImVec2 canvas_size) {
-  const auto bounds = Clipper2Lib::GetBounds(Paths64{app.result.stock_boundary});
+  const auto bounds = Clipper2Lib::GetBounds(app.result.stock);
   const float width = static_cast<float>(wave::to_world(bounds.right - bounds.left));
   const float height = static_cast<float>(wave::to_world(bounds.bottom - bounds.top));
   if (width <= 0.0f || height <= 0.0f) return;
@@ -200,7 +336,7 @@ void draw_canvas(AppState& app) {
     draw_list->AddLine({canvas_min.x, y}, {canvas_max.x, y}, IM_COL32(48, 57, 68, 100));
 
   if (app.show_stock)
-    draw_path(draw_list, app.result.stock_boundary, transform, IM_COL32(125, 138, 152, 190), 2.0f);
+    draw_paths(draw_list, app.result.stock, transform, IM_COL32(125, 138, 152, 190), 2.0f);
 
   const int count = static_cast<int>(app.result.generations.size());
   if (app.show_all_iterations) {
@@ -264,15 +400,205 @@ void draw_canvas(AppState& app) {
   ImGui::EndChild();
 }
 
+wave::Vec3f subtract(wave::Vec3f a, wave::Vec3f b) {
+  return {a.x - b.x, a.y - b.y, a.z - b.z};
+}
+
+float dot(wave::Vec3f a, wave::Vec3f b) {
+  return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+struct OrbitProjection {
+  ImVec2 center;
+  wave::Vec3f model_center;
+  wave::Vec3f right;
+  wave::Vec3f up;
+  wave::Vec3f forward;
+  float scale = 1.0f;
+
+  ImVec2 point(wave::Vec3f value) const {
+    const auto relative = subtract(value, model_center);
+    return {center.x + dot(relative, right) * scale,
+            center.y - dot(relative, up) * scale};
+  }
+
+  float depth(wave::Vec3f value) const {
+    return dot(subtract(value, model_center), forward);
+  }
+};
+
+bool viewer_bounds(const AppState& app, wave::Bounds3f& output) {
+  output = {};
+  for (const auto* slicer : {&app.subject_slicer, &app.stock_slicer}) {
+    if (slicer->empty()) continue;
+    const auto& bounds = slicer->mesh().bounds;
+    if (!output.valid) output = bounds;
+    else {
+      output.lower.x = std::min(output.lower.x, bounds.lower.x);
+      output.lower.y = std::min(output.lower.y, bounds.lower.y);
+      output.lower.z = std::min(output.lower.z, bounds.lower.z);
+      output.upper.x = std::max(output.upper.x, bounds.upper.x);
+      output.upper.y = std::max(output.upper.y, bounds.upper.y);
+      output.upper.z = std::max(output.upper.z, bounds.upper.z);
+    }
+  }
+  return output.valid;
+}
+
+void draw_mesh_viewer(AppState& app) {
+  ImGui::SeparatorText("3D slice view");
+  const ImVec2 panel_min = ImGui::GetCursorScreenPos();
+  const ImVec2 panel_size{ImGui::GetContentRegionAvail().x, 230.0f};
+  ImGui::InvisibleButton("mesh-orbit-view", panel_size,
+                         ImGuiButtonFlags_MouseButtonLeft);
+  const bool hovered = ImGui::IsItemHovered();
+  if (hovered && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+    app.orbit.yaw += ImGui::GetIO().MouseDelta.x * 0.009f;
+    app.orbit.pitch = std::clamp(app.orbit.pitch - ImGui::GetIO().MouseDelta.y * 0.009f,
+                                 -1.45f, 1.45f);
+  }
+  if (hovered && ImGui::GetIO().MouseWheel != 0.0f)
+    app.orbit.zoom = std::clamp(app.orbit.zoom *
+                                   std::pow(1.13f, ImGui::GetIO().MouseWheel),
+                               0.15f, 12.0f);
+
+  ImDrawList* draw = ImGui::GetWindowDrawList();
+  const ImVec2 panel_max{panel_min.x + panel_size.x, panel_min.y + panel_size.y};
+  draw->AddRectFilled(panel_min, panel_max, IM_COL32(12, 17, 23, 255), 4.0f);
+  draw->AddRect(panel_min, panel_max, IM_COL32(58, 68, 81, 255), 4.0f);
+  draw->PushClipRect(panel_min, panel_max, true);
+
+  wave::Bounds3f bounds;
+  if (!viewer_bounds(app, bounds)) {
+    draw->AddText({panel_min.x + 12.0f, panel_min.y + 12.0f},
+                  IM_COL32(145, 155, 166, 255), "Load a subject or stock mesh");
+    draw->PopClipRect();
+    ImGui::TextDisabled("Left-drag: orbit   Wheel: zoom");
+    return;
+  }
+
+  const wave::Vec3f center{(bounds.lower.x + bounds.upper.x) * 0.5f,
+                           (bounds.lower.y + bounds.upper.y) * 0.5f,
+                           (bounds.lower.z + bounds.upper.z) * 0.5f};
+  const float extent = std::max({bounds.upper.x - bounds.lower.x,
+                                 bounds.upper.y - bounds.lower.y,
+                                 bounds.upper.z - bounds.lower.z, 1e-5f});
+  const float cy = std::cos(app.orbit.yaw);
+  const float sy = std::sin(app.orbit.yaw);
+  const float cp = std::cos(app.orbit.pitch);
+  const float sp = std::sin(app.orbit.pitch);
+  OrbitProjection projection{
+      {panel_min.x + panel_size.x * 0.5f, panel_min.y + panel_size.y * 0.5f},
+      center, {-sy, cy, 0.0f}, {-sp * cy, -sp * sy, cp},
+      {cp * cy, cp * sy, sp},
+      std::min(panel_size.x, panel_size.y) * 0.76f / extent * app.orbit.zoom};
+
+  std::array<wave::Vec3f, 4> plane{{
+      {bounds.lower.x, bounds.lower.y, app.slice_z},
+      {bounds.upper.x, bounds.lower.y, app.slice_z},
+      {bounds.upper.x, bounds.upper.y, app.slice_z},
+      {bounds.lower.x, bounds.upper.y, app.slice_z},
+  }};
+  std::array<ImVec2, 4> plane_points{};
+  for (std::size_t i = 0; i < plane.size(); ++i) plane_points[i] = projection.point(plane[i]);
+  draw->AddConvexPolyFilled(plane_points.data(), 4, IM_COL32(35, 213, 230, 35));
+
+  struct RenderTriangle {
+    ImVec2 points[3];
+    float depth;
+    ImU32 fill;
+    ImU32 edge;
+  };
+  std::vector<RenderTriangle> render_triangles;
+  auto append_mesh = [&](const wave::MeshSlicer& slicer, ImU32 fill, ImU32 edge) {
+    if (slicer.empty()) return;
+    const auto& triangles = slicer.mesh().triangles;
+    const std::size_t stride = std::max<std::size_t>(1, triangles.size() / 6000);
+    render_triangles.reserve(render_triangles.size() + (triangles.size() + stride - 1) / stride);
+    for (std::size_t i = 0; i < triangles.size(); i += stride) {
+      const auto& triangle = triangles[i];
+      render_triangles.push_back({
+          {projection.point(triangle.a), projection.point(triangle.b),
+           projection.point(triangle.c)},
+          (projection.depth(triangle.a) + projection.depth(triangle.b) +
+           projection.depth(triangle.c)) / 3.0f,
+          fill, edge});
+    }
+  };
+  append_mesh(app.stock_slicer, IM_COL32(79, 141, 214, 50), IM_COL32(95, 158, 229, 75));
+  append_mesh(app.subject_slicer, IM_COL32(246, 205, 78, 78), IM_COL32(255, 221, 104, 105));
+  std::sort(render_triangles.begin(), render_triangles.end(),
+            [](const RenderTriangle& a, const RenderTriangle& b) {
+              return a.depth < b.depth;
+            });
+  for (const auto& triangle : render_triangles) {
+    draw->AddTriangleFilled(triangle.points[0], triangle.points[1], triangle.points[2],
+                            triangle.fill);
+    draw->AddTriangle(triangle.points[0], triangle.points[1], triangle.points[2],
+                      triangle.edge, 1.0f);
+  }
+  for (int i = 0; i < 4; ++i)
+    draw->AddLine(plane_points[i], plane_points[(i + 1) % 4],
+                  IM_COL32(52, 226, 238, 230), 2.0f);
+  const ImVec2 label = projection.point({bounds.lower.x, bounds.lower.y, app.slice_z});
+  draw->AddText({label.x + 5.0f, label.y + 3.0f}, IM_COL32(80, 236, 245, 255), "slice Z");
+  draw->PopClipRect();
+  ImGui::TextDisabled("Left-drag: orbit   Wheel: zoom");
+}
+
 void controls(AppState& app, const std::filesystem::path& input) {
-  ImGui::TextUnformatted("Clipper2 contour wave");
-  ImGui::TextDisabled("%s", input.filename().string().c_str());
-  ImGui::Separator();
+  ImGui::TextUnformatted("GPU mesh slicer + contour wave");
+  ImGui::TextDisabled("2D fallback: %s", input.filename().string().c_str());
+  draw_mesh_viewer(app);
+
+  ImGui::SeparatorText("Models");
+  ImGui::SetNextItemWidth(-1.0f);
+  ImGui::InputTextWithHint("##subject-mesh", "Subject .obj or .stl",
+                           app.subject_mesh_path.data(), app.subject_mesh_path.size());
+  if (ImGui::Button("Load subject mesh")) load_mesh(app, false);
+  if (!app.subject_slicer.empty()) {
+    ImGui::SameLine();
+    if (ImGui::Button("Use SVG subject")) {
+      app.subject_slicer = wave::MeshSlicer{};
+      update_slice_range(app, false);
+      reslice(app);
+    }
+  }
+  ImGui::SetNextItemWidth(-1.0f);
+  ImGui::InputTextWithHint("##stock-mesh", "Optional stock .obj or .stl",
+                           app.stock_mesh_path.data(), app.stock_mesh_path.size());
+  if (ImGui::Button("Load stock mesh")) load_mesh(app, true);
+  if (!app.stock_slicer.empty()) {
+    ImGui::SameLine();
+    if (ImGui::Button("Use allowance stock")) {
+      app.stock_slicer = wave::MeshSlicer{};
+      update_slice_range(app, false);
+      reslice(app);
+    }
+  }
+
+  if (!app.subject_slicer.empty() || !app.stock_slicer.empty()) {
+    bool slice_changed = ImGui::SliderFloat("Slice Z", &app.slice_z,
+                                            app.slice_min, app.slice_max, "%.4f");
+    slice_changed |= ImGui::SliderInt("BVH query grid", &app.query_grid, 1, 128);
+    if (slice_changed) reslice(app);
+  }
+
+  ImGui::SeparatorText("Wave analysis");
 
   bool changed = false;
-  changed |= ImGui::DragFloat("Allowance", &app.allowance, 1.0f, 0.001f, 100000.0f, "%.3f");
+  if (app.stock_slicer.empty())
+    changed |= ImGui::DragFloat("Allowance", &app.allowance, 1.0f, 0.001f,
+                                100000.0f, "%.3f");
+  changed |= ImGui::DragFloat("Subject inflation", &app.subject_inflation, 0.1f,
+                              -100000.0f, 100000.0f, "%+.3f");
+  changed |= ImGui::DragFloat("Stock inflation", &app.stock_inflation, 0.1f,
+                              -100000.0f, 100000.0f, "%+.3f");
   changed |= ImGui::DragFloat("Engagement", &app.engagement, 1.0f, 0.001f, 100000.0f, "%.3f");
-  if (changed) recompute(app);
+  if (changed) {
+    app.view.needs_fit = true;
+    recompute(app);
+  }
 
   if (ImGui::Button("Recompute")) recompute(app);
   ImGui::SameLine();
@@ -291,7 +617,8 @@ void controls(AppState& app, const std::filesystem::path& input) {
   }
   ImGui::Checkbox("Show all generations", &app.show_all_iterations);
   ImGui::Checkbox("Show subject", &app.show_subject);
-  ImGui::Checkbox("Show allowance box", &app.show_stock);
+  ImGui::Checkbox(app.stock_slicer.empty() ? "Show allowance box" : "Show stock slice",
+                  &app.show_stock);
   ImGui::Checkbox("Show leading fronts", &app.show_leading_fronts);
   if (app.show_leading_fronts)
     ImGui::Checkbox("Show parent links", &app.show_parent_links);
@@ -300,13 +627,40 @@ void controls(AppState& app, const std::filesystem::path& input) {
   if (app.animate) ImGui::SliderFloat("Speed", &app.animation_speed, 0.25f, 20.0f, "%.2f gen/s");
 
   ImGui::Separator();
-  ImGui::Text("Input paths: %zu", app.svg.source_path_count);
+  if (app.subject_slicer.empty())
+    ImGui::Text("Subject: SVG (%zu source paths)", app.svg.source_path_count);
+  else
+    ImGui::Text("Subject: %s", app.subject_slicer.mesh().source.filename().string().c_str());
   ImGui::Text("Union paths: %zu", app.result.subject.size());
   ImGui::Text("Generations: %d", count);
   ImGui::Text("Stopped on: %s", wave::stop_reason_name(app.result.stop_reason));
   if (count > 0)
     ImGui::Text("Selected contours: %zu",
                 app.result.generations[app.selected_iteration].size());
+
+  if (!app.subject_slicer.empty()) {
+    const auto& stats = app.subject_slicer.stats();
+    ImGui::SeparatorText("Subject slice statistics");
+    ImGui::Text("BVH: %s, %.3f ms", stats.gpu_accelerated ? "cuBQL GPU" : "CPU fallback",
+                stats.build_milliseconds);
+    ImGui::Text("Triangles: %zu input, %zu pruned", stats.input_triangles,
+                stats.pruned_triangles);
+    ImGui::Text("Query: %zu candidates, %.3f ms", app.subject_slice.candidate_triangles,
+                app.subject_slice.query_milliseconds);
+    ImGui::Text("2D union: %zu contributors, %.3f ms",
+                app.subject_slice.contributing_triangles,
+                app.subject_slice.polygon_milliseconds);
+  }
+  if (!app.stock_slicer.empty()) {
+    const auto& stats = app.stock_slicer.stats();
+    ImGui::SeparatorText("Stock slice statistics");
+    ImGui::Text("BVH: %s, %.3f ms", stats.gpu_accelerated ? "cuBQL GPU" : "CPU fallback",
+                stats.build_milliseconds);
+    ImGui::Text("Triangles: %zu input, %zu pruned", stats.input_triangles,
+                stats.pruned_triangles);
+    ImGui::Text("Query: %zu candidates, %.3f ms", app.stock_slice.candidate_triangles,
+                app.stock_slice.query_milliseconds);
+  }
 
   ImGui::SeparatorText("Front lineage");
   if (app.selected_iteration < static_cast<int>(app.lineage.generations.size())) {
@@ -346,8 +700,8 @@ void controls(AppState& app, const std::filesystem::path& input) {
   ImGui::TextDisabled("  cyan -> orange: early -> late");
   ImGui::TextDisabled("Right-drag: pan   Wheel: zoom");
   ImGui::TextWrapped(
-      "Waves are seeded only at the allowance box. The reached area expands by "
-      "Engagement, is clipped to the box, and then has the subject removed. Each "
+      "Waves are seeded only at the stock boundary. The reached area expands by "
+      "Engagement, is clipped to the stock, and then has the subject removed. Each "
       "colored generation is only the newly reached area; subject boundaries never "
       "act as wave sources.");
   ImGui::TextWrapped(
@@ -355,27 +709,161 @@ void controls(AppState& app, const std::filesystem::path& input) {
       "show parentage. Event markers: S split, M merge, T termination, B unexpected birth.");
 }
 
-std::filesystem::path resolve_input(int argc, char** argv) {
-  if (argc > 1) return argv[1];
+struct StartupInputs {
+  std::filesystem::path svg;
+  std::filesystem::path subject_mesh;
+  std::filesystem::path stock_mesh;
+  std::filesystem::path screenshot;
+  std::optional<float> subject_inflation;
+  std::optional<float> stock_inflation;
+  std::optional<float> allowance;
+  std::optional<float> engagement;
+  std::optional<float> slice_z;
+  std::optional<int> query_grid;
+  bool help = false;
+};
+
+StartupInputs resolve_inputs(int argc, char** argv) {
+  StartupInputs result;
+  for (int i = 1; i < argc; ++i) {
+    const std::string_view argument = argv[i];
+    auto value_after = [&](std::string_view option) -> std::filesystem::path {
+      if (i + 1 >= argc) throw std::runtime_error(std::string(option) + " requires a path");
+      return argv[++i];
+    };
+    auto float_after = [&](std::string_view option) -> float {
+      const std::string text = value_after(option).string();
+      std::size_t consumed = 0;
+      float value = 0.0f;
+      try {
+        value = std::stof(text, &consumed);
+      } catch (const std::exception&) {
+        throw std::runtime_error(std::string(option) + " requires a number");
+      }
+      if (consumed != text.size() || !std::isfinite(value))
+        throw std::runtime_error(std::string(option) + " requires a finite number");
+      return value;
+    };
+    auto int_after = [&](std::string_view option) -> int {
+      const std::string text = value_after(option).string();
+      std::size_t consumed = 0;
+      int value = 0;
+      try {
+        value = std::stoi(text, &consumed);
+      } catch (const std::exception&) {
+        throw std::runtime_error(std::string(option) + " requires an integer");
+      }
+      if (consumed != text.size())
+        throw std::runtime_error(std::string(option) + " requires an integer");
+      return value;
+    };
+    if (argument == "--help" || argument == "-h") result.help = true;
+    else if (argument == "--svg") result.svg = value_after(argument);
+    else if (argument == "--subject-mesh") result.subject_mesh = value_after(argument);
+    else if (argument == "--stock-mesh") result.stock_mesh = value_after(argument);
+    else if (argument == "--screenshot") result.screenshot = value_after(argument);
+    else if (argument == "--subject-inflate") result.subject_inflation = float_after(argument);
+    else if (argument == "--stock-inflate") result.stock_inflation = float_after(argument);
+    else if (argument == "--allowance") result.allowance = float_after(argument);
+    else if (argument == "--engagement") result.engagement = float_after(argument);
+    else if (argument == "--slice-z") result.slice_z = float_after(argument);
+    else if (argument == "--query-grid") result.query_grid = int_after(argument);
+    else if (!argument.starts_with("--") && result.svg.empty()) result.svg = argument;
+    else throw std::runtime_error("Unknown command-line argument: " + std::string(argument));
+  }
+  if (!result.svg.empty()) return result;
   const std::filesystem::path local = "wavetest.svg";
-  if (std::filesystem::exists(local)) return local;
+  if (std::filesystem::exists(local)) {
+    result.svg = local;
+    return result;
+  }
   const auto beside_executable = std::filesystem::path(argv[0]).parent_path() / "wavetest.svg";
-  return beside_executable;
+  result.svg = beside_executable;
+  return result;
+}
+
+void print_help(const char* executable) {
+  std::cout
+      << "Usage: " << executable << " [SVG] [options]\n\n"
+      << "GPU downward-prism mesh slicing and Clipper2 wavefront analysis.\n\n"
+      << "Input options:\n"
+      << "  --svg PATH              2D fallback subject (default: wavetest.svg)\n"
+      << "  --subject-mesh PATH     Load an OBJ or STL subject mesh\n"
+      << "  --stock-mesh PATH       Load an OBJ or STL stock mesh\n\n"
+      << "Geometry options:\n"
+      << "  --slice-z VALUE         Initial mesh slice height\n"
+      << "  --query-grid N          GPU query grid resolution, 1..256 (default: 32)\n"
+      << "  --subject-inflate VALUE Signed subject boundary offset (default: 0)\n"
+      << "  --stock-inflate VALUE   Signed stock boundary offset (default: 0)\n"
+      << "  --allowance VALUE       Fallback stock allowance when no stock mesh is loaded\n"
+      << "  --engagement VALUE      Wave propagation distance per generation\n\n"
+      << "Other options:\n"
+      << "  --screenshot PATH       Render one frame to a binary PPM file and exit\n"
+      << "  -h, --help              Show this help and exit\n\n"
+      << "Positive inflation expands a boundary; negative inflation contracts it.\n";
+}
+
+void save_screenshot(const std::filesystem::path& filename, int width, int height) {
+  std::vector<unsigned char> pixels(static_cast<std::size_t>(width) * height * 3);
+  glPixelStorei(GL_PACK_ALIGNMENT, 1);
+  glReadPixels(0, 0, width, height, GL_RGB, GL_UNSIGNED_BYTE, pixels.data());
+  std::ofstream stream(filename, std::ios::binary);
+  if (!stream) throw std::runtime_error("Unable to write screenshot: " + filename.string());
+  stream << "P6\n" << width << ' ' << height << "\n255\n";
+  const std::size_t row_bytes = static_cast<std::size_t>(width) * 3;
+  for (int y = height - 1; y >= 0; --y)
+    stream.write(reinterpret_cast<const char*>(pixels.data() + y * row_bytes), row_bytes);
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
   try {
-    const auto input = resolve_input(argc, argv);
+    const auto inputs = resolve_inputs(argc, argv);
+    if (inputs.help) {
+      print_help(argv[0]);
+      return 0;
+    }
+    const auto& input = inputs.svg;
     AppState app;
     app.svg = wave::load_svg_closed_paths(input);
+    app.subject_paths = app.svg.paths;
     const double span = std::max(
         wave::to_world(app.svg.bounds.right - app.svg.bounds.left),
         wave::to_world(app.svg.bounds.bottom - app.svg.bounds.top));
     app.allowance = static_cast<float>(span * 0.05);
     app.engagement = static_cast<float>(span * 0.025);
     recompute(app);
+    if (!inputs.subject_mesh.empty()) {
+      std::snprintf(app.subject_mesh_path.data(), app.subject_mesh_path.size(), "%s",
+                    inputs.subject_mesh.string().c_str());
+      load_mesh(app, false);
+    }
+    if (!inputs.stock_mesh.empty()) {
+      std::snprintf(app.stock_mesh_path.data(), app.stock_mesh_path.size(), "%s",
+                    inputs.stock_mesh.string().c_str());
+      load_mesh(app, true);
+    }
+    if (inputs.query_grid) {
+      if (*inputs.query_grid < 1 || *inputs.query_grid > 256)
+        throw std::runtime_error("--query-grid must be between 1 and 256");
+      app.query_grid = *inputs.query_grid;
+    }
+    if (inputs.slice_z) app.slice_z = *inputs.slice_z;
+    if (inputs.subject_inflation) app.subject_inflation = *inputs.subject_inflation;
+    if (inputs.stock_inflation) app.stock_inflation = *inputs.stock_inflation;
+    if (inputs.allowance) {
+      if (!(*inputs.allowance > 0.0f))
+        throw std::runtime_error("--allowance must be positive");
+      app.allowance = *inputs.allowance;
+    }
+    if (inputs.engagement) {
+      if (!(*inputs.engagement > 0.0f))
+        throw std::runtime_error("--engagement must be positive");
+      app.engagement = *inputs.engagement;
+    }
+    if (!app.subject_slicer.empty() || !app.stock_slicer.empty()) reslice(app);
+    else recompute(app);
 
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) != 0)
       throw std::runtime_error(std::string("SDL initialization failed: ") + SDL_GetError());
@@ -388,7 +876,7 @@ int main(int argc, char** argv) {
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 0);
     SDL_Window* window = SDL_CreateWindow(
         "Clipper2 contour wave", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-        1280, 800, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
+        1500, 900, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
     if (!window) throw std::runtime_error(std::string("Window creation failed: ") + SDL_GetError());
     SDL_GLContext gl_context = SDL_GL_CreateContext(window);
     if (!gl_context) throw std::runtime_error(std::string("OpenGL context failed: ") + SDL_GetError());
@@ -405,6 +893,7 @@ int main(int argc, char** argv) {
     ImGui_ImplOpenGL3_Init("#version 150");
 
     bool running = true;
+    bool screenshot_pending = !inputs.screenshot.empty();
     double animation_accumulator = 0.0;
     auto previous_time = std::chrono::steady_clock::now();
     while (running) {
@@ -440,7 +929,7 @@ int main(int argc, char** argv) {
       ImGui::Begin("Clipper2 wave workspace", nullptr,
                    ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
                        ImGuiWindowFlags_NoSavedSettings);
-      ImGui::BeginChild("Controls", ImVec2(330.0f, 0.0f), ImGuiChildFlags_Borders);
+      ImGui::BeginChild("Controls", ImVec2(365.0f, 0.0f), ImGuiChildFlags_Borders);
       controls(app, input);
       ImGui::EndChild();
       ImGui::SameLine();
@@ -455,6 +944,11 @@ int main(int argc, char** argv) {
       glClearColor(0.035f, 0.047f, 0.063f, 1.0f);
       glClear(GL_COLOR_BUFFER_BIT);
       ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+      if (screenshot_pending) {
+        save_screenshot(inputs.screenshot, display_width, display_height);
+        screenshot_pending = false;
+        running = false;
+      }
       SDL_GL_SwapWindow(window);
     }
 

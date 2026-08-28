@@ -1,9 +1,45 @@
-# Clipper2 contour-wave demo
+# GPU mesh slicer and Clipper2 contour-wave demo
 
-This desktop demo loads the closed polygonal paths from `wavetest.svg`, creates
-an allowance rectangle around their bounding box, and sends waves inward from
-that rectangle using Clipper2. Subject boundaries only block waves; they never
-become wave sources.
+This desktop demo combines an NVIDIA cuBQL-accelerated downward-prism mesh
+slicer with the existing Clipper2 wavefront and lineage analysis. It can load
+independent OBJ or STL models for the subject and stock. A slice is converted
+directly to Clipper2 `Paths64`, so it becomes the input to the plan view and
+wave analysis without a rasterization step. `wavetest.svg` remains the default
+2D subject when no subject mesh is loaded.
+
+## Downward-prism mesh slicing
+
+For a non-vertical triangle `T`, let `hT(x,y)` be the affine height of its plane
+over its XY projection. The triangle represents the unbounded downward prism:
+
+```text
+P(T) = { (x,y,z) : (x,y) is in projectXY(T), z <= hT(x,y) }
+```
+
+At mesh-load time, all triangle AABBs are uploaded and cuBQL builds a GPU BVH.
+The BVH is queried against itself in parallel. Prism `A` is completely contained
+in prism `B` exactly when every projected vertex of `A` is inside the projected
+triangle `B` and every vertex height of `A` is no higher than `hB` there. Such
+triangles are flagged, their AABBs are invalidated, and the BVH is rebuilt so
+subsequent slice queries never visit them. Equal duplicate prisms retain the
+lowest triangle ID.
+
+Each horizontal slice launches one cuBQL box traversal per XY grid tile. Tiles
+query from the slice height through the model's maximum Z, and atomic flags
+deduplicate triangles crossing tile boundaries. Only candidate IDs return to
+the CPU. Each candidate triangle is clipped against `z >= slice_z`, projected
+to XY, normalized to a common winding, and unioned with Clipper2.
+
+This is deliberately a downward-envelope slicer, not a conventional closed-solid
+surface intersection. Vertical triangles have zero projected area and are
+discarded. The CPU-only fallback preserves the same semantics but uses a simple
+self-comparison, so CUDA is strongly preferred for substantial meshes.
+
+When a stock mesh is loaded, its sliced polygons define the clipping domain and
+wave seed boundary. Without one, the original allowance rectangle around the
+subject is used.
+
+## Wave propagation
 
 For a subject `S`, allowance rectangle `B`, engagement `e`, and a one-integer-unit
 boundary seed `R0`, cumulative reached areas and visible wave bands are:
@@ -25,8 +61,9 @@ visualization.
 ## Build and run
 
 SDL2 and OpenGL development packages are required. On Ubuntu/Debian they are
-available as `libsdl2-dev` and `libgl-dev`. CMake fetches pinned versions of
-Clipper2 and Dear ImGui.
+available as `libsdl2-dev` and `libgl-dev`. CUDA 12 or newer is required for the
+GPU path. CMake fetches pinned versions of Clipper2, Dear ImGui, and cuBQL. It
+prefers `/usr/local/cuda/bin/nvcc` when available and builds for the native GPU.
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -35,14 +72,43 @@ ctest --test-dir build --output-on-failure
 ./build/clipper2_wave_demo
 ```
 
-An alternate SVG can be passed as the first argument. The focused parser accepts
+Build the functional CPU fallback with:
+
+```bash
+cmake -S . -B build -DWAVE_ENABLE_CUDA=OFF
+```
+
+An alternate SVG can be passed as the first argument or with `--svg`. The focused parser accepts
 closed `M`, `L`, `H`, `V`, and `Z` path commands and applies `scale`, `translate`,
 `matrix`, and `rotate` transforms. Curve commands are intentionally rejected
 instead of silently approximated.
 
+Models can be loaded from the sidebar or at startup:
+
+```bash
+./build/clipper2_wave_demo \
+  --subject-mesh part.obj \
+  --stock-mesh stock.stl \
+  --subject-inflate 0.25 \
+  --stock-inflate -0.1
+```
+
+For automated visual checks, `--screenshot output.ppm` renders one frame and
+exits. Run `./build/clipper2_wave_demo --help` for the complete command-line
+reference, including initial slice height, query grid, allowance, engagement,
+and boundary offsets.
+
 ## Controls
 
-- Drag **Allowance** or **Engagement** to recompute immediately.
+- Enter an OBJ/STL path and load the subject or optional stock independently.
+- Drag inside the 3D panel to orbit; use its mouse wheel to zoom.
+- Adjust **Slice Z** to reslice both loaded models.
+- Adjust **BVH query grid** to trade traversal count for GPU parallelism.
+- Adjust **Subject inflation** and **Stock inflation** independently. Positive
+  values expand boundaries and negative values contract them. Offsets are
+  applied after slicing, so changing them does not rebuild or query the BVH.
+- Drag **Allowance** (when no stock model is loaded) or **Engagement** to
+  recompute immediately.
 - Use **Generation** to inspect a pass, or animate through passes.
 - Toggle the subject, allowance box, or complete generation overlay.
 - Toggle **Show leading fronts** to display the previous front in violet and
@@ -50,7 +116,9 @@ instead of silently approximated.
 - Toggle **Show parent links** to display the ancestry between consecutive
   leading-front components.
 - Use **Detected events** to jump directly to splits, merges, and termination.
-- Right-drag the canvas to pan; use the mouse wheel to zoom.
+- Right-drag the plan canvas to pan; use its mouse wheel to zoom.
+- Inspect BVH build/prune, candidate-query, and CPU polygon-union timings in
+  the sidebar.
 
 Geometry is converted to 64-bit integers at 1000 integer units per transformed
 SVG unit before it is sent to Clipper2.

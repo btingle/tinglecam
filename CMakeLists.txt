@@ -6,6 +6,33 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 include(FetchContent)
+include(CheckLanguage)
+
+option(WAVE_ENABLE_CUDA "Enable the cuBQL CUDA mesh slicer" ON)
+if(WAVE_ENABLE_CUDA)
+  # Prefer the active /usr/local CUDA toolkit over an older distribution nvcc.
+  # CUDACXX or an explicit CMAKE_CUDA_COMPILER still takes precedence.
+  if(NOT DEFINED CMAKE_CUDA_COMPILER AND NOT DEFINED ENV{CUDACXX})
+    find_program(WAVE_LOCAL_NVCC nvcc HINTS /usr/local/cuda/bin NO_DEFAULT_PATH)
+    if(WAVE_LOCAL_NVCC)
+      set(CMAKE_CUDA_COMPILER "${WAVE_LOCAL_NVCC}" CACHE FILEPATH "CUDA compiler")
+    endif()
+  endif()
+  if(NOT CMAKE_CUDA_ARCHITECTURES)
+    if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.24)
+      set(CMAKE_CUDA_ARCHITECTURES native CACHE STRING "CUDA architectures")
+    else()
+      set(CMAKE_CUDA_ARCHITECTURES "70;80" CACHE STRING "CUDA architectures")
+    endif()
+  endif()
+  check_language(CUDA)
+  if(CMAKE_CUDA_COMPILER)
+    enable_language(CUDA)
+    set(WAVE_HAVE_CUDA ON)
+  else()
+    message(WARNING "CUDA was not found; building the CPU mesh-slicer fallback")
+  endif()
+endif()
 
 # Keep third-party builds small and deterministic.
 set(CLIPPER2_UTILS OFF CACHE BOOL "" FORCE)
@@ -27,20 +54,42 @@ FetchContent_Declare(
   GIT_SHALLOW TRUE
 )
 
+if(WAVE_HAVE_CUDA)
+  FetchContent_Declare(
+    cubql
+    GIT_REPOSITORY https://github.com/NVIDIA/cuBQL.git
+    GIT_TAG 20f9db19cdb160e2b83d8f05dfdb0437fe11fe24
+    GIT_SHALLOW TRUE
+  )
+endif()
+
 FetchContent_MakeAvailable(clipper2 imgui)
+if(WAVE_HAVE_CUDA)
+  FetchContent_MakeAvailable(cubql)
+endif()
 
 find_package(SDL2 REQUIRED CONFIG)
 find_package(OpenGL REQUIRED)
 
 add_library(wave_geometry
   src/geometry.cpp
+  src/mesh_slicer.cpp
   src/topology.cpp
 )
+if(WAVE_HAVE_CUDA)
+  target_sources(wave_geometry PRIVATE src/mesh_slicer_cuda.cu)
+  target_link_libraries(wave_geometry PRIVATE cuBQL_cuda_float3_static)
+  target_compile_definitions(wave_geometry PUBLIC WAVE_HAVE_CUDA=1)
+  set_target_properties(wave_geometry PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
+else()
+  target_sources(wave_geometry PRIVATE src/mesh_slicer_cuda_stub.cpp)
+  target_compile_definitions(wave_geometry PUBLIC WAVE_HAVE_CUDA=0)
+endif()
 target_include_directories(wave_geometry PUBLIC src)
 target_link_libraries(wave_geometry PUBLIC Clipper2)
 target_compile_options(wave_geometry PRIVATE
-  $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall;-Wextra;-Wpedantic>
-  $<$<CXX_COMPILER_ID:MSVC>:/W4>
+  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:GNU,Clang>>:-Wall;-Wextra;-Wpedantic>
+  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/W4>
 )
 
 add_library(imgui_sdl_opengl STATIC
@@ -74,3 +123,8 @@ add_executable(wave_geometry_tests tests/geometry_tests.cpp)
 target_link_libraries(wave_geometry_tests PRIVATE wave_geometry)
 add_test(NAME wave_geometry_tests
          COMMAND wave_geometry_tests ${CMAKE_CURRENT_SOURCE_DIR}/wavetest.svg)
+
+add_executable(mesh_slicer_tests tests/mesh_slicer_tests.cpp)
+target_link_libraries(mesh_slicer_tests PRIVATE wave_geometry)
+add_test(NAME mesh_slicer_tests COMMAND mesh_slicer_tests)
+add_test(NAME demo_help COMMAND clipper2_wave_demo --help)

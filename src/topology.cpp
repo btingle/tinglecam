@@ -166,10 +166,10 @@ FrontLineage build_front_lineage(const WaveResult& wave, double engagement) {
   FrontLineage result;
   if (wave.generations.empty()) return result;
 
-  const Paths64 stock{wave.stock_boundary};
+  const Paths64 stock = wave.stock.empty() ? Paths64{wave.stock_boundary} : wave.stock;
   const Paths64 free_space = Difference(stock, wave.subject, FillRule::NonZero);
   Paths64 static_boundaries = wave.subject;
-  static_boundaries.push_back(wave.stock_boundary);
+  static_boundaries.insert(static_boundaries.end(), stock.begin(), stock.end());
   result.generations.reserve(wave.generations.size());
 
   for (std::size_t generation = 0; generation < wave.generations.size(); ++generation) {

@@ -338,28 +338,39 @@ WaveResult build_wavefront(const Paths64& raw_subject,
                            std::size_t max_iterations) {
   if (raw_subject.empty()) throw std::invalid_argument("Subject is empty");
   if (!(allowance > 0.0)) throw std::invalid_argument("Allowance must be positive");
-  if (!(engagement > 0.0)) throw std::invalid_argument("Engagement must be positive");
-  if (max_iterations == 0) throw std::invalid_argument("Iteration limit must be positive");
-
-  WaveResult result;
-  result.subject = Union(raw_subject, FillRule::NonZero);
-  const Rect64 bounds = GetBounds(result.subject);
+  const Paths64 subject = Union(raw_subject, FillRule::NonZero);
+  const Rect64 bounds = GetBounds(subject);
   const std::int64_t margin = std::max<std::int64_t>(1, to_integer(allowance));
-  result.stock_boundary = {
+  const Path64 stock_boundary = {
       Point64(bounds.left - margin, bounds.top - margin),
       Point64(bounds.right + margin, bounds.top - margin),
       Point64(bounds.right + margin, bounds.bottom + margin),
       Point64(bounds.left - margin, bounds.bottom + margin),
   };
+  return build_wavefront(subject, Paths64{stock_boundary}, engagement, max_iterations);
+}
 
-  const Paths64 stock{result.stock_boundary};
+WaveResult build_wavefront(const Paths64& raw_subject,
+                           const Paths64& raw_stock,
+                           double engagement,
+                           std::size_t max_iterations) {
+  if (raw_subject.empty()) throw std::invalid_argument("Subject is empty");
+  if (raw_stock.empty()) throw std::invalid_argument("Stock is empty");
+  if (!(engagement > 0.0)) throw std::invalid_argument("Engagement must be positive");
+  if (max_iterations == 0) throw std::invalid_argument("Iteration limit must be positive");
+
+  WaveResult result;
+  result.subject = Union(raw_subject, FillRule::NonZero);
+  result.stock = Union(raw_stock, FillRule::NonZero);
+  if (result.stock.empty()) throw std::invalid_argument("Stock union is empty");
+  result.stock_boundary = result.stock.front();
 
   // Seed propagation with a one-integer-unit ring at the stock boundary. The
   // subject is deliberately not part of this seed, so its boundaries can never
   // become independent wave sources.
-  const Paths64 stock_inner = InflatePaths(stock, -1.0, JoinType::Miter,
+  const Paths64 stock_inner = InflatePaths(result.stock, -1.0, JoinType::Miter,
                                            EndType::Polygon);
-  Paths64 reached = Difference(stock, stock_inner, FillRule::NonZero);
+  Paths64 reached = Difference(result.stock, stock_inner, FillRule::NonZero);
   reached = Difference(reached, result.subject, FillRule::NonZero);
   reached = Union(reached, FillRule::NonZero);
   result.generations.push_back(reached);
@@ -371,7 +382,7 @@ WaveResult build_wavefront(const Paths64& raw_subject,
     // Expand only geometry already reached from the box. Clipping to stock keeps
     // the expansion inward; subtracting the subject blocks colliding wavefronts.
     Paths64 next = InflatePaths(reached, delta, JoinType::Miter, EndType::Polygon);
-    next = Intersect(next, stock, FillRule::NonZero);
+    next = Intersect(next, result.stock, FillRule::NonZero);
     next = Difference(next, result.subject, FillRule::NonZero);
     next = Union(next, FillRule::NonZero);
 
