@@ -41,7 +41,7 @@ struct FrontLineage {
 // Extracts the reached/unreached interface from each vector wave band, then
 // associates consecutive front components using the same engagement offset as
 // the wave propagation.
-FrontLineage build_front_lineage(const WaveResult& wave, double engagement);
+FrontLineage build_front_lineage(const WaveResult& wave);
 
 Point64 representative_point(const LeadingFront& front);
 double front_length(const LeadingFront& front);

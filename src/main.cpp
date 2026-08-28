@@ -57,6 +57,7 @@ struct AppState {
   int query_grid = 32;
   float allowance = 150.0f;
   float engagement = 80.0f;
+  float softening_percent = 10.0f;
   float subject_inflation = 0.0f;
   float stock_inflation = 0.0f;
   int selected_iteration = -1;
@@ -145,8 +146,9 @@ void recompute(AppState& app) {
       stock = app.sliced_stock;
     }
     stock = offset_boundaries(stock, app.stock_inflation, "Stock");
-    app.result = wave::build_wavefront(subject, stock, app.engagement);
-    app.lineage = wave::build_front_lineage(app.result, app.engagement);
+    const double softening = app.engagement * app.softening_percent * 0.01;
+    app.result = wave::build_wavefront(subject, stock, app.engagement, softening);
+    app.lineage = wave::build_front_lineage(app.result);
     if (app.selected_iteration < 0 && !app.lineage.events.empty())
       app.selected_iteration = static_cast<int>(app.lineage.events.front().generation);
     else
@@ -156,6 +158,12 @@ void recompute(AppState& app) {
     app.error.clear();
   } catch (const std::exception& error) {
     app.error = error.what();
+    // The previous slice's analysis no longer describes what is on screen, and
+    // selected_iteration is left negative, so drop both rather than draw stale
+    // geometry against indices that no longer exist.
+    app.result = {};
+    app.lineage = {};
+    app.selected_iteration = -1;
   }
 }
 
@@ -271,6 +279,15 @@ void draw_front(ImDrawList* draw_list, const wave::LeadingFront& front,
   }
 }
 
+// selected_iteration is -1 until a recompute succeeds. Casting that straight to
+// size_t yields SIZE_MAX, so every lookup into the lineage goes through here.
+std::optional<std::size_t> selected_generation(const AppState& app) {
+  if (app.selected_iteration < 0) return std::nullopt;
+  const auto index = static_cast<std::size_t>(app.selected_iteration);
+  if (index >= app.lineage.generations.size()) return std::nullopt;
+  return index;
+}
+
 void fit_view(AppState& app, ImVec2 canvas_size) {
   const auto bounds = Clipper2Lib::GetBounds(app.result.stock);
   const float width = static_cast<float>(wave::to_world(bounds.right - bounds.left));
@@ -346,7 +363,7 @@ void draw_canvas(AppState& app) {
                  iteration_color(i, count, selected ? 255 : 145),
                  selected ? 3.0f : 1.25f);
     }
-  } else if (count > 0) {
+  } else if (app.selected_iteration >= 0 && app.selected_iteration < count) {
     draw_paths(draw_list, app.result.generations[app.selected_iteration], transform,
                iteration_color(app.selected_iteration, count), 2.5f);
   }
@@ -354,9 +371,9 @@ void draw_canvas(AppState& app) {
   if (app.show_subject)
     draw_paths(draw_list, app.result.subject, transform, IM_COL32(252, 226, 89, 255), 3.0f);
 
-  if (app.show_leading_fronts &&
-      app.selected_iteration < static_cast<int>(app.lineage.generations.size())) {
-    const std::size_t generation = static_cast<std::size_t>(app.selected_iteration);
+  const auto canvas_generation = selected_generation(app);
+  if (app.show_leading_fronts && canvas_generation) {
+    const std::size_t generation = *canvas_generation;
     if (generation > 0) {
       const auto& previous = app.lineage.generations[generation - 1].fronts;
       for (const auto& front : previous)
@@ -595,6 +612,8 @@ void controls(AppState& app, const std::filesystem::path& input) {
   changed |= ImGui::DragFloat("Stock inflation", &app.stock_inflation, 0.1f,
                               -100000.0f, 100000.0f, "%+.3f");
   changed |= ImGui::DragFloat("Engagement", &app.engagement, 1.0f, 0.001f, 100000.0f, "%.3f");
+  changed |= ImGui::SliderFloat("Wave softening", &app.softening_percent,
+                                0.0f, 100.0f, "%.1f%%");
   if (changed) {
     app.view.needs_fit = true;
     recompute(app);
@@ -663,8 +682,8 @@ void controls(AppState& app, const std::filesystem::path& input) {
   }
 
   ImGui::SeparatorText("Front lineage");
-  if (app.selected_iteration < static_cast<int>(app.lineage.generations.size())) {
-    const std::size_t generation = static_cast<std::size_t>(app.selected_iteration);
+  if (const auto selected = selected_generation(app)) {
+    const std::size_t generation = *selected;
     const auto& current = app.lineage.generations[generation].fronts;
     const std::size_t previous_count = generation == 0
                                            ? 0
@@ -707,6 +726,9 @@ void controls(AppState& app, const std::filesystem::path& input) {
   ImGui::TextWrapped(
       "Selected leading fronts: violet = previous, green = current. White links "
       "show parentage. Event markers: S split, M merge, T termination, B unexpected birth.");
+  ImGui::TextWrapped(
+      "Wave softening rounds a fraction of each engagement step. Its effect "
+      "accumulates over successive generations; 0%% preserves sharp mitered waves.");
 }
 
 struct StartupInputs {
@@ -718,6 +740,7 @@ struct StartupInputs {
   std::optional<float> stock_inflation;
   std::optional<float> allowance;
   std::optional<float> engagement;
+  std::optional<float> softening_percent;
   std::optional<float> slice_z;
   std::optional<int> query_grid;
   bool help = false;
@@ -766,6 +789,7 @@ StartupInputs resolve_inputs(int argc, char** argv) {
     else if (argument == "--stock-inflate") result.stock_inflation = float_after(argument);
     else if (argument == "--allowance") result.allowance = float_after(argument);
     else if (argument == "--engagement") result.engagement = float_after(argument);
+    else if (argument == "--softening-percent") result.softening_percent = float_after(argument);
     else if (argument == "--slice-z") result.slice_z = float_after(argument);
     else if (argument == "--query-grid") result.query_grid = int_after(argument);
     else if (!argument.starts_with("--") && result.svg.empty()) result.svg = argument;
@@ -796,7 +820,8 @@ void print_help(const char* executable) {
       << "  --subject-inflate VALUE Signed subject boundary offset (default: 0)\n"
       << "  --stock-inflate VALUE   Signed stock boundary offset (default: 0)\n"
       << "  --allowance VALUE       Fallback stock allowance when no stock mesh is loaded\n"
-      << "  --engagement VALUE      Wave propagation distance per generation\n\n"
+      << "  --engagement VALUE      Wave propagation distance per generation\n"
+      << "  --softening-percent P   Rounded fraction of each step, 0..100 (default: 10)\n\n"
       << "Other options:\n"
       << "  --screenshot PATH       Render one frame to a binary PPM file and exit\n"
       << "  -h, --help              Show this help and exit\n\n"
@@ -861,6 +886,11 @@ int main(int argc, char** argv) {
       if (!(*inputs.engagement > 0.0f))
         throw std::runtime_error("--engagement must be positive");
       app.engagement = *inputs.engagement;
+    }
+    if (inputs.softening_percent) {
+      if (*inputs.softening_percent < 0.0f || *inputs.softening_percent > 100.0f)
+        throw std::runtime_error("--softening-percent must be between 0 and 100");
+      app.softening_percent = *inputs.softening_percent;
     }
     if (!app.subject_slicer.empty() || !app.stock_slicer.empty()) reslice(app);
     else recompute(app);

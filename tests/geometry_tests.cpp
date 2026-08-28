@@ -12,6 +12,34 @@ void require(bool condition, const char* message) {
   if (!condition) throw std::runtime_error(message);
 }
 
+// Two wave bands sweeping left to right across plain rectangular stock. When
+// `notched` is set, the second band's leading edge carries a five-unit step
+// standing in for the quantization staircase that Clipper's offset output
+// leaves on a real wavefront. The step is far too small to separate two
+// wavefronts, so both variants must report a single leading front.
+wave::WaveResult two_band_sweep(bool notched) {
+  wave::WaveResult wave_result;
+  wave_result.stock = wave::Paths64{{{0, 0}, {60000, 0}, {60000, 20000}, {0, 20000}}};
+  wave_result.stock_boundary = wave_result.stock.front();
+  wave_result.engagement = 10.0;
+  wave_result.softening = 0.0;
+  const wave::Path64 first{{0, 0}, {10000, 0}, {10000, 20000}, {0, 20000}};
+  wave::Path64 second{{10000, 0}, {20000, 0}, {20000, 10000}};
+  if (notched) {
+    second.push_back({19995, 10000});
+    second.push_back({19995, 10001});
+    second.push_back({20000, 10001});
+  }
+  second.push_back({20000, 20000});
+  second.push_back({10000, 20000});
+  wave_result.generations = {wave::Paths64{first}, wave::Paths64{second}};
+  wave_result.reached_generations = {
+      wave::Paths64{first},
+      Clipper2Lib::Union(wave::Paths64{first, second},
+                         Clipper2Lib::FillRule::NonZero)};
+  return wave_result;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -52,7 +80,7 @@ int main(int argc, char** argv) {
     require(wave::paths_equal_canonical({square}, {reversed}),
             "canonical comparison should ignore winding");
 
-    const auto lineage = wave::build_front_lineage(result, 75.0);
+    const auto lineage = wave::build_front_lineage(result);
     require(lineage.generations.size() == result.generations.size(),
             "lineage should cover every wave generation");
     require(!lineage.generations.front().fronts.empty(),
@@ -71,6 +99,17 @@ int main(int argc, char** argv) {
               "lineage event occurred in an unexpected generation");
       require(lineage.events[i].kind == expected_kinds[i],
               "lineage event has an unexpected kind");
+    }
+
+    for (const bool notched : {false, true}) {
+      const auto sweep = wave::build_front_lineage(two_band_sweep(notched));
+      require(sweep.generations.size() == 2, "the sweep should cover both bands");
+      require(sweep.generations[0].fronts.size() == 1,
+              "the first band should expose one leading front");
+      require(sweep.generations[1].fronts.size() == 1,
+              "a quantization step must not cut the leading front in two");
+      require(sweep.events.empty(),
+              "a quantization step must not raise a split or birth event");
     }
 
     std::cout << "Loaded " << svg.source_path_count << " paths and generated "

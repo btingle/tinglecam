@@ -64,20 +64,58 @@ std::pair<Point64, Point64> normal_probes(const Point64& a, const Point64& b,
   };
 }
 
+// Reclassifies each maximal run of non-leading segments that is flanked by
+// leading segments and is shorter than the noise floor. Returns how many
+// segments were reclassified.
+std::size_t absorb_quantization_gaps(std::vector<bool>& leading,
+                                     const std::vector<double>& segment_length,
+                                     double noise_floor) {
+  const std::size_t count = leading.size();
+  std::vector<std::size_t> absorbed;
+  for (std::size_t i = 0; i < count; ++i) {
+    // Starting only where a gap follows a leading segment visits each maximal
+    // gap run once and guarantees it is flanked on the left.
+    if (leading[i] || !leading[(i + count - 1) % count]) continue;
+    double total = 0.0;
+    std::size_t cursor = i;
+    std::size_t run_length = 0;
+    while (run_length < count && !leading[cursor]) {
+      total += segment_length[cursor];
+      cursor = (cursor + 1) % count;
+      ++run_length;
+    }
+    if (run_length >= count || total > noise_floor) continue;
+    for (std::size_t k = 0; k < run_length; ++k) absorbed.push_back((i + k) % count);
+  }
+  // Applied after the scan so reclassification cannot merge two distinct runs.
+  for (const auto index : absorbed) leading[index] = true;
+  return absorbed.size();
+}
+
 std::vector<LeadingFront> extract_leading_fronts(const Paths64& wave_band,
                                                  const Paths64& unreached,
                                                  const Paths64& static_boundaries) {
   std::vector<LeadingFront> fronts;
   constexpr std::int64_t probe_distance = 2;
+  // Offset output is quantized to the integer grid, so a wavefront can carry
+  // single-unit staircase steps whose normal points along the front rather than
+  // across it. Those steps fail the probe test and would otherwise cut one
+  // wavefront into two that share an endpoint. Measured over the sample meshes,
+  // such artifacts reach 8 integer units while the shortest genuine gap between
+  // fronts is 878, so this floor sits with wide margin between the two.
+  constexpr double gap_noise_floor = 32.0;
 
   for (const auto& ring : wave_band) {
     const std::size_t count = ring.size();
     if (count < 2) continue;
     std::vector<bool> leading(count, false);
+    std::vector<double> segment_length(count, 0.0);
     std::size_t leading_count = 0;
     for (std::size_t i = 0; i < count; ++i) {
       const Point64& a = ring[i];
       const Point64& b = ring[(i + 1) % count];
+      segment_length[i] = std::hypot(static_cast<double>(b.x - a.x),
+                                     static_cast<double>(b.y - a.y));
       if (a == b || segment_on_paths(a, b, static_boundaries)) continue;
       const auto [plus, minus] = normal_probes(a, b, probe_distance);
       if (point_in_nonzero_paths(plus, unreached) ||
@@ -87,11 +125,17 @@ std::vector<LeadingFront> extract_leading_fronts(const Paths64& wave_band,
       }
     }
 
+    if (leading_count == 0) continue;
+    // Runs the closed-ring check afterwards so a ring whose only interruption
+    // was quantization noise stays a closed front instead of becoming an open
+    // curve that appears to start and end at the same point.
+    leading_count +=
+        absorb_quantization_gaps(leading, segment_length, gap_noise_floor);
+
     if (leading_count == count) {
       fronts.push_back({ring, true, {}, {}});
       continue;
     }
-    if (leading_count == 0) continue;
 
     std::size_t first_gap = 0;
     while (first_gap < count && leading[first_gap]) ++first_gap;
@@ -116,10 +160,17 @@ std::vector<LeadingFront> extract_leading_fronts(const Paths64& wave_band,
   return fronts;
 }
 
-Paths64 front_reach(const LeadingFront& front, double distance) {
+Paths64 front_reach(const LeadingFront& front, double distance,
+                    double softening) {
   if (front.path.size() < 2) return {};
-  return InflatePaths(Paths64{front.path}, distance, JoinType::Miter,
-                      front.closed ? EndType::Joined : EndType::Square);
+  const EndType end_type = front.closed ? EndType::Joined : EndType::Square;
+  if (softening <= 0.0)
+    return InflatePaths(Paths64{front.path}, distance, JoinType::Miter, end_type);
+  if (softening >= distance)
+    return InflatePaths(Paths64{front.path}, distance, JoinType::Round, end_type);
+  Paths64 result = InflatePaths(Paths64{front.path}, distance - softening,
+                                JoinType::Miter, end_type);
+  return InflatePaths(result, softening, JoinType::Round, EndType::Polygon);
 }
 
 double open_intersection_length(const LeadingFront& front, const Paths64& clips) {
@@ -159,8 +210,10 @@ Point64 average_points(const std::vector<Point64>& points) {
 
 }  // namespace
 
-FrontLineage build_front_lineage(const WaveResult& wave, double engagement) {
-  if (!(engagement > 0.0)) throw std::invalid_argument("Engagement must be positive");
+FrontLineage build_front_lineage(const WaveResult& wave) {
+  if (!(wave.engagement > 0.0)) throw std::invalid_argument("Engagement must be positive");
+  if (wave.softening < 0.0 || wave.softening > wave.engagement)
+    throw std::invalid_argument("Softening must be between zero and engagement");
   if (wave.generations.size() != wave.reached_generations.size())
     throw std::invalid_argument("Wave bands and cumulative reached sets do not match");
   FrontLineage result;
@@ -181,7 +234,10 @@ FrontLineage build_front_lineage(const WaveResult& wave, double engagement) {
   }
 
   const double engagement_integer = static_cast<double>(
-      std::max<std::int64_t>(1, to_integer(engagement)));
+      std::max<std::int64_t>(1, to_integer(wave.engagement)));
+  const double softening_integer = static_cast<double>(
+      std::clamp<std::int64_t>(to_integer(wave.softening), 0,
+                               static_cast<std::int64_t>(engagement_integer)));
   const double tolerance = std::clamp(engagement_integer * 0.001, 4.0, 100.0);
 
   for (std::size_t generation = 1; generation < result.generations.size(); ++generation) {
@@ -190,7 +246,8 @@ FrontLineage build_front_lineage(const WaveResult& wave, double engagement) {
     Paths64 band_guard = InflatePaths(wave.generations[generation], tolerance,
                                       JoinType::Miter, EndType::Polygon);
     for (std::size_t parent = 0; parent < previous.size(); ++parent) {
-      Paths64 candidate = front_reach(previous[parent], engagement_integer + tolerance);
+      Paths64 candidate = front_reach(previous[parent], engagement_integer + tolerance,
+                                      softening_integer);
       candidate = Intersect(candidate, band_guard, FillRule::NonZero);
       if (candidate.empty()) continue;
       for (std::size_t child = 0; child < current.size(); ++child) {

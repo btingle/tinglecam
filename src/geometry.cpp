@@ -264,6 +264,17 @@ auto canonical_paths(const Paths64& paths) {
   return result;
 }
 
+Paths64 inflate_with_softening(const Paths64& paths, double distance,
+                               double softening) {
+  if (softening <= 0.0)
+    return InflatePaths(paths, distance, JoinType::Miter, EndType::Polygon);
+  if (softening >= distance)
+    return InflatePaths(paths, distance, JoinType::Round, EndType::Polygon);
+  Paths64 expanded = InflatePaths(paths, distance - softening,
+                                  JoinType::Miter, EndType::Polygon);
+  return InflatePaths(expanded, softening, JoinType::Round, EndType::Polygon);
+}
+
 }  // namespace
 
 double to_world(std::int64_t value) { return static_cast<double>(value) / kIntegerScale; }
@@ -335,6 +346,7 @@ bool paths_equal_canonical(const Paths64& lhs, const Paths64& rhs) {
 WaveResult build_wavefront(const Paths64& raw_subject,
                            double allowance,
                            double engagement,
+                           double softening,
                            std::size_t max_iterations) {
   if (raw_subject.empty()) throw std::invalid_argument("Subject is empty");
   if (!(allowance > 0.0)) throw std::invalid_argument("Allowance must be positive");
@@ -347,21 +359,27 @@ WaveResult build_wavefront(const Paths64& raw_subject,
       Point64(bounds.right + margin, bounds.bottom + margin),
       Point64(bounds.left - margin, bounds.bottom + margin),
   };
-  return build_wavefront(subject, Paths64{stock_boundary}, engagement, max_iterations);
+  return build_wavefront(subject, Paths64{stock_boundary}, engagement,
+                         softening, max_iterations);
 }
 
 WaveResult build_wavefront(const Paths64& raw_subject,
                            const Paths64& raw_stock,
                            double engagement,
+                           double softening,
                            std::size_t max_iterations) {
   if (raw_subject.empty()) throw std::invalid_argument("Subject is empty");
   if (raw_stock.empty()) throw std::invalid_argument("Stock is empty");
   if (!(engagement > 0.0)) throw std::invalid_argument("Engagement must be positive");
+  if (softening < 0.0 || softening > engagement)
+    throw std::invalid_argument("Softening must be between zero and engagement");
   if (max_iterations == 0) throw std::invalid_argument("Iteration limit must be positive");
 
   WaveResult result;
   result.subject = Union(raw_subject, FillRule::NonZero);
   result.stock = Union(raw_stock, FillRule::NonZero);
+  result.engagement = engagement;
+  result.softening = softening;
   if (result.stock.empty()) throw std::invalid_argument("Stock union is empty");
   result.stock_boundary = result.stock.front();
 
@@ -378,10 +396,13 @@ WaveResult build_wavefront(const Paths64& raw_subject,
 
   const double delta = static_cast<double>(
       std::max<std::int64_t>(1, to_integer(engagement)));
+  const double softening_delta = static_cast<double>(
+      std::clamp<std::int64_t>(to_integer(softening), 0,
+                               static_cast<std::int64_t>(delta)));
   for (std::size_t iteration = 0; iteration < max_iterations; ++iteration) {
     // Expand only geometry already reached from the box. Clipping to stock keeps
     // the expansion inward; subtracting the subject blocks colliding wavefronts.
-    Paths64 next = InflatePaths(reached, delta, JoinType::Miter, EndType::Polygon);
+    Paths64 next = inflate_with_softening(reached, delta, softening_delta);
     next = Intersect(next, result.stock, FillRule::NonZero);
     next = Difference(next, result.subject, FillRule::NonZero);
     next = Union(next, FillRule::NonZero);
