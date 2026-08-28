@@ -53,7 +53,10 @@ double gouge_length(const wave::Toolpath& toolpath, const wave::Paths64& subject
   if (forbidden.empty()) return 0.0;
   double total = 0.0;
   for (const auto& move : toolpath.moves) {
-    if (move.kind == wave::MoveKind::Retract || move.path.size() < 2) continue;
+    // Lifts happen above the work, so only motion at depth can gouge.
+    if (move.kind == wave::MoveKind::Retract || move.kind == wave::MoveKind::Entry ||
+        move.path.size() < 2)
+      continue;
     Clipper2Lib::Clipper64 clipper;
     clipper.AddOpenSubject(wave::Paths64{move.path});
     clipper.AddClip(forbidden);
@@ -143,8 +146,8 @@ int main(int argc, char** argv) {
               "a quantization step must not raise a split or birth event");
       const auto sweep_path = wave::build_toolpath(two_band_sweep(notched), sweep);
       require(sweep_path.stats.cut_count == 2, "both bands should be cut");
-      require(sweep_path.stats.retract_count == 1,
-              "two adjacent bands need only the opening plunge");
+      require(sweep_path.stats.entry_count == 1 && sweep_path.stats.retract_count == 0,
+              "two adjacent bands need only the opening ramp");
       require(sweep_path.stats.step_count == 1,
               "the move onto the second band is a stepover, not free travel");
     }
@@ -157,12 +160,22 @@ int main(int argc, char** argv) {
             "lineage precedence should leave no front unreachable");
     require(toolpath.stats.cut_count == front_count,
             "every leading front should be cut exactly once");
-    require(toolpath.stats.cut_count == toolpath.stats.step_count +
-                                            toolpath.stats.link_count +
-                                            toolpath.stats.retract_count,
-            "every cut should be preceded by exactly one connecting move");
-    require(toolpath.stats.retract_count >= 1,
-            "the first cut is always entered by a plunge");
+    require(toolpath.moves.front().kind == wave::MoveKind::Entry,
+            "nothing is cleared at the start, so the first move ramps in");
+    require(toolpath.stats.retract_count + toolpath.stats.entry_count <=
+                toolpath.stats.cut_count,
+            "a lift only ever happens on the way to a cut");
+    for (std::size_t i = 1; i < toolpath.moves.size(); ++i)
+      require(!(toolpath.moves[i].kind == wave::MoveKind::Cut &&
+                toolpath.moves[i - 1].kind == wave::MoveKind::Cut),
+              "consecutive cuts must be joined by a connecting move");
+    // A lift that sets down in cleared material owes the tool a move at depth
+    // before it can start cutting, or the descent itself does the cutting.
+    for (std::size_t i = 0; i + 1 < toolpath.moves.size(); ++i)
+      require(!(toolpath.moves[i].kind == wave::MoveKind::Retract &&
+                toolpath.moves[i + 1].kind == wave::MoveKind::Cut) ||
+                  toolpath.moves[i].path.back() == toolpath.moves[i + 1].path.front(),
+              "a retract must hand the tool to the cut it serves");
 
     // A front may only be entered once the parents that opened the way to it
     // have been cut, or the tool takes a full-width bite instead of a stepover.

@@ -109,6 +109,8 @@ and boundary offsets.
   applied after slicing, so changing them does not rebuild or query the BVH.
 - Drag **Allowance** (when no stock model is loaded) or **Stepover** to
   recompute immediately.
+- Drag **Link detour limit** to set how far a transition may travel around an
+  obstruction before the tool lifts over it instead.
 - Use **Generation** to inspect a pass, or animate through passes.
 - Toggle the subject, allowance box, or complete generation overlay.
 - Toggle **Show leading fronts** to display the previous front in violet and
@@ -182,7 +184,19 @@ classification is:
   air at depth;
 - **step** when it also crosses the band piece its target front bounds, which is
   the same one-stepover bite the front itself takes;
-- **retract** otherwise: lift, rapid, and plunge again.
+- **retract** when the straight segment is blocked and no route around it is
+  worth taking: lift, rapid, and set the tool down in cleared material, from
+  where a further move at depth reaches the front. The descent itself never
+  cuts;
+- **entry** where not even that is possible, because nothing has been cleared
+  near the front yet. The tool has to ramp or helix into solid material, and the
+  first move of any toolpath is one of these.
+
+Before a lift is considered, a blocked segment is routed along the boundary of
+the region it may travel through, walked in both directions and then pulled
+straight wherever a shortcut stays clear. The detour is taken when it is no more
+than `detour_limit` times the direct distance, so the tool follows a contour
+around an obstruction instead of rapiding over it.
 
 The test is stated as avoiding the forbidden region -- everything not yet
 cleared, which covers uncut material, the subject, and the space beyond the

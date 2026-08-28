@@ -23,9 +23,14 @@ enum class MoveKind {
   Step,
   // Travel at depth through material that has already been cleared.
   Link,
-  // Lift to clearance, rapid, plunge again. The path holds only the rapid's
-  // endpoints; a zero-length retract is the initial plunge.
+  // Lift to clearance, rapid, and plunge back down. The plunge lands in cleared
+  // material, so the descent itself cuts nothing; the path holds only the
+  // rapid's endpoints.
   Retract,
+  // Entering material that has not been cleared, which no straight descent can
+  // do. The tool has to ramp or helix in, and the first move of any toolpath is
+  // one of these.
+  Entry,
 };
 
 struct ToolpathMove {
@@ -36,15 +41,26 @@ struct ToolpathMove {
   double length = 0.0;
 };
 
+struct ToolpathOptions {
+  // A detour through cleared material is taken in place of a retract when it is
+  // no longer than this multiple of the straight-line distance. Raising it
+  // trades cycle time for fewer lifts.
+  double detour_limit = 6.0;
+};
+
 struct ToolpathStats {
   double cut_length = 0.0;
   double step_length = 0.0;
   double link_length = 0.0;
   double retract_length = 0.0;
+  double entry_length = 0.0;
   std::size_t cut_count = 0;
   std::size_t step_count = 0;
   std::size_t link_count = 0;
   std::size_t retract_count = 0;
+  std::size_t entry_count = 0;
+  // Retracts routed around an obstruction at depth instead of lifting.
+  std::size_t detour_count = 0;
   // Fronts the sequencer could not reach because their parents never were.
   std::size_t unreachable_fronts = 0;
 };
@@ -60,7 +76,14 @@ struct Toolpath {
 // a straight link when the link stays inside the material cleared so far, and
 // by a retract otherwise. A link that only crosses the band its target front
 // bounds is reported as a step: engaged, but no deeper than one stepover.
-Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage);
+//
+// When the straight segment is blocked, the move is routed along the boundary
+// of the region it may travel through before a lift is considered, so the tool
+// follows a contour around an obstruction rather than rapiding over it. A lift
+// that does happen sets down in cleared material; only where no cleared landing
+// exists is an entry emitted, and that one has to be ramped.
+Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage,
+                        const ToolpathOptions& options = {});
 
 // Where the tool is after travelling a given distance along the whole path.
 struct ToolpathCursor {

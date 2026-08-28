@@ -70,6 +70,7 @@ struct AppState {
   bool toolpath_play = true;
   // World units per second, and how far the tool has travelled along the path.
   float toolpath_speed = 40.0f;
+  float detour_limit = 6.0f;
   float toolpath_progress = 0.0f;
   bool show_parent_links = true;
   bool show_event_markers = true;
@@ -157,7 +158,9 @@ void recompute(AppState& app) {
         std::min<double>(app.stepover * app.softening_percent * 0.01, app.stepover);
     app.result = wave::build_wavefront(subject, stock, app.stepover, softening);
     app.lineage = wave::build_front_lineage(app.result);
-    app.toolpath = wave::build_toolpath(app.result, app.lineage);
+    wave::ToolpathOptions toolpath_options;
+    toolpath_options.detour_limit = app.detour_limit;
+    app.toolpath = wave::build_toolpath(app.result, app.lineage, toolpath_options);
     app.toolpath_progress = 0.0f;
     if (app.selected_iteration < 0 && !app.lineage.events.empty())
       app.selected_iteration = static_cast<int>(app.lineage.events.front().generation);
@@ -318,6 +321,7 @@ ImU32 move_color(wave::MoveKind kind) {
     case wave::MoveKind::Step: return IM_COL32(255, 196, 61, 255);
     case wave::MoveKind::Link: return IM_COL32(96, 190, 255, 255);
     case wave::MoveKind::Retract: return IM_COL32(255, 92, 118, 255);
+    case wave::MoveKind::Entry: return IM_COL32(255, 110, 220, 255);
   }
   return IM_COL32(232, 236, 241, 255);
 }
@@ -478,7 +482,7 @@ void draw_canvas(AppState& app) {
         // drawing them, so those stay visible ahead of the tool.
         if (!done && move.kind == wave::MoveKind::Cut) continue;
         const ImU32 color = done ? move_color(move.kind) : fade(move_color(move.kind), 0.30f);
-        if (move.kind == wave::MoveKind::Retract) {
+        if (move.kind == wave::MoveKind::Retract || move.kind == wave::MoveKind::Entry) {
           retracts.push_back(&move);
           continue;
         }
@@ -715,6 +719,8 @@ void controls(AppState& app, const std::filesystem::path& input) {
   changed |= ImGui::DragFloat("Stock inflation", &app.stock_inflation, 0.1f,
                               -100000.0f, 100000.0f, "%+.3f");
   changed |= ImGui::DragFloat("Stepover", &app.stepover, 1.0f, 0.001f, 100000.0f, "%.3f");
+  changed |= ImGui::DragFloat("Link detour limit", &app.detour_limit, 0.05f, 1.0f,
+                              50.0f, "%.2fx");
   changed |= ImGui::SliderFloat("Wave softening", &app.softening_percent,
                                 0.0f, 100.0f, "%.1f%%");
   if (changed) {
@@ -840,6 +846,11 @@ void controls(AppState& app, const std::filesystem::path& input) {
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(move_color(wave::MoveKind::Retract)),
                        "Retract: %8.1f units in %zu moves", stats.retract_length,
                        stats.retract_count);
+    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(move_color(wave::MoveKind::Entry)),
+                       "Entry:   %8.1f units in %zu moves", stats.entry_length,
+                       stats.entry_count);
+    ImGui::Text("%zu transition%s routed around an obstruction", stats.detour_count,
+                stats.detour_count == 1 ? "" : "s");
     if (stats.unreachable_fronts > 0)
       ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%zu front(s) never reached",
                          stats.unreachable_fronts);
