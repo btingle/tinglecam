@@ -345,7 +345,7 @@ bool paths_equal_canonical(const Paths64& lhs, const Paths64& rhs) {
 
 WaveResult build_wavefront(const Paths64& raw_subject,
                            double allowance,
-                           double engagement,
+                           double stepover,
                            double softening,
                            std::size_t max_iterations) {
   if (raw_subject.empty()) throw std::invalid_argument("Subject is empty");
@@ -359,26 +359,26 @@ WaveResult build_wavefront(const Paths64& raw_subject,
       Point64(bounds.right + margin, bounds.bottom + margin),
       Point64(bounds.left - margin, bounds.bottom + margin),
   };
-  return build_wavefront(subject, Paths64{stock_boundary}, engagement,
+  return build_wavefront(subject, Paths64{stock_boundary}, stepover,
                          softening, max_iterations);
 }
 
 WaveResult build_wavefront(const Paths64& raw_subject,
                            const Paths64& raw_stock,
-                           double engagement,
+                           double stepover,
                            double softening,
                            std::size_t max_iterations) {
   if (raw_subject.empty()) throw std::invalid_argument("Subject is empty");
   if (raw_stock.empty()) throw std::invalid_argument("Stock is empty");
-  if (!(engagement > 0.0)) throw std::invalid_argument("Engagement must be positive");
-  if (softening < 0.0 || softening > engagement)
-    throw std::invalid_argument("Softening must be between zero and engagement");
+  if (!(stepover > 0.0)) throw std::invalid_argument("Stepover must be positive");
+  if (softening < 0.0 || softening > stepover)
+    throw std::invalid_argument("Softening must be between zero and stepover");
   if (max_iterations == 0) throw std::invalid_argument("Iteration limit must be positive");
 
   WaveResult result;
   result.subject = Union(raw_subject, FillRule::NonZero);
   result.stock = Union(raw_stock, FillRule::NonZero);
-  result.engagement = engagement;
+  result.stepover = stepover;
   result.softening = softening;
   if (result.stock.empty()) throw std::invalid_argument("Stock union is empty");
   result.stock_boundary = result.stock.front();
@@ -395,7 +395,7 @@ WaveResult build_wavefront(const Paths64& raw_subject,
   result.reached_generations.push_back(reached);
 
   const double delta = static_cast<double>(
-      std::max<std::int64_t>(1, to_integer(engagement)));
+      std::max<std::int64_t>(1, to_integer(stepover)));
   const double softening_delta = static_cast<double>(
       std::clamp<std::int64_t>(to_integer(softening), 0,
                                static_cast<std::int64_t>(delta)));

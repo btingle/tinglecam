@@ -1,5 +1,6 @@
 #include "geometry.h"
 #include "mesh_slicer.h"
+#include "toolpath.h"
 #include "topology.h"
 
 #include <SDL.h>
@@ -56,8 +57,8 @@ struct AppState {
   float slice_max = 1.0f;
   int query_grid = 32;
   float allowance = 150.0f;
-  float engagement = 80.0f;
-  float softening_percent = 10.0f;
+  float stepover = 80.0f;
+  float softening_percent = 100.0f;
   float subject_inflation = 0.0f;
   float stock_inflation = 0.0f;
   int selected_iteration = -1;
@@ -65,9 +66,12 @@ struct AppState {
   bool show_subject = true;
   bool show_stock = true;
   bool show_leading_fronts = true;
+  bool show_toolpath = true;
+  bool toolpath_up_to_selection = false;
   bool show_parent_links = true;
   bool show_event_markers = true;
   bool animate = false;
+  wave::Toolpath toolpath;
   float animation_speed = 4.0f;
   ViewState view;
   OrbitState orbit;
@@ -146,9 +150,11 @@ void recompute(AppState& app) {
       stock = app.sliced_stock;
     }
     stock = offset_boundaries(stock, app.stock_inflation, "Stock");
-    const double softening = app.engagement * app.softening_percent * 0.01;
-    app.result = wave::build_wavefront(subject, stock, app.engagement, softening);
+    const double softening =
+        std::min<double>(app.stepover * app.softening_percent * 0.01, app.stepover);
+    app.result = wave::build_wavefront(subject, stock, app.stepover, softening);
     app.lineage = wave::build_front_lineage(app.result);
+    app.toolpath = wave::build_toolpath(app.result, app.lineage);
     if (app.selected_iteration < 0 && !app.lineage.events.empty())
       app.selected_iteration = static_cast<int>(app.lineage.events.front().generation);
     else
@@ -163,6 +169,7 @@ void recompute(AppState& app) {
     // geometry against indices that no longer exist.
     app.result = {};
     app.lineage = {};
+    app.toolpath = {};
     app.selected_iteration = -1;
   }
 }
@@ -227,7 +234,7 @@ void load_mesh(AppState& app, bool stock) {
                                   bounds.upper.y - bounds.lower.y);
       if (span > 0.0f) {
         app.allowance = span * 0.05f;
-        app.engagement = span * 0.025f;
+        app.stepover = span * 0.025f;
       }
     }
     update_slice_range(app, true);
@@ -261,6 +268,25 @@ void draw_paths(ImDrawList* draw_list, const Paths64& paths,
 void draw_path(ImDrawList* draw_list, const Path64& path,
                const CanvasTransform& transform, ImU32 color, float width) {
   draw_paths(draw_list, Paths64{path}, transform, color, width);
+}
+
+// Toolpath moves are open runs, including the cuts: a closed front is emitted
+// with an explicit repeated endpoint, so nothing here may wrap around.
+void draw_polyline(ImDrawList* draw_list, const Path64& path,
+                   const CanvasTransform& transform, ImU32 color, float width) {
+  for (std::size_t i = 1; i < path.size(); ++i)
+    draw_list->AddLine(transform.point(path[i - 1]), transform.point(path[i]),
+                       color, width);
+}
+
+ImU32 move_color(wave::MoveKind kind) {
+  switch (kind) {
+    case wave::MoveKind::Cut: return IM_COL32(90, 245, 174, 235);
+    case wave::MoveKind::Step: return IM_COL32(255, 196, 61, 255);
+    case wave::MoveKind::Link: return IM_COL32(96, 190, 255, 255);
+    case wave::MoveKind::Retract: return IM_COL32(255, 92, 118, 255);
+  }
+  return IM_COL32(232, 236, 241, 255);
 }
 
 void draw_front(ImDrawList* draw_list, const wave::LeadingFront& front,
@@ -399,6 +425,34 @@ void draw_canvas(AppState& app) {
                                      IM_COL32(90, 245, 174, 255));
         }
       }
+    }
+  }
+
+  if (app.show_toolpath) {
+    // Retracts are drawn last and connecting moves before the cuts they serve,
+    // so a transition stays visible where it overlaps the front it leaves.
+    const int limit = app.toolpath_up_to_selection && app.selected_iteration >= 0
+                          ? app.selected_iteration
+                          : -1;
+    std::vector<const wave::ToolpathMove*> retracts;
+    for (const auto& move : app.toolpath.moves) {
+      if (move.kind == wave::MoveKind::Cut && limit >= 0 &&
+          move.front.generation > static_cast<std::size_t>(limit))
+        break;
+      if (move.kind == wave::MoveKind::Retract) {
+        retracts.push_back(&move);
+        continue;
+      }
+      const bool is_cut = move.kind == wave::MoveKind::Cut;
+      draw_polyline(draw_list, move.path, transform, move_color(move.kind),
+                    is_cut ? 2.0f : 3.5f);
+    }
+    for (const auto* move : retracts) {
+      if (move->path.size() < 2) continue;
+      const ImVec2 from = transform.point(move->path.front());
+      const ImVec2 to = transform.point(move->path.back());
+      draw_list->AddLine(from, to, move_color(move->kind), 2.0f);
+      draw_list->AddCircle(to, 6.0f, move_color(move->kind), 0, 2.0f);
     }
   }
 
@@ -611,7 +665,7 @@ void controls(AppState& app, const std::filesystem::path& input) {
                               -100000.0f, 100000.0f, "%+.3f");
   changed |= ImGui::DragFloat("Stock inflation", &app.stock_inflation, 0.1f,
                               -100000.0f, 100000.0f, "%+.3f");
-  changed |= ImGui::DragFloat("Engagement", &app.engagement, 1.0f, 0.001f, 100000.0f, "%.3f");
+  changed |= ImGui::DragFloat("Stepover", &app.stepover, 1.0f, 0.001f, 100000.0f, "%.3f");
   changed |= ImGui::SliderFloat("Wave softening", &app.softening_percent,
                                 0.0f, 100.0f, "%.1f%%");
   if (changed) {
@@ -681,6 +735,27 @@ void controls(AppState& app, const std::filesystem::path& input) {
                 app.stock_slice.query_milliseconds);
   }
 
+  ImGui::SeparatorText("Toolpath");
+  ImGui::Checkbox("Show toolpath", &app.show_toolpath);
+  ImGui::SameLine();
+  ImGui::Checkbox("Up to selection", &app.toolpath_up_to_selection);
+  {
+    const auto& stats = app.toolpath.stats;
+    ImGui::Text("Cut:     %8.1f units in %zu moves", stats.cut_length, stats.cut_count);
+    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(move_color(wave::MoveKind::Step)),
+                       "Step:    %8.1f units in %zu moves", stats.step_length,
+                       stats.step_count);
+    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(move_color(wave::MoveKind::Link)),
+                       "Link:    %8.1f units in %zu moves", stats.link_length,
+                       stats.link_count);
+    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(move_color(wave::MoveKind::Retract)),
+                       "Retract: %8.1f units in %zu moves", stats.retract_length,
+                       stats.retract_count);
+    if (stats.unreachable_fronts > 0)
+      ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%zu front(s) never reached",
+                         stats.unreachable_fronts);
+  }
+
   ImGui::SeparatorText("Front lineage");
   if (const auto selected = selected_generation(app)) {
     const std::size_t generation = *selected;
@@ -720,14 +795,14 @@ void controls(AppState& app, const std::filesystem::path& input) {
   ImGui::TextDisabled("Right-drag: pan   Wheel: zoom");
   ImGui::TextWrapped(
       "Waves are seeded only at the stock boundary. The reached area expands by "
-      "Engagement, is clipped to the stock, and then has the subject removed. Each "
+      "Stepover, is clipped to the stock, and then has the subject removed. Each "
       "colored generation is only the newly reached area; subject boundaries never "
       "act as wave sources.");
   ImGui::TextWrapped(
       "Selected leading fronts: violet = previous, green = current. White links "
       "show parentage. Event markers: S split, M merge, T termination, B unexpected birth.");
   ImGui::TextWrapped(
-      "Wave softening rounds a fraction of each engagement step. Its effect "
+      "Wave softening rounds a fraction of each stepover step. Its effect "
       "accumulates over successive generations; 0%% preserves sharp mitered waves.");
 }
 
@@ -739,7 +814,7 @@ struct StartupInputs {
   std::optional<float> subject_inflation;
   std::optional<float> stock_inflation;
   std::optional<float> allowance;
-  std::optional<float> engagement;
+  std::optional<float> stepover;
   std::optional<float> softening_percent;
   std::optional<float> slice_z;
   std::optional<int> query_grid;
@@ -788,7 +863,7 @@ StartupInputs resolve_inputs(int argc, char** argv) {
     else if (argument == "--subject-inflate") result.subject_inflation = float_after(argument);
     else if (argument == "--stock-inflate") result.stock_inflation = float_after(argument);
     else if (argument == "--allowance") result.allowance = float_after(argument);
-    else if (argument == "--engagement") result.engagement = float_after(argument);
+    else if (argument == "--stepover") result.stepover = float_after(argument);
     else if (argument == "--softening-percent") result.softening_percent = float_after(argument);
     else if (argument == "--slice-z") result.slice_z = float_after(argument);
     else if (argument == "--query-grid") result.query_grid = int_after(argument);
@@ -820,8 +895,8 @@ void print_help(const char* executable) {
       << "  --subject-inflate VALUE Signed subject boundary offset (default: 0)\n"
       << "  --stock-inflate VALUE   Signed stock boundary offset (default: 0)\n"
       << "  --allowance VALUE       Fallback stock allowance when no stock mesh is loaded\n"
-      << "  --engagement VALUE      Wave propagation distance per generation\n"
-      << "  --softening-percent P   Rounded fraction of each step, 0..100 (default: 10)\n\n"
+      << "  --stepover VALUE        Wave propagation distance per generation\n"
+      << "  --softening-percent P   Rounded fraction of each step, 0..100 (default: 100)\n\n"
       << "Other options:\n"
       << "  --screenshot PATH       Render one frame to a binary PPM file and exit\n"
       << "  -h, --help              Show this help and exit\n\n"
@@ -857,7 +932,7 @@ int main(int argc, char** argv) {
         wave::to_world(app.svg.bounds.right - app.svg.bounds.left),
         wave::to_world(app.svg.bounds.bottom - app.svg.bounds.top));
     app.allowance = static_cast<float>(span * 0.05);
-    app.engagement = static_cast<float>(span * 0.025);
+    app.stepover = static_cast<float>(span * 0.025);
     recompute(app);
     if (!inputs.subject_mesh.empty()) {
       std::snprintf(app.subject_mesh_path.data(), app.subject_mesh_path.size(), "%s",
@@ -882,10 +957,10 @@ int main(int argc, char** argv) {
         throw std::runtime_error("--allowance must be positive");
       app.allowance = *inputs.allowance;
     }
-    if (inputs.engagement) {
-      if (!(*inputs.engagement > 0.0f))
-        throw std::runtime_error("--engagement must be positive");
-      app.engagement = *inputs.engagement;
+    if (inputs.stepover) {
+      if (!(*inputs.stepover > 0.0f))
+        throw std::runtime_error("--stepover must be positive");
+      app.stepover = *inputs.stepover;
     }
     if (inputs.softening_percent) {
       if (*inputs.softening_percent < 0.0f || *inputs.softening_percent > 100.0f)

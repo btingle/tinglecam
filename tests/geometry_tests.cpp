@@ -1,4 +1,5 @@
 #include "geometry.h"
+#include "toolpath.h"
 #include "topology.h"
 
 #include <cmath>
@@ -21,7 +22,7 @@ wave::WaveResult two_band_sweep(bool notched) {
   wave::WaveResult wave_result;
   wave_result.stock = wave::Paths64{{{0, 0}, {60000, 0}, {60000, 20000}, {0, 20000}}};
   wave_result.stock_boundary = wave_result.stock.front();
-  wave_result.engagement = 10.0;
+  wave_result.stepover = 10.0;
   wave_result.softening = 0.0;
   const wave::Path64 first{{0, 0}, {10000, 0}, {10000, 20000}, {0, 20000}};
   wave::Path64 second{{10000, 0}, {20000, 0}, {20000, 10000}};
@@ -38,6 +39,36 @@ wave::WaveResult two_band_sweep(bool notched) {
       Clipper2Lib::Union(wave::Paths64{first, second},
                          Clipper2Lib::FillRule::NonZero)};
   return wave_result;
+}
+
+// Total length of toolpath motion that runs inside the subject. The subject is
+// eroded first because cuts legitimately hug its boundary; only a real
+// incursion past that slack counts. Retracts are exempt: they happen above the
+// work.
+double gouge_length(const wave::Toolpath& toolpath, const wave::Paths64& subject,
+                    double erosion) {
+  const wave::Paths64 forbidden = Clipper2Lib::InflatePaths(
+      subject, -erosion, Clipper2Lib::JoinType::Miter,
+      Clipper2Lib::EndType::Polygon);
+  if (forbidden.empty()) return 0.0;
+  double total = 0.0;
+  for (const auto& move : toolpath.moves) {
+    if (move.kind == wave::MoveKind::Retract || move.path.size() < 2) continue;
+    Clipper2Lib::Clipper64 clipper;
+    clipper.AddOpenSubject(wave::Paths64{move.path});
+    clipper.AddClip(forbidden);
+    wave::Paths64 closed_solution;
+    wave::Paths64 open_solution;
+    if (!clipper.Execute(Clipper2Lib::ClipType::Intersection,
+                         Clipper2Lib::FillRule::NonZero, closed_solution,
+                         open_solution))
+      continue;
+    for (const auto& piece : open_solution)
+      for (std::size_t i = 1; i < piece.size(); ++i)
+        total += std::hypot(wave::to_world(piece[i].x - piece[i - 1].x),
+                            wave::to_world(piece[i].y - piece[i - 1].y));
+  }
+  return total;
 }
 
 }  // namespace
@@ -110,11 +141,56 @@ int main(int argc, char** argv) {
               "a quantization step must not cut the leading front in two");
       require(sweep.events.empty(),
               "a quantization step must not raise a split or birth event");
+      const auto sweep_path = wave::build_toolpath(two_band_sweep(notched), sweep);
+      require(sweep_path.stats.cut_count == 2, "both bands should be cut");
+      require(sweep_path.stats.retract_count == 1,
+              "two adjacent bands need only the opening plunge");
+      require(sweep_path.stats.step_count == 1,
+              "the move onto the second band is a stepover, not free travel");
     }
+
+    const auto toolpath = wave::build_toolpath(result, lineage);
+    std::size_t front_count = 0;
+    for (const auto& generation : lineage.generations)
+      front_count += generation.fronts.size();
+    require(toolpath.stats.unreachable_fronts == 0,
+            "lineage precedence should leave no front unreachable");
+    require(toolpath.stats.cut_count == front_count,
+            "every leading front should be cut exactly once");
+    require(toolpath.stats.cut_count == toolpath.stats.step_count +
+                                            toolpath.stats.link_count +
+                                            toolpath.stats.retract_count,
+            "every cut should be preceded by exactly one connecting move");
+    require(toolpath.stats.retract_count >= 1,
+            "the first cut is always entered by a plunge");
+
+    // A front may only be entered once the parents that opened the way to it
+    // have been cut, or the tool takes a full-width bite instead of a stepover.
+    std::vector<std::vector<bool>> cut(lineage.generations.size());
+    for (std::size_t i = 0; i < lineage.generations.size(); ++i)
+      cut[i].assign(lineage.generations[i].fronts.size(), false);
+    for (const auto& move : toolpath.moves) {
+      if (move.kind != wave::MoveKind::Cut) continue;
+      const auto& front = lineage.generations[move.front.generation].fronts[move.front.index];
+      for (const auto parent : front.parents)
+        require(cut[move.front.generation - 1][parent],
+                "a front was cut before one of its parents");
+      cut[move.front.generation][move.front.index] = true;
+    }
+
+    require(gouge_length(toolpath, result.subject, 500.0) == 0.0,
+            "no cutting or linking move may pass through the subject");
 
     std::cout << "Loaded " << svg.source_path_count << " paths and generated "
               << result.generations.size() << " non-empty wavefronts and "
               << lineage.events.size() << " lineage events.\n";
+    std::cout << "Toolpath: cut " << toolpath.stats.cut_length << " in "
+              << toolpath.stats.cut_count << " moves, step "
+              << toolpath.stats.step_length << " in " << toolpath.stats.step_count
+              << ", link " << toolpath.stats.link_length << " in "
+              << toolpath.stats.link_count << ", retract "
+              << toolpath.stats.retract_length << " in "
+              << toolpath.stats.retract_count << ".\n";
     for (const auto& event : lineage.events)
       std::cout << "  event at " << event.generation << ": "
                 << wave::lineage_event_kind_name(event.kind) << '\n';

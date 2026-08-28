@@ -41,7 +41,7 @@ subject is used.
 
 ## Wave propagation
 
-For a subject `S`, allowance rectangle `B`, engagement `e`, and a one-integer-unit
+For a subject `S`, allowance rectangle `B`, stepover `e`, and a one-integer-unit
 boundary seed `R0`, cumulative reached areas and visible wave bands are:
 
 ```text
@@ -95,7 +95,7 @@ Models can be loaded from the sidebar or at startup:
 
 For automated visual checks, `--screenshot output.ppm` renders one frame and
 exits. Run `./build/clipper2_wave_demo --help` for the complete command-line
-reference, including initial slice height, query grid, allowance, engagement,
+reference, including initial slice height, query grid, allowance, stepover,
 and boundary offsets.
 
 ## Controls
@@ -107,7 +107,7 @@ and boundary offsets.
 - Adjust **Subject inflation** and **Stock inflation** independently. Positive
   values expand boundaries and negative values contract them. Offsets are
   applied after slicing, so changing them does not rebuild or query the BVH.
-- Drag **Allowance** (when no stock model is loaded) or **Engagement** to
+- Drag **Allowance** (when no stock model is loaded) or **Stepover** to
   recompute immediately.
 - Use **Generation** to inspect a pass, or animate through passes.
 - Toggle the subject, allowance box, or complete generation overlay.
@@ -138,7 +138,7 @@ segment is leading exactly when one side is in `U[k]`; segments coincident with
 the subject or allowance box are excluded. Consecutive leading segments are
 retained as maximal open or closed curves.
 
-For parentage, each front from generation `k-1` is inflated by Engagement and
+For parentage, each front from generation `k-1` is inflated by Stepover and
 intersected with the actual `k` generation band. Current leading curves are
 clipped against that contribution to establish graph edges. The resulting
 bipartite transition graph classifies:
@@ -150,4 +150,40 @@ bipartite transition graph classifies:
 
 This is an exact description of the discrete generations, subject only to a
 small integer tolerance at coincident boundaries. Events that both begin and end
-within one engagement step remain below the temporal resolution of the graph.
+within one stepover step remain below the temporal resolution of the graph.
+
+## Toolpath sequencing
+
+The lineage is ordered into a single tool motion by `build_toolpath`. A front may
+only be entered once every parent that opened the way to it has been cut, so
+sequencing is a topological order of the lineage graph. Among the fronts that
+are ready, the nearest to the current tool position is taken next; because a
+front's children are the fronts closest to it, this walks each branch to its end
+before backtracking without needing an explicit depth-first traversal.
+
+Each front is entered at its nearest point: a closed front is rotated to start
+there, an open one is reversed when its far endpoint is closer. Closed fronts are
+normalised to one winding so the cutter stays on the same side of the material
+throughout; which winding is climb is left to the post stage.
+
+The move between two consecutive cuts is a straight segment, classified by what
+it passes through. `cleared` accumulates band pieces as they are actually cut,
+which is not the same as the cumulative reached set: with branch-first ordering,
+generation 20 of one branch is cut long before generation 12 of another. The
+classification is:
+
+- **link** when the segment stays inside `cleared`, so the tool travels through
+  air at depth;
+- **step** when it also crosses the band piece its target front bounds, which is
+  the same one-stepover bite the front itself takes;
+- **retract** otherwise: lift, rapid, and plunge again.
+
+The test is stated as avoiding the forbidden region -- everything not yet
+cleared, which covers uncut material, the subject, and the space beyond the
+stock at once -- rather than as staying inside the cleared region. Fronts are
+offset output on the integer grid, so a move sliding along a wall sits tens of
+units off the wall's true position and reads as a gouge under the direct test.
+
+Band pieces are grouped as an outer contour with its holes. A hole ring taken on
+its own describes the island it encloses rather than band material, which would
+otherwise credit the subject as cleared and route links straight through it.

@@ -31,7 +31,7 @@ enum class StopReason {
 struct WaveResult {
   Paths64 subject;
   Paths64 stock;
-  double engagement = 0.0;
+  double stepover = 0.0;
   double softening = 0.0;
   // First outer stock path, retained for source compatibility with the
   // original rectangular-stock demo.
@@ -47,13 +47,13 @@ SvgGeometry load_svg_closed_paths(const std::filesystem::path& filename);
 
 WaveResult build_wavefront(const Paths64& raw_subject,
                            double allowance,
-                           double engagement,
+                           double stepover,
                            double softening = 0.0,
                            std::size_t max_iterations = 2000);
 
 WaveResult build_wavefront(const Paths64& raw_subject,
                            const Paths64& raw_stock,
-                           double engagement,
+                           double stepover,
                            double softening = 0.0,
                            std::size_t max_iterations = 2000);
 

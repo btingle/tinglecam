@@ -75,6 +75,7 @@ add_library(wave_geometry
   src/geometry.cpp
   src/mesh_slicer.cpp
   src/topology.cpp
+  src/toolpath.cpp
 )
 if(WAVE_HAVE_CUDA)
   target_sources(wave_geometry PRIVATE src/mesh_slicer_cuda.cu)
