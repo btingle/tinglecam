@@ -97,12 +97,10 @@ SimulationResult simulate_material(const Paths64& raw_stock,
         const double length = segment_length(segment_from, segment_to);
         if (!(length > 0.0)) continue;
 
-        // Sample long Clipper edges at roughly one tool radius so a single
-        // straight edge does not smear a changing engagement across its whole
-        // duration. The cap prevents unreasonable work for a microscopic tool
-        // on a very large imported coordinate range.
-        const std::size_t pieces = std::clamp<std::size_t>(
-            static_cast<std::size_t>(std::ceil(length / tool_radius)), 1, 256);
+        // The caller normalizes cutting paths to the configured simulation
+        // pitch. Evaluate those intervals exactly rather than imposing a
+        // second, unrelated subdivision here.
+        const std::size_t pieces = 1;
         for (std::size_t piece = 0; piece < pieces; ++piece) {
           const double begin_ratio = static_cast<double>(piece) / pieces;
           const double end_ratio = static_cast<double>(piece + 1) / pieces;

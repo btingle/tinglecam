@@ -11,19 +11,6 @@
 
 namespace cam {
 
-// What is left once the three libraries and the job have taken their share.
-struct Preferences {
-  bool display_inches = false;
-  int display_decimals = 3;
-  std::string default_tool_id;
-  std::string default_machine_id;
-  std::string default_material_id;
-  int slice_grid = 32;
-  bool prefer_gpu = true;
-  std::string last_job_path;
-  std::vector<std::string> recent_jobs;
-};
-
 // Where the user's own tools, preferences and jobs live.
 std::filesystem::path config_directory();
 
@@ -50,9 +37,6 @@ void save_material(const std::filesystem::path& path, const Material& material);
 
 Job load_job(const std::filesystem::path& path);
 void save_job(const std::filesystem::path& path, const Job& job);
-
-Preferences load_preferences(const std::filesystem::path& path);
-void save_preferences(const std::filesystem::path& path, const Preferences& value);
 
 // Round-trips through the same serialisation the files use, which is what the
 // tests check rather than reaching into the JSON.

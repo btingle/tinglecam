@@ -75,6 +75,7 @@ Path64 close_ring_from(const Path64& ring, std::size_t start) {
   return path;
 }
 
+
 // The area a connecting move must stay out of: everything that is not yet
 // cleared, which is uncut material, the subject, and the space beyond the
 // stock all at once. Eroding by `tolerance` is what makes the test usable --
@@ -336,6 +337,7 @@ struct Node {
   std::size_t pending_parents = 0;
   bool cut = false;
 };
+
 
 }  // namespace
 
@@ -640,6 +642,142 @@ Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage,
   for (const auto& node : nodes)
     if (!node.cut) ++toolpath.stats.unreachable_fronts;
   return toolpath;
+}
+
+Toolpath resample_toolpath(const Toolpath& source, double pitch) {
+  if (pitch < 1.0 / kIntegerScale || !std::isfinite(pitch))
+    throw std::invalid_argument(
+        "Path pitch must be at least the 0.001 mm geometry resolution");
+
+  const auto engaged = [](MoveKind kind) {
+    return kind == MoveKind::Cut || kind == MoveKind::Step ||
+           kind == MoveKind::Link;
+  };
+  struct Span {
+    Point64 from;
+    Point64 to;
+    double begin = 0.0;
+    double end = 0.0;
+    MoveKind kind = MoveKind::Cut;
+    FrontId front;
+  };
+  const auto same_source = [](const ToolpathMove& move, const Span& span) {
+    if (move.kind != span.kind) return false;
+    return move.kind != MoveKind::Cut ||
+           (move.front.generation == span.front.generation &&
+            move.front.index == span.front.index);
+  };
+
+  Toolpath result;
+  result.stats.detour_count = source.stats.detour_count;
+  result.stats.lifts_over_subject = source.stats.lifts_over_subject;
+  result.stats.unreachable_fronts = source.stats.unreachable_fronts;
+
+  std::size_t first = 0;
+  while (first < source.moves.size()) {
+    if (!engaged(source.moves[first].kind)) {
+      result.moves.push_back(source.moves[first]);
+      ++first;
+      continue;
+    }
+
+    std::size_t last = first + 1;
+    while (last < source.moves.size() && engaged(source.moves[last].kind) &&
+           !source.moves[last - 1].path.empty() &&
+           !source.moves[last].path.empty() &&
+           source.moves[last - 1].path.back() ==
+               source.moves[last].path.front())
+      ++last;
+
+    std::vector<Span> spans;
+    double total = 0.0;
+    for (std::size_t move_index = first; move_index < last; ++move_index) {
+      const ToolpathMove& move = source.moves[move_index];
+      for (std::size_t point = 1; point < move.path.size(); ++point) {
+        const double length =
+            distance_world(move.path[point - 1], move.path[point]);
+        if (!(length > 0.0)) continue;
+        spans.push_back({move.path[point - 1], move.path[point], total,
+                         total + length, move.kind, move.front});
+        total += length;
+      }
+    }
+    if (spans.empty()) {
+      for (std::size_t move_index = first; move_index < last; ++move_index)
+        result.moves.push_back(source.moves[move_index]);
+      first = last;
+      continue;
+    }
+
+    const auto point_at = [&](double distance) {
+      distance = std::clamp(distance, 0.0, total);
+      const auto found = std::lower_bound(
+          spans.begin(), spans.end(), distance,
+          [](const Span& span, double value) { return span.end < value; });
+      const Span& span = found == spans.end() ? spans.back() : *found;
+      const double length = span.end - span.begin;
+      const double ratio =
+          length > 0.0 ? std::clamp((distance - span.begin) / length, 0.0, 1.0)
+                       : 0.0;
+      return lerp_point(span.from, span.to, ratio);
+    };
+
+    std::vector<double> samples{0.0};
+    for (double distance = pitch; distance < total - 1e-9; distance += pitch)
+      samples.push_back(distance);
+    samples.push_back(total);
+
+    std::size_t span_index = 0;
+    for (std::size_t sample = 1; sample < samples.size(); ++sample) {
+      const double midpoint = (samples[sample - 1] + samples[sample]) * 0.5;
+      while (span_index + 1 < spans.size() &&
+             midpoint > spans[span_index].end)
+        ++span_index;
+      const Span& span = spans[span_index];
+      const Point64 from = point_at(samples[sample - 1]);
+      const Point64 to = point_at(samples[sample]);
+      if (from == to) continue;
+      if (!result.moves.empty() && same_source(result.moves.back(), span) &&
+          result.moves.back().path.back() == from) {
+        result.moves.back().path.push_back(to);
+        result.moves.back().length += distance_world(from, to);
+      } else {
+        ToolpathMove move;
+        move.kind = span.kind;
+        move.front = span.front;
+        move.path = {from, to};
+        move.length = distance_world(from, to);
+        result.moves.push_back(std::move(move));
+      }
+    }
+    first = last;
+  }
+
+  for (const ToolpathMove& move : result.moves) {
+    switch (move.kind) {
+      case MoveKind::Cut:
+        ++result.stats.cut_count;
+        result.stats.cut_length += move.length;
+        break;
+      case MoveKind::Step:
+        ++result.stats.step_count;
+        result.stats.step_length += move.length;
+        break;
+      case MoveKind::Link:
+        ++result.stats.link_count;
+        result.stats.link_length += move.length;
+        break;
+      case MoveKind::Retract:
+        ++result.stats.retract_count;
+        result.stats.retract_length += move.length;
+        break;
+      case MoveKind::Entry:
+        ++result.stats.entry_count;
+        result.stats.entry_length += move.length;
+        break;
+    }
+  }
+  return result;
 }
 
 double toolpath_length(const Toolpath& toolpath) {

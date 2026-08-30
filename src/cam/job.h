@@ -17,18 +17,8 @@
 
 namespace cam {
 
-enum class OperationType {
-  AdaptiveRough,
-  Contour,
-  Face,
-};
-
-const char* operation_type_name(OperationType value);
-std::optional<OperationType> operation_type_from_name(const std::string& text);
-
 struct Operation {
   std::string name = "Rough";
-  OperationType type = OperationType::AdaptiveRough;
   std::string tool_id;
   std::string machine_id;
   std::string material_id;
@@ -47,12 +37,20 @@ struct Operation {
   double top_z = 0.0;
   double bottom_z = -5.0;
 
-  CuttingDirection direction = CuttingDirection::Climb;
   bool lead_in = true;
+  // How much larger than its model the raw blank may be. The run-in is placed
+  // so the first pass that touches the stock aims for a full stepover less
+  // this, which leaves exactly this much headroom: an oversize blank pushes the
+  // first bite back up towards the stepover instead of past it.
+  double stock_deviation = 0.2;
+  // Uniform distance between samples used by simulation and feed assignment.
+  double path_pitch = 0.2;
+  // When false, use the selected machine's range for this material.
+  bool manual_feed_range = false;
+  double full_engagement_feed = 500.0;
+  double no_engagement_feed = 2000.0;
   int slice_grid = 32;
   double simulation_stock_inflation = 0.0;
-
-  FeedPolicy feeds;
 };
 
 struct Job {
@@ -94,13 +92,21 @@ struct PlanStats {
   double rapid_minutes = 0.0;
   double tool_change_minutes = 0.0;
   double maximum_load = 0.0;
-  double maximum_power_kw = 0.0;
-  double maximum_force = 0.0;
-  double maximum_deflection = 0.0;
   double removed_volume = 0.0;  // mm^3
   double gouge_area = 0.0;
   std::size_t unsafe_plunges = 0;
   std::size_t unresolved_entries = 0;
+  // Rapids the planner had to route over the part because the free space
+  // around it is disconnected. A slice says nothing about how far the part
+  // rises above it, so each one is an assumption about the clearance plane.
+  std::size_t lifts_over_subject = 0;
+  // Fronts the sequencer never reached. The material they bound is still
+  // there when the operation finishes.
+  std::size_t unreachable_fronts = 0;
+  // Stock still standing that is not part of the finished shape. Roughing
+  // always leaves some -- the radial allowance is exactly this -- so it is
+  // reported rather than warned about.
+  double excess_area = 0.0;
 };
 
 struct OperationPlan {

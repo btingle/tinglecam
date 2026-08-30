@@ -7,9 +7,8 @@
 
 namespace wave {
 
-// One sampled straight portion of an engaged toolpath move. Long input edges
-// are subdivided to roughly one tool radius for useful temporal resolution.
-// Load is a dimensionless
+// One normalized straight portion of an engaged toolpath move. Load is a
+// dimensionless
 // approximation: newly removed area divided by the area of a full-width slot
 // over the same distance. A value of 1 is therefore approximately full radial
 // engagement, while values above 1 can occur at entries and tight corners.

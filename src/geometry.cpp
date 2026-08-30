@@ -401,11 +401,17 @@ WaveResult build_wavefront(const Paths64& raw_subject,
   wall = Difference(wall, result.subject, FillRule::NonZero);
   wall = Union(wall, FillRule::NonZero);
 
-  // Whole generations only, so that a front lands exactly on the stock wall
-  // rather than a fraction of a step short of it.
+  // The lead-in is used exactly as asked for, not rounded up to a whole number
+  // of stepovers. Rounding put a front precisely on the stock wall, which left
+  // the front before it -- the first one that touches the material at all --
+  // taking whatever fraction of a stepover happened to be left over. The caller
+  // sizes the run-in to place that first bite where it wants it, so the wave
+  // has to honour the distance it was given.
+  result.lead_in = lead_in > 0.0 ? lead_in : 0.0;
+  // How many fronts stand outside the stock wall: the ones still a positive
+  // distance in front of it.
   result.lead_in_generations =
       lead_in > 0.0 ? static_cast<std::size_t>(std::ceil(lead_in / stepover)) : 0;
-  result.lead_in = static_cast<double>(result.lead_in_generations) * stepover;
 
   // Propagation runs through the stock and, where there is a lead-in, through
   // the air in front of it as well. That approach region is grown from the wall
@@ -415,7 +421,7 @@ WaveResult build_wavefront(const Paths64& raw_subject,
   Paths64 domain = result.stock;
   if (result.lead_in_generations > 0 && !wall.empty()) {
     Paths64 approach = InflatePaths(
-        wall, delta * static_cast<double>(result.lead_in_generations),
+        wall, static_cast<double>(std::max<std::int64_t>(1, to_integer(result.lead_in))),
         JoinType::Round, EndType::Polygon);
     approach = Difference(approach, result.subject, FillRule::NonZero);
     domain = Union(domain, approach, FillRule::NonZero);

@@ -50,29 +50,13 @@ void accumulate(PlanStats& into, const PlanStats& from) {
   into.gouge_area += from.gouge_area;
   into.unsafe_plunges += from.unsafe_plunges;
   into.unresolved_entries += from.unresolved_entries;
+  into.lifts_over_subject += from.lifts_over_subject;
+  into.unreachable_fronts += from.unreachable_fronts;
+  into.excess_area += from.excess_area;
   into.maximum_load = std::max(into.maximum_load, from.maximum_load);
-  into.maximum_power_kw = std::max(into.maximum_power_kw, from.maximum_power_kw);
-  into.maximum_force = std::max(into.maximum_force, from.maximum_force);
-  into.maximum_deflection = std::max(into.maximum_deflection, from.maximum_deflection);
 }
 
 }  // namespace
-
-const char* operation_type_name(OperationType value) {
-  switch (value) {
-    case OperationType::AdaptiveRough: return "adaptive-rough";
-    case OperationType::Contour: return "contour";
-    case OperationType::Face: return "face";
-  }
-  return "unknown";
-}
-
-std::optional<OperationType> operation_type_from_name(const std::string& text) {
-  if (text == "adaptive-rough") return OperationType::AdaptiveRough;
-  if (text == "contour") return OperationType::Contour;
-  if (text == "face") return OperationType::Face;
-  return std::nullopt;
-}
 
 void JobGeometry::load_part(const std::filesystem::path& file) {
   part_.set_mesh(wave::load_triangle_mesh(file));
@@ -152,6 +136,33 @@ OperationPlan plan_operation(const JobGeometry& geometry,
                  operation.material_id;
     return plan;
   }
+  const MaterialFeedRange* library_feeds =
+      machine.feeds_for(operation.material_id);
+  if (!operation.manual_feed_range && !library_feeds) {
+    plan.error = "Machine " + machine.name + " has no feed range for " +
+                 material.name;
+    return plan;
+  }
+  const double full_engagement_feed =
+      operation.manual_feed_range ? operation.full_engagement_feed
+                                  : library_feeds->full_engagement;
+  const double no_engagement_feed =
+      operation.manual_feed_range ? operation.no_engagement_feed
+                                  : library_feeds->no_engagement;
+  if (!(full_engagement_feed > 0.0) ||
+      no_engagement_feed < full_engagement_feed ||
+      !std::isfinite(full_engagement_feed) ||
+      !std::isfinite(no_engagement_feed)) {
+    plan.error =
+        "Feed range must be positive and run from a slower full-engagement "
+        "feed to an equal or faster no-engagement feed";
+    return plan;
+  }
+  if (operation.path_pitch < 1.0 / wave::kIntegerScale ||
+      !std::isfinite(operation.path_pitch)) {
+    plan.error = "Path pitch must be at least 0.001 mm";
+    return plan;
+  }
 
   const double radius = tool.diameter * 0.5;
 
@@ -176,6 +187,17 @@ OperationPlan plan_operation(const JobGeometry& geometry,
     plan.warnings.push_back("Stepdown reduced to " + std::to_string(axial_ceiling) +
                             " mm, the deepest this tool takes in one pass");
     stepdown = axial_ceiling;
+  }
+
+  // Held below the stepover: at or past it the first engaging front misses the
+  // stock altogether and the one behind it arrives at more than a full bite,
+  // which is the opposite of what the allowance is for.
+  double first_bite_allowance = std::max(operation.stock_deviation, 0.0);
+  if (first_bite_allowance > stepover * 0.9) {
+    first_bite_allowance = stepover * 0.9;
+    plan.warnings.push_back(
+        "Stock oversize reduced to " + std::to_string(first_bite_allowance) +
+        " mm, which is as much as this stepover leaves room for");
   }
 
   Operation effective = operation;
@@ -232,11 +254,20 @@ OperationPlan plan_operation(const JobGeometry& geometry,
               : offset_outward(level.part_slice,
                                radius + operation.radial_stock_to_leave);
 
-      const double lead_in = operation.lead_in ? radius : 0.0;
+      // The run-in is seeded a tool radius plus the stock allowance in front
+      // of the wall. The front one stepover behind that is the first to touch
+      // the material, and it bites a stepover less the allowance -- so a blank
+      // up to that much oversize still takes no more than a full stepover on
+      // its first pass, and one exactly on size takes very nearly a full one.
+      // Without this the run-in landed a front on the wall itself and the pass
+      // before it grazed off whatever fraction of a stepover was left over.
+      const double lead_in = operation.lead_in ? radius + first_bite_allowance : 0.0;
       level.wave = wave::build_wavefront(keep_out, level.stock_slice, stepover,
                                          stepover, lead_in);
       level.lineage = wave::build_front_lineage(level.wave);
-      level.toolpath = wave::build_toolpath(level.wave, level.lineage, radius);
+      level.toolpath = wave::resample_toolpath(
+          wave::build_toolpath(level.wave, level.lineage, radius),
+          operation.path_pitch);
 
       const wave::Paths64 final_subject =
           level.part_slice.empty() ? keep_out : level.part_slice;
@@ -244,11 +275,10 @@ OperationPlan plan_operation(const JobGeometry& geometry,
                                                  level.toolpath, radius,
                                                  operation.simulation_stock_inflation);
 
-      CutContext context;
-      context.axial_depth = level.axial_depth;
-      context.direction = operation.direction;
-      level.feeds = plan_feeds(level.toolpath, level.simulation, tool, machine,
-                               material, *data, context, operation.feeds);
+      level.feeds =
+          plan_feeds(level.toolpath, level.simulation, machine,
+                     full_engagement_feed, no_engagement_feed,
+                     data->spindle_rpm, data->plunge_feed);
 
       if (level.toolpath.moves.empty()) level.nothing_to_cut = true;
     } catch (const std::exception& error) {
@@ -272,22 +302,14 @@ OperationPlan plan_operation(const JobGeometry& geometry,
     plan.stats.rapid_minutes += level.feeds.stats.rapid_minutes;
     plan.stats.maximum_load =
         std::max(plan.stats.maximum_load, level.simulation.stats.maximum_load);
-    plan.stats.maximum_power_kw =
-        std::max(plan.stats.maximum_power_kw, level.feeds.stats.maximum_power_kw);
-    plan.stats.maximum_force =
-        std::max(plan.stats.maximum_force, level.feeds.stats.maximum_force);
-    plan.stats.maximum_deflection =
-        std::max(plan.stats.maximum_deflection, level.feeds.stats.maximum_deflection);
     plan.stats.removed_volume +=
         level.simulation.stats.removed_area * level.axial_depth;
     plan.stats.gouge_area += level.simulation.stats.gouge_area;
     plan.stats.unsafe_plunges += level.simulation.stats.unsafe_plunges;
     plan.stats.unresolved_entries += level.simulation.stats.unresolved_entries;
-
-    for (const std::string& warning : level.feeds.warnings)
-      if (std::find(plan.warnings.begin(), plan.warnings.end(), warning) ==
-          plan.warnings.end())
-        plan.warnings.push_back(warning);
+    plan.stats.lifts_over_subject += level.toolpath.stats.lifts_over_subject;
+    plan.stats.unreachable_fronts += level.toolpath.stats.unreachable_fronts;
+    plan.stats.excess_area += level.simulation.stats.excess_area;
   }
 
   if (plan.stats.cut_levels == 0)
@@ -299,9 +321,27 @@ OperationPlan plan_operation(const JobGeometry& geometry,
   if (plan.stats.gouge_area > 0.0)
     plan.warnings.push_back("The cutter reaches into the finished part; increase "
                             "the radial stock to leave");
+  // Every unresolved entry is posted as a straight descent into uncut stock,
+  // because the ramp that ought to replace it is not built yet. That is worth
+  // saying whatever the tool is, and worth saying twice for a tool that cannot
+  // cut on its centre at all.
+  if (plan.stats.unresolved_entries > 0)
+    plan.warnings.push_back(
+        std::to_string(plan.stats.unresolved_entries) +
+        " entry move(s) descend straight into material that has not been "
+        "cleared; the planner has no ramp to offer in their place");
   if (!tool.center_cutting && plan.stats.unresolved_entries > 0)
     plan.warnings.push_back("This tool is not centre cutting and the path needs "
                             "to enter solid material");
+  if (plan.stats.lifts_over_subject > 0)
+    plan.warnings.push_back(
+        std::to_string(plan.stats.lifts_over_subject) +
+        " rapid(s) pass over the part. One slice cannot say how high it stands, "
+        "so check the clearance plane clears the whole model");
+  if (plan.stats.unreachable_fronts > 0)
+    plan.warnings.push_back(
+        std::to_string(plan.stats.unreachable_fronts) +
+        " front(s) were never reached, so the stock they bound is left standing");
 
   return plan;
 }

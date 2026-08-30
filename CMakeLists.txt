@@ -42,7 +42,7 @@ set(CLIPPER2_USINGZ OFF CACHE STRING "" FORCE)
 FetchContent_Declare(
   clipper2
   GIT_REPOSITORY https://github.com/AngusJohnson/Clipper2.git
-  GIT_TAG Clipper2_1.5.4
+  GIT_TAG Clipper2_2.0.1
   SOURCE_SUBDIR CPP
   GIT_SHALLOW TRUE
 )

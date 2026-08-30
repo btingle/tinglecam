@@ -1,14 +1,4 @@
 {
   "id": "hdpe",
-  "name": "HDPE",
-  "group": "plastic",
-  "hardness": "Shore D 65",
-  "notes": "Almost no cutting force, so the limits that bind are the machine's feed ceiling and its acceleration. Melts rather than burns if the chip is too thin to carry heat away.",
-  "specific_cutting_energy": 0.15,
-  "kienzle_kc11": 0.0,
-  "kienzle_mc": 0.0,
-  "vc_multiplier": 1.0,
-  "fz_multiplier": 1.0,
-  "chip_class": "gummy",
-  "work_hardening": false
+  "name": "HDPE"
 }

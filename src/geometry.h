@@ -36,11 +36,13 @@ struct WaveResult {
   // First outer stock path, retained for source compatibility with the
   // original rectangular-stock demo.
   Path64 stock_boundary;
-  // How far outside the stock the propagation was seeded, and how many whole
-  // generations that occupies. Fronts below `lead_in_generations` stand in the
-  // air in front of the stock, so a cutter following them takes up its bite
-  // over the run-in instead of at first contact. Zero leaves the wave seeded on
-  // the stock wall.
+  // How far outside the stock the propagation was seeded, and how many fronts
+  // stand outside the stock wall as a result. Fronts below
+  // `lead_in_generations` are in front of the material, so a cutter following
+  // them takes up its bite over the run-in instead of at first contact. The
+  // distance is used as given rather than rounded to whole stepovers: where the
+  // first bite falls is the caller's decision, not the wave's. Zero leaves the
+  // wave seeded on the stock wall.
   double lead_in = 0.0;
   std::size_t lead_in_generations = 0;
   // Everything the wave propagates through: the stock, plus the air in front of
@@ -57,10 +59,10 @@ struct WaveResult {
 // transforms found on their ancestor groups and on the path itself.
 SvgGeometry load_svg_closed_paths(const std::filesystem::path& filename);
 
-// `lead_in` is rounded up to a whole number of stepovers and used to seed the
-// wave that far in front of the stock. It is grown from the stock wall the
-// wave actually starts at rather than from the stock solid, so no lead-in is
-// manufactured across boundary the subject occludes.
+// `lead_in` seeds the wave that far in front of the stock, at exactly the
+// distance given. It is grown from the stock wall the wave actually starts at
+// rather than from the stock solid, so no lead-in is manufactured across
+// boundary the subject occludes.
 WaveResult build_wavefront(const Paths64& raw_subject,
                            double allowance,
                            double stepover,

@@ -1,14 +1,4 @@
 {
   "id": "stainless-304",
-  "name": "Stainless 304",
-  "group": "stainless",
-  "hardness": "HB 170",
-  "notes": "Austenitic and work hardening: a chip too thin to cut leaves a hardened skin the next tooth has to get through. The minimum chip thickness is a hard constraint here, not a preference.",
-  "specific_cutting_energy": 2.4,
-  "kienzle_kc11": 2000.0,
-  "kienzle_mc": 0.21,
-  "vc_multiplier": 1.0,
-  "fz_multiplier": 1.0,
-  "chip_class": "gummy",
-  "work_hardening": true
+  "name": "Stainless 304"
 }

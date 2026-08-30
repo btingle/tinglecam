@@ -1,14 +1,4 @@
 {
   "id": "steel-1018",
-  "name": "Mild steel 1018",
-  "group": "steel",
-  "hardness": "HB 126",
-  "notes": "Low-carbon steel. Forgiving, but four times the specific cutting energy of aluminium, so spindle power becomes the binding limit on a small machine long before anything else does.",
-  "specific_cutting_energy": 1.9,
-  "kienzle_kc11": 1700.0,
-  "kienzle_mc": 0.25,
-  "vc_multiplier": 1.0,
-  "fz_multiplier": 1.0,
-  "chip_class": "short",
-  "work_hardening": false
+  "name": "Mild steel 1018"
 }

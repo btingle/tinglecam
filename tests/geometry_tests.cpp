@@ -162,13 +162,27 @@ void check_lead_in() {
   // each one is a generation the plain wave does not have.
   const auto led = wave::build_wavefront(centred, stock, stepover, stepover, 10.0);
   require(led.lead_in_generations == 2, "ten units of lead-in is two stepovers");
-  require(std::abs(led.lead_in - 10.0) < 1e-9, "lead-in should round to whole steps");
+  require(std::abs(led.lead_in - 10.0) < 1e-9, "a whole-step lead-in is unchanged");
   require(led.generations.size() == plain.generations.size() + 2,
           "a two generation lead-in should add two generations");
   require(region_covers(led.domain, -52.0, 0.0),
           "the lead-in should open the air in front of an exposed stock face");
   require(!region_covers(led.domain, -62.0, 0.0),
           "the lead-in should reach no further than it was asked to");
+
+  // A lead-in that is not a whole number of stepovers is used exactly as given
+  // rather than rounded up. Where the first bite lands is the caller's decision
+  // -- it sizes the run-in to put a chosen fraction of a stepover on the first
+  // pass that touches the stock -- and rounding here would take that away.
+  const auto part_step = wave::build_wavefront(centred, stock, stepover, stepover, 7.0);
+  require(std::abs(part_step.lead_in - 7.0) < 1e-9,
+          "a lead-in is seeded at exactly the distance asked for");
+  require(part_step.lead_in_generations == 2,
+          "seven units at a five unit stepover leaves two fronts outside the wall");
+  require(region_covers(part_step.domain, -56.0, 0.0),
+          "a part-step lead-in should still open the whole distance");
+  require(!region_covers(part_step.domain, -58.0, 0.0),
+          "a part-step lead-in should reach no further than it was asked to");
 
   // Every front the lead-in adds stands clear of the stock, which is the whole
   // point of it: the cutter takes up its bite over those passes instead of
@@ -305,7 +319,9 @@ int main(int argc, char** argv) {
               "the move onto the second band is a stepover, not free travel");
       require(sweep_path.stats.link_count == 1,
               "the feed in from the air beside the stock cuts nothing");
+
     }
+
 
     {
       auto [outer_wave, outer_lineage] = outer_box_detour_case();

@@ -56,8 +56,8 @@ int main(int argc, char** argv) {
         wave::simulate_material(stock, subject, toolpath, 1.0);
     require(simulation.moves.size() == toolpath.moves.size(),
             "simulation moves must align with toolpath moves");
-    require(simulation.stats.cutting_steps == 10,
-            "a long straight cut should be sampled at tool-radius intervals");
+    require(simulation.stats.cutting_steps == 1,
+            "simulation should evaluate the normalized input interval directly");
     require_near(simulation.stats.removed_area, 20.0, 0.02,
                  "a boundary-to-boundary slot should remove width times length");
     double load_area = 0.0;

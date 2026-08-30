@@ -88,6 +88,12 @@ struct Toolpath {
 Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage,
                         double tool_radius = 0.0);
 
+// Resamples every uninterrupted at-depth cutting path at a uniform travelled
+// distance. Original micro-vertices are not retained; motion-type changes are
+// assigned by the midpoint of each resulting interval. Retracts and entries
+// remain separate and discontinuities restart the pitch.
+Toolpath resample_toolpath(const Toolpath& toolpath, double pitch);
+
 // Where the tool is after travelling a given distance along the whole path.
 struct ToolpathCursor {
   std::size_t move = 0;

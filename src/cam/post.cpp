@@ -200,9 +200,6 @@ PostResult post_job(const JobPlan& plan,
     }
     if (clearance < retract) clearance = retract + 5.0;
   }
-  const double high_feed =
-      machine->max_cutting_feed > 0.0 ? machine->max_cutting_feed : 2000.0;
-
   // ---- Preamble ---------------------------------------------------------
   writer.comment(job.name.empty() ? std::string("TingleCAM") : job.name);
   writer.comment(std::string("Machine: ") + machine->name);
@@ -243,8 +240,7 @@ PostResult post_job(const JobPlan& plan,
     writer.blank();
     writer.comment("Operation: " + operation.operation_name);
     writer.comment("Tool " + std::to_string(tool->tool_number) + " - " + tool->name);
-    writer.comment("Cutter " + writer.coordinate(tool->diameter) + " mm, " +
-                   std::to_string(tool->flutes) + " flute");
+    writer.comment("Cutter " + writer.coordinate(tool->diameter) + " mm");
 
     if (active_tool != tool->id) {
       writer.line("G0 Z" + writer.coordinate(clearance));
@@ -323,20 +319,16 @@ PostResult post_job(const JobPlan& plan,
           // one diagonal rapid would take the tool through whatever stands
           // between where it was and where it is going.
           writer.rapid(from_x, from_y, retract);
-          const double plunge = data ? level.feeds.stats.spindle_rpm *
-                                           data->feed_per_tooth * tool->flutes *
-                                           data->plunge_feed_factor
-                                     : high_feed * 0.2;
+          const double plunge = data ? data->plunge_feed : 100.0;
           writer.feed(from_x, from_y, cut_z, std::max(plunge, 1.0));
           at_depth = true;
         }
 
-        if (segment.kind == wave::MoveKind::Entry) {
-          writer.feed(to_x, to_y, cut_z, segment.feed);
-          continue;
-        }
-        writer.feed(to_x, to_y, cut_z,
-                    segment.rapid ? high_feed : std::max(segment.feed, 1.0));
+        // The rate is the schedule's own: a disengaged piece at depth is a
+        // feed at the machine's cutting maximum rather than a rapid, and it is
+        // timed at that same figure, so the estimate cannot drift from what
+        // this writes.
+        writer.feed(to_x, to_y, cut_z, segment.rate);
       }
 
       if (at_depth) {

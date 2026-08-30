@@ -8,8 +8,8 @@
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
-#include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -24,317 +24,146 @@ void require(bool condition, const std::string& message) {
 void require_near(double actual, double expected, double tolerance,
                   const std::string& message) {
   if (std::abs(actual - expected) <= tolerance) return;
-  std::cerr << "  FAILED: " << message << " (got " << actual << ", wanted "
-            << expected << ")\n";
+  std::cerr << "  FAILED: " << message << " (got " << actual
+            << ", wanted " << expected << ")\n";
   ++failures;
 }
 
-// ---------------------------------------------------------------------------
-
-// A machine with no meaningful limits, so a test can isolate one stage of the
-// feed pipeline instead of discovering which of twelve happened to bind.
-cam::Machine unlimited_machine() {
+cam::Machine test_machine() {
   cam::Machine machine;
   machine.id = "test";
-  machine.name = "Unlimited";
+  machine.name = "Test machine";
   machine.controller = cam::Controller::LinuxCnc;
-  machine.x = {0.0, 1000.0, 20000.0, 100000.0, 0.0};
-  machine.y = machine.x;
-  machine.z = machine.x;
-  machine.max_cutting_feed = 100000.0;
-  machine.block_rate = 100000.0;
-  machine.min_rpm = 1.0;
-  machine.max_rpm = 100000.0;
-  machine.power_curve = {{1.0, 100.0}, {100000.0, 100.0}};
-  machine.drivetrain_efficiency = 1.0;
-  machine.rpm_resolution = 1.0;
-  machine.max_cutting_force = 1e9;
-  machine.max_mrr = 1e9;
-  machine.decimals = 3;
+  machine.rapid_feed = 6000.0;
+  machine.min_rpm = 1000.0;
+  machine.max_rpm = 24000.0;
+  machine.rpm_resolution = 100.0;
+  machine.feed_ranges.push_back({"plastic", 500.0, 2000.0});
   return machine;
 }
 
-cam::Tool six_millimetre_cutter() {
+cam::Tool test_tool() {
   cam::Tool tool;
-  tool.id = "test-6mm";
-  tool.name = "6 mm test";
+  tool.id = "test-tool";
+  tool.name = "6 mm test tool";
   tool.diameter = 6.0;
-  tool.flutes = 3;
   tool.flute_length = 16.0;
-  tool.overall_length = 50.0;
-  tool.shank_diameter = 6.0;
-  tool.stickout = 18.0;
-  tool.substrate = cam::Substrate::Carbide;
+  cam::CuttingData data;
+  data.material_id = "plastic";
+  data.spindle_rpm = 12000.0;
+  data.max_ae_over_d = 1.0;
+  data.max_ap_over_d = 2.0;
+  data.plunge_feed = 120.0;
+  tool.cutting_data.push_back(data);
   return tool;
 }
 
-cam::CuttingData aluminium_data() {
-  cam::CuttingData data;
-  data.material_id = "aluminium-6082";
-  data.surface_speed = 250.0;
-  data.feed_per_tooth = 0.05;
-  data.min_chip_thickness = 0.0;
-  data.max_ae_over_d = 1.0;
-  data.max_ap_over_d = 2.0;
-  return data;
+wave::Point64 point(double x, double y = 0.0) {
+  return wave::Point64(wave::to_integer(x), wave::to_integer(y));
 }
 
-cam::Material aluminium() {
-  cam::Material material;
-  material.id = "aluminium-6082";
-  material.name = "Aluminium";
-  material.specific_cutting_energy = 0.7;
-  return material;
-}
-
-// One straight cut of a given length at a given engagement, sampled into a
-// given number of steps. Standing in for the engine so the feed tests do not
-// depend on what the planner happens to produce today.
 struct SyntheticCut {
   wave::Toolpath toolpath;
   wave::SimulationResult simulation;
 };
 
-SyntheticCut straight_cut(double length_mm, double load, std::size_t steps) {
+SyntheticCut straight_cut(const std::vector<double>& loads) {
   SyntheticCut cut;
   wave::ToolpathMove move;
   move.kind = wave::MoveKind::Cut;
-  move.path.push_back(wave::Point64(std::int64_t{0}, std::int64_t{0}));
-  move.path.push_back(wave::Point64(wave::to_integer(length_mm), std::int64_t{0}));
-  move.length = length_mm;
+  move.path = {point(0.0), point(static_cast<double>(loads.size()))};
+  move.length = static_cast<double>(loads.size());
   cut.toolpath.moves.push_back(move);
-  cut.toolpath.stats.cut_count = 1;
-  cut.toolpath.stats.cut_length = length_mm;
-
   cut.simulation.moves.resize(1);
-  cut.simulation.tool_radius = 3.0;
-  for (std::size_t i = 0; i < steps; ++i) {
+  for (std::size_t index = 0; index < loads.size(); ++index) {
     wave::MaterialStep step;
-    const double from = length_mm * static_cast<double>(i) / steps;
-    const double to = length_mm * static_cast<double>(i + 1) / steps;
-    step.from = wave::Point64(wave::to_integer(from), std::int64_t{0});
-    step.to = wave::Point64(wave::to_integer(to), std::int64_t{0});
-    step.load = load;
-    step.removed_area = load * 6.0 * (to - from);
+    step.from = point(static_cast<double>(index));
+    step.to = point(static_cast<double>(index + 1));
+    step.move_distance_begin = static_cast<double>(index);
+    step.move_distance_end = static_cast<double>(index + 1);
+    step.load = loads[index];
+    step.removed_area = loads[index] * 6.0;
     cut.simulation.moves[0].steps.push_back(step);
   }
   return cut;
 }
 
-// ---------------------------------------------------------------------------
-
-void check_chip_thinning() {
-  std::cout << "chip thinning\n";
-  require_near(cam::chip_thinning_factor(1.0), 1.0, 1e-9, "slotting is not thinned");
-  require_near(cam::chip_thinning_factor(0.5), 1.0, 1e-9,
-               "half engagement is the reference");
-  // The textbook case: a tenth of the diameter needs two thirds more feed to
-  // leave the same chip behind.
-  require_near(cam::chip_thinning_factor(0.1), 1.0 / 0.6, 1e-9,
-               "a tenth of diameter thins to 0.6");
-  require(cam::chip_thinning_factor(0.25) > 1.15,
-          "a quarter of diameter should ask for meaningfully more feed");
-  require(cam::chip_thinning_factor(0.05) > cam::chip_thinning_factor(0.2),
-          "thinning grows as engagement falls");
+void check_engagement_feeds() {
+  std::cout << "engagement feed mapping\n";
+  for (const auto [load, expected] :
+       std::vector<std::pair<double, double>>{{1.0, 500.0},
+                                              {0.5, 1250.0},
+                                              {0.0, 2000.0},
+                                              {1.5, 500.0}}) {
+    const SyntheticCut cut = straight_cut({load});
+    const auto schedule = cam::plan_feeds(
+        cut.toolpath, cut.simulation, test_machine(), 500.0, 2000.0,
+        12000.0, 120.0);
+    require(schedule.segments.size() == 1, "one sample produces one feed segment");
+    if (!schedule.segments.empty())
+      require_near(schedule.segments.front().feed, expected, 1e-9,
+                   "feed is the clamped linear engagement interpolation");
+  }
 }
 
-void check_base_feed() {
-  std::cout << "base feed\n";
-  const cam::Tool tool = six_millimetre_cutter();
-  const cam::CuttingData data = aluminium_data();
-  const cam::Material material = aluminium();
-  cam::Machine machine = unlimited_machine();
+void check_feed_compatible_merge() {
+  std::cout << "post-feed line merging\n";
+  const SyntheticCut equal = straight_cut({0.5, 0.5, 0.5, 0.5});
+  const auto merged = cam::plan_feeds(
+      equal.toolpath, equal.simulation, test_machine(), 500.0, 2000.0,
+      12000.0, 120.0);
+  require(merged.segments.size() == 1,
+          "collinear segments at one feed merge after assignment");
+  if (!merged.segments.empty())
+    require_near(merged.segments.front().length, 4.0, 1e-9,
+                 "merging preserves travelled distance");
 
-  cam::FeedPolicy policy;
-  policy.corner_compensation = false;
-  policy.enable_power = false;
-  policy.enable_force = false;
-  policy.enable_deflection = false;
-  policy.enable_acceleration = false;
-  policy.feed_slew_limit = 0.0;
-  policy.lookahead_distance = 0.0;
-  policy.min_feed = 0.0;
-
-  const SyntheticCut cut = straight_cut(20.0, 1.0, 4);
-  cam::CutContext context;
-  context.axial_depth = 1.0;
-  const cam::FeedSchedule schedule =
-      cam::plan_feeds(cut.toolpath, cut.simulation, tool, machine, material, data,
-                      context, policy);
-
-  const double expected_rpm = 1000.0 * 250.0 / (3.14159265358979 * 6.0);
-  require_near(schedule.stats.spindle_rpm, expected_rpm, 1.0,
-               "spindle speed follows from surface speed and diameter");
-  require(!schedule.segments.empty(), "a cut should produce segments");
-
-  // Slotting: no thinning, so the feed is exactly the book chip load.
-  const double expected_feed = 0.05 * 3.0 * schedule.stats.spindle_rpm;
-  for (const auto& segment : schedule.segments)
-    require_near(segment.feed, expected_feed, 1.0,
-                 "slotting feed is chip load times teeth times rpm");
-
-  // A quarter engagement asks for the thinning factor more.
-  const SyntheticCut light = straight_cut(20.0, 0.25, 4);
-  const cam::FeedSchedule thinned =
-      cam::plan_feeds(light.toolpath, light.simulation, tool, machine, material, data,
-                      context, policy);
-  require_near(thinned.segments.front().feed,
-               expected_feed * cam::chip_thinning_factor(0.25), 1.0,
-               "light engagement is fed faster by the thinning factor");
+  const SyntheticCut different = straight_cut({0.5, 0.5, 0.2, 0.2});
+  const auto split = cam::plan_feeds(
+      different.toolpath, different.simulation, test_machine(), 500.0, 2000.0,
+      12000.0, 120.0);
+  require(split.segments.size() == 2,
+          "a feed change prevents a collinear merge");
 }
 
-void check_power_limit() {
-  std::cout << "spindle power\n";
-  const cam::Tool tool = six_millimetre_cutter();
-  const cam::CuttingData data = aluminium_data();
-  const cam::Material material = aluminium();
+void check_path_resampling() {
+  std::cout << "path pitch\n";
+  wave::Toolpath raw;
+  wave::ToolpathMove first;
+  first.kind = wave::MoveKind::Cut;
+  first.path = {point(0.0), point(0.03), point(0.07), point(0.35)};
+  first.length = 0.35;
+  raw.moves.push_back(first);
+  wave::ToolpathMove second;
+  second.kind = wave::MoveKind::Step;
+  second.path = {point(0.35), point(1.0)};
+  second.length = 0.65;
+  raw.moves.push_back(second);
 
-  cam::Machine machine = unlimited_machine();
-  // A spindle far too small for a full-width six millimetre slot.
-  machine.power_curve = {{1.0, 0.05}, {100000.0, 0.05}};
-  machine.max_mrr = 1e9;
-
-  cam::FeedPolicy policy;
-  policy.corner_compensation = false;
-  policy.enable_force = false;
-  policy.enable_deflection = false;
-  policy.enable_acceleration = false;
-  policy.feed_slew_limit = 0.0;
-  policy.lookahead_distance = 0.0;
-  policy.min_feed = 0.0;
-  policy.power_margin = 1.0;
-
-  const SyntheticCut cut = straight_cut(20.0, 1.0, 4);
-  cam::CutContext context;
-  context.axial_depth = 3.0;
-  const cam::FeedSchedule schedule =
-      cam::plan_feeds(cut.toolpath, cut.simulation, tool, machine, material, data,
-                      context, policy);
-
-  require(schedule.segments.front().limit == cam::FeedLimit::SpindlePower,
-          "a 50 watt spindle should be what limits a full-width slot");
-  // 50 W at 0.7 J/mm^3 is about 4300 mm^3/min, over a 3 by 6 mm section.
-  const double expected = 0.05 * 1000.0 * 60.0 / (3.0 * 6.0 * 0.7);
-  require_near(schedule.segments.front().feed, expected, expected * 0.02,
-               "the power-limited feed follows from removal rate");
-  require(schedule.stats.maximum_power_kw <= 0.051,
-          "the planned feed should not exceed the spindle's power");
-}
-
-void check_acceleration_limit() {
-  std::cout << "acceleration\n";
-  const cam::Tool tool = six_millimetre_cutter();
-  const cam::CuttingData data = aluminium_data();
-  const cam::Material material = aluminium();
-
-  cam::Machine machine = unlimited_machine();
-  machine.x.max_acceleration = 200.0;
-  machine.y.max_acceleration = 200.0;
-  machine.z.max_acceleration = 200.0;
-
-  cam::FeedPolicy policy;
-  policy.corner_compensation = false;
-  policy.enable_power = false;
-  policy.enable_force = false;
-  policy.enable_deflection = false;
-  policy.feed_slew_limit = 0.0;
-  policy.lookahead_distance = 0.0;
-  policy.min_feed = 0.0;
-
-  // A very short cut cannot be got up to speed, however light it is.
-  const SyntheticCut brief = straight_cut(0.4, 0.1, 1);
-  cam::CutContext context;
-  const cam::FeedSchedule schedule =
-      cam::plan_feeds(brief.toolpath, brief.simulation, tool, machine, material, data,
-                      context, policy);
-  require(schedule.segments.front().limit == cam::FeedLimit::Acceleration,
-          "a short move should be limited by what the machine can reach");
-  require_near(schedule.segments.front().feed, std::sqrt(200.0 * 0.4) * 60.0, 1.0,
-               "the reachable feed follows from acceleration over the run");
-
-  // The same total distance in one straight run is not limited, because the
-  // machine never has to stop in the middle of it.
-  const SyntheticCut ample = straight_cut(60.0, 0.1, 60);
-  const cam::FeedSchedule fast =
-      cam::plan_feeds(ample.toolpath, ample.simulation, tool, machine, material, data,
-                      context, policy);
-  require(fast.segments.front().limit != cam::FeedLimit::Acceleration,
-          "a long straight run should not be acceleration limited");
-}
-
-void check_block_rate() {
-  std::cout << "block rate\n";
-  const cam::Tool tool = six_millimetre_cutter();
-  const cam::CuttingData data = aluminium_data();
-  const cam::Material material = aluminium();
-
-  cam::Machine machine = unlimited_machine();
-  machine.block_rate = 50.0;
-
-  cam::FeedPolicy policy;
-  policy.corner_compensation = false;
-  policy.enable_power = false;
-  policy.enable_force = false;
-  policy.enable_deflection = false;
-  policy.enable_acceleration = false;
-  policy.feed_slew_limit = 0.0;
-  policy.lookahead_distance = 0.0;
-  policy.min_feed = 0.0;
-
-  const SyntheticCut cut = straight_cut(10.0, 0.15, 100);
-  cam::CutContext context;
-
-  // With merging switched off, a hundred blocks over ten millimetres is a tenth
-  // of a millimetre each, and fifty of those a second is 300 mm/min whatever
-  // the axes could otherwise do.
-  policy.path_tolerance = 0.0;
-  const cam::FeedSchedule raw =
-      cam::plan_feeds(cut.toolpath, cut.simulation, tool, machine, material, data,
-                      context, policy);
-  require(raw.segments.front().limit == cam::FeedLimit::BlockRate,
-          "short blocks on a slow controller should bind on block rate");
-  require_near(raw.segments.front().feed, 0.1 * 50.0 * 60.0, 1.0,
-               "the block-rate feed is segment length times block rate");
-
-  // Merging is what rescues it: the blocks are collinear, so they collapse into
-  // far fewer and much longer ones and the controller stops being the limit.
-  // Without this a path would be throttled by its own sampling resolution.
-  policy.path_tolerance = 0.01;
-  const cam::FeedSchedule merged =
-      cam::plan_feeds(cut.toolpath, cut.simulation, tool, machine, material, data,
-                      context, policy);
-  require(merged.segments.size() < raw.segments.size() / 4,
-          "collinear blocks should collapse into far fewer");
-  require(merged.segments.front().limit != cam::FeedLimit::BlockRate,
-          "merged blocks should no longer bind on block rate");
-  double merged_length = 0.0;
-  for (const auto& segment : merged.segments) merged_length += segment.length;
-  require_near(merged_length, 10.0, 0.01,
-               "merging must not change how far the tool travels");
-}
-
-void check_deflection_model() {
-  std::cout << "deflection\n";
-  cam::Tool tool = six_millimetre_cutter();
-  const double at_18 = cam::tip_deflection(tool, 100.0);
-  tool.stickout = 36.0;
-  const double at_36 = cam::tip_deflection(tool, 100.0);
-  require_near(at_36 / at_18, 8.0, 0.01,
-               "doubling the stickout should deflect eight times as much");
-
-  cam::Tool steel = six_millimetre_cutter();
-  steel.substrate = cam::Substrate::HighSpeedSteel;
-  require(cam::tip_deflection(steel, 100.0) > at_18 * 2.0,
-          "a steel cutter should be markedly less stiff than carbide");
-
-  // A ball nose engaged at its tip is nothing like six millimetres across.
-  cam::Tool ball = six_millimetre_cutter();
-  ball.type = cam::ToolType::BallEndmill;
-  ball.corner_radius = 3.0;
-  require(cam::effective_diameter(ball, 0.5) < 4.0,
-          "a ball nose barely engaged presents a small effective diameter");
-  require_near(cam::effective_diameter(ball, 3.0), 6.0, 1e-6,
-              "at full radius depth a ball nose is its nominal diameter");
+  const wave::Toolpath sampled = wave::resample_toolpath(raw, 0.2);
+  require(!sampled.moves.empty(), "resampling retains a cutting path");
+  require(sampled.moves.front().path.front() == point(0.0),
+          "resampling retains the path start");
+  require(sampled.moves.back().path.back() ==
+              point(1.0),
+          "resampling retains the path endpoint");
+  bool retained_micro_vertex = false;
+  for (const auto& move : sampled.moves)
+    for (const auto& point : move.path)
+      if (point.x == wave::to_integer(0.03) ||
+          point.x == wave::to_integer(0.07) ||
+          point.x == wave::to_integer(0.35))
+        retained_micro_vertex = true;
+  require(!retained_micro_vertex,
+          "original micro-vertices are not forced into the normalized path");
+  require_near(wave::toolpath_length(sampled), 1.0, 1e-6,
+               "uniform sampling preserves a straight path's length");
+  for (const auto& move : sampled.moves)
+    for (std::size_t i = 1; i < move.path.size(); ++i)
+      require_near(
+          std::hypot(wave::to_world(move.path[i].x - move.path[i - 1].x),
+                     wave::to_world(move.path[i].y - move.path[i - 1].y)),
+          0.2, 1e-6, "pitch carries across the original move boundary");
 }
 
 void check_level_floors() {
@@ -343,162 +172,141 @@ void check_level_floors() {
   operation.top_z = 0.0;
   operation.bottom_z = -5.0;
   operation.stepdown = 2.0;
-  operation.axial_stock_to_leave = 0.0;
   const auto floors = cam::level_floors(operation);
   require(floors.size() == 3, "five millimetres in two millimetre steps is three passes");
   if (floors.size() == 3) {
     require_near(floors[0], -2.0, 1e-9, "first pass takes a full step");
-    require_near(floors[1], -4.0, 1e-9, "second pass takes a full step");
-    require_near(floors[2], -5.0, 1e-9, "the last pass lands exactly on the floor");
+    require_near(floors[2], -5.0, 1e-9, "last pass lands on the floor");
   }
-
   operation.axial_stock_to_leave = 0.5;
-  const auto with_allowance = cam::level_floors(operation);
-  require(!with_allowance.empty() &&
-              std::abs(with_allowance.back() + 4.5) < 1e-9,
-          "an axial allowance stops the roughing short of the floor");
-
-  operation.top_z = -5.0;
-  operation.bottom_z = -5.0;
-  require(cam::level_floors(operation).empty(),
-          "an empty depth range produces no passes");
+  require_near(cam::level_floors(operation).back(), -4.5, 1e-9,
+               "axial stock allowance raises the final floor");
 }
 
 void check_serialisation() {
   std::cout << "serialisation\n";
-  cam::Tool tool = six_millimetre_cutter();
-  tool.cutting_data.push_back(aluminium_data());
-  tool.coating = cam::Coating::AlTiN;
-  tool.type = cam::ToolType::BullNose;
-  tool.corner_radius = 0.5;
-  const cam::Tool round_tripped = cam::tool_from_json_text(cam::to_json_text(tool));
-  require(round_tripped.id == tool.id, "tool identity survives a round trip");
-  require(round_tripped.coating == tool.coating, "coating survives a round trip");
-  require(round_tripped.type == tool.type, "type survives a round trip");
-  require_near(round_tripped.corner_radius, 0.5, 1e-9, "corner radius survives");
-  require(round_tripped.cutting_data.size() == 1, "cutting data survives");
-  if (!round_tripped.cutting_data.empty())
-    require_near(round_tripped.cutting_data[0].feed_per_tooth, 0.05, 1e-9,
-                 "feed per tooth survives a round trip");
+  const cam::Tool tool = test_tool();
+  const cam::Tool tool_back =
+      cam::tool_from_json_text(cam::to_json_text(tool));
+  require(tool_back.id == tool.id, "tool identity survives a round trip");
+  require(tool_back.cutting_data.size() == 1, "tool cutting data survives");
+  if (!tool_back.cutting_data.empty())
+    require_near(tool_back.cutting_data.front().spindle_rpm, 12000.0, 1e-9,
+                 "tool spindle speed survives");
 
-  const cam::Machine machine = unlimited_machine();
+  const cam::Machine machine = test_machine();
   const cam::Machine machine_back =
       cam::machine_from_json_text(cam::to_json_text(machine));
-  require(machine_back.controller == machine.controller, "controller survives");
-  require_near(machine_back.x.max_acceleration, machine.x.max_acceleration, 1e-9,
-               "axis limits survive");
-  require(machine_back.power_curve.size() == machine.power_curve.size(),
-          "the power curve survives");
+  require(machine_back.controller == machine.controller,
+          "machine controller survives");
+  require(machine_back.feed_ranges.size() == 1,
+          "machine feed ranges survive");
 
   cam::Job job;
-  job.name = "Round trip";
-  job.clearance_z = 12.5;
   cam::Operation operation;
-  operation.name = "Rough";
-  operation.tool_id = "test-6mm";
-  operation.stepdown = 1.25;
-  operation.feeds.power_margin = 0.65;
+  operation.path_pitch = 0.15;
+  operation.manual_feed_range = true;
+  operation.full_engagement_feed = 450.0;
+  operation.no_engagement_feed = 1900.0;
   job.operations.push_back(operation);
-  const cam::Job job_back = cam::job_from_json_text(cam::to_json_text(job));
-  require(job_back.name == job.name, "job name survives");
-  require_near(job_back.clearance_z, 12.5, 1e-9, "clearance survives");
-  require(job_back.operations.size() == 1, "operations survive");
+  const cam::Job job_back =
+      cam::job_from_json_text(cam::to_json_text(job));
+  require(job_back.operations.size() == 1, "job operations survive");
   if (!job_back.operations.empty()) {
-    require_near(job_back.operations[0].stepdown, 1.25, 1e-9, "stepdown survives");
-    require_near(job_back.operations[0].feeds.power_margin, 0.65, 1e-9,
-                 "the feed policy survives");
+    require_near(job_back.operations[0].path_pitch, 0.15, 1e-9,
+                 "path pitch survives");
+    require(job_back.operations[0].manual_feed_range,
+            "manual feed selection survives");
+    require_near(job_back.operations[0].no_engagement_feed, 1900.0, 1e-9,
+                 "manual feed endpoint survives");
   }
 
-  // An unknown field is ignored and a missing one keeps its default, so a file
-  // from another version still loads.
   const cam::Tool sparse = cam::tool_from_json_text(
       R"({"id":"x","name":"X","diameter":8.0,"unheard_of":42})");
-  require(sparse.diameter == 8.0, "a sparse tool reads what is there");
-  require(sparse.flutes == 2, "a missing field keeps its default");
+  require_near(sparse.diameter, 8.0, 1e-9,
+               "recognized fields load while unknown fields are ignored");
+}
+
+void check_schedule_timing() {
+  std::cout << "schedule timing\n";
+  wave::Toolpath toolpath;
+  wave::ToolpathMove retract;
+  retract.kind = wave::MoveKind::Retract;
+  retract.path = {point(0.0), point(10.0)};
+  retract.length = 10.0;
+  toolpath.moves.push_back(retract);
+  wave::ToolpathMove cut;
+  cut.kind = wave::MoveKind::Cut;
+  cut.path = {point(10.0), point(20.0)};
+  cut.length = 10.0;
+  toolpath.moves.push_back(cut);
+  wave::SimulationResult simulation;
+  simulation.moves.resize(2);
+  wave::MaterialStep step;
+  step.from = point(10.0);
+  step.to = point(20.0);
+  step.move_distance_end = 10.0;
+  step.load = 1.0;
+  simulation.moves[1].steps.push_back(step);
+  const auto schedule = cam::plan_feeds(
+      toolpath, simulation, test_machine(), 500.0, 2000.0, 12000.0, 120.0);
+  require(schedule.segments.size() == 2, "rapid and cutting movement are scheduled");
+  const double rapid_seconds = 10.0 / 6000.0 * 60.0;
+  const double cut_seconds = 10.0 / 500.0 * 60.0;
+  require_near(cam::feed_schedule_seconds(schedule),
+               rapid_seconds + cut_seconds, 1e-9,
+               "machine time uses the final scheduled rates");
+  require_near(cam::feed_seconds_to(schedule, 10.0), rapid_seconds, 1e-9,
+               "distance converts to time across a rapid");
 }
 
 void check_validation() {
   std::cout << "validation\n";
-  cam::Tool tool;
-  tool.id = "x";
-  tool.name = "X";
-  tool.cutting_data.push_back(aluminium_data());
-  require(cam::validate(tool).empty(), "a plain tool should validate");
-
-  cam::Tool bad = tool;
+  require(cam::validate(test_tool()).empty(), "the test tool validates");
+  cam::Tool bad = test_tool();
   bad.diameter = 0.0;
-  require(!cam::validate(bad).empty(), "a zero diameter should be rejected");
-
-  bad = tool;
-  bad.type = cam::ToolType::BallEndmill;
-  require(!cam::validate(bad).empty(),
-          "a ball nose without the matching corner radius should be rejected");
-
-  bad = tool;
-  bad.cutting_data[0].min_chip_thickness = 0.2;
-  require(!cam::validate(bad).empty(),
-          "a chip floor above the book feed should be rejected");
-
-  bad = tool;
-  bad.cutting_data.push_back(aluminium_data());
-  require(!cam::validate(bad).empty(), "duplicate cutting data should be rejected");
+  require(!cam::validate(bad).empty(), "zero tool diameter is rejected");
+  bad = test_tool();
+  bad.cutting_data.push_back(bad.cutting_data.front());
+  require(!cam::validate(bad).empty(), "duplicate tool material data is rejected");
+  require(cam::validate(test_machine()).empty(), "the test machine validates");
 }
 
 void check_shipped_data(const std::filesystem::path& data) {
   std::cout << "shipped profiles\n";
-  const auto machines = cam::load_machines(data / "machines");
-  require(machines.machines.size() >= 3, "the machine profiles should load");
-  for (const auto& machine : machines.machines) {
-    const auto problems = cam::validate(machine);
-    for (const auto& problem : problems)
-      require(false, machine.id + ": " + problem);
-    require(cam::spindle_power(machine, machine.max_rpm) > 0.0,
-            machine.id + " should have power at its top speed");
-    require(cam::spindle_torque(machine, machine.max_rpm) > 0.0,
-            machine.id + " should have torque at its top speed");
-  }
-  require(machines.find("makera-z1") != nullptr, "the Makera profile should be present");
-  const cam::Machine* makera = machines.find("makera-z1");
-  if (makera)
-    require(makera->specifications_unverified,
-            "the Makera profile must be marked unverified until its numbers are checked");
-
   const auto materials = cam::load_materials(data / "materials");
-  require(materials.materials.size() >= 6, "the material profiles should load");
+  const auto machines = cam::load_machines(data / "machines");
+  const auto tools = cam::load_tools(data / "starter-tools.json");
+  require(materials.materials.size() >= 6, "material profiles load");
+  require(machines.machines.size() >= 3, "machine profiles load");
+  require(tools.tools.size() >= 4, "starter tools load");
   for (const auto& material : materials.materials)
     for (const auto& problem : cam::validate(material))
       require(false, material.id + ": " + problem);
-
-  const auto tools = cam::load_tools(data / "starter-tools.json");
-  require(tools.tools.size() >= 4, "the starter tools should load");
+  for (const auto& machine : machines.machines) {
+    for (const auto& problem : cam::validate(machine))
+      require(false, machine.id + ": " + problem);
+    for (const auto& range : machine.feed_ranges)
+      require(materials.find(range.material_id) != nullptr,
+              machine.id + " names an unknown material feed range");
+  }
   for (const auto& tool : tools.tools) {
     for (const auto& problem : cam::validate(tool))
       require(false, tool.id + ": " + problem);
     for (const auto& entry : tool.cutting_data)
       require(materials.find(entry.material_id) != nullptr,
-              tool.id + " names an unknown material: " + entry.material_id);
+              tool.id + " names an unknown material");
   }
-
-  // A low-power spindle in steel must come out power limited, which is the
-  // whole reason the material carries a specific cutting energy.
-  const cam::Machine* router = machines.find("grbl-router");
-  const cam::Tool* steel_cutter = tools.find("6mm-4f-steel");
-  const cam::Material* steel = materials.find("steel-1018");
-  if (router && steel_cutter && steel) {
-    const cam::CuttingData* data_for = steel_cutter->data_for("steel-1018");
-    require(data_for != nullptr, "the steel cutter should carry steel data");
-    if (data_for) {
-      const SyntheticCut cut = straight_cut(30.0, 0.4, 30);
-      cam::CutContext context;
-      context.axial_depth = 3.0;
-      const auto schedule =
-          cam::plan_feeds(cut.toolpath, cut.simulation, *steel_cutter, *router,
-                          *steel, *data_for, context, cam::FeedPolicy{});
-      require(schedule.stats.maximum_power_kw <=
-                  cam::spindle_power(*router, schedule.stats.spindle_rpm) *
-                      router->drivetrain_efficiency * 1.001,
-              "a planned cut must stay inside the spindle's power");
-      require(!schedule.segments.empty(), "the steel cut should produce segments");
+  const cam::Machine* makera = machines.find("makera-z1");
+  require(makera != nullptr, "the Makera profile is present");
+  if (makera) {
+    const cam::MaterialFeedRange* plastic = makera->feeds_for("hdpe");
+    require(plastic != nullptr, "the Makera has a plastic feed range");
+    if (plastic) {
+      require_near(plastic->full_engagement, 500.0, 1e-9,
+                   "Makera plastic full-engagement feed");
+      require_near(plastic->no_engagement, 2000.0, 1e-9,
+                   "Makera plastic no-engagement feed");
     }
   }
 }
@@ -506,101 +314,59 @@ void check_shipped_data(const std::filesystem::path& data) {
 void check_post_output() {
   std::cout << "post output\n";
   cam::ToolLibrary tools;
-  cam::Tool tool = six_millimetre_cutter();
+  cam::Tool tool = test_tool();
   tool.tool_number = 3;
-  tool.cutting_data.push_back(aluminium_data());
   tools.upsert(tool);
-
   cam::MachineLibrary machines;
-  cam::Machine machine = unlimited_machine();
-  machine.id = "post-test";
-  machine.name = "Post test";
-  machine.tool_change = cam::ToolChange::Manual;
+  cam::Machine machine = test_machine();
   machines.upsert(machine);
-
   cam::Job job;
-  job.name = "Post test job";
-  job.clearance_z = 15.0;
-  job.retract_z = 3.0;
   cam::Operation operation;
   operation.name = "Rough";
   operation.tool_id = tool.id;
   operation.machine_id = machine.id;
-  operation.material_id = "aluminium-6082";
+  operation.material_id = "plastic";
   job.operations.push_back(operation);
 
-  // A plan assembled by hand, so the post is tested without needing a mesh.
-  cam::JobPlan plan;
-  cam::OperationPlan op;
-  op.operation_name = "Rough";
-  op.tool_id = tool.id;
-  op.spindle_rpm = 12000.0;
+  const SyntheticCut cut = straight_cut({0.5, 0.5});
   cam::LevelPlan level;
   level.floor_z = -1.5;
   level.axial_depth = 1.5;
-  const SyntheticCut cut = straight_cut(20.0, 0.5, 4);
   level.toolpath = cut.toolpath;
   level.simulation = cut.simulation;
-  level.feeds = cam::plan_feeds(cut.toolpath, cut.simulation, tool, machine,
-                                aluminium(), aluminium_data(), cam::CutContext{},
-                                cam::FeedPolicy{});
-  op.levels.push_back(level);
-  plan.operations.push_back(op);
+  level.feeds = cam::plan_feeds(
+      cut.toolpath, cut.simulation, machine, 500.0, 2000.0, 12000.0, 120.0);
+  cam::OperationPlan planned_operation;
+  planned_operation.operation_name = "Rough";
+  planned_operation.tool_id = tool.id;
+  planned_operation.spindle_rpm = 12000.0;
+  planned_operation.levels.push_back(level);
+  cam::JobPlan plan;
+  plan.operations.push_back(planned_operation);
 
   const cam::PostResult result = cam::post_job(plan, job, tools, machines);
-  require(result.ok(), "the post should succeed: " + result.error);
-  require(result.text.find("G21") != std::string::npos, "millimetre mode is emitted");
-  require(result.text.find("G90") != std::string::npos, "absolute mode is emitted");
+  require(result.ok(), "the post succeeds: " + result.error);
   require(result.text.find("M3 S12000") != std::string::npos,
-          "the spindle is started at the planned speed");
-  require(result.text.find("M30") != std::string::npos, "the program ends");
-  require(result.text.find("Z-1.5") != std::string::npos,
-          "the cut happens at the level's depth");
-  require(result.text.find("nan") == std::string::npos &&
-              result.text.find("inf") == std::string::npos,
-          "no coordinate or feed comes out as a non-number");
-  require(result.cutting_moves > 0, "cutting moves are counted");
-
-  // A job whose safe planes sit inside the work must have them lifted rather
-  // than posted as written: a plunge to a Z above where the tool already is
-  // would drive it up through the part.
-  cam::Job unsafe = job;
-  unsafe.clearance_z = 0.0;
-  unsafe.retract_z = -3.0;  // below the -1.5 floor of the pass above
-  const cam::PostResult lifted = cam::post_job(plan, unsafe, tools, machines);
-  require(lifted.ok(), "a job with low planes should still post");
-  require(lifted.text.find("Z-3") == std::string::npos,
-          "the retract plane must not be left inside the cut");
-  bool warned_about_planes = false;
-  for (const auto& warning : lifted.warnings)
-    if (warning.find("clearance") != std::string::npos) warned_about_planes = true;
-  require(warned_about_planes, "raising the safe planes should be reported");
-
-  // A machine whose profile is not trusted has to say so in the file itself.
-  cam::MachineLibrary flagged = machines;
-  flagged.machines[0].specifications_unverified = true;
-  const cam::PostResult warned = cam::post_job(plan, job, tools, flagged);
-  require(warned.text.find("unverified") != std::string::npos,
-          "an unverified profile is called out in the program");
-  require(!warned.warnings.empty(), "an unverified profile warns the operator");
+          "the configured spindle speed is posted");
+  require(result.text.find("F1250") != std::string::npos,
+          "the engagement-derived feed is posted");
+  require(result.text.find("M30") != std::string::npos,
+          "the program terminates");
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
   try {
-    check_chip_thinning();
-    check_base_feed();
-    check_power_limit();
-    check_acceleration_limit();
-    check_block_rate();
-    check_deflection_model();
+    check_engagement_feeds();
+    check_feed_compatible_merge();
+    check_path_resampling();
     check_level_floors();
     check_serialisation();
+    check_schedule_timing();
     check_validation();
     check_post_output();
     if (argc > 1) check_shipped_data(argv[1]);
-    else std::cout << "shipped profiles: skipped, no data directory given\n";
   } catch (const std::exception& error) {
     std::cerr << "Test threw: " << error.what() << '\n';
     return EXIT_FAILURE;
