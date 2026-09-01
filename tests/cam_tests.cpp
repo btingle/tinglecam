@@ -62,6 +62,17 @@ wave::Point64 point(double x, double y = 0.0) {
   return wave::Point64(wave::to_integer(x), wave::to_integer(y));
 }
 
+wave::Path64 box(double x0, double y0, double x1, double y1) {
+  return {point(x0, y0), point(x1, y0), point(x1, y1), point(x0, y1)};
+}
+
+double area(const wave::Paths64& paths) {
+  double signed_area = 0.0;
+  for (const auto& path : paths) signed_area += Clipper2Lib::Area(path);
+  return std::abs(signed_area) /
+         (wave::kIntegerScale * wave::kIntegerScale);
+}
+
 struct SyntheticCut {
   wave::Toolpath toolpath;
   wave::SimulationResult simulation;
@@ -183,6 +194,424 @@ void check_level_floors() {
                "axial stock allowance raises the final floor");
 }
 
+wave::FrontLineage single_front_lineage(const wave::Path64& front,
+                                        const wave::Path64& band) {
+  wave::FrontLineage lineage;
+  lineage.stepover = 2.0;
+  wave::LeadingFront leading;
+  leading.path = front;
+  leading.band = 0;
+  lineage.generations.push_back({{leading}, {wave::Paths64{band}}});
+  lineage.entry_fronts.push_back(leading);
+  return lineage;
+}
+
+// A node whose two fronts both end on one static boundary ring, with the
+// propagation bands inset from that ring by `band_inset` millimetres. The
+// rails run along the ring, so the inset is exactly the disagreement between
+// the two descriptions of the same wall that the rail check has to survive.
+wave::FrontLineage railed_node(double band_inset) {
+  const double lo = band_inset;
+  const double hi = 10.0 - band_inset;
+  wave::FrontLineage lineage;
+  lineage.stepover = 2.0;
+  lineage.boundary_components = {box(0, 0, 10, 10)};
+  lineage.generations.resize(3);
+  lineage.generations[0].bands = {wave::Paths64{box(lo, 0, hi, 2)}};
+  lineage.generations[1].bands = {wave::Paths64{box(lo, 2, hi, 4)}};
+  lineage.generations[2].bands = {wave::Paths64{box(lo, 4, 5, 6)},
+                                  wave::Paths64{box(5, 4, hi, 6)}};
+
+  auto contact = [](wave::Point64 at) {
+    wave::BoundaryContact result;
+    result.valid = true;
+    result.component = 0;
+    result.point = at;
+    return result;
+  };
+
+  wave::LeadingFront first;
+  first.path = {point(0, 1), point(10, 1)};
+  first.children = {0};
+  first.boundary_contacts[0] = contact(point(0, 1));
+  first.boundary_contacts[1] = contact(point(10, 1));
+  lineage.generations[0].fronts = {first};
+
+  // Two children keep the node non-terminal, so its footprint is closed by the
+  // two rails rather than by a terminal cap.
+  wave::LeadingFront second;
+  second.path = {point(0, 3), point(10, 3)};
+  second.parents = {0};
+  second.children = {0, 1};
+  second.boundary_contacts[0] = contact(point(0, 3));
+  second.boundary_contacts[1] = contact(point(10, 3));
+  lineage.generations[1].fronts = {second};
+
+  wave::LeadingFront left;
+  left.path = {point(0, 5), point(5, 5)};
+  left.parents = {0};
+  left.band = 0;
+  wave::LeadingFront right;
+  right.path = {point(5, 5), point(10, 5)};
+  right.parents = {0};
+  right.band = 1;
+  lineage.generations[2].fronts = {left, right};
+  return lineage;
+}
+
+// The boundary rings and the propagation bands are separately rounded
+// descriptions of the same walls, and a rail is deliberately laid on the ring.
+// A rail may therefore miss the bands by the same slack a contact was accepted
+// with -- and by no more than that.
+void check_boundary_rail_slack() {
+  std::cout << "boundary rail slack\n";
+  const wave::LayerTopology rounded =
+      wave::build_layer_topology(railed_node(0.003));
+  const std::size_t node = rounded.front_nodes[0][0];
+  require_near(area(rounded.nodes[node].footprint), 20.0, 1e-6,
+               "a rail a few microns off its bands still closes its node");
+
+  bool rejected = false;
+  try {
+    (void)wave::build_layer_topology(railed_node(0.5));
+  } catch (const std::runtime_error&) {
+    rejected = true;
+  }
+  require(rejected,
+          "the slack is a rounding allowance, not a licence to leave the bands");
+}
+
+// Two stock walls the subject keeps apart, so the wave has two entry fronts and
+// declining one is a question with a visible answer.
+void check_entry_front_selection() {
+  std::cout << "entry front selection\n";
+  const wave::Paths64 stock{box(0, 0, 40, 10)};
+  // A bar across the middle, leaving a corridor at each end and no way round.
+  const wave::Paths64 subject{box(12, -1, 28, 11)};
+  const auto all = wave::build_wavefront(subject, stock, 1.0);
+  const auto lineage = wave::build_front_lineage(all);
+  require(lineage.entry_fronts.size() == 2,
+          "a subject spanning the stock leaves two separate entries");
+  if (lineage.entry_fronts.size() != 2) return;
+
+  const double left_area = area(wave::entry_front_territory(lineage, 0));
+  const double right_area = area(wave::entry_front_territory(lineage, 1));
+  require(left_area > 0.0 && right_area > 0.0,
+          "each entry is answerable for material");
+  require_near(left_area + right_area, area(stock) - area(subject), 1.0,
+               "between them the entries reach everything the wave can");
+
+  // Decline the one whose territory is smaller, and check the wave never starts
+  // there rather than merely being told not to cut there.
+  const std::size_t declined = left_area <= right_area ? 0 : 1;
+  wave::EntryMute mute;
+  mute.anchors.push_back(
+      wave::representative_point(lineage.entry_fronts[declined]));
+  mute.tolerance = wave::to_integer(1.0);
+  const auto one = wave::build_wavefront(subject, stock, 1.0, 0.0, 0.0, 2000, mute);
+  require(one.muted_entries == 1, "the declined seed piece is dropped");
+  const auto reduced = wave::build_front_lineage(one);
+  require(reduced.entry_fronts.size() == 1,
+          "only the entry that was kept propagates");
+  if (reduced.entry_fronts.empty()) return;
+  const double kept = area(wave::entry_front_territory(reduced, 0));
+  require_near(kept, std::max(left_area, right_area), 1.0,
+               "the surviving entry reaches what it always did and no further");
+  require(kept < left_area + right_area - 1.0,
+          "the corridor behind the declined entry is out of reach, "
+          "since the subject blocks the way round");
+
+  // An anchor that names nothing is not an error and mutes nothing: that is how
+  // a selection outlives a change of depth that moves the fronts.
+  wave::EntryMute stray;
+  stray.anchors.push_back(point(500.0, 500.0));
+  stray.tolerance = wave::to_integer(1.0);
+  const auto untouched =
+      wave::build_wavefront(subject, stock, 1.0, 0.0, 0.0, 2000, stray);
+  require(untouched.muted_entries == 0,
+          "an anchor matching no entry declines nothing");
+  require(wave::build_front_lineage(untouched).entry_fronts.size() == 2,
+          "and leaves every entry propagating");
+}
+
+// The blank that stands in for a stock model when there is none.
+void check_box_stock(const std::filesystem::path& part_mesh) {
+  std::cout << "box stock\n";
+  cam::JobGeometry geometry;
+  require(!geometry.has_stock(), "nothing loaded is not a blank");
+  geometry.load_part(part_mesh);
+  require(!geometry.has_stock(), "a part alone is still not a blank");
+
+  geometry.set_box_stock(true, 4.0);
+  require(geometry.has_stock(), "the box stands in for a stock model");
+  require(geometry.box_stock(), "and reports that it is what is standing in");
+
+  const auto& bounds = geometry.part().mesh().bounds;
+  require(bounds.valid, "the part has bounds to grow");
+  if (!bounds.valid) return;
+  const wave::Paths64& box = geometry.stock_outline(0.0, 32);
+  require(box.size() == 1 && box.front().size() == 4,
+          "the blank is one rectangle");
+  if (box.size() != 1) return;
+  const auto rect = Clipper2Lib::GetBounds(box);
+  require_near(wave::to_world(rect.left), bounds.lower.x - 4.0, 1e-3,
+               "the blank is grown by the margin in X");
+  require_near(wave::to_world(rect.right), bounds.upper.x + 4.0, 1e-3,
+               "on both sides");
+  require_near(wave::to_world(rect.bottom - rect.top),
+               static_cast<double>(bounds.upper.y - bounds.lower.y) + 8.0, 1e-3,
+               "and in Y");
+
+  // Every depth gets the same rectangle: it is a prism, not a sliced solid.
+  double low = 0.0;
+  double high = 0.0;
+  require(geometry.z_range(low, high), "a box blank still has a depth range");
+  require(geometry.stock_outline(low, 32) == box &&
+              geometry.stock_outline(high, 32) == box,
+          "the blank is the same at every depth");
+
+  const double wider = 9.0;
+  geometry.set_box_stock(true, wider);
+  const auto grown = Clipper2Lib::GetBounds(geometry.stock_outline(0.0, 32));
+  require_near(wave::to_world(grown.left), bounds.lower.x - wider, 1e-3,
+               "changing the margin re-cuts the blank rather than reusing it");
+
+  // A real model always wins, so turning the fallback on cannot quietly
+  // replace a blank the job actually names.
+  geometry.load_stock(part_mesh);
+  require(geometry.has_stock() && !geometry.box_stock(),
+          "a loaded stock model wins over the box");
+  geometry.clear_stock();
+  require(geometry.box_stock(),
+          "and dropping it hands the job back to the box");
+}
+
+void check_inter_layer_topology() {
+  std::cout << "inter-layer topology\n";
+  wave::FrontLineage upper = single_front_lineage(
+      {point(0.0, 5.0), point(10.0, 5.0)}, box(0.0, 4.0, 10.0, 6.0));
+  wave::FrontLineage lower_inside = single_front_lineage(
+      {point(1.0, 5.1), point(9.0, 5.1)}, box(1.0, 4.2, 9.0, 5.8));
+  auto joined = wave::build_inter_layer_topology(
+      {&upper, &lower_inside}, 0.2);
+  require(joined.node_chains.size() == 1,
+          "an exactly contained area forms a Z chain");
+  require(joined.entry_front_chains.size() == 1,
+          "a whole entry curve inside the tolerance envelope forms a Z chain");
+
+  wave::FrontLineage lower_outside = single_front_lineage(
+      {point(-0.001, 5.1), point(9.0, 5.1)},
+      box(-0.001, 4.2, 9.0, 5.8));
+  auto exact = wave::build_inter_layer_topology(
+      {&upper, &lower_outside}, 0.2);
+  require(exact.node_chains.empty(),
+          "area matching does not inflate the upper footprint by even one grid unit");
+  require(exact.entry_front_chains.size() == 1,
+          "entry-front matching remains independently tolerant");
+
+  wave::FrontLineage split;
+  split.stepover = 0.5;
+  split.generations.resize(3);
+  split.generations[0].bands = {wave::Paths64{box(0, 0, 10, 2)}};
+  split.generations[1].bands = {wave::Paths64{box(0, 2, 10, 4)}};
+  split.generations[2].bands = {wave::Paths64{box(0, 4, 5, 6)},
+                                wave::Paths64{box(5, 4, 10, 6)}};
+  wave::LeadingFront root;
+  root.path = {point(0, 1), point(10, 1)};
+  root.children = {0};
+  split.generations[0].fronts = {root};
+  wave::LeadingFront fork;
+  fork.path = {point(0, 3), point(10, 3)};
+  fork.parents = {0};
+  fork.children = {0, 1};
+  split.generations[1].fronts = {fork};
+  wave::LeadingFront left;
+  left.path = {point(0, 5), point(5, 5)};
+  left.parents = {0};
+  left.band = 0;
+  wave::LeadingFront right;
+  right.path = {point(5, 5), point(10, 5)};
+  right.parents = {0};
+  right.band = 1;
+  split.generations[2].fronts = {left, right};
+  const wave::LayerTopology nodes = wave::build_layer_topology(split);
+  require(nodes.nodes.size() == 3,
+          "a split front stays upstream while each outgoing branch starts a node");
+  require(nodes.front_nodes[0][0] == nodes.front_nodes[1][0],
+          "the split front belongs to its singular parent's node");
+  require(nodes.front_nodes[1][0] != nodes.front_nodes[2][0] &&
+              nodes.front_nodes[2][0] != nodes.front_nodes[2][1],
+          "the split front does not collapse its outgoing branches together");
+  const std::size_t upstream_node = nodes.front_nodes[0][0];
+  const std::size_t terminal_node = nodes.front_nodes[2][0];
+  require_near(area(nodes.nodes[upstream_node].footprint), 20.0, 1e-6,
+               "a stable open node is bounded by its first and last fronts");
+  require_near(area(nodes.nodes[terminal_node].footprint), 10.0, 1e-6,
+               "a singleton terminal owns its full closed terminal band");
+
+  wave::FrontLineage inconsistent;
+  inconsistent.stepover = 2.0;
+  inconsistent.boundary_components = {box(0, 0, 10, 10),
+                                      box(20, 0, 30, 10)};
+  inconsistent.generations.resize(2);
+  wave::LeadingFront before;
+  before.path = {point(0, 2), point(0, 8)};
+  before.children = {0};
+  before.boundary_contacts[0].valid = true;
+  before.boundary_contacts[0].component = 0;
+  wave::LeadingFront after = before;
+  after.children.clear();
+  after.parents = {0};
+  after.boundary_contacts[0].component = 1;
+  inconsistent.generations[0].fronts = {before};
+  inconsistent.generations[1].fronts = {after};
+  bool rejected = false;
+  try {
+    (void)wave::build_layer_topology(inconsistent);
+  } catch (const std::runtime_error&) {
+    rejected = true;
+  }
+  require(rejected,
+          "a known boundary-component change across 1-to-1 lineage is an error");
+
+  wave::FrontLineage detaching;
+  detaching.stepover = 2.0;
+  detaching.boundary_components = {box(0, 0, 10, 4)};
+  detaching.generations.resize(2);
+  detaching.generations[0].bands = {wave::Paths64{box(0, 0, 10, 2)}};
+  detaching.generations[1].bands = {wave::Paths64{box(0, 2, 10, 4)}};
+  wave::LeadingFront attached;
+  attached.path = {point(0, 1), point(10, 1)};
+  attached.children = {0};
+  attached.boundary_contacts[0] = {true, 0, point(0, 1)};
+  attached.boundary_contacts[1] = {true, 0, point(10, 1)};
+  wave::LeadingFront detached;
+  detached.path = {point(1, 3), point(9, 3)};
+  detached.parents = {0};
+  detaching.generations[0].fronts = {attached};
+  detaching.generations[1].fronts = {detached};
+  const wave::LayerTopology detached_node =
+      wave::build_layer_topology(detaching);
+  require(detached_node.nodes.size() == 1 &&
+              !detached_node.nodes.front().footprint.empty(),
+          "a validated boundary detachment remains one closed node");
+
+  wave::FrontLineage disconnected = detaching;
+  disconnected.generations[0].fronts[0].closed = true;
+  disconnected.generations[0].fronts[0].path = box(0, 0, 2, 2);
+  disconnected.generations[1].bands = {
+      wave::Paths64{box(20, 20, 22, 22)}};
+  bool rejected_open_boundary = false;
+  try {
+    (void)wave::build_layer_topology(disconnected);
+  } catch (const std::runtime_error&) {
+    rejected_open_boundary = true;
+  }
+  require(rejected_open_boundary,
+          "an attaching node whose swept boundary is disconnected is an error");
+
+  wave::FrontLineage terminal_cap;
+  terminal_cap.stepover = 2.0;
+  terminal_cap.boundary_components = {box(0, 0, 100, 100)};
+  terminal_cap.generations.resize(1);
+  wave::LeadingFront terminal_front;
+  terminal_front.path = {point(0, 40), point(40, 0)};
+  terminal_front.boundary_contacts[0] = {true, 0, point(0, 40)};
+  terminal_front.boundary_contacts[1] = {true, 0, point(40, 0)};
+  terminal_cap.generations[0].fronts = {terminal_front};
+  terminal_cap.generations[0].bands = {
+      wave::Paths64{{point(0, 40), point(40, 0), point(0, 0)}}};
+  const wave::LayerTopology capped =
+      wave::build_layer_topology(terminal_cap);
+  require_near(area(capped.nodes.front().footprint), 800.0, 1e-6,
+               "a terminal cap chooses the local boundary arc, not its complement");
+}
+
+void check_general_traversal_and_contours() {
+  std::cout << "general traversal and contours\n";
+  const std::vector<cam::DerivedContour> contours{
+      {{point(0), point(1)}, false},
+      {{point(10), point(11)}, false},
+  };
+  wave::TraversalSettings settings;
+  settings.allow_stay_down = false;
+  settings.cutting_feed = 10.0;
+  settings.rapid_feed = 100.0;
+  settings.floor_z = -2.0;
+  settings.rapid_clearance_height = 10.0;
+  const auto routed = wave::plan_traversal(
+      cam::contour_traversal_tasks(contours,
+                                   cam::ContourDirectionPolicy::Either),
+      settings);
+  require(routed.order.size() == 2, "both generic traversal tasks are ordered");
+  require(routed.toolpath.stats.cut_count == 2,
+          "each traversal task emits one cut");
+  require(routed.toolpath.stats.retract_count == 2,
+          "disconnected tasks use the safe rapid plane");
+  require_near(routed.estimated_minutes, 0.65, 1e-9,
+               "routing cost includes initial descent and full retract height");
+
+  const auto offset = cam::derive_offset_contours(
+      wave::Paths64{box(0, 0, 10, 10)}, 1.0, nullptr);
+  require(offset.size() == 1 && offset.front().closed,
+          "unclipped offset geometry remains a closed contour");
+  const wave::Paths64 half_stock{box(-2, -2, 5, 12)};
+  const auto clipped = cam::derive_offset_contours(
+      wave::Paths64{box(0, 0, 10, 10)}, 1.0, &half_stock);
+  require(!clipped.empty(), "stock clipping retains the reachable contour section");
+  for (const auto& contour : clipped)
+    require(!contour.closed, "a stock-clipped contour may be open");
+
+  auto approached = cam::contour_traversal_tasks(
+      offset, cam::ContourDirectionPolicy::Either, 4);
+  const std::size_t contour_point_count =
+      approached.empty() || approached.front().variants.empty()
+          ? 0
+          : approached.front().variants.front().path.size();
+  const wave::Paths64 stock{box(-2, -2, 12, 12)};
+  const wave::Paths64 protected_centres{box(0, 0, 10, 10)};
+  cam::add_safe_stock_approaches(approached, stock, protected_centres, 1.0);
+  require(!approached.empty() && !approached.front().variants.empty() &&
+              approached.front().variants.front().path.size() ==
+                  contour_point_count &&
+              approached.front().variants.front().safe_approach.has_value(),
+          "finishing keeps its contour separate from its safe approach");
+
+  wave::TraversalTask first;
+  first.variants.push_back(
+      {{point(0), point(1)}, wave::Path64{point(5, 5), point(0)}});
+  wave::TraversalTask second;
+  second.variants.push_back(
+      {{point(2), point(3)}, wave::Path64{point(5, 5), point(2)}});
+  wave::TraversalSettings cleanup;
+  cleanup.allow_stay_down = true;
+  cleanup.prefer_stay_down_when_legal = true;
+  cleanup.stay_down_region = {box(-2, -2, 4, 2)};
+  cleanup.initial_position = point(-1);
+  cleanup.cutting_feed = 1000.0;
+  cleanup.rapid_feed = 2000.0;
+  cleanup.floor_z = -1.0;
+  cleanup.rapid_clearance_height = 10.0;
+  const auto direct_cleanup = wave::plan_traversal({first, second}, cleanup);
+  require(direct_cleanup.toolpath.stats.retract_count == 0,
+          "legal cleanup connections stay down instead of using safe approaches");
+  for (const auto& move : direct_cleanup.toolpath.moves)
+    for (const auto& p : move.path)
+      require(p != point(5, 5),
+              "a safe-entry landing is not a mandatory cleanup waypoint");
+
+  wave::TraversalSettings disconnected = cleanup;
+  disconnected.allow_stay_down = false;
+  disconnected.initial_position.reset();
+  const auto safe_entry = wave::plan_traversal({first}, disconnected);
+  require(safe_entry.toolpath.moves.size() == 3 &&
+              safe_entry.toolpath.moves[0].kind == wave::MoveKind::Retract &&
+              safe_entry.toolpath.moves[0].path.front() == point(5, 5) &&
+              safe_entry.toolpath.moves[1].path.front() == point(5, 5) &&
+              safe_entry.toolpath.moves[1].path.back() == point(0),
+          "a disconnected contour still enters through its safe approach");
+}
+
 void check_serialisation() {
   std::cout << "serialisation\n";
   const cam::Tool tool = test_tool();
@@ -205,21 +634,47 @@ void check_serialisation() {
   cam::Job job;
   cam::Operation operation;
   operation.path_pitch = 0.15;
+  operation.mode = cam::OperationMode::ContourFinishing;
+  operation.entry_front_match_tolerance = 0.12;
+  operation.contour_direction = cam::ContourDirectionPolicy::Climb;
   operation.manual_feed_range = true;
   operation.full_engagement_feed = 450.0;
   operation.no_engagement_feed = 1900.0;
+  // Two declined entries, one of them spanning two depths. The grouping is the
+  // point: it is the only record that a declined entry exists at all.
+  operation.muted_entries = {{point(3.5, -2.25), point(3.5, -2.5)},
+                             {point(-9.125, 4.0)}};
   job.operations.push_back(operation);
+  job.rapid_clearance_height = 12.0;
   const cam::Job job_back =
       cam::job_from_json_text(cam::to_json_text(job));
   require(job_back.operations.size() == 1, "job operations survive");
   if (!job_back.operations.empty()) {
     require_near(job_back.operations[0].path_pitch, 0.15, 1e-9,
                  "path pitch survives");
+    require(job_back.operations[0].mode == cam::OperationMode::ContourFinishing,
+            "operation mode survives");
+    require_near(job_back.operations[0].entry_front_match_tolerance, 0.12, 1e-9,
+                 "entry-front tolerance survives");
+    const auto& muted = job_back.operations[0].muted_entries;
+    require(muted.size() == 2 && muted[0].size() == 2 && muted[1].size() == 1,
+            "declined entry fronts survive with their grouping intact");
+    if (muted.size() == 2 && muted[0].size() == 2 && muted[1].size() == 1) {
+      require(muted[0][0] == point(3.5, -2.25) && muted[0][1] == point(3.5, -2.5),
+              "declined anchors survive to the grid unit");
+      require(muted[1][0] == point(-9.125, 4.0),
+              "a negative anchor survives the millimetre round trip");
+    }
+    require(job_back.operations[0].contour_direction ==
+                cam::ContourDirectionPolicy::Climb,
+            "contour direction survives");
     require(job_back.operations[0].manual_feed_range,
             "manual feed selection survives");
     require_near(job_back.operations[0].no_engagement_feed, 1900.0, 1e-9,
                  "manual feed endpoint survives");
   }
+  require_near(job_back.rapid_clearance_height, 12.0, 1e-9,
+               "the single safe rapid height survives");
 
   const cam::Tool sparse = cam::tool_from_json_text(
       R"({"id":"x","name":"X","diameter":8.0,"unheard_of":42})");
@@ -258,6 +713,137 @@ void check_schedule_timing() {
                "machine time uses the final scheduled rates");
   require_near(cam::feed_seconds_to(schedule, 10.0), rapid_seconds, 1e-9,
                "distance converts to time across a rapid");
+
+  const auto vertical = cam::plan_feeds(
+      toolpath, simulation, test_machine(), 500.0, 2000.0, 12000.0,
+      120.0, -2.0, 10.0);
+  const double descent_seconds = 12.0 / 6000.0 * 60.0;
+  const double lift_seconds = 12.0 / 6000.0 * 60.0;
+  require(vertical.motion.size() == 4,
+          "machine motion includes traverse, plunge, cut, and final lift");
+  require_near(cam::feed_schedule_seconds(vertical),
+               rapid_seconds + descent_seconds + cut_seconds + lift_seconds,
+               1e-9, "machine time includes vertical motion");
+  require_near(cam::feed_motion_length(vertical), 44.0, 1e-9,
+               "XYZ travel has a counter independent of planar path distance");
+  require_near(vertical.stats.rapid_distance, 34.0, 1e-9,
+               "travel totals include the traverse, plunge, and final lift");
+  require_near(vertical.stats.rapid_minutes,
+               rapid_seconds / 60.0 + descent_seconds / 60.0 +
+                   lift_seconds / 60.0,
+               1e-9, "travel time uses each vertical phase's commanded rate");
+  require_near(cam::feed_seconds_to(vertical, 10.0),
+               rapid_seconds + descent_seconds, 1e-9,
+               "the cutting start is reached only after the rapid descent");
+
+  const cam::MotionCursor halfway_down = cam::feed_motion_at_seconds(
+      vertical, rapid_seconds + descent_seconds * 0.5);
+  require_near(halfway_down.z, 4.0, 1e-9,
+               "playback interpolates the cutter down to the pass");
+  require_near(halfway_down.path_distance, 10.0, 1e-9,
+               "planar simulation distance pauses during a plunge");
+  require_near(halfway_down.phase_distance, 6.0, 1e-9,
+               "the active vertical phase reports its travelled clearance");
+  require_near(halfway_down.motion_distance, 16.0, 1e-9,
+               "the XYZ counter includes rapid and vertical travel");
+  require(halfway_down.rapid,
+          "a simulation-cleared retract landing returns to depth at rapid");
+  require_near(halfway_down.rate, 6000.0, 1e-9,
+               "the playback cursor exposes the commanded rapid rate");
+
+  const cam::MotionCursor halfway_up = cam::feed_motion_at_seconds(
+      vertical,
+      rapid_seconds + descent_seconds + cut_seconds + lift_seconds * 0.5);
+  require_near(halfway_up.z, 4.0, 1e-9,
+               "playback interpolates the final rapid lift");
+  require_near(halfway_up.path_distance, 20.0, 1e-9,
+               "planar simulation distance pauses during a retract");
+
+  wave::Toolpath between_paths;
+  wave::SimulationResult between_simulation;
+  between_simulation.moves.resize(3);
+  wave::ToolpathMove first_cut;
+  first_cut.kind = wave::MoveKind::Cut;
+  first_cut.path = {point(0.0), point(1.0)};
+  first_cut.length = 1.0;
+  between_paths.moves.push_back(first_cut);
+  wave::MaterialStep first_step;
+  first_step.from = point(0.0);
+  first_step.to = point(1.0);
+  first_step.move_distance_end = 1.0;
+  between_simulation.moves[0].steps.push_back(first_step);
+  wave::ToolpathMove lift_and_cross;
+  lift_and_cross.kind = wave::MoveKind::Retract;
+  lift_and_cross.path = {point(1.0), point(3.0)};
+  lift_and_cross.length = 2.0;
+  between_paths.moves.push_back(lift_and_cross);
+  wave::ToolpathMove second_cut = first_cut;
+  second_cut.path = {point(3.0), point(4.0)};
+  between_paths.moves.push_back(second_cut);
+  wave::MaterialStep second_step = first_step;
+  second_step.from = point(3.0);
+  second_step.to = point(4.0);
+  between_simulation.moves[2].steps.push_back(second_step);
+  const auto transition = cam::plan_feeds(
+      between_paths, between_simulation, test_machine(), 500.0, 2000.0,
+      12000.0, 120.0, -2.0, 10.0);
+  require(transition.motion.size() == 7,
+          "a disconnected transition has plunge, cut, lift, traverse, "
+          "plunge, cut, and final lift phases");
+  if (transition.motion.size() == 7) {
+    require(transition.motion[2].rapid &&
+                transition.motion[2].from_z == -2.0 &&
+                transition.motion[2].to_z == 10.0,
+            "an internal retract first rises vertically");
+    require(transition.motion[3].rapid &&
+                transition.motion[3].from_z == 10.0 &&
+                transition.motion[3].to_z == 10.0,
+            "the disconnected XY move stays on the clearance plane");
+    require(transition.motion[4].rapid &&
+                transition.motion[4].from_z == 10.0 &&
+                transition.motion[4].to_z == -2.0,
+            "a cleared cutter descends rapidly only after reaching the next path");
+  }
+
+  // The next pass down starts wherever its own geometry does, which is not
+  // where the previous one left the cutter. That leg is the plan's to own.
+  const auto arrived = cam::plan_feeds(
+      between_paths, between_simulation, test_machine(), 500.0, 2000.0,
+      12000.0, 120.0, -2.0, 10.0, point(0.0, 5.0));
+  require(arrived.motion.size() == transition.motion.size() + 1,
+          "arriving from a previous pass adds one phase");
+  if (!arrived.motion.empty()) {
+    const cam::MotionPhase& opening = arrived.motion.front();
+    require(opening.arrival && opening.rapid,
+            "the pass opens with the rapid in from the previous one");
+    require(opening.from == point(0.0, 5.0) &&
+                opening.to == transition.motion.front().from,
+            "the arrival runs from where the cutter was left to where the "
+            "pass begins");
+    require(opening.from_z == 10.0 && opening.to_z == 10.0,
+            "the arrival stays on the clearance plane");
+    require_near(opening.path_distance_begin, opening.path_distance_end, 1e-12,
+                 "arriving covers no planar path distance");
+    require_near(cam::feed_schedule_seconds(arrived) -
+                     cam::feed_schedule_seconds(transition),
+                 5.0 / 6000.0 * 60.0, 1e-9,
+                 "the arrival is timed at the machine rapid");
+    require_near(arrived.stats.rapid_distance - transition.stats.rapid_distance,
+                 5.0, 1e-9, "the arrival counts as travel");
+  }
+  require(cam::feed_motion_at_seconds(arrived, 0.0).position == point(0.0, 5.0),
+          "playback starts the pass where the previous one finished");
+
+  const SyntheticCut unresolved = straight_cut({1.0});
+  const auto unresolved_schedule = cam::plan_feeds(
+      unresolved.toolpath, unresolved.simulation, test_machine(), 500.0,
+      2000.0, 12000.0, 120.0, -2.0, 10.0);
+  require(!unresolved_schedule.motion.empty() &&
+              !unresolved_schedule.motion.front().rapid,
+          "a cut without a verified cleared retract still uses a plunge");
+  if (!unresolved_schedule.motion.empty())
+    require_near(unresolved_schedule.motion.front().rate, 120.0, 1e-9,
+                 "an unresolved entry retains the configured plunge feed");
 }
 
 void check_validation() {
@@ -270,6 +856,26 @@ void check_validation() {
   bad.cutting_data.push_back(bad.cutting_data.front());
   require(!cam::validate(bad).empty(), "duplicate tool material data is rejected");
   require(cam::validate(test_machine()).empty(), "the test machine validates");
+}
+
+void check_planning_error_details() {
+  std::cout << "planning error details\n";
+  cam::Job job;
+  cam::Operation broken;
+  broken.name = "Broken roughing";
+  broken.tool_id = "missing-tool";
+  job.operations.push_back(broken);
+
+  const cam::JobPlan plan = cam::plan_job(
+      cam::JobGeometry{}, job, cam::ToolLibrary{}, cam::MachineLibrary{},
+      cam::MaterialLibrary{}, {});
+  require(!plan.ok(), "an operation with an unknown tool must fail planning");
+  require(plan.error.find("No operation could be planned") != std::string::npos,
+          "the job-level planning failure keeps its summary");
+  require(plan.error.find("Broken roughing") != std::string::npos,
+          "the job-level failure names the operation");
+  require(plan.error.find("Unknown tool: missing-tool") != std::string::npos,
+          "the job-level failure includes the concrete cause");
 }
 
 void check_shipped_data(const std::filesystem::path& data) {
@@ -350,8 +956,40 @@ void check_post_output() {
           "the configured spindle speed is posted");
   require(result.text.find("F1250") != std::string::npos,
           "the engagement-derived feed is posted");
+  require(result.text.find("F120") != std::string::npos,
+          "a cut without a cleared landing is posted at plunge feed");
   require(result.text.find("M30") != std::string::npos,
           "the program terminates");
+
+  wave::Toolpath safe_path;
+  wave::ToolpathMove landing;
+  landing.kind = wave::MoveKind::Retract;
+  landing.path = {point(0.0), point(0.0)};
+  safe_path.moves.push_back(landing);
+  wave::ToolpathMove safe_cut;
+  safe_cut.kind = wave::MoveKind::Cut;
+  safe_cut.path = {point(0.0), point(1.0)};
+  safe_cut.length = 1.0;
+  safe_path.moves.push_back(safe_cut);
+  wave::SimulationResult safe_simulation;
+  safe_simulation.moves.resize(2);
+  wave::MaterialStep safe_step;
+  safe_step.from = point(0.0);
+  safe_step.to = point(1.0);
+  safe_step.move_distance_end = 1.0;
+  safe_step.load = 1.0;
+  safe_simulation.moves[1].steps.push_back(safe_step);
+  level.toolpath = safe_path;
+  level.simulation = safe_simulation;
+  level.feeds = cam::plan_feeds(
+      safe_path, safe_simulation, machine, 500.0, 2000.0, 12000.0,
+      120.0, level.floor_z, job.rapid_clearance_height);
+  plan.operations.front().levels.front() = level;
+  const cam::PostResult rapid_entry =
+      cam::post_job(plan, job, tools, machines);
+  require(rapid_entry.ok(), "the safe-entry post succeeds: " + rapid_entry.error);
+  require(rapid_entry.text.find("F120") == std::string::npos,
+          "a simulation-cleared retract landing returns to depth with G0");
 }
 
 }  // namespace
@@ -362,11 +1000,17 @@ int main(int argc, char** argv) {
     check_feed_compatible_merge();
     check_path_resampling();
     check_level_floors();
+    check_boundary_rail_slack();
+    check_entry_front_selection();
+    check_inter_layer_topology();
+    check_general_traversal_and_contours();
     check_serialisation();
     check_schedule_timing();
     check_validation();
+    check_planning_error_details();
     check_post_output();
     if (argc > 1) check_shipped_data(argv[1]);
+    if (argc > 2) check_box_stock(argv[2]);
   } catch (const std::exception& error) {
     std::cerr << "Test threw: " << error.what() << '\n';
     return EXIT_FAILURE;

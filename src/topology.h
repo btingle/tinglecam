@@ -2,10 +2,31 @@
 
 #include "geometry.h"
 
+#include <array>
 #include <cstddef>
+#include <limits>
 #include <vector>
 
 namespace wave {
+
+constexpr std::size_t kNoTopologyId = std::numeric_limits<std::size_t>::max();
+
+struct BoundaryContact {
+  bool valid = false;
+  // Connected ring of the final propagation-domain or protected-subject
+  // boundary. This is deliberately not an input-object identifier.
+  std::size_t component = kNoTopologyId;
+  Point64 point = Point64(0, 0);
+  // Millimetres from the component's first vertex, following its stored
+  // winding, and the distance from the front endpoint to the classified point.
+  double arclength = 0.0;
+  double error = 0.0;
+};
+
+struct FrontId2D {
+  std::size_t generation = 0;
+  std::size_t index = 0;
+};
 
 struct LeadingFront {
   Path64 path;
@@ -16,6 +37,9 @@ struct LeadingFront {
   std::size_t band = 0;
   std::vector<std::size_t> parents;
   std::vector<std::size_t> children;
+  // Start and end contacts for an open front. Closed fronts have no endpoint
+  // contacts. An invalid contact is retained and diagnosed rather than guessed.
+  std::array<BoundaryContact, 2> boundary_contacts;
 };
 
 struct FrontGeneration {
@@ -44,12 +68,86 @@ struct LineageEvent {
 struct FrontLineage {
   std::vector<FrontGeneration> generations;
   std::vector<LineageEvent> events;
+  // Stable connected boundary rings used by BoundaryContact::component.
+  Paths64 boundary_components;
+  // Connected propagation-source curves from generation zero. These retain
+  // source identity even when the protected subject occludes the stock wall in
+  // several places.
+  std::vector<LeadingFront> entry_fronts;
+  double stepover = 0.0;
+};
+
+struct FrontNode {
+  std::size_t evaluation_order = 0;
+  std::vector<FrontId2D> fronts;
+  // One validated closed component. Stable open runs are bounded by their
+  // first/last fronts and endpoint rails. Runs whose fronts attach to or detach
+  // from a static boundary use their connected swept-band boundary instead.
+  Paths64 footprint;
+};
+
+struct LayerTopology {
+  std::vector<FrontNode> nodes;
+  // Same shape as FrontLineage::generations; maps every front to one node.
+  std::vector<std::vector<std::size_t>> front_nodes;
+  // Indices into FrontLineage::entry_fronts.
+  std::vector<std::size_t> entry_fronts;
+};
+
+struct LayerItemId {
+  std::size_t layer = 0;
+  std::size_t index = 0;
+};
+
+struct InterLayerChain {
+  std::vector<LayerItemId> members;
+};
+
+struct InterLayerTopology {
+  std::vector<LayerTopology> layers;
+  std::vector<InterLayerChain> node_chains;
+  std::vector<InterLayerChain> entry_front_chains;
+  // Per-layer mappings into the chain arrays. Unmatched items use
+  // kNoTopologyId.
+  std::vector<std::vector<std::size_t>> node_chain_ids;
+  std::vector<std::vector<std::size_t>> entry_front_chain_ids;
+  // Proposed section-first order: the first encountered member of an
+  // unambiguous node chain is followed down through its remaining Z members,
+  // then ordinary per-layer evaluation resumes.
+  std::vector<LayerItemId> node_schedule;
 };
 
 // Extracts the reached/unreached interface from each vector wave band, then
 // associates consecutive front components using the same stepover offset as
 // the wave propagation.
 FrontLineage build_front_lineage(const WaveResult& wave);
+
+// Collapses maximal 1-child -> 1-parent runs. A split front therefore remains
+// upstream, a merge front remains downstream, and a many-to-many front is a
+// singleton. Conflicting known endpoint-boundary components on a collapsed
+// edge, or any footprint that does not close as one connected component, are
+// internal topology errors. Validated attach/detach transitions are retained.
+LayerTopology build_layer_topology(const FrontLineage& lineage);
+
+// Builds exact node-area chains and tolerant entry-front chains between
+// adjacent Z layers. Area containment has deliberately no geometric tolerance.
+// Entry fronts use a strong whole-curve containment test inside the configured
+// envelope, and both association types accept only reciprocal unique matches.
+InterLayerTopology build_inter_layer_topology(
+    const std::vector<const FrontLineage*>& layers,
+    double entry_front_match_tolerance);
+
+// Shorter walk between two classified positions on one closed boundary ring.
+// Throws when the contacts do not name the same valid component.
+Path64 boundary_arc(const FrontLineage& lineage,
+                    const BoundaryContact& from,
+                    const BoundaryContact& to);
+
+// The material one entry front is answerable for: the union of the wave bands
+// of every front reachable from it down the lineage. A front the wave reaches
+// from two entries belongs to both territories, because that is what sharing a
+// source actually looks like -- these are not a partition of the stock.
+Paths64 entry_front_territory(const FrontLineage& lineage, std::size_t entry);
 
 Point64 representative_point(const LeadingFront& front);
 double front_length(const LeadingFront& front);

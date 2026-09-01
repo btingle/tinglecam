@@ -50,6 +50,22 @@ void merge_compatible_segments(std::vector<FeedSegment>& segments) {
   segments = std::move(merged);
 }
 
+double phase_seconds(const MotionPhase& phase) {
+  return phase.length / (std::max(phase.rate, 1.0) / 60.0);
+}
+
+wave::Point64 interpolate(const wave::Point64& from,
+                          const wave::Point64& to, double t) {
+  return {
+      static_cast<std::int64_t>(std::llround(
+          static_cast<double>(from.x) +
+          static_cast<double>(to.x - from.x) * t)),
+      static_cast<std::int64_t>(std::llround(
+          static_cast<double>(from.y) +
+          static_cast<double>(to.y - from.y) * t)),
+  };
+}
+
 }  // namespace
 
 const char* feed_limit_name(FeedLimit value) {
@@ -69,7 +85,10 @@ FeedSchedule plan_feeds(const wave::Toolpath& toolpath,
                         double full_engagement_feed,
                         double no_engagement_feed,
                         double spindle_rpm,
-                        double plunge_feed) {
+                        double plunge_feed,
+                        double floor_z,
+                        double rapid_plane,
+                        std::optional<wave::Point64> arrive_from) {
   FeedSchedule schedule;
   if (toolpath.moves.empty()) return schedule;
 
@@ -89,6 +108,11 @@ FeedSchedule plan_feeds(const wave::Toolpath& toolpath,
 
     if (move.kind == wave::MoveKind::Retract ||
         move.kind == wave::MoveKind::Entry) {
+      bool emitted = false;
+      const bool safe_retract =
+          move.kind == wave::MoveKind::Retract &&
+          index < simulation.moves.size() &&
+          !(simulation.moves[index].plunge_collision_area > 0.0);
       for (std::size_t i = 1; i < move.path.size(); ++i) {
         FeedSegment segment;
         segment.from = move.path[i - 1];
@@ -96,13 +120,34 @@ FeedSchedule plan_feeds(const wave::Toolpath& toolpath,
         segment.move_index = index;
         segment.kind = move.kind;
         segment.rapid = move.kind == wave::MoveKind::Retract;
+        segment.safe_retract = safe_retract;
         segment.limit = segment.rapid ? FeedLimit::Rapid : FeedLimit::Plunge;
         segment.length = distance_mm(segment.from, segment.to);
         segment.start_distance = move_start[index] + along;
         segment.feed = segment.rapid ? 0.0 : plunge;
         segment.rate = segment.rapid ? rapid : plunge;
         along += segment.length;
-        if (segment.length > 0.0) schedule.segments.push_back(segment);
+        if (segment.length > 0.0) {
+          schedule.segments.push_back(segment);
+          emitted = true;
+        }
+      }
+      // Keep a marker for an opening retract whose XY endpoints coincide.
+      // Although it has no planar length, it is the proof that the following
+      // descent lands in cleared air and is therefore eligible for G0.
+      if (!emitted && move.kind == wave::MoveKind::Retract &&
+          !move.path.empty()) {
+        FeedSegment marker;
+        marker.from = move.path.front();
+        marker.to = move.path.back();
+        marker.move_index = index;
+        marker.kind = wave::MoveKind::Retract;
+        marker.rapid = true;
+        marker.safe_retract = safe_retract;
+        marker.limit = FeedLimit::Rapid;
+        marker.start_distance = move_start[index];
+        marker.rate = rapid;
+        schedule.segments.push_back(marker);
       }
       continue;
     }
@@ -123,6 +168,132 @@ FeedSchedule plan_feeds(const wave::Toolpath& toolpath,
       segment.rate = segment.feed;
       segment.limit = FeedLimit::Engagement;
       schedule.segments.push_back(segment);
+    }
+  }
+
+  // Preserve the unmerged segments while constructing the commanded machine
+  // timeline.  The post lifts before every retract traversal, plunges before
+  // the next at-depth move, and lifts once more at the end of the pass.
+  const std::vector<FeedSegment> unmerged_segments = schedule.segments;
+  auto append_motion = [&](const wave::Point64& from,
+                           const wave::Point64& to, double from_z,
+                           double to_z, double path_begin, double path_end,
+                           double rate, wave::MoveKind kind, bool is_rapid) {
+    MotionPhase phase;
+    phase.from = from;
+    phase.to = to;
+    phase.from_z = from_z;
+    phase.to_z = to_z;
+    phase.path_distance_begin = path_begin;
+    phase.path_distance_end = path_end;
+    phase.length = std::hypot(distance_mm(from, to), to_z - from_z);
+    phase.rate = rate;
+    phase.kind = kind;
+    phase.rapid = is_rapid;
+    if (phase.length > 0.0) schedule.motion.push_back(phase);
+  };
+
+  bool at_depth = false;
+  bool rapid_descent = false;
+  wave::Point64 position{};
+  bool have_position = false;
+  std::size_t segment_index = 0;
+  for (std::size_t index = 0; index < toolpath.moves.size(); ++index) {
+    const wave::ToolpathMove& move = toolpath.moves[index];
+    const double path_begin = move_start[index];
+    if (move.kind == wave::MoveKind::Retract) {
+      if (move.path.empty()) continue;
+      while (segment_index < unmerged_segments.size() &&
+             unmerged_segments[segment_index].move_index < index)
+        ++segment_index;
+      const std::size_t first_segment = segment_index;
+      while (segment_index < unmerged_segments.size() &&
+             unmerged_segments[segment_index].move_index == index)
+        ++segment_index;
+      const wave::Point64 from = move.path.front();
+      if (at_depth) {
+        append_motion(from, from, floor_z, rapid_plane, path_begin,
+                      path_begin, rapid, wave::MoveKind::Retract, true);
+      }
+      for (std::size_t i = first_segment; i < segment_index; ++i) {
+        const FeedSegment& segment = unmerged_segments[i];
+        append_motion(segment.from, segment.to, rapid_plane, rapid_plane,
+                      segment.start_distance,
+                      segment.start_distance + segment.length, rapid,
+                      wave::MoveKind::Retract, true);
+      }
+      rapid_descent = first_segment < segment_index &&
+                      unmerged_segments[first_segment].safe_retract;
+      position = move.path.back();
+      have_position = true;
+      at_depth = false;
+      continue;
+    }
+
+    while (segment_index < unmerged_segments.size() &&
+           unmerged_segments[segment_index].move_index < index)
+      ++segment_index;
+    const std::size_t first_segment = segment_index;
+    while (segment_index < unmerged_segments.size() &&
+           unmerged_segments[segment_index].move_index == index)
+      ++segment_index;
+    if (first_segment == segment_index) continue;
+
+    const FeedSegment& first = unmerged_segments[first_segment];
+    if (!at_depth) {
+      const bool use_rapid = rapid_descent && move.kind != wave::MoveKind::Entry;
+      append_motion(first.from, first.from, rapid_plane, floor_z,
+                    first.start_distance, first.start_distance,
+                    use_rapid ? rapid : plunge,
+                    use_rapid ? wave::MoveKind::Retract
+                              : wave::MoveKind::Entry,
+                    use_rapid);
+      at_depth = true;
+      rapid_descent = false;
+    }
+    for (std::size_t i = first_segment; i < segment_index; ++i) {
+      const FeedSegment& segment = unmerged_segments[i];
+      append_motion(segment.from, segment.to, floor_z, floor_z,
+                    segment.start_distance,
+                    segment.start_distance + segment.length, segment.rate,
+                    segment.kind, segment.rapid);
+      position = segment.to;
+      have_position = true;
+    }
+  }
+  if (at_depth && have_position) {
+    const double path_end = wave::toolpath_length(toolpath);
+    append_motion(position, position, floor_z, rapid_plane, path_end,
+                  path_end, rapid, wave::MoveKind::Retract, true);
+  }
+
+  // Whatever ran before this pass left the cutter standing at the rapid plane,
+  // and the descent above starts from wherever this pass happens to begin. The
+  // rapid between the two is a real commanded move, so the schedule carries it
+  // rather than leaving the tool to appear at the new pass out of nowhere. It
+  // covers no path distance, exactly as the descent that follows it does.
+  if (arrive_from && !schedule.motion.empty()) {
+    const MotionPhase& opening = schedule.motion.front();
+    MotionPhase traverse;
+    traverse.from = *arrive_from;
+    traverse.to = opening.from;
+    traverse.from_z = rapid_plane;
+    traverse.to_z = rapid_plane;
+    traverse.path_distance_begin = opening.path_distance_begin;
+    traverse.path_distance_end = opening.path_distance_begin;
+    traverse.length = distance_mm(traverse.from, traverse.to);
+    traverse.rate = rapid;
+    traverse.kind = wave::MoveKind::Retract;
+    traverse.rapid = true;
+    traverse.arrival = true;
+    if (traverse.length > 0.0) {
+      schedule.motion.insert(schedule.motion.begin(), traverse);
+      // The travel totals below count safe-plane traverses through the
+      // segments that produced them and vertical moves through the phases.
+      // This one has no segment and is not vertical, so it is added here
+      // rather than by loosening either of those and double counting.
+      schedule.stats.rapid_distance += traverse.length;
+      schedule.stats.rapid_minutes += traverse.length / traverse.rate;
     }
   }
 
@@ -147,19 +318,56 @@ FeedSchedule plan_feeds(const wave::Toolpath& toolpath,
     schedule.stats.maximum_engagement =
         std::max(schedule.stats.maximum_engagement, segment.engagement);
   }
+  // Vertical positioning is non-cutting travel even when the descent uses the
+  // tool's plunge feed.  Keep it in the travel totals so the job estimate and
+  // the commanded-motion playback account for the same moves.
+  for (const MotionPhase& phase : schedule.motion) {
+    if (phase.from_z == phase.to_z) continue;
+    schedule.stats.rapid_distance += phase.length;
+    schedule.stats.rapid_minutes += phase.length / std::max(phase.rate, 1.0);
+  }
   return schedule;
 }
 
 double feed_schedule_seconds(const FeedSchedule& schedule) {
   double total = 0.0;
+  if (!schedule.motion.empty()) {
+    for (const MotionPhase& phase : schedule.motion)
+      total += phase_seconds(phase);
+    return total;
+  }
   for (const FeedSegment& segment : schedule.segments)
     total += segment.length / (std::max(segment.rate, 1.0) / 60.0);
+  return total;
+}
+
+double feed_motion_length(const FeedSchedule& schedule) {
+  double total = 0.0;
+  for (const MotionPhase& phase : schedule.motion) total += phase.length;
+  if (!schedule.motion.empty()) return total;
+  for (const FeedSegment& segment : schedule.segments) total += segment.length;
   return total;
 }
 
 double feed_seconds_to(const FeedSchedule& schedule, double distance) {
   if (!(distance > 0.0)) return 0.0;
   double total = 0.0;
+  if (!schedule.motion.empty()) {
+    for (const MotionPhase& phase : schedule.motion) {
+      if (phase.path_distance_begin == phase.path_distance_end) {
+        if (phase.path_distance_end <= distance) total += phase_seconds(phase);
+        continue;
+      }
+      if (phase.path_distance_begin >= distance) break;
+      const double fraction = std::clamp(
+          (distance - phase.path_distance_begin) /
+              (phase.path_distance_end - phase.path_distance_begin),
+          0.0, 1.0);
+      total += phase_seconds(phase) * fraction;
+      if (fraction < 1.0) break;
+    }
+    return total;
+  }
   for (const FeedSegment& segment : schedule.segments) {
     if (segment.start_distance >= distance) break;
     const double covered =
@@ -169,9 +377,80 @@ double feed_seconds_to(const FeedSchedule& schedule, double distance) {
   return total;
 }
 
+MotionCursor feed_motion_at_seconds(const FeedSchedule& schedule,
+                                    double seconds) {
+  MotionCursor cursor;
+  if (schedule.motion.empty()) return cursor;
+  if (!(seconds > 0.0)) {
+    const MotionPhase& phase = schedule.motion.front();
+    cursor.position = phase.from;
+    cursor.z = phase.from_z;
+    cursor.path_distance = phase.path_distance_begin;
+    cursor.kind = phase.kind;
+    cursor.rapid = phase.rapid;
+    cursor.rate = phase.rate;
+    cursor.phase_length = phase.length;
+    cursor.from_z = phase.from_z;
+    cursor.to_z = phase.to_z;
+    return cursor;
+  }
+
+  double elapsed = 0.0;
+  double travelled = 0.0;
+  for (const MotionPhase& phase : schedule.motion) {
+    const double duration = phase_seconds(phase);
+    if (seconds <= elapsed + duration) {
+      const double t = duration > 0.0
+                           ? std::clamp((seconds - elapsed) / duration, 0.0,
+                                        1.0)
+                           : 1.0;
+      cursor.position = interpolate(phase.from, phase.to, t);
+      cursor.z = phase.from_z + (phase.to_z - phase.from_z) * t;
+      cursor.path_distance =
+          phase.path_distance_begin +
+          (phase.path_distance_end - phase.path_distance_begin) * t;
+      cursor.kind = phase.kind;
+      cursor.rapid = phase.rapid;
+      cursor.rate = phase.rate;
+      cursor.phase_distance = phase.length * t;
+      cursor.phase_length = phase.length;
+      cursor.motion_distance = travelled + cursor.phase_distance;
+      cursor.from_z = phase.from_z;
+      cursor.to_z = phase.to_z;
+      return cursor;
+    }
+    elapsed += duration;
+    travelled += phase.length;
+  }
+
+  const MotionPhase& phase = schedule.motion.back();
+  cursor.position = phase.to;
+  cursor.z = phase.to_z;
+  cursor.path_distance = phase.path_distance_end;
+  cursor.kind = phase.kind;
+  cursor.rapid = phase.rapid;
+  cursor.rate = phase.rate;
+  cursor.phase_distance = phase.length;
+  cursor.phase_length = phase.length;
+  cursor.motion_distance = travelled;
+  cursor.from_z = phase.from_z;
+  cursor.to_z = phase.to_z;
+  return cursor;
+}
+
+double feed_distance_at_seconds(const FeedSchedule& schedule, double seconds) {
+  if (!schedule.motion.empty())
+    return feed_motion_at_seconds(schedule, seconds).path_distance;
+  return feed_distance_after(schedule, 0.0, seconds);
+}
+
 double feed_distance_after(const FeedSchedule& schedule, double distance,
                            double seconds) {
   if (schedule.segments.empty() || !(seconds > 0.0)) return distance;
+  if (!schedule.motion.empty()) {
+    return feed_distance_at_seconds(
+        schedule, feed_seconds_to(schedule, distance) + seconds);
+  }
   auto current = std::upper_bound(
       schedule.segments.begin(), schedule.segments.end(), distance,
       [](double value, const FeedSegment& segment) {

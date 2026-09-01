@@ -3,7 +3,7 @@
   "name": "GRBL gantry router",
   "specifications_unverified": true,
   "controller": "grbl",
-  "rapid_feed": 1500.0,
+  "rapid_feed": 3000.0,
   "min_rpm": 10000.0,
   "max_rpm": 30000.0,
   "rpm_resolution": 1000.0,

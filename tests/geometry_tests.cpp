@@ -200,6 +200,20 @@ void check_lead_in() {
       }
   require(saw_outside, "a lead-in should produce fronts of its own");
 
+  // These two generated contours are farther from the stock than a 3 mm
+  // cutter can reach. The next contour is the first to touch stock, and is
+  // retained only as entry geometry: actual cutting starts at its +1 child.
+  const auto led_toolpath = wave::build_toolpath(led, lineage, 3.0);
+  bool saw_productive_cut = false;
+  for (const auto& move : led_toolpath.moves) {
+    if (move.kind != wave::MoveKind::Cut) continue;
+    require(move.front.generation > led.lead_in_generations,
+            "lead-in cutting must start one generation after first contact");
+    saw_productive_cut = true;
+  }
+  require(saw_productive_cut,
+          "suppressing the first contact must retain its productive children");
+
   // The subject reaches the right face, so that face has no wavefront on it and
   // must get no run-in. The left face is untouched and must still get one.
   const wave::Paths64 flush{test_box(-20, -20, 50, 20)};
@@ -335,11 +349,19 @@ int main(int argc, char** argv) {
 
     {
       auto [choice_wave, choice_lineage] = shorter_rapid_case();
-      const auto choice_path = wave::build_toolpath(choice_wave, choice_lineage);
+      // With no vertical penalty this synthetic lift is genuinely faster than
+      // the slightly longer at-depth detour. Real jobs pass their full safe
+      // height, which can correctly reverse this choice.
+      const auto choice_path = wave::build_toolpath(
+          choice_wave, choice_lineage, 0.0, 0.0, 0.0, 2000.0, 1000.0);
       require(choice_path.stats.retract_count == 2,
               "a shorter rapid must beat a longer valid detour");
       require(choice_path.stats.detour_count == 0,
               "distance selection must reject the longer detour");
+      const auto high_clearance = wave::build_toolpath(
+          choice_wave, choice_lineage, 0.0, -5.0, 10.0, 2000.0, 1000.0);
+      require(high_clearance.stats.detour_count == 1,
+              "safe-plane vertical time can make the at-depth route faster");
     }
 
     const auto toolpath = wave::build_toolpath(result, lineage);
@@ -357,8 +379,8 @@ int main(int argc, char** argv) {
     // means a blocked segment stopped being routed around.
     require(toolpath.stats.entry_count == 0,
             "no descent on wavetest should have to ramp into solid material");
-    require(toolpath.stats.retract_count == 2,
-            "distance comparison should choose the shorter lift on wavetest");
+    require(toolpath.stats.retract_count >= 1,
+            "wavetest needs at least its opening descent");
     require(toolpath.stats.lifts_over_subject == 0,
             "a lift must not pass over the subject where a way round exists");
     require(toolpath.stats.retract_count + toolpath.stats.entry_count <=

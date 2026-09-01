@@ -335,18 +335,39 @@ struct Node {
   std::size_t generation = 0;
   std::size_t index = 0;
   std::size_t pending_parents = 0;
-  bool cut = false;
+  bool processed = false;
 };
+
+bool cutter_sweep_intersects_stock(const LeadingFront& front,
+                                   const Paths64& stock,
+                                   double tool_radius) {
+  if (front.path.size() < 2 || stock.empty() || !(tool_radius > 0.0))
+    return false;
+  const Paths64 sweep = InflatePaths(
+      Paths64{front.path},
+      static_cast<double>(std::max<std::int64_t>(1, to_integer(tool_radius))),
+      JoinType::Round, front.closed ? EndType::Joined : EndType::Round);
+  if (sweep.empty()) return false;
+  // A tangent has no intersection polygon and therefore remains an air pass;
+  // any positive-area overlap is real engagement, however small.
+  return !Intersect(sweep, stock, FillRule::NonZero).empty();
+}
 
 
 }  // namespace
 
 Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage,
-                        double tool_radius) {
+                        double tool_radius, double floor_z,
+                        double rapid_clearance_height, double rapid_feed,
+                        double traversal_feed) {
   Toolpath toolpath;
   if (lineage.generations.empty()) return toolpath;
   if (lineage.generations.size() != wave.generations.size())
     throw std::invalid_argument("Lineage and wave generations do not match");
+  if (!(rapid_feed > 0.0) || !(traversal_feed > 0.0) ||
+      !std::isfinite(floor_z) || !std::isfinite(rapid_clearance_height))
+    throw std::invalid_argument("Toolpath routing feeds and heights are invalid");
+  const LayerTopology layer_topology = build_layer_topology(lineage);
 
   // Link tests are run against offset output on the integer grid, so they need
   // the same order of slack the lineage uses when matching fronts.
@@ -373,6 +394,8 @@ Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage,
                                                 : wave.stepover * 0.5)),
                static_cast<double>(to_integer(wave.stepover)) * 0.5) +
       tolerance;
+  const double effective_tool_radius =
+      tool_radius > 0.0 ? tool_radius : wave.stepover * 0.5;
 
   std::vector<std::size_t> generation_offset(lineage.generations.size() + 1, 0);
   std::vector<Node> nodes;
@@ -420,14 +443,47 @@ Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage,
   const Paths64 stock_area =
       wave.stock.empty() ? Paths64{wave.stock_boundary} : wave.stock;
 
-  // Where the tool may be at all. A lift is routed through this rather than
-  // straight over the subject: the slice does not say how far the part rises
-  // above it, so flying over it cannot be assumed safe. Everything outside the
-  // stock is air, and travelling round the outside is often shorter than
-  // crossing the part.
-  const Paths64 free_space =
-      Difference(Paths64{world_box}, wave.subject, FillRule::NonZero);
-  const Paths64 free_forbidden = forbidden_region(free_space, world, tolerance);
+  // Lead-in propagation may contain one or more fronts wholly in the air. The
+  // first front on each branch whose cutter merely begins to overlap stock is
+  // also just entry geometry: start machining at its child (+1) instead of
+  // spending a whole contour on the incidental first contact. All of these
+  // fronts remain in the dependency graph so the child still inherits the
+  // correct entry order.
+  std::vector<bool> touches_stock(nodes.size(), false);
+  std::vector<bool> stock_reached(nodes.size(), false);
+  std::vector<bool> emits_cut(nodes.size(), false);
+  std::vector<std::vector<bool>> band_emits_cut(lineage.generations.size());
+  for (std::size_t generation = 0; generation < lineage.generations.size();
+       ++generation) {
+    band_emits_cut[generation].assign(
+        lineage.generations[generation].bands.size(), false);
+    for (std::size_t index = 0;
+         index < lineage.generations[generation].fronts.size(); ++index) {
+      const std::size_t node = generation_offset[generation] + index;
+      const LeadingFront& front =
+          lineage.generations[generation].fronts[index];
+      touches_stock[node] = cutter_sweep_intersects_stock(
+          front, stock_area, effective_tool_radius);
+
+      bool parent_reached_stock = false;
+      if (generation > 0) {
+        for (const std::size_t parent : front.parents) {
+          const std::size_t parent_node =
+              generation_offset[generation - 1] + parent;
+          if (parent_node < stock_reached.size() && stock_reached[parent_node]) {
+            parent_reached_stock = true;
+            break;
+          }
+        }
+      }
+      stock_reached[node] = touches_stock[node] || parent_reached_stock;
+      emits_cut[node] =
+          touches_stock[node] &&
+          (wave.lead_in_generations == 0 || parent_reached_stock);
+      if (emits_cut[node] && front.band < band_emits_cut[generation].size())
+        band_emits_cut[generation][front.band] = true;
+    }
+  }
 
   // The stock stands in air, so the space beside it is already empty: the tool
   // can be lowered there without cutting, and can travel there at depth. This
@@ -450,24 +506,15 @@ Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage,
   Paths64 cleared_forbidden = forbidden_region(cleared, world, tolerance);
   Point64 position;
   bool has_position = false;
+  std::optional<FrontId> previous_front;
 
-  struct LiftPlan {
-    Path64 path;
-    bool crosses_subject = false;
-  };
+  struct LiftPlan { Path64 path; };
 
-  // The XY path a lift takes to get from `origin` to `target`. Planning a
-  // candidate has no statistics side effects because it may lose the distance
-  // comparison to an at-depth detour.
+  // A disconnected move is deliberately simple: straight up to the single
+  // safe plane, direct XY there, then down. A 2D slice is not used to invent a
+  // controller trajectory or a lower obstacle-skimming rapid.
   const auto plan_lift = [&](const Point64& origin, const Point64& target) {
-    if (segment_avoids(origin, target, free_forbidden, tolerance))
-      return LiftPlan{Path64{origin, target}, false};
-    if (const auto route = route_around(origin, target, free_space, free_forbidden,
-                                        world, tolerance))
-      return LiftPlan{*route, false};
-    // The free space around the part is in two pieces here, so there is no way
-    // across that stays off it.
-    return LiftPlan{Path64{origin, target}, true};
+    return LiftPlan{Path64{origin, target}};
   };
 
   while (!ready.empty()) {
@@ -491,9 +538,9 @@ Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage,
     ready.erase(ready.begin() + static_cast<std::ptrdiff_t>(choice));
     Node& node = nodes[node_index];
     const auto& front = lineage.generations[node.generation].fronts[node.index];
-    node.cut = true;
+    node.processed = true;
 
-    if (front.path.size() >= 2) {
+    if (emits_cut[node_index]) {
       Path64 cut;
       if (front.closed) {
         // One winding for every loop, so the cutter stays on the same side of
@@ -504,9 +551,48 @@ Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage,
         cut = close_ring_from(ring, has_position ? nearest_vertex(ring, position) : 0);
       } else {
         cut = front.path;
-        if (has_position &&
-            distance_world(cut.back(), position) < distance_world(cut.front(), position))
-          std::reverse(cut.begin(), cut.end());
+        bool reverse_cut =
+            has_position && distance_world(cut.back(), position) <
+                                distance_world(cut.front(), position);
+        // Inside one topology node, choose the target end by the shared
+        // boundary walk rather than by its straight-line proximity. This is
+        // the common C-shaped transition the endpoint provenance was retained
+        // to resolve.
+        if (previous_front && previous_front->generation <
+                                  layer_topology.front_nodes.size() &&
+            node.generation < layer_topology.front_nodes.size()) {
+          const std::size_t previous_node =
+              layer_topology.front_nodes[previous_front->generation]
+                                        [previous_front->index];
+          const std::size_t target_node =
+              layer_topology.front_nodes[node.generation][node.index];
+          const LeadingFront& previous =
+              lineage.generations[previous_front->generation]
+                  .fronts[previous_front->index];
+          if (previous_node == target_node && !previous.closed &&
+              !previous.path.empty()) {
+            const std::size_t previous_side =
+                distance_world(position, previous.path.front()) <=
+                        distance_world(position, previous.path.back())
+                    ? 0
+                    : 1;
+            double best_boundary = std::numeric_limits<double>::infinity();
+            for (std::size_t target_side = 0; target_side < 2; ++target_side) {
+              const BoundaryContact& from =
+                  previous.boundary_contacts[previous_side];
+              const BoundaryContact& to = front.boundary_contacts[target_side];
+              if (!from.valid || !to.valid || from.component != to.component)
+                continue;
+              const double length =
+                  path_length_world(boundary_arc(lineage, from, to));
+              if (length < best_boundary) {
+                best_boundary = length;
+                reverse_cut = target_side == 1;
+              }
+            }
+          }
+        }
+        if (reverse_cut) std::reverse(cut.begin(), cut.end());
       }
 
       const Point64 entry = cut.front();
@@ -546,9 +632,53 @@ Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage,
               {engaged ? MoveKind::Step : MoveKind::Link, std::move(path), {}, length});
         };
 
+        std::optional<Path64> preferred_boundary;
+        if (previous_front && !front.closed) {
+          const std::size_t previous_node =
+              layer_topology.front_nodes[previous_front->generation]
+                                        [previous_front->index];
+          const std::size_t target_node =
+              layer_topology.front_nodes[node.generation][node.index];
+          const LeadingFront& previous =
+              lineage.generations[previous_front->generation]
+                  .fronts[previous_front->index];
+          if (previous_node == target_node && !previous.closed) {
+            const std::size_t previous_side =
+                distance_world(position, previous.path.front()) <=
+                        distance_world(position, previous.path.back())
+                    ? 0
+                    : 1;
+            const std::size_t target_side =
+                distance_world(entry, front.path.front()) <=
+                        distance_world(entry, front.path.back())
+                    ? 0
+                    : 1;
+            const BoundaryContact& from =
+                previous.boundary_contacts[previous_side];
+            const BoundaryContact& to = front.boundary_contacts[target_side];
+            if (from.valid && to.valid) {
+              if (from.component != to.component)
+                throw std::runtime_error(
+                    "Wavefront topology error: adjacent fronts in one node "
+                    "name different boundary components");
+              Path64 path = boundary_arc(lineage, from, to);
+              if (path.front() != position) path.insert(path.begin(), position);
+              if (path.back() != entry) path.push_back(entry);
+              preferred_boundary = std::move(path);
+            }
+          }
+        }
+
         // Free travel first: a move that never leaves cleared material costs
         // nothing in engagement, so it is always preferable to an engaged step.
-        if (segment_avoids(position, entry, cleared_forbidden, tolerance)) {
+        if (preferred_boundary) {
+          if (!stays_clear(*preferred_boundary, travel_forbidden, tolerance))
+            throw std::runtime_error(
+                "Wavefront topology error: shared-boundary transition leaves "
+                "the legal propagation band");
+          emit(*preferred_boundary,
+               !stays_clear(*preferred_boundary, cleared_forbidden, tolerance));
+        } else if (segment_avoids(position, entry, cleared_forbidden, tolerance)) {
           emit(Path64{position, entry}, false);
         } else if (segment_avoids(position, entry, travel_forbidden, tolerance)) {
           emit(Path64{position, entry}, true);
@@ -562,12 +692,13 @@ Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage,
           const double detour_distance =
               detour ? path_length_world(*detour)
                      : std::numeric_limits<double>::infinity();
+          const double detour_minutes = detour_distance / traversal_feed;
 
           std::optional<Point64> plunge =
               find_plunge_point(cleared, entry, plunge_clearance);
           Path64 approach;
           std::optional<LiftPlan> lift;
-          double lift_distance = std::numeric_limits<double>::infinity();
+          double lift_minutes = std::numeric_limits<double>::infinity();
           if (plunge) {
             approach = Path64{*plunge, entry};
             if (!stays_clear(approach, travel_forbidden, tolerance)) {
@@ -575,12 +706,15 @@ Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage,
               approach.clear();
             } else {
               lift = plan_lift(position, *plunge);
-              lift_distance = path_length_world(lift->path) +
-                              path_length_world(approach);
+              const double vertical =
+                  2.0 * std::abs(rapid_clearance_height - floor_z);
+              lift_minutes =
+                  (path_length_world(lift->path) + vertical) / rapid_feed +
+                  path_length_world(approach) / traversal_feed;
             }
           }
 
-          if (detour && detour_distance < lift_distance) {
+          if (detour && detour_minutes < lift_minutes) {
             emit(*detour, !stays_clear(*detour, cleared_forbidden, tolerance));
             ++toolpath.stats.detour_count;
           } else if (plunge && lift) {
@@ -591,7 +725,6 @@ Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage,
                 {MoveKind::Retract, std::move(lift->path), {}, rapid_length});
             ++toolpath.stats.retract_count;
             toolpath.stats.retract_length += rapid_length;
-            if (lift->crosses_subject) ++toolpath.stats.lifts_over_subject;
             if (*plunge != entry) {
               const bool engaged =
                   !stays_clear(approach, cleared_forbidden, tolerance);
@@ -608,7 +741,6 @@ Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage,
             toolpath.moves.push_back({MoveKind::Entry, rapid.path, {}, length});
             ++toolpath.stats.entry_count;
             toolpath.stats.entry_length += length;
-            if (rapid.crosses_subject) ++toolpath.stats.lifts_over_subject;
           }
         }
       }
@@ -620,12 +752,21 @@ Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage,
                                 {node.generation, node.index}, cut_length});
       ++toolpath.stats.cut_count;
       toolpath.stats.cut_length += cut_length;
+      previous_front = FrontId{node.generation, node.index};
     }
 
     auto& pending = band_pending[node.generation];
     if (front.band < pending.size() && --pending[front.band] == 0) {
-      cleared = Union(cleared, lineage.generations[node.generation].bands[front.band],
-                      FillRule::NonZero);
+      const Paths64& band =
+          lineage.generations[node.generation].bands[front.band];
+      // A band represented only by skipped lead-in/first-contact fronts is not
+      // credited as machined stock. Retain its truly exterior portion for
+      // entry routing; the +1 child supplies the band that actually cuts in.
+      const Paths64 cleared_band =
+          band_emits_cut[node.generation][front.band]
+              ? band
+              : Difference(band, stock_area, FillRule::NonZero);
+      cleared = Union(cleared, cleared_band, FillRule::NonZero);
       cleared_forbidden = forbidden_region(cleared, world, tolerance);
     }
 
@@ -640,7 +781,7 @@ Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage,
   }
 
   for (const auto& node : nodes)
-    if (!node.cut) ++toolpath.stats.unreachable_fronts;
+    if (!node.processed) ++toolpath.stats.unreachable_fronts;
   return toolpath;
 }
 

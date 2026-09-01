@@ -13,6 +13,20 @@ namespace {
 
 using nlohmann::json;
 
+std::optional<OperationMode> operation_mode_from_name(const std::string& name) {
+  if (name == "roughing") return OperationMode::Roughing;
+  if (name == "contour_finishing") return OperationMode::ContourFinishing;
+  return std::nullopt;
+}
+
+std::optional<ContourDirectionPolicy> contour_direction_from_name(
+    const std::string& name) {
+  if (name == "either") return ContourDirectionPolicy::Either;
+  if (name == "climb") return ContourDirectionPolicy::Climb;
+  if (name == "conventional") return ContourDirectionPolicy::Conventional;
+  return std::nullopt;
+}
+
 template <typename T>
 void read(const json& node, const char* key, T& target) {
   if (!node.contains(key) || node.at(key).is_null()) return;
@@ -163,8 +177,43 @@ Material material_from(const json& node) {
   return material;
 }
 
+// Anchors go out in millimetres, not in the integer grid: a job file outlives
+// any one build's scale constant.
+json to_json(const std::vector<std::vector<wave::Point64>>& muted) {
+  json out = json::array();
+  for (const std::vector<wave::Point64>& entry : muted) {
+    json points = json::array();
+    for (const wave::Point64& anchor : entry)
+      points.push_back(json{{"x", wave::to_world(anchor.x)},
+                            {"y", wave::to_world(anchor.y)}});
+    out.push_back(std::move(points));
+  }
+  return out;
+}
+
+void read_muted(const json& node, const char* key,
+                std::vector<std::vector<wave::Point64>>& muted) {
+  const auto found = node.find(key);
+  if (found == node.end() || !found->is_array()) return;
+  muted.clear();
+  for (const json& entry : *found) {
+    if (!entry.is_array()) continue;
+    std::vector<wave::Point64> points;
+    for (const json& anchor : entry) {
+      if (!anchor.is_object()) continue;
+      double x = 0.0;
+      double y = 0.0;
+      read(anchor, "x", x);
+      read(anchor, "y", y);
+      points.push_back({wave::to_integer(x), wave::to_integer(y)});
+    }
+    if (!points.empty()) muted.push_back(std::move(points));
+  }
+}
+
 json to_json(const Operation& operation) {
   return json{{"name", operation.name},
+              {"mode", operation_mode_name(operation.mode)},
               {"tool", operation.tool_id},
               {"machine", operation.machine_id},
               {"material", operation.material_id},
@@ -177,17 +226,25 @@ json to_json(const Operation& operation) {
               {"lead_in", operation.lead_in},
               {"stock_deviation", operation.stock_deviation},
               {"path_pitch", operation.path_pitch},
+              {"entry_front_match_tolerance",
+               operation.entry_front_match_tolerance},
+              {"clip_contours_to_stock", operation.clip_contours_to_stock},
+              {"contour_direction",
+               contour_direction_name(operation.contour_direction)},
+              {"rough_boundary_cleanup", operation.rough_boundary_cleanup},
               {"manual_feed_range", operation.manual_feed_range},
               {"full_engagement_feed", operation.full_engagement_feed},
               {"no_engagement_feed", operation.no_engagement_feed},
               {"slice_grid", operation.slice_grid},
               {"simulation_stock_inflation",
-               operation.simulation_stock_inflation}};
+               operation.simulation_stock_inflation},
+              {"muted_entries", to_json(operation.muted_entries)}};
 }
 
 Operation operation_from(const json& node) {
   Operation operation;
   read(node, "name", operation.name);
+  read_enum(node, "mode", operation.mode, operation_mode_from_name);
   read(node, "tool", operation.tool_id);
   read(node, "machine", operation.machine_id);
   read(node, "material", operation.material_id);
@@ -200,12 +257,19 @@ Operation operation_from(const json& node) {
   read(node, "lead_in", operation.lead_in);
   read(node, "stock_deviation", operation.stock_deviation);
   read(node, "path_pitch", operation.path_pitch);
+  read(node, "entry_front_match_tolerance",
+       operation.entry_front_match_tolerance);
+  read(node, "clip_contours_to_stock", operation.clip_contours_to_stock);
+  read_enum(node, "contour_direction", operation.contour_direction,
+            contour_direction_from_name);
+  read(node, "rough_boundary_cleanup", operation.rough_boundary_cleanup);
   read(node, "manual_feed_range", operation.manual_feed_range);
   read(node, "full_engagement_feed", operation.full_engagement_feed);
   read(node, "no_engagement_feed", operation.no_engagement_feed);
   read(node, "slice_grid", operation.slice_grid);
   read(node, "simulation_stock_inflation",
        operation.simulation_stock_inflation);
+  read_muted(node, "muted_entries", operation.muted_entries);
   return operation;
 }
 
@@ -214,13 +278,14 @@ json to_json(const Job& job) {
   for (const auto& operation : job.operations)
     operations.push_back(to_json(operation));
   return json{{"name", job.name},
+              {"box_stock", job.box_stock},
+              {"box_stock_margin", job.box_stock_margin},
               {"part_mesh", job.part_mesh.string()},
               {"stock_mesh", job.stock_mesh.string()},
               {"origin_x", job.origin_x},
               {"origin_y", job.origin_y},
               {"origin_z", job.origin_z},
-              {"clearance_z", job.clearance_z},
-              {"retract_z", job.retract_z},
+              {"rapid_clearance_height", job.rapid_clearance_height},
               {"work_offset", job.work_offset},
               {"operations", operations}};
 }
@@ -237,8 +302,9 @@ Job job_from(const json& node) {
   read(node, "origin_x", job.origin_x);
   read(node, "origin_y", job.origin_y);
   read(node, "origin_z", job.origin_z);
-  read(node, "clearance_z", job.clearance_z);
-  read(node, "retract_z", job.retract_z);
+  read(node, "box_stock", job.box_stock);
+  read(node, "box_stock_margin", job.box_stock_margin);
+  read(node, "rapid_clearance_height", job.rapid_clearance_height);
   read(node, "work_offset", job.work_offset);
   if (node.contains("operations") && node.at("operations").is_array())
     for (const auto& entry : node.at("operations"))

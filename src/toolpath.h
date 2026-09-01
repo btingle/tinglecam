@@ -66,27 +66,34 @@ struct Toolpath {
   ToolpathStats stats;
 };
 
-// Sequences every leading front into a single ordered tool motion. Fronts are
-// cut in an order that respects lineage precedence, so a front is never entered
-// before the parents that opened the way to it. Consecutive cuts are joined by
+// Sequences every stock-touching leading front into a single ordered tool
+// motion. Air-only lead-in fronts remain in the dependency graph to open their
+// children, but are not emitted as cuts. With lead-in enabled, the first front
+// on each branch that touches stock is also entry geometry; machining begins
+// at its child (+1). Productive fronts are cut in an order that respects
+// lineage precedence, so a front is never entered before the parents that
+// opened the way to it. Consecutive cuts are joined by
 // a straight link when the link stays inside the material cleared so far, and
 // by a retract otherwise. A link that only crosses the band its target front
 // bounds is reported as a step: engaged, but no deeper than one stepover.
 //
 // When the straight segment is blocked, both a detour through the travelable
-// region and a retract/rapid/approach are planned. Their complete represented
-// XY distances are compared and the shorter move is emitted. A lift sets down
-// in cleared material; only where no cleared landing exists is an entry
-// emitted, and that one has to be ramped. The rapid itself is kept out of the
-// subject as well, since a single slice says nothing about how far the part
-// rises above it.
+// region and a retract/rapid/approach are planned. Their estimated machine time
+// is compared, including the complete trip to the Z0-relative safe plane. A
+// lift sets down in cleared material; only where no cleared landing exists is
+// an entry emitted, and that one has to be ramped. Safe-plane XY motion is
+// direct: a 2D slice is not used to invent the controller's axis trajectory.
 //
 // `tool_radius` sizes the clearance a descent needs: the tool cuts everything
 // within a radius of its centre, so that is how far inside cleared material a
 // plunge has to land. Zero or negative falls back to half the stepover, which
 // is what the planner assumed before the radius was available to it.
 Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage,
-                        double tool_radius = 0.0);
+                        double tool_radius = 0.0,
+                        double floor_z = 0.0,
+                        double rapid_clearance_height = 10.0,
+                        double rapid_feed = 2000.0,
+                        double traversal_feed = 1000.0);
 
 // Resamples every uninterrupted at-depth cutting path at a uniform travelled
 // distance. Original micro-vertices are not retained; motion-type changes are

@@ -84,6 +84,7 @@ add_library(wave_geometry
   src/mesh_slicer.cpp
   src/simulation.cpp
   src/topology.cpp
+  src/traversal.cpp
   src/toolpath.cpp
 )
 if(WAVE_HAVE_CUDA)
@@ -119,6 +120,7 @@ target_link_libraries(imgui_sdl_opengl PUBLIC SDL2::SDL2 OpenGL::GL)
 # TingleCAM: the CAM application over the same engine. The demo above stays as
 # a way of looking at a wavefront generation by generation when a plan is wrong.
 add_library(tinglecam_core
+  src/cam/contours.cpp
   src/cam/config.cpp
   src/cam/feeds.cpp
   src/cam/job.cpp
@@ -173,7 +175,8 @@ add_test(NAME simulation_tests
 
 add_executable(cam_tests tests/cam_tests.cpp)
 target_link_libraries(cam_tests PRIVATE tinglecam_core)
-add_test(NAME cam_tests COMMAND cam_tests ${CMAKE_CURRENT_SOURCE_DIR}/data)
+add_test(NAME cam_tests COMMAND cam_tests ${CMAKE_CURRENT_SOURCE_DIR}/data
+         ${CMAKE_CURRENT_SOURCE_DIR}/objs/final_obj/L.obj)
 
 add_test(NAME tinglecam_help COMMAND tinglecam --help)
 

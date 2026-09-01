@@ -57,40 +57,45 @@ class Planner {
     return stage_;
   }
 
+  // Which stage the plan being taken came out of, so the caller can tell a
+  // wavefront pass waiting on an entry-front choice from a finished job.
+  cam::PlanStage produced() const { return produced_; }
+
   void start(cam::JobGeometry& geometry, cam::Job job, cam::ToolLibrary tools,
-             cam::MachineLibrary machines, cam::MaterialLibrary materials) {
-    cancel_and_join();
-    cancelled_.store(false);
-    running_.store(true);
-    fraction_.store(0.0);
-    finished_.store(false);
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      stage_ = "Starting";
-    }
+             cam::MachineLibrary machines, cam::MaterialLibrary materials,
+             cam::PlanStage upto = cam::PlanStage::Toolpaths) {
+    begin(upto);
     worker_ = std::thread([this, &geometry, job = std::move(job),
                            tools = std::move(tools), machines = std::move(machines),
-                           materials = std::move(materials)]() mutable {
+                           materials = std::move(materials), upto]() mutable {
       cam::JobPlan result;
       try {
-        result = cam::plan_job(
-            geometry, job, tools, machines, materials,
-            [this](double fraction, const std::string& stage) {
-              fraction_.store(fraction);
-              std::lock_guard<std::mutex> lock(mutex_);
-              stage_ = stage;
-              return !cancelled_.load();
-            });
+        result = cam::plan_job(geometry, job, tools, machines, materials,
+                               report(), upto);
       } catch (const std::exception& error) {
         result = {};
         result.error = error.what();
       }
-      {
-        std::lock_guard<std::mutex> lock(mutex_);
-        plan_ = std::move(result);
+      publish(std::move(result));
+    });
+  }
+
+  // Carries an already-taken wavefront plan the rest of the way. The plan is
+  // moved in and comes back out of `take` complete.
+  void start_toolpaths(cam::JobPlan plan, cam::Job job, cam::ToolLibrary tools,
+                       cam::MachineLibrary machines,
+                       cam::MaterialLibrary materials) {
+    begin(cam::PlanStage::Toolpaths);
+    worker_ = std::thread([this, plan = std::move(plan), job = std::move(job),
+                           tools = std::move(tools), machines = std::move(machines),
+                           materials = std::move(materials)]() mutable {
+      try {
+        cam::plan_job_toolpaths(plan, job, tools, machines, materials, report());
+      } catch (const std::exception& error) {
+        plan = {};
+        plan.error = error.what();
       }
-      finished_.store(true);
-      running_.store(false);
+      publish(std::move(plan));
     });
   }
 
@@ -106,6 +111,35 @@ class Planner {
   }
 
  private:
+  void begin(cam::PlanStage upto) {
+    cancel_and_join();
+    cancelled_.store(false);
+    running_.store(true);
+    fraction_.store(0.0);
+    finished_.store(false);
+    produced_ = upto;
+    std::lock_guard<std::mutex> lock(mutex_);
+    stage_ = "Starting";
+  }
+
+  cam::ProgressCallback report() {
+    return [this](double fraction, const std::string& stage) {
+      fraction_.store(fraction);
+      std::lock_guard<std::mutex> lock(mutex_);
+      stage_ = stage;
+      return !cancelled_.load();
+    };
+  }
+
+  void publish(cam::JobPlan result) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      plan_ = std::move(result);
+    }
+    finished_.store(true);
+    running_.store(false);
+  }
+
   void cancel_and_join() {
     cancelled_.store(true);
     if (worker_.joinable()) worker_.join();
@@ -118,6 +152,7 @@ class Planner {
   std::atomic<bool> finished_{false};
   std::atomic<bool> cancelled_{false};
   std::atomic<double> fraction_{0.0};
+  cam::PlanStage produced_ = cam::PlanStage::Toolpaths;
   std::string stage_;
   cam::JobPlan plan_;
 };
@@ -127,7 +162,24 @@ class Planner {
 // ---------------------------------------------------------------------------
 
 enum class Colouring { Feed, Limit, Load, Move };
-enum class ViewMode { Plan, Result };
+// The three stages the workflow runs through. Setup and Entries are choices
+// made before there is a toolpath to look at; Pass and Result are the two views
+// of one that exists.
+enum class ViewMode { Setup, Entries, Plan, Result };
+
+// Which body the plan view draws. The stock encloses the part, so showing both
+// means showing the stock through, not showing it on top.
+enum class ModelShow { Stock, Part, Both };
+
+const char* model_show_name(ModelShow value) {
+  switch (value) {
+    case ModelShow::Stock: return "Stock";
+    case ModelShow::Part: return "Part";
+    case ModelShow::Both: return "Both";
+  }
+  return "Both";
+}
+enum class NodeDebugColouring { None, Node, ZGroup };
 
 struct View {
   ImVec2 pan{0.0f, 0.0f};
@@ -149,6 +201,9 @@ struct Orbit {
 struct Playback {
   bool playing = false;
   double distance = 0.0;
+  // Elapsed commanded-machine time within this pass.  This is distinct from
+  // distance because the latter stands still during retracts and plunges.
+  double motion_seconds = 0.0;
   double speed = 40.0;  // mm of toolpath per second of wall clock
   // Run the cutter at the feeds the plan actually commands rather than at a
   // fixed distance per second. Those feeds came out of what the simulation
@@ -178,18 +233,31 @@ struct App {
   int selected_level = 0;
   int selected_plan_operation = 0;
   Colouring colouring = Colouring::Feed;
-  ViewMode mode = ViewMode::Plan;
+  ViewMode mode = ViewMode::Setup;
+  // Entry fronts the wavefront stage found, and whether the plan in hand still
+  // needs its toolpaths built. Rebuilt whenever a wavefront pass lands.
+  std::vector<cam::EntryOption> entries;
+  bool awaiting_entry_choice = false;
+  // Skip the choice: plan straight through to toolpaths with every entry live.
+  bool auto_select_entries = true;
+  int hovered_entry = -1;
   // Set from the command line so a screenshot can be told which view to take.
   int force_tab = -1;
   bool show_stock = true;
   bool show_part = true;
+  // What the plan view shows. Separate from the pass view's own toggles above:
+  // that view draws outlines and can afford both at once, while a solid needs
+  // to be told which of two nested bodies is the subject.
+  ModelShow models = ModelShow::Both;
   bool show_rapids = true;
   bool show_material = true;
   bool show_toolpath = true;
-  // The stacked view shows the finished part unless it is asked to follow the
-  // cutter, which is the more useful default: most of the time the question is
-  // what comes off the machine, not what it looks like part way through.
-  bool stack_follows_playback = false;
+  NodeDebugColouring node_debug_colouring = NodeDebugColouring::None;
+  bool show_entry_front_chains = false;
+  bool show_boundary_contacts = false;
+  // Follow the cutter by default so the stacked view and playback describe the
+  // same instant. It can still be switched off to inspect the finished stack.
+  bool stack_follows_playback = true;
   // Regions the triangulator refused this frame, so a fill that silently went
   // missing is reported rather than left to be spotted by eye.
   std::size_t fill_failures = 0;
@@ -341,6 +409,22 @@ ImU32 move_colour(wave::MoveKind kind) {
   return IM_COL32(200, 200, 200, 255);
 }
 
+ImU32 chain_colour(std::size_t chain, std::size_t layer,
+                   std::size_t layer_count, int alpha) {
+  const float hue = std::fmod(static_cast<float>(chain) * 0.61803398875f, 1.0f);
+  const float depth = layer_count <= 1
+                          ? 0.0f
+                          : static_cast<float>(layer) /
+                                static_cast<float>(layer_count - 1);
+  float r = 0.0f;
+  float g = 0.0f;
+  float b = 0.0f;
+  ImGui::ColorConvertHSVtoRGB(hue, 0.72f, 1.0f - depth * 0.28f, r, g, b);
+  return IM_COL32(static_cast<int>(r * 255.0f),
+                  static_cast<int>(g * 255.0f),
+                  static_cast<int>(b * 255.0f), alpha);
+}
+
 const cam::LevelPlan* current_level(const App& app) {
   if (!app.has_plan) return nullptr;
   if (app.selected_plan_operation < 0 ||
@@ -354,6 +438,12 @@ const cam::LevelPlan* current_level(const App& app) {
 
 double level_length(const cam::LevelPlan* level) {
   return level ? wave::toolpath_length(level->toolpath) : 0.0;
+}
+
+void sync_playback_time(App& app) {
+  const cam::LevelPlan* level = current_level(app);
+  app.playback.motion_seconds =
+      level ? cam::feed_seconds_to(level->feeds, app.playback.distance) : 0.0;
 }
 
 // The remaining stock for the pass being watched. Recomputed only when the
@@ -404,6 +494,14 @@ std::string clock_text(double seconds) {
   return buffer;
 }
 
+const char* motion_phase_name(const cam::MotionCursor& cursor) {
+  if (cursor.to_z > cursor.from_z) return "Rapid retract";
+  if (cursor.to_z < cursor.from_z)
+    return cursor.rapid ? "Rapid descent" : "Plunge";
+  if (cursor.rapid) return "Rapid traverse";
+  return wave::move_kind_name(cursor.kind);
+}
+
 // Playback runs along one pass and then falls into the next, so the whole job
 // can be watched without driving the slider by hand.
 void advance_playback(App& app, double seconds) {
@@ -425,25 +523,29 @@ void advance_playback(App& app, double seconds) {
     if (app.playback.real_time) {
       left_in_pass = std::max(
           cam::feed_schedule_seconds(level->feeds) -
-              cam::feed_seconds_to(level->feeds, app.playback.distance),
+              app.playback.motion_seconds,
           0.0);
       if (budget < left_in_pass) {
-        app.playback.distance = cam::feed_distance_after(
-            level->feeds, app.playback.distance, budget);
+        app.playback.motion_seconds += budget;
+        app.playback.distance = cam::feed_distance_at_seconds(
+            level->feeds, app.playback.motion_seconds);
         return;
       }
     } else {
       left_in_pass = std::max(total - app.playback.distance, 0.0);
       if (budget < left_in_pass) {
         app.playback.distance += budget;
+        sync_playback_time(app);
         return;
       }
     }
     budget -= left_in_pass;
     app.playback.distance = total;
+    app.playback.motion_seconds = cam::feed_schedule_seconds(level->feeds);
 
     if (!app.playback.follow) {
       app.playback.distance = 0.0;
+      app.playback.motion_seconds = 0.0;
       return;
     }
     const auto& levels = app.plan.operations[app.selected_plan_operation].levels;
@@ -453,6 +555,7 @@ void advance_playback(App& app, double seconds) {
     if (next < static_cast<int>(levels.size())) {
       app.selected_level = next;
       app.playback.distance = 0.0;
+      app.playback.motion_seconds = 0.0;
       refresh_material(app);
       continue;
     }
@@ -464,6 +567,7 @@ void advance_playback(App& app, double seconds) {
       app.selected_plan_operation = operation;
       app.selected_level = 0;
       app.playback.distance = 0.0;
+      app.playback.motion_seconds = 0.0;
       refresh_material(app);
       continue;
     }
@@ -483,6 +587,11 @@ void fit_view(App& app, ImVec2 canvas) {
                    level->part_slice.end());
   for (const auto& segment : level->feeds.segments)
     reference.push_back(Clipper2Lib::Path64{segment.from, segment.to});
+  // The pass opens where the previous one finished, which can be well outside
+  // anything this one touches.
+  for (const auto& phase : level->feeds.motion)
+    if (phase.arrival)
+      reference.push_back(Clipper2Lib::Path64{phase.from, phase.to});
   if (reference.empty()) return;
   const auto bounds = Clipper2Lib::GetBounds(reference);
   const float width = static_cast<float>(wave::to_world(bounds.right - bounds.left));
@@ -545,6 +654,64 @@ void draw_canvas(App& app) {
     if (app.show_part)
       draw_paths(list, level->part_slice, to_screen, IM_COL32(235, 200, 90, 220), 2.0f);
 
+    const auto& operation = app.plan.operations[app.selected_plan_operation];
+    const std::size_t layer_index = static_cast<std::size_t>(app.selected_level);
+    if (layer_index < operation.inter_layer.layers.size()) {
+      const wave::LayerTopology& topology =
+          operation.inter_layer.layers[layer_index];
+      if (app.node_debug_colouring != NodeDebugColouring::None &&
+          layer_index < operation.inter_layer.node_chain_ids.size()) {
+        const auto& ids = operation.inter_layer.node_chain_ids[layer_index];
+        for (std::size_t node = 0; node < topology.nodes.size() && node < ids.size();
+             ++node) {
+          const bool joined = ids[node] != wave::kNoTopologyId;
+          const ImU32 edge = app.node_debug_colouring ==
+                                     NodeDebugColouring::Node
+                                 ? chain_colour(node, 0, 1, 245)
+                                 : (joined
+                                        ? chain_colour(ids[node], layer_index,
+                                                       operation.levels.size(), 245)
+                                        : IM_COL32(145, 150, 165, 150));
+          // Use the same fill path as simulated stock. Pre-blending into an
+          // opaque dark colour avoids alpha accumulating on shared triangle
+          // edges while leaving the toolpath legible above the node area.
+          const ImU32 fill = blend(IM_COL32(16, 19, 25, 255), edge, 0.18f);
+          fill_paths(list, topology.nodes[node].footprint, to_screen, fill,
+                     &app.fill_failures);
+          draw_paths(list, topology.nodes[node].footprint, to_screen, edge, 2.2f);
+        }
+      }
+      if (app.show_entry_front_chains &&
+          layer_index < operation.inter_layer.entry_front_chain_ids.size()) {
+        const auto& ids = operation.inter_layer.entry_front_chain_ids[layer_index];
+        for (std::size_t entry = 0;
+             entry < topology.entry_fronts.size() && entry < ids.size(); ++entry) {
+          const std::size_t id = topology.entry_fronts[entry];
+          if (id >= level->lineage.entry_fronts.size()) continue;
+          const auto& path = level->lineage.entry_fronts[id].path;
+          std::vector<ImVec2> points;
+          points.reserve(path.size());
+          for (const Point64& point : path) points.push_back(to_screen(point));
+          if (points.size() >= 2)
+            list->AddPolyline(points.data(), static_cast<int>(points.size()),
+                              ids[entry] == wave::kNoTopologyId
+                                  ? IM_COL32(145, 150, 165, 150)
+                                  : chain_colour(ids[entry], layer_index,
+                                                 operation.levels.size(), 255),
+                              ImDrawFlags_None, 4.0f);
+        }
+      }
+      if (app.show_boundary_contacts) {
+        for (const auto& generation : level->lineage.generations)
+          for (const auto& front : generation.fronts)
+            if (!front.closed)
+              for (const auto& contact : front.boundary_contacts)
+                if (contact.valid)
+                  list->AddCircleFilled(to_screen(contact.point), 3.5f,
+                                        IM_COL32(255, 110, 210, 245));
+      }
+    }
+
     double lowest = 0.0;
     double highest = 0.0;
     for (const auto& segment : level->feeds.segments) {
@@ -556,6 +723,20 @@ void draw_canvas(App& app) {
 
     // Where the cutter has got to, in the same units the segments carry.
     const double travelled = app.playback.distance;
+
+    // The rapid in from the previous pass. It covers no path distance, so it
+    // cannot be placed by `travelled` like the rest; whether it has happened is
+    // a question about elapsed time.
+    if (app.show_toolpath && app.show_rapids)
+      for (const auto& phase : level->feeds.motion) {
+        if (!phase.arrival) continue;
+        const double duration = phase.length / (std::max(phase.rate, 1.0) / 60.0);
+        const ImU32 colour = app.playback.motion_seconds >= duration
+                                 ? IM_COL32(70, 82, 100, 255)
+                                 : IM_COL32(70, 82, 100, 56);
+        list->AddLine(to_screen(phase.from), to_screen(phase.to), colour, 1.0f);
+      }
+
     double walked = 0.0;
     for (const auto& segment : level->feeds.segments) {
       if (!app.show_toolpath) break;
@@ -604,9 +785,16 @@ void draw_canvas(App& app) {
           app.plan.operations[app.selected_plan_operation].operation_name)
         tool = app.tools.find(operation.tool_id);
     if (tool && app.show_toolpath) {
-      const wave::ToolpathCursor cursor =
-          wave::toolpath_at(level->toolpath, app.playback.distance);
-      const ImVec2 centre = to_screen(cursor.position);
+      const wave::Point64 position = level->feeds.motion.empty()
+                                         ? wave::toolpath_at(
+                                               level->toolpath,
+                                               app.playback.distance)
+                                               .position
+                                         : cam::feed_motion_at_seconds(
+                                               level->feeds,
+                                               app.playback.motion_seconds)
+                                               .position;
+      const ImVec2 centre = to_screen(position);
       const float radius =
           static_cast<float>(tool->diameter * 0.5) * app.view.zoom;
       list->AddCircleFilled(centre, std::max(radius, 2.0f),
@@ -689,6 +877,13 @@ ImU32 shaded(const float base[3], float lambert) {
                   static_cast<int>(base[2] * k * 255.0f + 0.5f), 255);
 }
 
+ImU32 shaded_alpha(const float base[3], float lambert, int alpha) {
+  const float k = 0.42f + 0.58f * std::clamp(lambert, 0.0f, 1.0f);
+  return IM_COL32(static_cast<int>(base[0] * k * 255.0f + 0.5f),
+                  static_cast<int>(base[1] * k * 255.0f + 0.5f),
+                  static_cast<int>(base[2] * k * 255.0f + 0.5f), alpha);
+}
+
 // One pass's remaining stock, as the slab of material it stands for. Every pass
 // is drawn as its own prism and the prisms stack, which is as close to the
 // finished part as a set of two-and-a-half-dimensional passes can describe.
@@ -702,7 +897,8 @@ void append_slab(std::vector<Facet>& facets, std::vector<ImVec2>& pool,
                  const Paths64& remaining, const Paths64& lid_mesh,
                  const Paths64& lid_rings, double bottom, double top,
                  const Projection& projection, const Vec3& light,
-                 const float wall_colour[3], const float face_colour[3], ImU32 edge) {
+                 const float wall_colour[3], const float face_colour[3], ImU32 edge,
+                 int alpha = 255) {
   const auto emit = [&](std::initializer_list<Vec3> corners, float depth_bias,
                         ImU32 fill, ImU32 outline) {
     Facet facet;
@@ -744,13 +940,15 @@ void append_slab(std::vector<Facet>& facets, std::vector<ImVec2>& pool,
       const Vec3 a_bottom{a_top.x, a_top.y, static_cast<float>(bottom)};
       const Vec3 b_bottom{b_top.x, b_top.y, static_cast<float>(bottom)};
       emit({a_top, b_top, b_bottom, a_bottom}, 0.0f,
-           shaded(wall_colour,
-                  normal.x * light.x + normal.y * light.y + normal.z * light.z),
+           shaded_alpha(wall_colour,
+                        normal.x * light.x + normal.y * light.y +
+                            normal.z * light.z,
+                        alpha),
            0);
     }
   }
 
-  const ImU32 face = shaded(face_colour, light.z);
+  const ImU32 face = shaded_alpha(face_colour, light.z, alpha);
   for (const auto& triangle : lid_mesh) {
     if (triangle.size() != 3) continue;
     emit({Vec3{static_cast<float>(wave::to_world(triangle[0].x)),
@@ -787,6 +985,586 @@ void append_slab(std::vector<Facet>& facets, std::vector<ImVec2>& pool,
     outline.edge = edge;
     facets.push_back(outline);
   }
+}
+
+// One entry front, as a vertical ribbon along the curve it actually occupies.
+// A front is a stretch of wall the wave starts from, not a volume: giving it
+// thickness put faces inside the stock for the depth sort to fight over, and
+// said something about the material that is not what a front is.
+//
+// A ribbon has no inside, so both faces are lit and neither is culled. Where a
+// lead-in stands the front off the stock, the ribbon stands off with it, which
+// is where the pass view draws the same curve.
+void append_ribbon(std::vector<Facet>& facets, std::vector<ImVec2>& pool,
+                   const wave::Path64& path, bool closed, double bottom, double top,
+                   const Projection& projection, const Vec3& light,
+                   const float colour[3], int alpha) {
+  if (path.size() < 2) return;
+  const std::size_t segments = closed ? path.size() : path.size() - 1;
+  for (std::size_t i = 0; i < segments; ++i) {
+    const Point64& a = path[i];
+    const Point64& b = path[(i + 1) % path.size()];
+    const float dx = static_cast<float>(wave::to_world(b.x - a.x));
+    const float dy = static_cast<float>(wave::to_world(b.y - a.y));
+    const float length = std::sqrt(dx * dx + dy * dy);
+    if (length < 1e-6f) continue;
+    const float nx = dy / length;
+    const float ny = -dx / length;
+    const float lambert = std::abs(nx * light.x + ny * light.y);
+
+    const Vec3 a_top{static_cast<float>(wave::to_world(a.x)),
+                     static_cast<float>(wave::to_world(a.y)),
+                     static_cast<float>(top)};
+    const Vec3 b_top{static_cast<float>(wave::to_world(b.x)),
+                     static_cast<float>(wave::to_world(b.y)),
+                     static_cast<float>(top)};
+    const Vec3 a_bottom{a_top.x, a_top.y, static_cast<float>(bottom)};
+    const Vec3 b_bottom{b_top.x, b_top.y, static_cast<float>(bottom)};
+
+    Facet facet;
+    facet.first = static_cast<std::uint32_t>(pool.size());
+    facet.count = 4;
+    float depth = 0.0f;
+    for (const Vec3& corner : {a_top, b_top, b_bottom, a_bottom}) {
+      pool.push_back(projection.point(corner));
+      depth += projection.depth(corner);
+    }
+    // Biased towards the eye so a front lying flat on the stock wall, which is
+    // what one with no lead-in does, is drawn over it rather than into it.
+    facet.depth = depth * 0.25f + 0.05f;
+    facet.fill = shaded_alpha(colour, lambert, alpha);
+    facet.edge = 0;
+    facets.push_back(facet);
+  }
+}
+
+// The active cutter in the stacked result. It is intentionally translucent:
+// the point of this view is to see both where the tool is and the stock it is
+// passing through. Side quads, a top cap, and the two silhouette rails make it
+// read as a cylinder under the same orthographic projection as the slabs.
+void append_cutter(std::vector<Facet>& facets, std::vector<ImVec2>& pool,
+                   const Vec3& centre, float radius, float bottom, float top,
+                   const Projection& projection, const Vec3& light) {
+  constexpr std::size_t kSides = 40;
+  constexpr float kPi = 3.14159265358979323846f;
+  const float colour[3] = {0.48f, 0.86f, 1.0f};
+
+  const auto point = [&](std::size_t side, float z) {
+    const float angle = 2.0f * kPi * static_cast<float>(side) /
+                        static_cast<float>(kSides);
+    return Vec3{centre.x + radius * std::cos(angle),
+                centre.y + radius * std::sin(angle), z};
+  };
+  const auto emit = [&](std::initializer_list<Vec3> corners, float depth_bias,
+                        ImU32 fill, ImU32 edge) {
+    Facet facet;
+    facet.first = static_cast<std::uint32_t>(pool.size());
+    facet.count = static_cast<std::uint32_t>(corners.size());
+    float depth = 0.0f;
+    for (const Vec3& corner : corners) {
+      pool.push_back(projection.point(corner));
+      depth += projection.depth(corner);
+    }
+    facet.depth = depth / static_cast<float>(corners.size()) + depth_bias;
+    facet.fill = fill;
+    facet.edge = edge;
+    facets.push_back(facet);
+  };
+
+  for (std::size_t side = 0; side < kSides; ++side) {
+    const std::size_t next = (side + 1) % kSides;
+    const float angle = 2.0f * kPi *
+                        (static_cast<float>(side) + 0.5f) /
+                        static_cast<float>(kSides);
+    const Vec3 normal{std::cos(angle), std::sin(angle), 0.0f};
+    const float facing = normal.x * projection.toward.x +
+                         normal.y * projection.toward.y;
+    const int alpha = facing > 0.0f ? 54 : 18;
+    emit({point(side, top), point(next, top), point(next, bottom),
+          point(side, bottom)},
+         0.0f,
+         shaded_alpha(colour,
+                      normal.x * light.x + normal.y * light.y,
+                      alpha),
+         0);
+
+    // The visible top is a triangle fan. Separate triangles do not overlap, so
+    // their alpha remains uniform while still fitting the convex-facet renderer.
+    emit({Vec3{centre.x, centre.y, top}, point(side, top), point(next, top)},
+         0.003f, shaded_alpha(colour, light.z, 42), 0);
+  }
+
+  const ImU32 outline = IM_COL32(165, 226, 250, 175);
+  for (const float z : {bottom, top}) {
+    Facet ring;
+    ring.first = static_cast<std::uint32_t>(pool.size());
+    ring.count = kSides;
+    float depth = 0.0f;
+    for (std::size_t side = 0; side < kSides; ++side) {
+      const Vec3 at = point(side, z);
+      pool.push_back(projection.point(at));
+      depth += projection.depth(at);
+    }
+    ring.depth = depth / static_cast<float>(kSides) + 0.006f;
+    ring.edge = outline;
+    facets.push_back(ring);
+  }
+
+  const float view_angle =
+      std::atan2(projection.toward.y, projection.toward.x);
+  for (const float angle : {view_angle - kPi * 0.5f,
+                            view_angle + kPi * 0.5f}) {
+    const Vec3 lower{centre.x + radius * std::cos(angle),
+                     centre.y + radius * std::sin(angle), bottom};
+    const Vec3 upper{lower.x, lower.y, top};
+    emit({lower, upper}, 0.007f, 0, outline);
+  }
+}
+
+// The parts of an orbited stack view that say nothing about what is being
+// drawn: the canvas, the mouse, the projection, the light, and the painter's
+// sort. Three views share them and differ only in the slabs they contribute.
+struct OrbitScene {
+  ImVec2 top_left;
+  ImVec2 size;
+  ImDrawList* list = nullptr;
+  bool hovered = false;
+  Projection projection;
+  Vec3 light;
+  double spacing = 0.05;
+  std::vector<Facet> facets;
+  std::vector<ImVec2> pool;
+};
+
+// Opens the child window and reads the orbit controls. Returns false when the
+// view has nothing to show, having already drawn `empty_message` and closed up.
+bool begin_scene(App& app, OrbitScene& scene, const char* id) {
+  ImGui::BeginChild(id, ImVec2(0, 0), ImGuiChildFlags_Borders,
+                    ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+  scene.top_left = ImGui::GetCursorScreenPos();
+  scene.size = ImGui::GetContentRegionAvail();
+  scene.size.x = std::max(scene.size.x, 50.0f);
+  scene.size.y = std::max(scene.size.y, 50.0f);
+  // A view may put a control over its own canvas, so the canvas has to let a
+  // later item take the mouse where the two overlap.
+  ImGui::SetNextItemAllowOverlap();
+  ImGui::InvisibleButton(id, scene.size, ImGuiButtonFlags_MouseButtonLeft);
+  scene.hovered = ImGui::IsItemHovered();
+  scene.list = ImGui::GetWindowDrawList();
+  const ImVec2 bottom_right{scene.top_left.x + scene.size.x,
+                            scene.top_left.y + scene.size.y};
+  scene.list->AddRectFilled(scene.top_left, bottom_right, IM_COL32(14, 17, 22, 255));
+  scene.list->PushClipRect(scene.top_left, bottom_right, true);
+  if (scene.hovered && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+    app.orbit.yaw += ImGui::GetIO().MouseDelta.x * 0.009f;
+    app.orbit.pitch = std::clamp(app.orbit.pitch - ImGui::GetIO().MouseDelta.y * 0.009f,
+                                 0.06f, 1.5f);
+  }
+  if (scene.hovered && ImGui::GetIO().MouseWheel != 0.0f)
+    app.orbit.zoom = std::clamp(app.orbit.zoom * std::pow(1.12f, ImGui::GetIO().MouseWheel),
+                                0.1f, 40.0f);
+  return true;
+}
+
+void scene_message(OrbitScene& scene, const char* message) {
+  const ImVec2 extent = ImGui::CalcTextSize(message);
+  scene.list->AddText({scene.top_left.x + (scene.size.x - extent.x) * 0.5f,
+                       scene.top_left.y + (scene.size.y - extent.y) * 0.5f},
+                      IM_COL32(120, 130, 145, 255), message);
+}
+
+void end_scene(OrbitScene& scene) {
+  scene.list->PopClipRect();
+  ImGui::EndChild();
+}
+
+// A control in the corner of a view, declared after the canvas so it takes the
+// mouse where the two overlap and orbiting does not start under the pointer.
+// Returns true when it was pressed.
+bool scene_button(OrbitScene& scene, const char* label, float from_right) {
+  const ImVec2 saved = ImGui::GetCursorScreenPos();
+  const float width = ImGui::CalcTextSize(label).x +
+                      ImGui::GetStyle().FramePadding.x * 2.0f;
+  ImGui::SetCursorScreenPos({scene.top_left.x + scene.size.x - width - from_right,
+                             scene.top_left.y + 8.0f});
+  const bool pressed = ImGui::Button(label);
+  if (ImGui::IsItemHovered()) scene.hovered = false;
+  // Back inside the canvas rather than to where the canvas left it: that was
+  // one item's spacing past the bottom, and putting the cursor there grows the
+  // parent, which ImGui rightly complains about.
+  (void)saved;
+  ImGui::SetCursorScreenPos(scene.top_left);
+  return pressed;
+}
+
+// Frames the view on a fixed world box. Nothing that moves may contribute to
+// it, or the model swims about under the thing being watched.
+void aim_scene(App& app, OrbitScene& scene, const Clipper2Lib::Rect64& extent,
+               double lowest, double highest) {
+  const double width = wave::to_world(extent.right - extent.left);
+  const double height = wave::to_world(extent.bottom - extent.top);
+  const double span = std::max({width, height, highest - lowest, 1e-3});
+  const Vec3 centre{
+      static_cast<float>(wave::to_world(extent.left + extent.right) * 0.5),
+      static_cast<float>(wave::to_world(extent.top + extent.bottom) * 0.5),
+      static_cast<float>((lowest + highest) * 0.5)};
+  const float cy = std::cos(app.orbit.yaw);
+  const float sy = std::sin(app.orbit.yaw);
+  const float cp = std::cos(app.orbit.pitch);
+  const float sp = std::sin(app.orbit.pitch);
+  scene.projection = Projection{
+      {scene.top_left.x + scene.size.x * 0.5f,
+       scene.top_left.y + scene.size.y * 0.5f},
+      centre,
+      {-sy, cy, 0.0f},
+      {-sp * cy, -sp * sy, cp},
+      {cp * cy, cp * sy, sp},
+      static_cast<float>(std::min(scene.size.x, scene.size.y) * 0.72 / span) *
+          app.orbit.zoom};
+
+  // One vertex every thousandth of the part is plenty at any sane zoom, and it
+  // keeps the number of quads in the hundreds rather than the tens of thousands.
+  scene.spacing = std::max(span / 400.0, 0.05);
+
+  // A single light fixed to the eye, so the model stays lit however it is
+  // orbited. Every surface here is horizontal or vertical, which is exactly the
+  // case a flat colour cannot describe on its own.
+  const Vec3 raw{scene.projection.toward.x * 0.85f + scene.projection.up.x * 0.35f +
+                     scene.projection.right.x * 0.35f,
+                 scene.projection.toward.y * 0.85f + scene.projection.up.y * 0.35f +
+                     scene.projection.right.y * 0.35f,
+                 scene.projection.toward.z * 0.85f + scene.projection.up.z * 0.35f +
+                     scene.projection.right.z * 0.35f};
+  const float raw_length =
+      std::max(1e-6f, std::sqrt(raw.x * raw.x + raw.y * raw.y + raw.z * raw.z));
+  scene.light = Vec3{raw.x / raw_length, raw.y / raw_length, raw.z / raw_length};
+}
+
+// Painter's algorithm, then straight into the draw list.
+void paint_scene(OrbitScene& scene) {
+  std::sort(scene.facets.begin(), scene.facets.end(),
+            [](const Facet& a, const Facet& b) { return a.depth < b.depth; });
+  // A wall is one quad per edge of the ring, and an antialiased fill insets
+  // every one of them by half a pixel, so the wall would come out ruled with
+  // hairlines where the quads meet.
+  const ImDrawListFlags saved_flags = scene.list->Flags;
+  scene.list->Flags &= ~ImDrawListFlags_AntiAliasedFill;
+  for (const Facet& facet : scene.facets) {
+    if (facet.count < 2) continue;
+    const ImVec2* points = scene.pool.data() + facet.first;
+    if (facet.fill != 0) {
+      // Only ever a triangle from the mesh or a quad from a wall, both convex.
+      if (facet.count == 3)
+        scene.list->AddTriangleFilled(points[0], points[1], points[2], facet.fill);
+      else
+        scene.list->AddQuadFilled(points[0], points[1], points[2], points[3],
+                                  facet.fill);
+    }
+    if (facet.edge != 0)
+      scene.list->AddPolyline(points, static_cast<int>(facet.count), facet.edge,
+                              facet.count > 2 ? ImDrawFlags_Closed : ImDrawFlags_None,
+                              1.0f);
+  }
+  scene.list->Flags = saved_flags;
+}
+
+// ---------------------------------------------------------------------------
+// Stage 1: the models, before there is a plan to look at.
+
+// The Z range the operation will actually cut, so the depth range being set can
+// be seen against the models rather than read off two numbers.
+void draw_setup(App& app) {
+  OrbitScene scene;
+  begin_scene(app, scene, "setup");
+  if (!app.geometry.has_part() || !app.geometry.has_stock()) {
+    scene_message(scene, "Load a part and a stock model to inspect them");
+    end_scene(scene);
+    return;
+  }
+  double low = 0.0;
+  double high = 0.0;
+  if (!app.geometry.z_range(low, high)) {
+    scene_message(scene, "The part and the stock do not overlap in Z");
+    end_scene(scene);
+    return;
+  }
+
+  const cam::Operation* operation =
+      app.job.operations.empty() ? nullptr
+                                 : &app.job.operations[std::clamp(
+                                       app.selected_operation, 0,
+                                       static_cast<int>(app.job.operations.size()) - 1)];
+  const int grid = operation ? operation->slice_grid : 32;
+
+  // Sampled at a fixed count rather than at the operation's stepdown: this is a
+  // look at the models, and it should not change shape when the stepdown does.
+  constexpr int kSlices = 24;
+  std::vector<double> depths;
+  for (int i = 0; i <= kSlices; ++i)
+    depths.push_back(high - (high - low) * (static_cast<double>(i) / kSlices));
+
+  Clipper2Lib::Rect64 extent;
+  bool any = false;
+  std::vector<Paths64> stock(depths.size());
+  std::vector<Paths64> part(depths.size());
+  for (std::size_t i = 0; i < depths.size(); ++i) {
+    stock[i] = app.geometry.stock_outline(depths[i], grid);
+    part[i] = app.geometry.part_outline(depths[i], grid);
+    for (const Paths64* rings : {&stock[i], &part[i]}) {
+      if (rings->empty()) continue;
+      const auto bounds = Clipper2Lib::GetBounds(*rings);
+      if (!any) { extent = bounds; any = true; continue; }
+      extent.left = std::min(extent.left, bounds.left);
+      extent.right = std::max(extent.right, bounds.right);
+      extent.top = std::min(extent.top, bounds.top);
+      extent.bottom = std::max(extent.bottom, bounds.bottom);
+    }
+  }
+  if (!any) {
+    scene_message(scene, "Neither model has anything to show at these depths");
+    end_scene(scene);
+    return;
+  }
+  aim_scene(app, scene, extent, low, high);
+
+  // Both bodies whole, and the stock made see-through when both are on. The
+  // earlier attempt drew the stock with a part-shaped hole cut out of it, which
+  // gave every wall of the part an exact coincident twin on the hole's inside
+  // for the depth sort to pick between -- the corduroy on a curved face.
+  const bool draw_stock = app.models != ModelShow::Part;
+  const bool draw_part = app.models != ModelShow::Stock;
+  const int stock_alpha = draw_part ? 96 : 255;
+
+  std::size_t untriangulated = 0;
+  const auto slab = [&](const std::vector<Paths64>& solid, std::size_t i,
+                        const float wall[3], const float face[3], ImU32 edge,
+                        int alpha) {
+    if (solid[i + 1].empty()) return;
+    const Paths64 rings = drawable_region(solid[i + 1], scene.spacing);
+    if (rings.empty()) return;
+    // Only the ring this depth newly exposes gets a lid; the rest is roofed by
+    // the slice above it. Without this every slice draws its own top face and
+    // the walls come out banded like a contour map.
+    const Paths64 above =
+        i == 0 ? Paths64{} : drawable_region(solid[i], scene.spacing);
+    Paths64 lid_rings =
+        above.empty() ? rings
+                      : Clipper2Lib::Difference(rings, above,
+                                                Clipper2Lib::FillRule::NonZero);
+    // A slice and the one above it are decimated independently, so their
+    // difference is littered with hairline slivers that are not steps in the
+    // model at all. Outlining those is what turns a smooth curved face into
+    // corduroy, so anything narrower than a drawn vertex goes.
+    const double least = scene.spacing * scene.spacing;
+    lid_rings.erase(std::remove_if(lid_rings.begin(), lid_rings.end(),
+                                   [&](const wave::Path64& ring) {
+                                     return std::abs(Clipper2Lib::Area(ring)) <
+                                            least * wave::kIntegerScale *
+                                                wave::kIntegerScale;
+                                   }),
+                    lid_rings.end());
+    append_slab(scene.facets, scene.pool, rings,
+                fill_mesh(lid_rings, &untriangulated), lid_rings, depths[i + 1],
+                depths[i], scene.projection, scene.light, wall, face, edge,
+                alpha);
+  };
+
+  for (std::size_t i = 0; i + 1 < depths.size(); ++i) {
+    if (draw_part) {
+      const float wall[3]{0.34f, 0.50f, 0.68f};
+      const float face[3]{0.46f, 0.65f, 0.84f};
+      slab(part, i, wall, face, 0, 255);
+    }
+    // A solid drawn as a stack of prisms puts one front wall per slice along a
+    // near-level sightline. Opaque that costs nothing, since the nearest wall
+    // hides the rest; see-through, all two dozen of them composite and the
+    // ghost comes out banded and nearly solid. So a transparent stock is drawn
+    // once below, as its silhouette, instead of here.
+    if (draw_stock && !draw_part) {
+      const float wall[3]{0.27f, 0.30f, 0.35f};
+      const float face[3]{0.34f, 0.37f, 0.43f};
+      slab(stock, i, wall, face, IM_COL32(150, 165, 185, 60), 255);
+    }
+  }
+
+  if (draw_stock && draw_part) {
+    // One prism over the whole depth range, outlined by everything the blank
+    // covers anywhere. For a blank that does not change shape with depth --
+    // a box, or anything prismatic -- this is the blank exactly.
+    Paths64 silhouette;
+    for (const Paths64& rings : stock)
+      silhouette.insert(silhouette.end(), rings.begin(), rings.end());
+    silhouette = Union(silhouette, Clipper2Lib::FillRule::NonZero);
+    const Paths64 rings = drawable_region(silhouette, scene.spacing);
+    if (!rings.empty()) {
+      const float wall[3]{0.34f, 0.38f, 0.45f};
+      const float face[3]{0.40f, 0.44f, 0.52f};
+      append_slab(scene.facets, scene.pool, rings,
+                  fill_mesh(rings, &untriangulated), rings, low, high,
+                  scene.projection, scene.light, wall, face,
+                  IM_COL32(160, 180, 205, 70), stock_alpha);
+    }
+  }
+  paint_scene(scene);
+
+  // One button cycling the three, rather than two checkboxes that can both be
+  // off and leave the view empty.
+  if (scene_button(scene, model_show_name(app.models), 10.0f))
+    app.models = app.models == ModelShow::Both      ? ModelShow::Stock
+                 : app.models == ModelShow::Stock   ? ModelShow::Part
+                                                    : ModelShow::Both;
+
+  char caption[220];
+  std::snprintf(caption, sizeof caption,
+                "Part and stock, Z %.2f to %.2f mm   Left-drag: orbit   Wheel: zoom",
+                low, high);
+  scene.list->AddText({scene.top_left.x + 12.0f, scene.top_left.y + 10.0f},
+                      IM_COL32(130, 142, 158, 255), caption);
+  if (operation) {
+    std::snprintf(caption, sizeof caption, "This operation cuts Z %.2f to %.2f mm",
+                  operation->bottom_z, operation->top_z);
+    scene.list->AddText({scene.top_left.x + 12.0f, scene.top_left.y + 28.0f},
+                        IM_COL32(120, 165, 210, 255), caption);
+  }
+  end_scene(scene);
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2: which entry fronts the wave may start from.
+
+// Distinct hues per entry, so an option in the list and its territory in the
+// stack are recognisably the same thing.
+void entry_colour(std::size_t index, bool muted, bool highlighted,
+                  float wall[3], float face[3], ImU32& edge) {
+  static const float palette[][3] = {
+      {0.30f, 0.62f, 0.88f}, {0.94f, 0.62f, 0.30f}, {0.42f, 0.80f, 0.52f},
+      {0.86f, 0.44f, 0.70f}, {0.70f, 0.60f, 0.92f}, {0.90f, 0.82f, 0.36f},
+  };
+  const float* base = palette[index % (sizeof palette / sizeof palette[0])];
+  const float lift = highlighted ? 1.22f : 1.0f;
+  for (int i = 0; i < 3; ++i) {
+    // A declined entry keeps its hue but loses its colour, so the stack still
+    // reads as one object rather than going dark in patches.
+    const float grey = 0.34f;
+    face[i] = muted ? grey + (base[i] - grey) * 0.12f
+                    : std::min(base[i] * lift, 1.0f);
+    wall[i] = face[i] * 0.78f;
+  }
+  edge = muted ? IM_COL32(120, 128, 140, 70)
+               : IM_COL32(static_cast<int>(std::min(base[0] * 300.0f, 255.0f)),
+                          static_cast<int>(std::min(base[1] * 300.0f, 255.0f)),
+                          static_cast<int>(std::min(base[2] * 300.0f, 255.0f)),
+                          highlighted ? 220 : 130);
+}
+
+void draw_entries(App& app) {
+  OrbitScene scene;
+  begin_scene(app, scene, "entries");
+  if (!app.has_plan || app.plan.operations.empty()) {
+    scene_message(scene, "Plan the job to see the entry fronts on offer");
+    end_scene(scene);
+    return;
+  }
+  const auto& operation = app.plan.operations[std::clamp(
+      app.selected_plan_operation, 0,
+      static_cast<int>(app.plan.operations.size()) - 1)];
+  const auto& levels = operation.levels;
+  if (app.entries.empty() || levels.empty()) {
+    scene_message(scene, "This operation propagates from no entry front");
+    end_scene(scene);
+    return;
+  }
+
+  Clipper2Lib::Rect64 extent;
+  bool any = false;
+  double lowest = 0.0;
+  double highest = 0.0;
+  for (const auto& level : levels) {
+    if (level.stock_slice.empty()) continue;
+    const auto bounds = Clipper2Lib::GetBounds(level.stock_slice);
+    if (!any) {
+      extent = bounds;
+      lowest = level.floor_z;
+      highest = level.floor_z + level.axial_depth;
+      any = true;
+      continue;
+    }
+    extent.left = std::min(extent.left, bounds.left);
+    extent.right = std::max(extent.right, bounds.right);
+    extent.top = std::min(extent.top, bounds.top);
+    extent.bottom = std::max(extent.bottom, bounds.bottom);
+    lowest = std::min(lowest, level.floor_z);
+    highest = std::max(highest, level.floor_z + level.axial_depth);
+  }
+  if (!any) {
+    scene_message(scene, "Nothing was reached in this operation");
+    end_scene(scene);
+    return;
+  }
+  aim_scene(app, scene, extent, lowest, highest);
+
+  // The stock, as one plain solid. A pass gets a top face only where the pass
+  // above did not already roof it, or the walls come out banded like a contour
+  // map with a lid at every depth.
+  std::size_t untriangulated = 0;
+  for (std::size_t i = 0; i < levels.size(); ++i) {
+    const cam::LevelPlan& level = levels[i];
+    if (level.stock_slice.empty()) continue;
+    const Paths64 rings = drawable_region(level.stock_slice, scene.spacing);
+    if (rings.empty()) continue;
+    const Paths64 above =
+        i == 0 ? Paths64{} : drawable_region(levels[i - 1].stock_slice, scene.spacing);
+    const Paths64 lid_rings =
+        above.empty() ? rings
+                      : Clipper2Lib::Difference(rings, above,
+                                                Clipper2Lib::FillRule::NonZero);
+    const float wall[3]{0.26f, 0.29f, 0.34f};
+    const float face[3]{0.32f, 0.35f, 0.41f};
+    append_slab(scene.facets, scene.pool, rings,
+                fill_mesh(lid_rings, &untriangulated), lid_rings, level.floor_z,
+                level.floor_z + level.axial_depth, scene.projection, scene.light,
+                wall, face, IM_COL32(110, 122, 140, 60));
+  }
+
+  // Each entry front on the surface it actually occupies. A front is a stretch
+  // of wall the wave starts from, so it is a ribbon down the pass it belongs
+  // to, and the ribbons of one entry stack into a wall down its Z chain.
+  for (std::size_t option = 0; option < app.entries.size(); ++option) {
+    const cam::EntryOption& entry = app.entries[option];
+    const bool highlighted = static_cast<int>(option) == app.hovered_entry;
+    float wall[3];
+    float face[3];
+    ImU32 edge = 0;
+    entry_colour(option, entry.muted, highlighted, wall, face, edge);
+    const int alpha = entry.muted ? 120 : (highlighted ? 255 : 225);
+    for (const wave::LayerItemId& member : entry.members) {
+      if (member.layer >= levels.size()) continue;
+      const cam::LevelPlan& level = levels[member.layer];
+      const auto& layer = operation.inter_layer.layers[member.layer];
+      if (member.index >= layer.entry_fronts.size()) continue;
+      const std::size_t front = layer.entry_fronts[member.index];
+      if (front >= level.lineage.entry_fronts.size()) continue;
+      const wave::LeadingFront& curve = level.lineage.entry_fronts[front];
+      append_ribbon(scene.facets, scene.pool, curve.path, curve.closed,
+                    level.floor_z, level.floor_z + level.axial_depth,
+                    scene.projection, scene.light, face, alpha);
+    }
+  }
+  paint_scene(scene);
+
+  char caption[220];
+  std::size_t live = 0;
+  for (const cam::EntryOption& entry : app.entries) live += entry.muted ? 0 : 1;
+  std::snprintf(caption, sizeof caption,
+                "%zu of %zu entry front%s propagating   Left-drag: orbit   Wheel: zoom",
+                live, app.entries.size(), app.entries.size() == 1 ? "" : "s");
+  scene.list->AddText({scene.top_left.x + 12.0f, scene.top_left.y + 10.0f},
+                      IM_COL32(130, 142, 158, 255), caption);
+  if (live == 0)
+    scene.list->AddText({scene.top_left.x + 12.0f, scene.top_left.y + 28.0f},
+                        IM_COL32(232, 156, 92, 255),
+                        "With every entry declined the wave has nowhere to start");
+  end_scene(scene);
 }
 
 void draw_result(App& app) {
@@ -831,7 +1609,29 @@ void draw_result(App& app) {
     return;
   }
 
-  // Bounds over every pass, so orbiting does not change the framing.
+  const int active_level = std::clamp(
+      app.selected_level, 0, static_cast<int>(levels.size()) - 1);
+  const cam::LevelPlan& active = levels[active_level];
+  const cam::Tool* active_tool = app.tools.find(
+      app.plan.operations[app.selected_plan_operation].tool_id);
+  std::optional<cam::MotionCursor> cutter_cursor;
+  if (active_tool != nullptr && !active.toolpath.moves.empty()) {
+    if (!active.feeds.motion.empty()) {
+      cutter_cursor = cam::feed_motion_at_seconds(
+          active.feeds, app.playback.motion_seconds);
+    } else {
+      const wave::ToolpathCursor planar =
+          wave::toolpath_at(active.toolpath, app.playback.distance);
+      cutter_cursor = cam::MotionCursor{planar.position, active.floor_z,
+                                        app.playback.distance, planar.kind,
+                                        planar.kind == wave::MoveKind::Retract};
+    }
+  }
+
+  // Bounds over the whole operation: every pass's stock and every pass's
+  // toolpath, plus room above for the flute. Deliberately nothing that moves.
+  // Framing the live cutter kept the tool centred and swam the model around it
+  // on every frame, which made the stack impossible to read.
   Clipper2Lib::Rect64 extent_2d;
   bool any = false;
   double lowest = 0.0;
@@ -851,6 +1651,29 @@ void draw_result(App& app) {
       extent_2d.bottom = std::max(extent_2d.bottom, bounds.bottom);
       lowest = std::min(lowest, level.floor_z);
       highest = std::max(highest, level.floor_z + level.axial_depth);
+    }
+  }
+  const double material_lowest = lowest;
+  const double material_highest = highest;
+  // Everywhere the cutter is ever commanded to be, with room for its flute,
+  // taken once from the plan rather than from where it happens to stand this
+  // frame. A lead-in and a retract both reach outside the stock, so the stack
+  // alone is not enough to keep the tool in shot.
+  if (any && active_tool != nullptr) {
+    const std::int64_t radius = wave::to_integer(active_tool->diameter * 0.5);
+    for (const auto& level : levels) {
+      for (const cam::MotionPhase& phase : level.feeds.motion) {
+        for (const Point64& point : {phase.from, phase.to}) {
+          extent_2d.left = std::min(extent_2d.left, point.x - radius);
+          extent_2d.right = std::max(extent_2d.right, point.x + radius);
+          extent_2d.top = std::min(extent_2d.top, point.y - radius);
+          extent_2d.bottom = std::max(extent_2d.bottom, point.y + radius);
+        }
+        lowest = std::min({lowest, phase.from_z, phase.to_z});
+        highest = std::max({highest,
+                            std::max(phase.from_z, phase.to_z) +
+                                active_tool->flute_length});
+      }
     }
   }
   if (!any) {
@@ -959,6 +1782,17 @@ void draw_result(App& app) {
                 level.floor_z + level.axial_depth, projection, light, wall_colour,
                 face_colour, edge);
   }
+  if (cutter_cursor && active_tool != nullptr) {
+    append_cutter(
+        facets, pool,
+        Vec3{static_cast<float>(wave::to_world(cutter_cursor->position.x)),
+             static_cast<float>(wave::to_world(cutter_cursor->position.y)),
+             static_cast<float>(cutter_cursor->z)},
+        static_cast<float>(active_tool->diameter * 0.5),
+        static_cast<float>(cutter_cursor->z),
+        static_cast<float>(cutter_cursor->z + active_tool->flute_length),
+        projection, light);
+  }
   std::sort(facets.begin(), facets.end(),
             [](const Facet& a, const Facet& b) { return a.depth < b.depth; });
 
@@ -968,7 +1802,7 @@ void draw_result(App& app) {
   const ImDrawListFlags saved_flags = list->Flags;
   list->Flags &= ~ImDrawListFlags_AntiAliasedFill;
   for (const Facet& facet : facets) {
-    if (facet.count < 3) continue;
+    if (facet.count < 2) continue;
     const ImVec2* points = pool.data() + facet.first;
     if (facet.fill != 0) {
       // Only ever a triangle from the mesh or a quad from a wall, both convex.
@@ -979,14 +1813,15 @@ void draw_result(App& app) {
     }
     if (facet.edge != 0)
       list->AddPolyline(points, static_cast<int>(facet.count), facet.edge,
-                        ImDrawFlags_Closed, 1.0f);
+                        facet.count > 2 ? ImDrawFlags_Closed : ImDrawFlags_None,
+                        1.0f);
   }
   list->Flags = saved_flags;
 
   char caption[200];
   std::snprintf(caption, sizeof caption,
                 "%zu passes stacked, Z %.2f to %.2f mm   Left-drag: orbit   Wheel: zoom",
-                levels.size(), lowest, highest);
+                levels.size(), material_lowest, material_highest);
   list->AddText({top_left.x + 12.0f, top_left.y + 10.0f}, IM_COL32(130, 142, 158, 255),
                 caption);
   if (untriangulated > 0) {
@@ -1144,16 +1979,23 @@ void load_meshes(App& app) {
     if (app.stock_path[0] != '\0') {
       app.geometry.load_stock(app.stock_path.data());
       app.job.stock_mesh = app.stock_path.data();
+    } else {
+      // No model named, so a box around the part is the only blank on offer.
+      // Any model loaded earlier goes, or it would go on standing in for one
+      // the job no longer names.
+      app.geometry.clear_stock();
+      app.job.stock_mesh.clear();
+      app.job.box_stock = true;
     }
+    app.geometry.set_box_stock(app.job.box_stock, app.job.box_stock_margin);
     for (auto& operation : app.job.operations) depth_defaults(app, operation);
     double low = 0.0;
     double high = 0.0;
     if (app.geometry.z_range(low, high)) {
-      // Put the safe planes above the work now that there is work to be above.
-      // Left at their defaults they would sit inside a part whose top is not at
-      // zero, which is most parts.
-      if (app.job.retract_z < high + 0.5) app.job.retract_z = high + 2.0;
-      if (app.job.clearance_z < high + 1.0) app.job.clearance_z = high + 10.0;
+      // Put the single safe rapid plane above the work now that there is work
+      // to be above. It is stored relative to program Z0.
+      if (app.job.rapid_clearance_height < high + 1.0)
+        app.job.rapid_clearance_height = high + 10.0;
       say(app, "Loaded. Z runs " + std::to_string(low) + " to " + std::to_string(high));
     }
     app.has_plan = false;
@@ -1167,6 +2009,20 @@ void job_panel(App& app) {
   text_field("Name", app.job.name);
   ImGui::InputText("Part model", app.part_path.data(), app.part_path.size());
   ImGui::InputText("Stock model", app.stock_path.data(), app.stock_path.size());
+  // A named model always wins, so the fallback is only offered without one.
+  ImGui::BeginDisabled(app.stock_path[0] != '\0');
+  if (ImGui::Checkbox("Box stock around the part", &app.job.box_stock))
+    app.geometry.set_box_stock(app.job.box_stock, app.job.box_stock_margin);
+  ImGui::SetItemTooltip(
+      "Stand a rectangular blank in for a stock model: the part's bounding box "
+      "grown in X and Y. Z stays at the part's own range.");
+  if (app.job.box_stock) {
+    if (ImGui::DragScalar("Box margin (mm)", ImGuiDataType_Double,
+                          &app.job.box_stock_margin, 0.1f))
+      app.geometry.set_box_stock(app.job.box_stock,
+                                 std::max(app.job.box_stock_margin, 0.0));
+  }
+  ImGui::EndDisabled();
   if (ImGui::Button("Load models")) load_meshes(app);
   ImGui::SameLine();
   if (ImGui::Button("Fit view")) app.view.needs_fit = true;
@@ -1174,8 +2030,12 @@ void job_panel(App& app) {
   ImGui::DragScalar("Origin X", ImGuiDataType_Double, &app.job.origin_x, 0.1f);
   ImGui::DragScalar("Origin Y", ImGuiDataType_Double, &app.job.origin_y, 0.1f);
   ImGui::DragScalar("Origin Z", ImGuiDataType_Double, &app.job.origin_z, 0.1f);
-  ImGui::DragScalar("Clearance Z", ImGuiDataType_Double, &app.job.clearance_z, 0.1f);
-  ImGui::DragScalar("Retract Z", ImGuiDataType_Double, &app.job.retract_z, 0.1f);
+  ImGui::DragScalar("Rapid plane Z (above origin)", ImGuiDataType_Double,
+                    &app.job.rapid_clearance_height, 0.1f);
+  ImGui::SetItemTooltip(
+      "The absolute safe-plane height above program Z0, not the distance of "
+      "each retract. A retract travels from its pass depth to this plane. "
+      "Re-plan after changing it.");
   text_field("Work offset", app.job.work_offset, 16);
 }
 
@@ -1216,6 +2076,24 @@ void operations_panel(App& app) {
 
   cam::Operation& operation = app.job.operations[app.selected_operation];
   text_field("Operation name", operation.name);
+  static constexpr cam::OperationMode kModes[]{
+      cam::OperationMode::Roughing,
+      cam::OperationMode::ContourFinishing,
+  };
+  enum_combo("Mode", operation.mode, cam::operation_mode_name, kModes,
+             std::size(kModes));
+  static constexpr cam::ContourDirectionPolicy kDirections[]{
+      cam::ContourDirectionPolicy::Either,
+      cam::ContourDirectionPolicy::Climb,
+      cam::ContourDirectionPolicy::Conventional,
+  };
+  enum_combo("Contour direction", operation.contour_direction,
+             cam::contour_direction_name, kDirections,
+             std::size(kDirections));
+  ImGui::Checkbox("Clip contours to stock", &operation.clip_contours_to_stock);
+  if (operation.mode == cam::OperationMode::Roughing)
+    ImGui::Checkbox("Boundary cleanup contour",
+                    &operation.rough_boundary_cleanup);
 
   const auto pick = [&](const char* label, std::string& id, const auto& entries,
                         auto name_of) {
@@ -1289,6 +2167,11 @@ void operations_panel(App& app) {
   ImGui::SetItemTooltip(
       "The complete at-depth path is resampled at this travelled-distance "
       "interval before simulation and feed assignment.");
+  ImGui::DragScalar("Entry-front Z match (mm)", ImGuiDataType_Double,
+                    &operation.entry_front_match_tolerance, 0.01f);
+  ImGui::SetItemTooltip(
+      "The complete lower-layer entry curve must fit in this envelope around "
+      "the upper curve. Node-area Z matching remains exact.");
 }
 
 void feeds_panel(App& app) {
@@ -1317,6 +2200,165 @@ void feeds_panel(App& app) {
   ImGui::EndDisabled();
 }
 
+// Recomputes the entry options for the plan in hand, and remembers whether the
+// job is still waiting for a choice about them.
+void refresh_entries(App& app) {
+  app.awaiting_entry_choice = false;
+  app.hovered_entry = -1;
+  if (!app.has_plan || app.plan.operations.empty()) {
+    app.entries.clear();
+    return;
+  }
+  const int index = std::clamp(app.selected_plan_operation, 0,
+                               static_cast<int>(app.plan.operations.size()) - 1);
+  const cam::OperationPlan& plan = app.plan.operations[index];
+  const cam::Operation* operation = nullptr;
+  for (const cam::Operation& candidate : app.job.operations)
+    if (candidate.name == plan.operation_name) operation = &candidate;
+  if (!operation || !plan.ok()) {
+    app.entries.clear();
+    return;
+  }
+  // Folded into what was already on offer rather than replacing it: a declined
+  // entry is not seeded, so it is absent from the plan, and a list rebuilt from
+  // the plan alone could never offer it back.
+  cam::merge_entry_options(app.entries, cam::entry_options(plan, *operation),
+                           operation->entry_front_match_tolerance);
+  // A plan started from scratch while entries were already declined has no
+  // record of them but the operation's own. Put those back on offer, without
+  // the numbers the plan cannot supply for a front it never seeded.
+  const double tolerance = std::max(operation->entry_front_match_tolerance, 0.001);
+  for (const std::vector<wave::Point64>& group : operation->muted_entries) {
+    bool known = false;
+    for (const cam::EntryOption& entry : app.entries)
+      for (const wave::Point64& anchor : entry.anchors)
+        for (const wave::Point64& muted : group)
+          if (std::hypot(wave::to_world(anchor.x - muted.x),
+                         wave::to_world(anchor.y - muted.y)) <= tolerance)
+            known = true;
+    if (known || group.empty()) continue;
+    cam::EntryOption declined;
+    declined.anchors = group;
+    declined.muted = true;
+    app.entries.push_back(std::move(declined));
+  }
+  app.awaiting_entry_choice = !plan.has_toolpaths();
+}
+
+void start_plan(App& app) {
+  app.gcode.clear();
+  app.post = {};
+  // A plan started by hand re-offers everything; only a replan from inside the
+  // entry panel keeps the list it is editing.
+  app.entries.clear();
+  app.awaiting_entry_choice = false;
+  app.planner.start(app.geometry, app.job, app.tools, app.machines, app.materials,
+                    app.auto_select_entries ? cam::PlanStage::Toolpaths
+                                            : cam::PlanStage::Wavefronts);
+}
+
+// The operation the entry choice applies to. Only one operation exists for now,
+// so this is the one whose name the selected plan carries.
+cam::Operation* selected_operation(App& app) {
+  if (!app.has_plan || app.plan.operations.empty()) return nullptr;
+  const int index = std::clamp(app.selected_plan_operation, 0,
+                               static_cast<int>(app.plan.operations.size()) - 1);
+  const std::string& name = app.plan.operations[index].operation_name;
+  for (cam::Operation& candidate : app.job.operations)
+    if (candidate.name == name) return &candidate;
+  return nullptr;
+}
+
+// Rebuilds the wavefronts with the current choice, which is the only way to see
+// what declining an entry does: the wave has to run again without it.
+void replan_wavefronts(App& app) {
+  app.planner.start(app.geometry, app.job, app.tools, app.machines, app.materials,
+                    cam::PlanStage::Wavefronts);
+}
+
+void start_toolpaths(App& app) {
+  app.gcode.clear();
+  app.post = {};
+  app.awaiting_entry_choice = false;
+  app.planner.start_toolpaths(std::move(app.plan), app.job, app.tools,
+                              app.machines, app.materials);
+  app.plan = {};
+  app.has_plan = false;
+}
+
+void entry_panel(App& app) {
+  ImGui::SeparatorText("Entry fronts");
+  if (app.entries.empty()) {
+    ImGui::TextDisabled("This operation propagates from no entry front");
+    if (ImGui::Button("Build toolpaths", ImVec2(-1, 0))) start_toolpaths(app);
+    return;
+  }
+  ImGui::TextWrapped(
+      "Each entry is a stretch of stock wall the wave starts from. Its colour "
+      "in the stack is the material it reaches. Declining one makes the "
+      "wavefronts run again without it.");
+
+  cam::Operation* operation = selected_operation(app);
+  bool changed = false;
+  app.hovered_entry = -1;
+  for (std::size_t i = 0; i < app.entries.size(); ++i) {
+    cam::EntryOption& entry = app.entries[i];
+    float wall[3];
+    float face[3];
+    ImU32 edge = 0;
+    entry_colour(i, entry.muted, false, wall, face, edge);
+    ImGui::PushID(static_cast<int>(i));
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
+    ImGui::Dummy(ImVec2(14.0f, ImGui::GetTextLineHeight()));
+    ImGui::GetWindowDrawList()->AddRectFilled(
+        {origin.x, origin.y + 3.0f}, {origin.x + 10.0f, origin.y + 13.0f},
+        IM_COL32(static_cast<int>(face[0] * 255), static_cast<int>(face[1] * 255),
+                 static_cast<int>(face[2] * 255), 255),
+        2.0f);
+    ImGui::SameLine();
+    bool live = !entry.muted;
+    char label[96];
+    if (entry.members.empty())
+      // Declined before this plan ran, so the wave never seeded it and there is
+      // no territory to quote. Turning it back on is what measures it again.
+      std::snprintf(label, sizeof label, "declined##%zu", i);
+    else
+      std::snprintf(label, sizeof label, "%.0f mm2 over %zu pass%s",
+                    entry.territory_area, entry.members.size(),
+                    entry.members.size() == 1 ? "" : "es");
+    if (ImGui::Checkbox(label, &live)) {
+      entry.muted = !live;
+      changed = true;
+    }
+    if (ImGui::IsItemHovered()) {
+      app.hovered_entry = static_cast<int>(i);
+      if (entry.members.empty())
+        ImGui::SetTooltip("Turn this back on to see what it reaches");
+      else
+        ImGui::SetTooltip("Z %.2f to %.2f mm", entry.bottom_z, entry.top_z);
+    }
+    ImGui::PopID();
+  }
+
+  if (changed && operation) {
+    operation->muted_entries.clear();
+    for (const cam::EntryOption& entry : app.entries)
+      if (entry.muted) operation->muted_entries.push_back(entry.anchors);
+    replan_wavefronts(app);
+    return;
+  }
+
+  std::size_t live = 0;
+  for (const cam::EntryOption& entry : app.entries) live += entry.muted ? 0 : 1;
+  ImGui::Separator();
+  ImGui::BeginDisabled(live == 0);
+  if (ImGui::Button("Build toolpaths", ImVec2(-1, 0))) start_toolpaths(app);
+  ImGui::EndDisabled();
+  if (live == 0)
+    ImGui::TextColored(ImVec4(0.91f, 0.61f, 0.36f, 1.0f),
+                       "Leave at least one entry propagating");
+}
+
 void plan_panel(App& app) {
   ImGui::SeparatorText("Plan");
   if (app.planner.running()) {
@@ -1328,15 +2370,21 @@ void plan_panel(App& app) {
 
   const bool ready = app.geometry.has_part() && app.geometry.has_stock();
   ImGui::BeginDisabled(!ready);
-  if (ImGui::Button("Plan job", ImVec2(-1, 0))) {
-    app.gcode.clear();
-    app.post = {};
-    app.planner.start(app.geometry, app.job, app.tools, app.machines, app.materials);
-  }
+  if (ImGui::Button("Plan job", ImVec2(-1, 0))) start_plan(app);
   ImGui::EndDisabled();
   if (!ready) ImGui::TextDisabled("Load a part and a stock model first");
+  ImGui::Checkbox("Use every entry front", &app.auto_select_entries);
+  ImGui::SetItemTooltip(
+      "Plan straight through to the toolpaths. Turn this off to stop after the "
+      "wavefronts and choose which entry fronts the wave may start from.");
 
   if (!app.has_plan) return;
+
+  if (app.awaiting_entry_choice) {
+    ImGui::Separator();
+    entry_panel(app);
+    return;
+  }
 
   const cam::PlanStats& stats = app.plan.stats;
   ImGui::Separator();
@@ -1454,14 +2502,20 @@ void view_panel(App& app) {
     app.selected_plan_operation =
         std::clamp(app.selected_plan_operation, 0, static_cast<int>(operations.size()) - 1);
     if (ImGui::Combo("Operation", &app.selected_plan_operation, operations.data(),
-                     static_cast<int>(operations.size())))
+                     static_cast<int>(operations.size()))) {
       app.selected_level = 0;
+      app.playback.distance = 0.0;
+      app.playback.motion_seconds = 0.0;
+    }
   }
   const auto& levels = app.plan.operations[app.selected_plan_operation].levels;
   if (!levels.empty()) {
     int last = static_cast<int>(levels.size()) - 1;
     app.selected_level = std::clamp(app.selected_level, 0, last);
-    ImGui::SliderInt("Pass", &app.selected_level, 0, last);
+    if (ImGui::SliderInt("Pass", &app.selected_level, 0, last)) {
+      app.playback.distance = 0.0;
+      app.playback.motion_seconds = 0.0;
+    }
     ImGui::TextDisabled("Depth %.3f mm, cutting %.3f mm",
                         levels[app.selected_level].floor_z,
                         levels[app.selected_level].axial_depth);
@@ -1479,7 +2533,26 @@ void view_panel(App& app) {
   ImGui::Checkbox("Material##show", &app.show_material);
   ImGui::SameLine();
   ImGui::Checkbox("Toolpath", &app.show_toolpath);
-  ImGui::Checkbox("Stack follows the cutter", &app.stack_follows_playback);
+  if (ImGui::TreeNode("Debug view")) {
+    const auto& topology =
+        app.plan.operations[app.selected_plan_operation].inter_layer;
+    ImGui::TextDisabled("%zu node Z-group%s, %zu entry-front Z-group%s",
+                        topology.node_chains.size(),
+                        topology.node_chains.size() == 1 ? "" : "s",
+                        topology.entry_front_chains.size(),
+                        topology.entry_front_chains.size() == 1 ? "" : "s");
+    static const char* kNodeColourings[]{"Off", "By node", "By Z-group"};
+    int node_colouring = static_cast<int>(app.node_debug_colouring);
+    if (ImGui::Combo("Node boundaries", &node_colouring, kNodeColourings,
+                     std::size(kNodeColourings)))
+      app.node_debug_colouring =
+          static_cast<NodeDebugColouring>(node_colouring);
+    ImGui::Checkbox("Entry-front Z-groups", &app.show_entry_front_chains);
+    ImGui::Checkbox("Boundary contacts", &app.show_boundary_contacts);
+    ImGui::TextDisabled("Closed node areas use the simulated-stock fill path.");
+    ImGui::TreePop();
+  }
+  ImGui::Checkbox("Stock follows the cutter", &app.stack_follows_playback);
   ImGui::SetItemTooltip(
       "Off, the stacked view shows the finished part. On, it shows how far the "
       "job has got: passes above the cutter finished, the one it is in part way "
@@ -1493,11 +2566,14 @@ void view_panel(App& app) {
   ImGui::SameLine();
   if (ImGui::Button("Restart")) {
     app.playback.distance = 0.0;
+    app.playback.motion_seconds = 0.0;
     app.playback.playing = true;
   }
   ImGui::SameLine();
   if (ImGui::Button("End")) {
     app.playback.distance = total;
+    app.playback.motion_seconds =
+        level ? cam::feed_schedule_seconds(level->feeds) : 0.0;
     app.playback.playing = false;
   }
   ImGui::SameLine();
@@ -1506,10 +2582,14 @@ void view_panel(App& app) {
 
   float where = static_cast<float>(app.playback.distance);
   ImGui::SetNextItemWidth(-160.0f);
-  if (ImGui::SliderFloat("Along pass", &where, 0.0f, static_cast<float>(total), "%.1f mm"))
+  if (ImGui::SliderFloat("Along pass", &where, 0.0f,
+                         static_cast<float>(total), "%.1f mm")) {
     app.playback.distance = where;
+    sync_playback_time(app);
+  }
 
-  ImGui::Checkbox("Machine time", &app.playback.real_time);
+  if (ImGui::Checkbox("Machine time", &app.playback.real_time))
+    sync_playback_time(app);
   ImGui::SetItemTooltip(
       "Run the cutter at the feeds the plan commands. Those came out of what "
       "the simulation measured it removing, so the pass crawls where the "
@@ -1522,17 +2602,27 @@ void view_panel(App& app) {
                            ImGuiSliderFlags_Logarithmic))
       app.playback.time_scale = scale;
     if (level && !level->nothing_to_cut) {
-      const double elapsed =
-          cam::feed_seconds_to(level->feeds, app.playback.distance);
+      const double elapsed = app.playback.motion_seconds;
       const double whole = cam::feed_schedule_seconds(level->feeds);
       ImGui::Text("%s of %s in this pass, %.1f min in the job",
                   clock_text(elapsed).c_str(), clock_text(whole).c_str(),
                   app.plan.stats.cutting_minutes + app.plan.stats.rapid_minutes);
+      const cam::MotionCursor motion = cam::feed_motion_at_seconds(
+          level->feeds, app.playback.motion_seconds);
+      const double motion_total = cam::feed_motion_length(level->feeds);
+      ImGui::Text("Machine XYZ travel %.1f of %.1f mm",
+                  motion.motion_distance, motion_total);
+      ImGui::Text("%s %.1f of %.1f mm at %.0f mm/min (%.2fx view)",
+                  motion_phase_name(motion), motion.phase_distance,
+                  motion.phase_length, motion.rate, app.playback.time_scale);
+      ImGui::TextDisabled("Tool Z %.3f mm; rapid plane %.3f mm",
+                          motion.z, app.job.rapid_clearance_height);
       const cam::FeedSegment* segment = nullptr;
       if (!level->feeds.segments.empty())
         segment = &level->feeds.segments[segment_at(level->feeds.segments,
                                                     app.playback.distance)];
-      if (segment != nullptr)
+      const bool positioning = motion.rapid || motion.from_z != motion.to_z;
+      if (segment != nullptr && !positioning)
         ImGui::Text("Now %.0f mm/min, %.0f%% engaged, %s", segment->rate,
                     segment->engagement * 100.0, cam::feed_limit_name(segment->limit));
     }
@@ -1557,7 +2647,9 @@ void sidebar(App& app) {
   if (!app.banner.empty()) {
     const ImVec4 colour = app.banner_is_error ? ImVec4(1.0f, 0.45f, 0.4f, 1.0f)
                                               : ImVec4(0.55f, 0.85f, 0.65f, 1.0f);
-    ImGui::TextColored(colour, "%s", app.banner.c_str());
+    ImGui::PushStyleColor(ImGuiCol_Text, colour);
+    ImGui::TextWrapped("%s", app.banner.c_str());
+    ImGui::PopStyleColor();
     ImGui::Separator();
   }
   job_panel(app);
@@ -1613,11 +2705,15 @@ int main(int argc, char** argv) {
   double stepdown = 0.0;
   double stepover = 0.0;
   double path_pitch = 0.0;
+  double entry_front_tolerance = 0.0;
+  double rapid_clearance = 0.0;
   double full_feed = 0.0;
   double no_feed = 0.0;
   std::string tool_id;
   std::string machine_id;
   std::string material_id;
+  std::string mode_name;
+  std::string direction_name;
   for (int i = 1; i < argc; ++i) {
     const std::string argument = argv[i];
     const auto value = [&]() -> std::string {
@@ -1631,6 +2727,17 @@ int main(int argc, char** argv) {
       else if (argument == "--view") view_name = value();
       else if (argument == "--at") progress_fraction = std::stod(value());
       else if (argument == "--follow") app.stack_follows_playback = true;
+      else if (argument == "--choose-fronts") app.auto_select_entries = false;
+      else if (argument == "--models") {
+        const std::string which = value();
+        app.models = which == "stock"  ? ModelShow::Stock
+                     : which == "part" ? ModelShow::Part
+                                       : ModelShow::Both;
+      }
+      else if (argument == "--box-stock") {
+        app.job.box_stock = true;
+        app.job.box_stock_margin = std::stod(value());
+      }
       else if (argument == "--gcode") gcode_out = value();
       else if (argument == "--tool") tool_id = value();
       else if (argument == "--machine") machine_id = value();
@@ -1638,11 +2745,16 @@ int main(int argc, char** argv) {
       else if (argument == "--stepdown") stepdown = std::stod(value());
       else if (argument == "--stepover") stepover = std::stod(value());
       else if (argument == "--path-pitch") path_pitch = std::stod(value());
+      else if (argument == "--entry-front-tolerance")
+        entry_front_tolerance = std::stod(value());
+      else if (argument == "--rapid-clearance") rapid_clearance = std::stod(value());
+      else if (argument == "--mode") mode_name = value();
+      else if (argument == "--contour-direction") direction_name = value();
       else if (argument == "--full-feed") full_feed = std::stod(value());
       else if (argument == "--no-feed") no_feed = std::stod(value());
       else if (argument == "--help" || argument == "-h") {
         std::printf(
-            "TingleCAM -- adaptive roughing over the wavefront engine\n\n"
+            "TingleCAM -- wavefront roughing and contour finishing\n\n"
             "  --part PATH        Part model (OBJ or STL)\n"
             "  --stock PATH       Stock model (OBJ or STL)\n"
             "  --tool ID          Tool from the library\n"
@@ -1651,11 +2763,23 @@ int main(int argc, char** argv) {
             "  --stepover RATIO   Radial engagement as a fraction of diameter\n"
             "  --stepdown MM      Axial depth per pass\n"
             "  --path-pitch MM    Simulation/feed sampling interval (default 0.2)\n"
+            "  --mode rough|finish\n"
+            "                     Roughing or offset-contour finishing\n"
+            "  --contour-direction either|climb|conventional\n"
+            "                     Permitted contour traversal direction\n"
+            "  --entry-front-tolerance MM\n"
+            "                     Whole-curve Z association envelope (default 3)\n"
+            "  --rapid-clearance MM\n"
+            "                     Safe rapid height above program Z0 (default 10)\n"
             "  --full-feed RATE   Manual feed at full engagement, mm/min\n"
             "  --no-feed RATE     Manual feed at zero engagement, mm/min\n"
             "  --gcode PATH       Plan and post without opening a window, then exit\n"
             "  --screenshot PATH  Render one frame to a binary PPM and exit\n"
-            "  --view pass|result Which view a screenshot should capture\n"
+            "  --box-stock MM     Use the part's bounding box, grown by MM, as stock\n"
+            "  --models stock|part|both   What the plan view shows\n"
+            "  --choose-fronts    Stop after the wavefronts to pick entry fronts\n"
+            "  --view models|fronts|pass|result\n"
+            "                     Which view a screenshot should capture\n"
             "  --at FRACTION      How far through the pass to place the cutter, 0 to 1\n"
             "  -h, --help         Show this help and exit\n\n"
             "Tools live in %s\n"
@@ -1672,6 +2796,7 @@ int main(int argc, char** argv) {
     }
   }
   if (app.part_path[0] != '\0' || app.stock_path[0] != '\0') load_meshes(app);
+  app.geometry.set_box_stock(app.job.box_stock, app.job.box_stock_margin);
 
   // Anything the command line set has to reach the operation the panels would
   // otherwise have created, so make it here and apply them to it.
@@ -1693,6 +2818,32 @@ int main(int argc, char** argv) {
     if (stepdown > 0.0) operation.stepdown = stepdown;
     if (stepover > 0.0) operation.stepover_ratio = stepover;
     if (path_pitch > 0.0) operation.path_pitch = path_pitch;
+    if (entry_front_tolerance > 0.0)
+      operation.entry_front_match_tolerance = entry_front_tolerance;
+    if (rapid_clearance > 0.0)
+      app.job.rapid_clearance_height = rapid_clearance;
+    if (!mode_name.empty()) {
+      if (mode_name == "rough") operation.mode = cam::OperationMode::Roughing;
+      else if (mode_name == "finish")
+        operation.mode = cam::OperationMode::ContourFinishing;
+      else {
+        std::fprintf(stderr, "--mode must be rough or finish\n");
+        return EXIT_FAILURE;
+      }
+    }
+    if (!direction_name.empty()) {
+      if (direction_name == "either")
+        operation.contour_direction = cam::ContourDirectionPolicy::Either;
+      else if (direction_name == "climb")
+        operation.contour_direction = cam::ContourDirectionPolicy::Climb;
+      else if (direction_name == "conventional")
+        operation.contour_direction = cam::ContourDirectionPolicy::Conventional;
+      else {
+        std::fprintf(stderr,
+                     "--contour-direction must be either, climb, or conventional\n");
+        return EXIT_FAILURE;
+      }
+    }
     if (full_feed > 0.0 || no_feed > 0.0) {
       operation.manual_feed_range = true;
       if (full_feed > 0.0) operation.full_engagement_feed = full_feed;
@@ -1740,10 +2891,33 @@ int main(int argc, char** argv) {
         plan.stats.gouge_area, plan.stats.excess_area);
     std::printf(
         "%zu passes cut of %zu, %.0f mm of cutting in %.1f min, peak load %.2f\n"
+        "%zu node Z-chain(s), %zu entry-front Z-chain(s)\n"
         "%zu lines written to %s\n",
         plan.stats.cut_levels, plan.stats.levels, plan.stats.cutting_distance,
         plan.stats.cutting_minutes + plan.stats.rapid_minutes, plan.stats.maximum_load,
+        plan.operations.empty() ? 0 :
+            plan.operations.front().inter_layer.node_chains.size(),
+        plan.operations.empty() ? 0 :
+            plan.operations.front().inter_layer.entry_front_chains.size(),
         post.line_count, gcode_out.string().c_str());
+    if (!plan.operations.empty()) {
+      const auto& topology = plan.operations.front().inter_layer;
+      std::size_t unjoined_entries = 0;
+      for (const auto& layer : topology.entry_front_chain_ids)
+        unjoined_entries += static_cast<std::size_t>(std::count(
+            layer.begin(), layer.end(), wave::kNoTopologyId));
+      for (std::size_t chain = 0; chain < topology.entry_front_chains.size();
+           ++chain) {
+        const auto& members = topology.entry_front_chains[chain].members;
+        if (!members.empty())
+          std::printf("  entry chain %zu: layers %zu-%zu (%zu fronts)\n", chain,
+                      members.front().layer, members.back().layer,
+                      members.size());
+      }
+      if (unjoined_entries != 0)
+        std::printf("  %zu entry front(s) remain unassociated\n",
+                    unjoined_entries);
+    }
     return EXIT_SUCCESS;
   }
 
@@ -1788,8 +2962,13 @@ int main(int argc, char** argv) {
   int screenshot_delay = 0;
   auto previous_frame = std::chrono::steady_clock::now();
   if (screenshot_pending && app.geometry.has_part() && app.geometry.has_stock())
-    app.planner.start(app.geometry, app.job, app.tools, app.machines, app.materials);
-  if (!view_name.empty()) app.force_tab = view_name == "result" ? 1 : 0;
+    start_plan(app);
+  if (!view_name.empty()) {
+    if (view_name == "result") app.force_tab = 3;
+    else if (view_name == "fronts") app.force_tab = 1;
+    else if (view_name == "models") app.force_tab = 0;
+    else app.force_tab = 2;
+  }
   while (running) {
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
@@ -1807,6 +2986,7 @@ int main(int argc, char** argv) {
       app.selected_plan_operation = 0;
       app.view.needs_fit = true;
       app.playback.distance = 0.0;
+      app.playback.motion_seconds = 0.0;
       app.material.clear();
       app.material_distance = -1.0;
       app.material_level = -1;
@@ -1814,9 +2994,27 @@ int main(int argc, char** argv) {
         const cam::LevelPlan* level = current_level(app);
         app.playback.distance =
             std::clamp(progress_fraction, 0.0, 1.0) * level_length(level);
+        sync_playback_time(app);
       }
-      if (!app.plan.ok()) say(app, app.plan.error, true);
-      else say(app, "Planned " + std::to_string(app.plan.stats.cut_levels) + " passes");
+      refresh_entries(app);
+      if (!app.plan.ok()) {
+        std::fprintf(stderr, "Planning failed:\n%s\n", app.plan.error.c_str());
+        for (const std::string& warning : app.plan.warnings)
+          std::fprintf(stderr, "  warning: %s\n", warning.c_str());
+        say(app, app.plan.error, true);
+      } else if (screenshot_pending) {
+        // The view was chosen on the command line; leave it alone.
+      } else if (app.awaiting_entry_choice) {
+        // Stop on the choice rather than in front of the finished result: the
+        // toolpaths do not exist yet, so the playback tabs have nothing to show.
+        app.mode = ViewMode::Entries;
+        app.force_tab = 1;
+        say(app, "Wavefronts built. " + std::to_string(app.entries.size()) +
+                     " entry front(s) on offer");
+      } else {
+        app.force_tab = 3;
+        say(app, "Planned " + std::to_string(app.plan.stats.cut_levels) + " passes");
+      }
     }
 
     const auto now = std::chrono::steady_clock::now();
@@ -1847,22 +3045,35 @@ int main(int argc, char** argv) {
     ImGui::SameLine();
     ImGui::BeginChild("views", ImVec2(0, 0));
     if (ImGui::BeginTabBar("view-tabs")) {
-      const ImGuiTabItemFlags plan_flag =
-          app.force_tab == 0 ? ImGuiTabItemFlags_SetSelected : 0;
-      const ImGuiTabItemFlags result_flag =
-          app.force_tab == 1 ? ImGuiTabItemFlags_SetSelected : 0;
-      if (ImGui::BeginTabItem("Pass", nullptr, plan_flag)) {
+      const auto flag = [&](int index) -> ImGuiTabItemFlags {
+        return app.force_tab == index ? ImGuiTabItemFlags_SetSelected : 0;
+      };
+      if (ImGui::BeginTabItem("Plan", nullptr, flag(0))) {
+        app.mode = ViewMode::Setup;
+        draw_setup(app);
+        ImGui::EndTabItem();
+      }
+      if (ImGui::BeginTabItem("Select fronts", nullptr, flag(1))) {
+        app.mode = ViewMode::Entries;
+        draw_entries(app);
+        ImGui::EndTabItem();
+      }
+      if (ImGui::BeginTabItem("Pass", nullptr, flag(2))) {
         app.mode = ViewMode::Plan;
         draw_canvas(app);
         ImGui::EndTabItem();
       }
-      if (ImGui::BeginTabItem("Stacked result", nullptr, result_flag)) {
+      if (ImGui::BeginTabItem("Stacked result", nullptr, flag(3))) {
         app.mode = ViewMode::Result;
         draw_result(app);
         ImGui::EndTabItem();
       }
       ImGui::EndTabBar();
     }
+    // One frame of forcing is enough; leaving it set would pin the tab against
+    // the mouse. A screenshot keeps asking, since the view it wants is chosen
+    // before there is a plan to show in it.
+    if (!screenshot_pending) app.force_tab = -1;
     ImGui::EndChild();
     ImGui::End();
     tool_builder(app);

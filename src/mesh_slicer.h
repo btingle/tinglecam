@@ -65,6 +65,9 @@ class MeshSlicer {
   MeshSlicer& operator=(const MeshSlicer&) = delete;
 
   void set_mesh(Mesh mesh);
+  // Back to holding nothing. `set_mesh` rejects an empty mesh, so this is how a
+  // slicer is emptied once it has been given one.
+  void clear();
   MeshSlice slice(float z, int grid_resolution = 32) const;
   const Mesh& mesh() const;
   const MeshBuildStats& stats() const;

@@ -264,6 +264,13 @@ MeshSlice MeshSlicer::slice(float z, int grid_resolution) const {
 
 const Mesh& MeshSlicer::mesh() const { return impl_->mesh; }
 const MeshBuildStats& MeshSlicer::stats() const { return impl_->stats; }
+void MeshSlicer::clear() {
+  cuda_slicer::destroy(impl_->gpu);
+  impl_->gpu = nullptr;
+  impl_->mesh = {};
+  impl_->stats = {};
+}
+
 bool MeshSlicer::empty() const { return impl_->mesh.triangles.empty(); }
 
 }  // namespace wave

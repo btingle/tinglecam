@@ -28,6 +28,19 @@ enum class StopReason {
   IterationLimit,
 };
 
+// Entry points the wave must not propagate from. The wave is seeded on the
+// boundary of its domain, and the connected pieces of that seed are the entry
+// fronts: dropping one before propagation begins is what it means to decline
+// an entry. A piece is dropped when it passes within `tolerance` of any anchor.
+// Material only that piece could have reached is then left standing, which the
+// plan reports rather than hides.
+struct EntryMute {
+  std::vector<Point64> anchors;
+  double tolerance = 0.0;
+
+  bool empty() const { return anchors.empty(); }
+};
+
 struct WaveResult {
   Paths64 subject;
   Paths64 stock;
@@ -52,6 +65,8 @@ struct WaveResult {
   Paths64 domain;
   std::vector<Paths64> generations;
   std::vector<Paths64> reached_generations;
+  // Seed pieces an EntryMute removed before propagation.
+  std::size_t muted_entries = 0;
   StopReason stop_reason = StopReason::Empty;
 };
 
@@ -68,14 +83,16 @@ WaveResult build_wavefront(const Paths64& raw_subject,
                            double stepover,
                            double softening = 0.0,
                            double lead_in = 0.0,
-                           std::size_t max_iterations = 2000);
+                           std::size_t max_iterations = 2000,
+                           const EntryMute& muted = {});
 
 WaveResult build_wavefront(const Paths64& raw_subject,
                            const Paths64& raw_stock,
                            double stepover,
                            double softening = 0.0,
                            double lead_in = 0.0,
-                           std::size_t max_iterations = 2000);
+                           std::size_t max_iterations = 2000,
+                           const EntryMute& muted = {});
 
 bool paths_equal_canonical(const Paths64& lhs, const Paths64& rhs);
 double to_world(std::int64_t value);

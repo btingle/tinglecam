@@ -176,10 +176,9 @@ PostResult post_job(const JobPlan& plan,
     return result;
   }
 
-  // The clearance and retract planes have to be above everything the job cuts.
-  // A job whose depths were set before the models were loaded can easily name a
-  // retract inside the work, and a plunge to a Z above where the tool already
-  // is would drive it up through the part.
+  // The one rapid plane has to be above everything the job cuts. A 2D slice
+  // cannot certify a lower traverse, so disconnected moves always use this
+  // Z0-relative plane.
   double highest_cut = -std::numeric_limits<double>::infinity();
   for (const OperationPlan& operation : plan.operations)
     for (const LevelPlan& level : operation.levels)
@@ -187,18 +186,15 @@ PostResult post_job(const JobPlan& plan,
         highest_cut = std::max(highest_cut, level.floor_z + level.axial_depth);
 
   Writer writer(*machine, result);
-  double clearance = job.clearance_z + job.origin_z;
-  double retract = job.retract_z + job.origin_z;
+  double rapid_plane = job.rapid_clearance_height + job.origin_z;
   if (std::isfinite(highest_cut)) {
     const double top = highest_cut + job.origin_z;
-    if (retract < top + 0.5 || clearance < top + 1.0) {
+    if (rapid_plane < top + 1.0) {
       result.warnings.push_back(
-          "The retract and clearance planes were at or below the top of the cut; "
-          "they have been raised above it");
-      retract = std::max(retract, top + 2.0);
-      clearance = std::max(clearance, top + 10.0);
+          "The rapid clearance plane was at or below the top of the cut; it "
+          "has been raised above it");
+      rapid_plane = top + 10.0;
     }
-    if (clearance < retract) clearance = retract + 5.0;
   }
   // ---- Preamble ---------------------------------------------------------
   writer.comment(job.name.empty() ? std::string("TingleCAM") : job.name);
@@ -243,7 +239,7 @@ PostResult post_job(const JobPlan& plan,
     writer.comment("Cutter " + writer.coordinate(tool->diameter) + " mm");
 
     if (active_tool != tool->id) {
-      writer.line("G0 Z" + writer.coordinate(clearance));
+      writer.line("G0 Z" + writer.coordinate(rapid_plane));
       if (spindle_running) {
         writer.line("M5");
         spindle_running = false;
@@ -296,6 +292,7 @@ PostResult post_job(const JobPlan& plan,
                      writer.coordinate(level.axial_depth) + " mm");
 
       bool at_depth = false;
+      bool rapid_descent = false;
       for (const FeedSegment& segment : level.feeds.segments) {
         const double from_x = wave::to_world(segment.from.x) + job.origin_x;
         const double from_y = wave::to_world(segment.from.y) + job.origin_y;
@@ -307,10 +304,11 @@ PostResult post_job(const JobPlan& plan,
             // Straight up where it stands, then across. Lifting and traversing
             // together would drag the cutter through the wall it is leaving.
             writer.rapid(from_x, from_y, cut_z);
-            writer.rapid(from_x, from_y, retract);
+            writer.rapid(from_x, from_y, rapid_plane);
             at_depth = false;
           }
-          writer.rapid(to_x, to_y, retract);
+          writer.rapid(to_x, to_y, rapid_plane);
+          rapid_descent = segment.safe_retract;
           continue;
         }
 
@@ -318,10 +316,18 @@ PostResult post_job(const JobPlan& plan,
           // Across at height first, then straight down. Combining the two into
           // one diagonal rapid would take the tool through whatever stands
           // between where it was and where it is going.
-          writer.rapid(from_x, from_y, retract);
-          const double plunge = data ? data->plunge_feed : 100.0;
-          writer.feed(from_x, from_y, cut_z, std::max(plunge, 1.0));
+          writer.rapid(from_x, from_y, rapid_plane);
+          if (rapid_descent && segment.kind != wave::MoveKind::Entry) {
+            // Retract landings are checked against the simulated remaining
+            // stock. Where that footprint is clear, returning to depth is a
+            // positioning move rather than a cutting plunge.
+            writer.rapid(from_x, from_y, cut_z);
+          } else {
+            const double plunge = data ? data->plunge_feed : 100.0;
+            writer.feed(from_x, from_y, cut_z, std::max(plunge, 1.0));
+          }
           at_depth = true;
+          rapid_descent = false;
         }
 
         // The rate is the schedule's own: a disengaged piece at depth is a
@@ -337,18 +343,18 @@ PostResult post_job(const JobPlan& plan,
             wave::to_world(level.feeds.segments.back().to.x) + job.origin_x;
         const double last_y =
             wave::to_world(level.feeds.segments.back().to.y) + job.origin_y;
-        writer.rapid(last_x, last_y, retract);
+        writer.rapid(last_x, last_y, rapid_plane);
       }
     }
 
-    writer.line("G0 Z" + writer.coordinate(clearance));
+    writer.line("G0 Z" + writer.coordinate(rapid_plane));
   }
 
   // ---- Postamble --------------------------------------------------------
   writer.blank();
   if (coolant_running) writer.line("M9");
   if (spindle_running) writer.line("M5");
-  writer.line("G0 Z" + writer.coordinate(clearance));
+  writer.line("G0 Z" + writer.coordinate(rapid_plane));
   if (machine->tool_change == ToolChange::Automatic ||
       machine->controller == Controller::LinuxCnc)
     writer.line("G0 X" + writer.coordinate(machine->tool_change_x) + " Y" +

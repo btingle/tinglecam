@@ -3,7 +3,7 @@
   "name": "Makera Z1",
   "specifications_unverified": true,
   "controller": "smoothieware",
-  "rapid_feed": 2000.0,
+  "rapid_feed": 3000.0,
   "min_rpm": 6000.0,
   "max_rpm": 15000.0,
   "rpm_resolution": 100.0,

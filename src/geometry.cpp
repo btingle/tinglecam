@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
+#include <limits>
 #include <numbers>
 #include <regex>
 #include <stdexcept>
@@ -275,6 +276,59 @@ Paths64 inflate_with_softening(const Paths64& paths, double distance,
   return InflatePaths(expanded, softening, JoinType::Round, EndType::Polygon);
 }
 
+// Shortest distance from a point to a closed ring, in integer units.
+double distance_to_ring(const Point64& point, const Path64& ring) {
+  if (ring.empty()) return std::numeric_limits<double>::max();
+  double best = std::numeric_limits<double>::max();
+  for (std::size_t i = 0; i < ring.size(); ++i) {
+    const Point64& a = ring[i];
+    const Point64& b = ring[(i + 1) % ring.size()];
+    const double dx = static_cast<double>(b.x - a.x);
+    const double dy = static_cast<double>(b.y - a.y);
+    const double length_squared = dx * dx + dy * dy;
+    double t = 0.0;
+    if (length_squared > 0.0)
+      t = std::clamp((static_cast<double>(point.x - a.x) * dx +
+                      static_cast<double>(point.y - a.y) * dy) /
+                         length_squared,
+                     0.0, 1.0);
+    best = std::min(best, std::hypot(static_cast<double>(point.x - a.x) - dx * t,
+                                     static_cast<double>(point.y - a.y) - dy * t));
+  }
+  return best;
+}
+
+// The seed's connected pieces are the entry fronts, one apiece: they are the
+// stretches of domain wall the protected subject leaves separate. Declining an
+// entry therefore removes a whole piece, rather than cutting a notch out of one
+// -- a notch would be closed again by the first inflation, since the wave steps
+// a full stepover while the seed ring is one unit thick.
+Paths64 drop_muted_seeds(const Paths64& seed, const EntryMute& muted,
+                         WaveResult& result) {
+  Clipper64 clipper;
+  clipper.AddSubject(seed);
+  PolyTree64 tree;
+  Paths64 open_solution;
+  if (!clipper.Execute(ClipType::Union, FillRule::NonZero, tree, open_solution))
+    return seed;
+  const double tolerance = std::max(muted.tolerance, 1.0);
+  Paths64 kept;
+  for (std::size_t i = 0; i < tree.Count(); ++i) {
+    const PolyPath64* piece = tree.Child(i);
+    bool drop = false;
+    for (const Point64& anchor : muted.anchors)
+      if (distance_to_ring(anchor, piece->Polygon()) <= tolerance) drop = true;
+    if (drop) {
+      ++result.muted_entries;
+      continue;
+    }
+    kept.push_back(piece->Polygon());
+    for (std::size_t j = 0; j < piece->Count(); ++j)
+      kept.push_back(piece->Child(j)->Polygon());
+  }
+  return Union(kept, FillRule::NonZero);
+}
+
 }  // namespace
 
 double to_world(std::int64_t value) { return static_cast<double>(value) / kIntegerScale; }
@@ -348,7 +402,8 @@ WaveResult build_wavefront(const Paths64& raw_subject,
                            double stepover,
                            double softening,
                            double lead_in,
-                           std::size_t max_iterations) {
+                           std::size_t max_iterations,
+                           const EntryMute& muted) {
   if (raw_subject.empty()) throw std::invalid_argument("Subject is empty");
   if (!(allowance > 0.0)) throw std::invalid_argument("Allowance must be positive");
   const Paths64 subject = Union(raw_subject, FillRule::NonZero);
@@ -361,7 +416,7 @@ WaveResult build_wavefront(const Paths64& raw_subject,
       Point64(bounds.left - margin, bounds.bottom + margin),
   };
   return build_wavefront(subject, Paths64{stock_boundary}, stepover,
-                         softening, lead_in, max_iterations);
+                         softening, lead_in, max_iterations, muted);
 }
 
 WaveResult build_wavefront(const Paths64& raw_subject,
@@ -369,7 +424,8 @@ WaveResult build_wavefront(const Paths64& raw_subject,
                            double stepover,
                            double softening,
                            double lead_in,
-                           std::size_t max_iterations) {
+                           std::size_t max_iterations,
+                           const EntryMute& muted) {
   if (raw_subject.empty()) throw std::invalid_argument("Subject is empty");
   if (raw_stock.empty()) throw std::invalid_argument("Stock is empty");
   if (!(stepover > 0.0)) throw std::invalid_argument("Stepover must be positive");
@@ -445,6 +501,11 @@ WaveResult build_wavefront(const Paths64& raw_subject,
   Paths64 reached = Difference(domain, domain_inner, FillRule::NonZero);
   reached = Difference(reached, subject_face, FillRule::NonZero);
   reached = Union(reached, FillRule::NonZero);
+  if (!muted.empty()) reached = drop_muted_seeds(reached, muted, result);
+  if (reached.empty()) {
+    result.stop_reason = StopReason::Empty;
+    return result;
+  }
   result.generations.push_back(reached);
   result.reached_generations.push_back(reached);
 
