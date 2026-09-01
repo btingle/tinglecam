@@ -26,6 +26,8 @@ enum class StopReason {
   Empty,
   Unchanged,
   IterationLimit,
+  // Stopped on purpose, before the first propagation step.
+  Seeded,
 };
 
 // Entry points the wave must not propagate from. The wave is seeded on the
@@ -93,6 +95,17 @@ WaveResult build_wavefront(const Paths64& raw_subject,
                            double lead_in = 0.0,
                            std::size_t max_iterations = 2000,
                            const EntryMute& muted = {});
+
+// The wave before it has propagated at all: the domain, and generation zero
+// seeded on its boundary. The entry fronts are exactly the connected pieces of
+// that seed, so this answers what a wave could start from without paying for
+// where it would then go. `build_wavefront` begins with precisely this.
+WaveResult seed_wavefront(const Paths64& raw_subject,
+                          const Paths64& raw_stock,
+                          double stepover,
+                          double softening = 0.0,
+                          double lead_in = 0.0,
+                          const EntryMute& muted = {});
 
 bool paths_equal_canonical(const Paths64& lhs, const Paths64& rhs);
 double to_world(std::int64_t value);

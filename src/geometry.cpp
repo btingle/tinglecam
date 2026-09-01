@@ -419,20 +419,18 @@ WaveResult build_wavefront(const Paths64& raw_subject,
                          softening, lead_in, max_iterations, muted);
 }
 
-WaveResult build_wavefront(const Paths64& raw_subject,
-                           const Paths64& raw_stock,
-                           double stepover,
-                           double softening,
-                           double lead_in,
-                           std::size_t max_iterations,
-                           const EntryMute& muted) {
+WaveResult seed_wavefront(const Paths64& raw_subject,
+                          const Paths64& raw_stock,
+                          double stepover,
+                          double softening,
+                          double lead_in,
+                          const EntryMute& muted) {
   if (raw_subject.empty()) throw std::invalid_argument("Subject is empty");
   if (raw_stock.empty()) throw std::invalid_argument("Stock is empty");
   if (!(stepover > 0.0)) throw std::invalid_argument("Stepover must be positive");
   if (softening < 0.0 || softening > stepover)
     throw std::invalid_argument("Softening must be between zero and stepover");
   if (lead_in < 0.0) throw std::invalid_argument("Lead-in must not be negative");
-  if (max_iterations == 0) throw std::invalid_argument("Iteration limit must be positive");
 
   WaveResult result;
   result.subject = Union(raw_subject, FillRule::NonZero);
@@ -441,12 +439,6 @@ WaveResult build_wavefront(const Paths64& raw_subject,
   result.softening = softening;
   if (result.stock.empty()) throw std::invalid_argument("Stock union is empty");
   result.stock_boundary = result.stock.front();
-
-  const double delta = static_cast<double>(
-      std::max<std::int64_t>(1, to_integer(stepover)));
-  const double softening_delta = static_cast<double>(
-      std::clamp<std::int64_t>(to_integer(softening), 0,
-                               static_cast<std::int64_t>(delta)));
 
   // The stock wall the wave starts from: a one-integer-unit ring at the stock
   // boundary. The subject is deliberately not part of it, so its boundaries can
@@ -508,13 +500,34 @@ WaveResult build_wavefront(const Paths64& raw_subject,
   }
   result.generations.push_back(reached);
   result.reached_generations.push_back(reached);
+  result.stop_reason = StopReason::Seeded;
+  return result;
+}
+
+WaveResult build_wavefront(const Paths64& raw_subject,
+                           const Paths64& raw_stock,
+                           double stepover,
+                           double softening,
+                           double lead_in,
+                           std::size_t max_iterations,
+                           const EntryMute& muted) {
+  if (max_iterations == 0) throw std::invalid_argument("Iteration limit must be positive");
+  WaveResult result = seed_wavefront(raw_subject, raw_stock, stepover, softening,
+                                     lead_in, muted);
+  if (result.generations.empty()) return result;
+  Paths64 reached = result.reached_generations.back();
+  const double delta = static_cast<double>(
+      std::max<std::int64_t>(1, to_integer(stepover)));
+  const double softening_delta = static_cast<double>(
+      std::clamp<std::int64_t>(to_integer(softening), 0,
+                               static_cast<std::int64_t>(delta)));
 
   for (std::size_t iteration = 0; iteration < max_iterations; ++iteration) {
     // Expand only geometry already reached from the box. Clipping to the domain
     // keeps the expansion inward; subtracting the subject blocks colliding
     // wavefronts.
     Paths64 next = inflate_with_softening(reached, delta, softening_delta);
-    next = Intersect(next, domain, FillRule::NonZero);
+    next = Intersect(next, result.domain, FillRule::NonZero);
     next = Difference(next, result.subject, FillRule::NonZero);
     next = Union(next, FillRule::NonZero);
 
@@ -548,6 +561,7 @@ const char* stop_reason_name(StopReason reason) {
     case StopReason::Empty: return "empty output";
     case StopReason::Unchanged: return "unchanged output";
     case StopReason::IterationLimit: return "iteration safety limit";
+    case StopReason::Seeded: return "seeded but not propagated";
   }
   return "unknown";
 }

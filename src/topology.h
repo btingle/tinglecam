@@ -129,6 +129,18 @@ FrontLineage build_front_lineage(const WaveResult& wave);
 // internal topology errors. Validated attach/detach transitions are retained.
 LayerTopology build_layer_topology(const FrontLineage& lineage);
 
+// Entry identity down the stack, from the entry curves alone. An upper front
+// claims a lower one when the whole of the lower curve falls inside an envelope
+// grown around the upper, and only a mutual, unambiguous claim links them.
+//
+// This asks nothing of the node topology and nothing of any generation past the
+// first, so a wave that has been seeded and never propagated can answer it.
+// `chain_ids` receives, per layer, the chain each entry front belongs to.
+std::vector<InterLayerChain> chain_entry_fronts(
+    const std::vector<const FrontLineage*>& lineages,
+    double entry_front_match_tolerance,
+    std::vector<std::vector<std::size_t>>* chain_ids = nullptr);
+
 // Builds exact node-area chains and tolerant entry-front chains between
 // adjacent Z layers. Area containment has deliberately no geometric tolerance.
 // Entry fronts use a strong whole-curve containment test inside the configured
@@ -143,11 +155,12 @@ Path64 boundary_arc(const FrontLineage& lineage,
                     const BoundaryContact& from,
                     const BoundaryContact& to);
 
-// The material one entry front is answerable for: the union of the wave bands
-// of every front reachable from it down the lineage. A front the wave reaches
-// from two entries belongs to both territories, because that is what sharing a
-// source actually looks like -- these are not a partition of the stock.
-Paths64 entry_front_territory(const FrontLineage& lineage, std::size_t entry);
+// How far two separately rounded descriptions of the same wall may disagree,
+// in integer units. The boundary rings come from a boolean on the machinable
+// region and the propagation bands from offsetting; they agree to a couple of
+// grid units, not exactly. Anything measuring one against the other has to
+// allow this much, and no more.
+double boundary_slack(double stepover);
 
 Point64 representative_point(const LeadingFront& front);
 double front_length(const LeadingFront& front);

@@ -25,33 +25,34 @@ The build produces:
 
 ## Workflow
 
-Planning runs in two stages, split where the entry fronts become known and
-before anything depends on which of them were chosen.
+Which entry fronts the wave may start from is an input to planning, not a stage
+of it. Finding them costs a seeding pass and no propagation, so a choice can be
+made and unmade without planning anything.
 
 1. **Plan** shows the part and stock models so the depth range can be set
-   against them. Planning the job slices, propagates the wave, and builds the
-   lineage and inter-layer topology for every depth.
-2. **Select fronts** draws each entry front's territory -- the material the wave
-   reaches from it -- as an area in the stacked view, and lets any of them be
-   declined. Declining one runs the wavefronts again without it, which is the
-   only way to see what it was holding: the surviving entries reach further.
-   Slices are cached, so this pass costs the wave alone.
-3. **Pass** and **Stacked result** are the toolpath and simulation views, built
-   once from the final selection.
+   against them.
+2. **Select fronts** draws each entry front where it actually is and lets any of
+   them be declined. Nothing is planned here: the fronts are generation zero of
+   the wave, which is built before the first propagation step, so this asks the
+   models for their slices and stops. Slices are cached, so it is quick after
+   the first look.
+3. Planning the job runs the wave without the declined entries, then builds the
+   toolpaths, simulation and feeds. **Pass** and **Stacked result** show what
+   came out.
 
-**Use every entry front** on the plan panel skips the choice and runs straight
-through, which is what a job that does not care about entry order wants.
-`--choose-fronts` does the same from the command line in reverse: it stops after
-the wavefronts.
+The list does not move when the choice does. Declining an entry drops its own
+seed piece before propagation begins and leaves every other piece exactly where
+it was, so the fronts on offer are the same fronts whatever has been declined --
+which is what lets a front be declined and reinstated for the price of a click,
+and lets a front be declined that a plan would have failed on.
 
-A declined entry front is not seeded, so it leaves no trace in the plan it was
-declined out of. The operation therefore keeps its own record: one group of
-anchor points per declined entry, a point on each layer it appeared at. Anchors
-are matched geometrically rather than by index, so a selection survives a change
-of stepdown or stepover that renumbers everything, and it is saved with the job.
+The choice is recorded on the operation as one group of anchor points per
+declined entry, a point on each layer it appeared at. Anchors are matched
+geometrically rather than by index, so a selection survives a change of stepdown
+or stepover that renumbers everything, and it is saved with the job.
 
-Material only a declined entry could have reached is left standing, and the
-plan says how many entries were declined rather than hiding it.
+Material only a declined entry could have reached is left standing, and the plan
+says how many entries were declined rather than hiding it.
 
 ## Stock
 
@@ -73,7 +74,8 @@ For every roughing depth, TingleCAM:
 2. Offsets the protected part by the cutter radius and stock allowance.
 3. Builds the wavefront passes, endpoint boundary provenance, per-layer nodes,
    and inter-layer associations.
-4. Sequences the wavefront passes and adds a boundary cleanup contour.
+4. Sequences the wavefront passes and adds a boundary cleanup contour, clipped
+   to what the wave reached.
 5. Resamples each uninterrupted at-depth path at a uniform traveled-distance
    pitch.
 6. Simulates the normalized intervals against the remaining stock.
@@ -81,6 +83,16 @@ For every roughing depth, TingleCAM:
 8. Merges adjacent collinear intervals only when their assigned feeds and
    motion types are compatible.
 9. Posts the resulting linear motion.
+
+The cleanup contour is derived from the part slice rather than from the wave,
+so on its own it is emitted wherever the part has a boundary -- including
+depths the wave never reached, whether because the only entry into them was
+declined or because nothing can get in at all. Cutting there is a finishing
+pass through solid stock that nothing has roughed, so the contour is clipped to
+the region the wave actually swept. A depth the wave could not start at emits
+nothing. The contour lies exactly on that region's inner boundary, both being
+the same slice offset by the same distance, so the clip allows `boundary_slack`
+-- the same rounding allowance a front's boundary contact is accepted with.
 
 Lead-in wavefronts that remain wholly in air are retained in the lineage graph
 to establish entry ordering, but are not emitted as machining contours. On
@@ -162,18 +174,17 @@ not a volume, so it is drawn on the surface: giving it thickness would put faces
 inside the stock for the depth sort to fight over and would claim something
 about the material that a front does not say. Where a lead-in stands a front off
 the stock, its ribbon stands off with it -- the same place the pass view's
-entry-front overlay draws that curve. How much material each entry reaches is
-reported as an area in the list rather than drawn.
+entry-front overlay draws that curve. Nothing quantifies what an entry reaches:
+reaching is propagation, and this view deliberately does not propagate.
 
-The **Plan** view shows the part and the stock, cycling between stock, part, and
-both with the button in its corner. With both shown the stock is drawn
-see-through, over the whole depth range as one prism outlined by everything the
-blank covers -- exact for a prismatic blank, and a silhouette otherwise. A solid
-drawn as a stack of prisms puts one front wall per slice along a near-level
-sightline, which costs nothing opaque but composites into bands when
-see-through. Slices are decimated independently, so the difference between one
-and the next is littered with hairline slivers that are not steps in the model;
-those are dropped rather than outlined.
+The **Plan** view shows the loaded meshes themselves, cycling between stock,
+part, and both with the button in its corner. Nothing here is a plan, so nothing
+here looks at the models through a slicer: sampling them at a fixed set of
+depths put a staircase on every curved face and littered the flat ones with the
+hairline slivers two independently decimated slices differ by. With both shown
+the stock is drawn see-through over the part. The two solids simply overlap;
+cutting a part-shaped hole in the stock instead gave every wall of the part an
+exact coincident twin on the hole's inside for the depth sort to pick between.
 
 The stacked view is framed on the whole operation -- every pass's stock, every
 pass's commanded position, and room for the flute -- taken once from the plan.
@@ -296,7 +307,6 @@ data:
 --path-pitch MM
 --mode rough|finish
 --box-stock MM
---choose-fronts
 --models stock|part|both
 --contour-direction either|climb|conventional
 --entry-front-tolerance MM

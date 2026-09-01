@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -43,12 +44,16 @@ constexpr float kSidebarWidth = 520.0f;
 // ---------------------------------------------------------------------------
 
 // Planning a job of any size takes long enough that doing it on the frame
-// thread would freeze the window, so it runs on its own thread and reports back
+// thread would freeze the window, and finding the entry fronts has to slice the
+// models, which is no faster. Both run on their own thread and report back
 // through here. Everything the worker touches is either atomic or under the
-// mutex; the plan itself is handed over once, at the end.
-class Planner {
+// mutex; the result itself is handed over once, at the end.
+//
+// `Result` carries an `error` string, which is where a thrown exception lands.
+template <typename Result>
+class Background {
  public:
-  ~Planner() { cancel_and_join(); }
+  ~Background() { cancel_and_join(); }
 
   bool running() const { return running_.load(); }
   double fraction() const { return fraction_.load(); }
@@ -57,71 +62,45 @@ class Planner {
     return stage_;
   }
 
-  // Which stage the plan being taken came out of, so the caller can tell a
-  // wavefront pass waiting on an entry-front choice from a finished job.
-  cam::PlanStage produced() const { return produced_; }
-
-  void start(cam::JobGeometry& geometry, cam::Job job, cam::ToolLibrary tools,
-             cam::MachineLibrary machines, cam::MaterialLibrary materials,
-             cam::PlanStage upto = cam::PlanStage::Toolpaths) {
-    begin(upto);
-    worker_ = std::thread([this, &geometry, job = std::move(job),
-                           tools = std::move(tools), machines = std::move(machines),
-                           materials = std::move(materials), upto]() mutable {
-      cam::JobPlan result;
-      try {
-        result = cam::plan_job(geometry, job, tools, machines, materials,
-                               report(), upto);
-      } catch (const std::exception& error) {
-        result = {};
-        result.error = error.what();
-      }
-      publish(std::move(result));
-    });
-  }
-
-  // Carries an already-taken wavefront plan the rest of the way. The plan is
-  // moved in and comes back out of `take` complete.
-  void start_toolpaths(cam::JobPlan plan, cam::Job job, cam::ToolLibrary tools,
-                       cam::MachineLibrary machines,
-                       cam::MaterialLibrary materials) {
-    begin(cam::PlanStage::Toolpaths);
-    worker_ = std::thread([this, plan = std::move(plan), job = std::move(job),
-                           tools = std::move(tools), machines = std::move(machines),
-                           materials = std::move(materials)]() mutable {
-      try {
-        cam::plan_job_toolpaths(plan, job, tools, machines, materials, report());
-      } catch (const std::exception& error) {
-        plan = {};
-        plan.error = error.what();
-      }
-      publish(std::move(plan));
-    });
-  }
-
-  void cancel() { cancelled_.store(true); }
-
-  // True once, when a finished plan is ready to be taken.
-  bool take(cam::JobPlan& into) {
-    if (!finished_.exchange(false)) return false;
-    if (worker_.joinable()) worker_.join();
-    std::lock_guard<std::mutex> lock(mutex_);
-    into = std::move(plan_);
-    return true;
-  }
-
- private:
-  void begin(cam::PlanStage upto) {
+  void start(std::function<Result(const cam::ProgressCallback&)> task) {
     cancel_and_join();
     cancelled_.store(false);
     running_.store(true);
     fraction_.store(0.0);
     finished_.store(false);
-    produced_ = upto;
-    std::lock_guard<std::mutex> lock(mutex_);
-    stage_ = "Starting";
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stage_ = "Starting";
+    }
+    worker_ = std::thread([this, task = std::move(task)]() mutable {
+      Result result;
+      try {
+        result = task(report());
+      } catch (const std::exception& error) {
+        result = {};
+        result.error = error.what();
+      }
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        result_ = std::move(result);
+      }
+      finished_.store(true);
+      running_.store(false);
+    });
   }
 
+  void cancel() { cancelled_.store(true); }
+
+  // True once, when a finished result is ready to be taken.
+  bool take(Result& into) {
+    if (!finished_.exchange(false)) return false;
+    if (worker_.joinable()) worker_.join();
+    std::lock_guard<std::mutex> lock(mutex_);
+    into = std::move(result_);
+    return true;
+  }
+
+ private:
   cam::ProgressCallback report() {
     return [this](double fraction, const std::string& stage) {
       fraction_.store(fraction);
@@ -129,15 +108,6 @@ class Planner {
       stage_ = stage;
       return !cancelled_.load();
     };
-  }
-
-  void publish(cam::JobPlan result) {
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      plan_ = std::move(result);
-    }
-    finished_.store(true);
-    running_.store(false);
   }
 
   void cancel_and_join() {
@@ -152,9 +122,8 @@ class Planner {
   std::atomic<bool> finished_{false};
   std::atomic<bool> cancelled_{false};
   std::atomic<double> fraction_{0.0};
-  cam::PlanStage produced_ = cam::PlanStage::Toolpaths;
   std::string stage_;
-  cam::JobPlan plan_;
+  Result result_;
 };
 
 // ---------------------------------------------------------------------------
@@ -223,7 +192,15 @@ struct App {
   cam::JobPlan plan;
   bool has_plan = false;
 
-  Planner planner;
+  Background<cam::JobPlan> planner;
+  // The entry fronts on offer, and the blank they stand on. Found without
+  // planning anything, so declining one costs a click and not a propagation.
+  Background<cam::EntryDiscovery> scout;
+  cam::EntryDiscovery discovery;
+  // What the list in hand was found for, and what the run in flight will make
+  // it. Empty means nothing has been found yet.
+  std::string discovery_signature;
+  std::string discovery_pending;
   std::string banner;
   bool banner_is_error = false;
 
@@ -234,12 +211,6 @@ struct App {
   int selected_plan_operation = 0;
   Colouring colouring = Colouring::Feed;
   ViewMode mode = ViewMode::Setup;
-  // Entry fronts the wavefront stage found, and whether the plan in hand still
-  // needs its toolpaths built. Rebuilt whenever a wavefront pass lands.
-  std::vector<cam::EntryOption> entries;
-  bool awaiting_entry_choice = false;
-  // Skip the choice: plan straight through to toolpaths with every entry live.
-  bool auto_select_entries = true;
   int hovered_entry = -1;
   // Set from the command line so a screenshot can be told which view to take.
   int force_tab = -1;
@@ -987,6 +958,57 @@ void append_slab(std::vector<Facet>& facets, std::vector<ImVec2>& pool,
   }
 }
 
+// A loaded model as the triangles it was given, rather than as the stack of
+// prisms a slicer sees it as. Sampling the mesh at a fixed set of depths put a
+// staircase on every curved face and littered the flat ones with the hairline
+// slivers two independently decimated slices differ by -- neither of which is
+// in the model. Nothing in this view is a plan, so nothing here has any reason
+// to look at the models through a slicer.
+//
+// Faces turned away from the eye are dropped. Every model loaded here is a
+// closed solid wound outward, so those are exactly the faces the rest of the
+// solid stands in front of.
+void append_mesh(std::vector<Facet>& facets, std::vector<ImVec2>& pool,
+                 const wave::Mesh& mesh, const Projection& projection,
+                 const Vec3& light, const float colour[3], int alpha) {
+  facets.reserve(facets.size() + mesh.triangles.size() / 2);
+  pool.reserve(pool.size() + mesh.triangles.size() * 3 / 2);
+  for (const wave::Triangle3f& triangle : mesh.triangles) {
+    const Vec3 corners[3]{{triangle.a.x, triangle.a.y, triangle.a.z},
+                          {triangle.b.x, triangle.b.y, triangle.b.z},
+                          {triangle.c.x, triangle.c.y, triangle.c.z}};
+    const Vec3 u{corners[1].x - corners[0].x, corners[1].y - corners[0].y,
+                 corners[1].z - corners[0].z};
+    const Vec3 v{corners[2].x - corners[0].x, corners[2].y - corners[0].y,
+                 corners[2].z - corners[0].z};
+    Vec3 normal{u.y * v.z - u.z * v.y, u.z * v.x - u.x * v.z,
+                u.x * v.y - u.y * v.x};
+    const float length = std::sqrt(normal.x * normal.x + normal.y * normal.y +
+                                   normal.z * normal.z);
+    if (length < 1e-12f) continue;  // degenerate, and it has no normal to shade
+    normal = {normal.x / length, normal.y / length, normal.z / length};
+    if (normal.x * projection.toward.x + normal.y * projection.toward.y +
+            normal.z * projection.toward.z <= 0.0f)
+      continue;
+
+    Facet facet;
+    facet.first = static_cast<std::uint32_t>(pool.size());
+    facet.count = 3;
+    float depth = 0.0f;
+    for (const Vec3& corner : corners) {
+      pool.push_back(projection.point(corner));
+      depth += projection.depth(corner);
+    }
+    facet.depth = depth / 3.0f;
+    facet.fill = shaded_alpha(colour,
+                              normal.x * light.x + normal.y * light.y +
+                                  normal.z * light.z,
+                              alpha);
+    facet.edge = 0;
+    facets.push_back(facet);
+  }
+}
+
 // One entry front, as a vertical ribbon along the curve it actually occupies.
 // A front is a stretch of wall the wave starts from, not a volume: giving it
 // thickness put faces inside the stock for the depth sort to fight over, and
@@ -1294,115 +1316,76 @@ void draw_setup(App& app) {
                                  : &app.job.operations[std::clamp(
                                        app.selected_operation, 0,
                                        static_cast<int>(app.job.operations.size()) - 1)];
-  const int grid = operation ? operation->slice_grid : 32;
 
-  // Sampled at a fixed count rather than at the operation's stepdown: this is a
-  // look at the models, and it should not change shape when the stepdown does.
-  constexpr int kSlices = 24;
-  std::vector<double> depths;
-  for (int i = 0; i <= kSlices; ++i)
-    depths.push_back(high - (high - low) * (static_cast<double>(i) / kSlices));
+  const bool draw_stock = app.models != ModelShow::Part;
+  const bool draw_part = app.models != ModelShow::Stock;
+  // A rectangular blank has no mesh behind it, so it is drawn as the single
+  // prism it is defined to be rather than pretending to a model it never had.
+  const bool boxed = app.geometry.box_stock();
+  const wave::Paths64 box =
+      boxed ? app.geometry.stock_outline(low, operation ? operation->slice_grid : 32)
+            : wave::Paths64{};
 
   Clipper2Lib::Rect64 extent;
   bool any = false;
-  std::vector<Paths64> stock(depths.size());
-  std::vector<Paths64> part(depths.size());
-  for (std::size_t i = 0; i < depths.size(); ++i) {
-    stock[i] = app.geometry.stock_outline(depths[i], grid);
-    part[i] = app.geometry.part_outline(depths[i], grid);
-    for (const Paths64* rings : {&stock[i], &part[i]}) {
-      if (rings->empty()) continue;
-      const auto bounds = Clipper2Lib::GetBounds(*rings);
-      if (!any) { extent = bounds; any = true; continue; }
-      extent.left = std::min(extent.left, bounds.left);
-      extent.right = std::max(extent.right, bounds.right);
-      extent.top = std::min(extent.top, bounds.top);
-      extent.bottom = std::max(extent.bottom, bounds.bottom);
+  const auto cover = [&](std::int64_t left, std::int64_t top, std::int64_t right,
+                         std::int64_t bottom) {
+    if (!any) {
+      extent = Clipper2Lib::Rect64(left, top, right, bottom);
+      any = true;
+      return;
+    }
+    extent.left = std::min(extent.left, left);
+    extent.right = std::max(extent.right, right);
+    extent.top = std::min(extent.top, top);
+    extent.bottom = std::max(extent.bottom, bottom);
+  };
+  const auto cover_mesh = [&](const wave::Mesh& mesh) {
+    if (!mesh.bounds.valid) return;
+    cover(wave::to_integer(mesh.bounds.lower.x), wave::to_integer(mesh.bounds.lower.y),
+          wave::to_integer(mesh.bounds.upper.x), wave::to_integer(mesh.bounds.upper.y));
+  };
+  if (draw_part) cover_mesh(app.geometry.part().mesh());
+  if (draw_stock) {
+    if (boxed) {
+      if (!box.empty()) {
+        const auto bounds = Clipper2Lib::GetBounds(box);
+        cover(bounds.left, bounds.top, bounds.right, bounds.bottom);
+      }
+    } else {
+      cover_mesh(app.geometry.stock().mesh());
     }
   }
   if (!any) {
-    scene_message(scene, "Neither model has anything to show at these depths");
+    scene_message(scene, "Neither model has anything to show");
     end_scene(scene);
     return;
   }
   aim_scene(app, scene, extent, low, high);
 
-  // Both bodies whole, and the stock made see-through when both are on. The
-  // earlier attempt drew the stock with a part-shaped hole cut out of it, which
-  // gave every wall of the part an exact coincident twin on the hole's inside
-  // for the depth sort to pick between -- the corduroy on a curved face.
-  const bool draw_stock = app.models != ModelShow::Part;
-  const bool draw_part = app.models != ModelShow::Stock;
-  const int stock_alpha = draw_part ? 96 : 255;
-
-  std::size_t untriangulated = 0;
-  const auto slab = [&](const std::vector<Paths64>& solid, std::size_t i,
-                        const float wall[3], const float face[3], ImU32 edge,
-                        int alpha) {
-    if (solid[i + 1].empty()) return;
-    const Paths64 rings = drawable_region(solid[i + 1], scene.spacing);
-    if (rings.empty()) return;
-    // Only the ring this depth newly exposes gets a lid; the rest is roofed by
-    // the slice above it. Without this every slice draws its own top face and
-    // the walls come out banded like a contour map.
-    const Paths64 above =
-        i == 0 ? Paths64{} : drawable_region(solid[i], scene.spacing);
-    Paths64 lid_rings =
-        above.empty() ? rings
-                      : Clipper2Lib::Difference(rings, above,
-                                                Clipper2Lib::FillRule::NonZero);
-    // A slice and the one above it are decimated independently, so their
-    // difference is littered with hairline slivers that are not steps in the
-    // model at all. Outlining those is what turns a smooth curved face into
-    // corduroy, so anything narrower than a drawn vertex goes.
-    const double least = scene.spacing * scene.spacing;
-    lid_rings.erase(std::remove_if(lid_rings.begin(), lid_rings.end(),
-                                   [&](const wave::Path64& ring) {
-                                     return std::abs(Clipper2Lib::Area(ring)) <
-                                            least * wave::kIntegerScale *
-                                                wave::kIntegerScale;
-                                   }),
-                    lid_rings.end());
-    append_slab(scene.facets, scene.pool, rings,
-                fill_mesh(lid_rings, &untriangulated), lid_rings, depths[i + 1],
-                depths[i], scene.projection, scene.light, wall, face, edge,
-                alpha);
-  };
-
-  for (std::size_t i = 0; i + 1 < depths.size(); ++i) {
-    if (draw_part) {
-      const float wall[3]{0.34f, 0.50f, 0.68f};
-      const float face[3]{0.46f, 0.65f, 0.84f};
-      slab(part, i, wall, face, 0, 255);
-    }
-    // A solid drawn as a stack of prisms puts one front wall per slice along a
-    // near-level sightline. Opaque that costs nothing, since the nearest wall
-    // hides the rest; see-through, all two dozen of them composite and the
-    // ghost comes out banded and nearly solid. So a transparent stock is drawn
-    // once below, as its silhouette, instead of here.
-    if (draw_stock && !draw_part) {
-      const float wall[3]{0.27f, 0.30f, 0.35f};
-      const float face[3]{0.34f, 0.37f, 0.43f};
-      slab(stock, i, wall, face, IM_COL32(150, 165, 185, 60), 255);
-    }
+  // Both bodies whole, and the stock made see-through when both are on. Cutting
+  // a part-shaped hole in the stock instead gave every wall of the part an
+  // exact coincident twin on the hole's inside for the depth sort to pick
+  // between; letting the two solids simply overlap has no coincidence in it.
+  if (draw_part) {
+    const float colour[3]{0.42f, 0.60f, 0.80f};
+    append_mesh(scene.facets, scene.pool, app.geometry.part().mesh(),
+                scene.projection, scene.light, colour, 255);
   }
-
-  if (draw_stock && draw_part) {
-    // One prism over the whole depth range, outlined by everything the blank
-    // covers anywhere. For a blank that does not change shape with depth --
-    // a box, or anything prismatic -- this is the blank exactly.
-    Paths64 silhouette;
-    for (const Paths64& rings : stock)
-      silhouette.insert(silhouette.end(), rings.begin(), rings.end());
-    silhouette = Union(silhouette, Clipper2Lib::FillRule::NonZero);
-    const Paths64 rings = drawable_region(silhouette, scene.spacing);
-    if (!rings.empty()) {
-      const float wall[3]{0.34f, 0.38f, 0.45f};
-      const float face[3]{0.40f, 0.44f, 0.52f};
-      append_slab(scene.facets, scene.pool, rings,
-                  fill_mesh(rings, &untriangulated), rings, low, high,
-                  scene.projection, scene.light, wall, face,
-                  IM_COL32(160, 180, 205, 70), stock_alpha);
+  if (draw_stock) {
+    const float colour[3]{0.34f, 0.38f, 0.45f};
+    const int alpha = draw_part ? 90 : 255;
+    if (boxed) {
+      const wave::Paths64 rings = drawable_region(box, scene.spacing);
+      if (!rings.empty()) {
+        const float face[3]{0.40f, 0.44f, 0.52f};
+        append_slab(scene.facets, scene.pool, rings, fill_mesh(rings, nullptr),
+                    rings, low, high, scene.projection, scene.light, colour,
+                    face, IM_COL32(160, 180, 205, 70), alpha);
+      }
+    } else {
+      append_mesh(scene.facets, scene.pool, app.geometry.stock().mesh(),
+                  scene.projection, scene.light, colour, alpha);
     }
   }
   paint_scene(scene);
@@ -1460,17 +1443,19 @@ void entry_colour(std::size_t index, bool muted, bool highlighted,
 void draw_entries(App& app) {
   OrbitScene scene;
   begin_scene(app, scene, "entries");
-  if (!app.has_plan || app.plan.operations.empty()) {
-    scene_message(scene, "Plan the job to see the entry fronts on offer");
+  if (app.scout.running()) {
+    scene_message(scene, "Finding the entry fronts");
     end_scene(scene);
     return;
   }
-  const auto& operation = app.plan.operations[std::clamp(
-      app.selected_plan_operation, 0,
-      static_cast<int>(app.plan.operations.size()) - 1)];
-  const auto& levels = operation.levels;
-  if (app.entries.empty() || levels.empty()) {
-    scene_message(scene, "This operation propagates from no entry front");
+  if (!app.discovery.error.empty()) {
+    scene_message(scene, app.discovery.error.c_str());
+    end_scene(scene);
+    return;
+  }
+  const std::vector<cam::EntryLevel>& levels = app.discovery.levels;
+  if (app.discovery.entries.empty() || levels.empty()) {
+    scene_message(scene, "This operation starts from no entry front");
     end_scene(scene);
     return;
   }
@@ -1479,7 +1464,7 @@ void draw_entries(App& app) {
   bool any = false;
   double lowest = 0.0;
   double highest = 0.0;
-  for (const auto& level : levels) {
+  for (const cam::EntryLevel& level : levels) {
     if (level.stock_slice.empty()) continue;
     const auto bounds = Clipper2Lib::GetBounds(level.stock_slice);
     if (!any) {
@@ -1497,18 +1482,18 @@ void draw_entries(App& app) {
     highest = std::max(highest, level.floor_z + level.axial_depth);
   }
   if (!any) {
-    scene_message(scene, "Nothing was reached in this operation");
+    scene_message(scene, "The blank has nothing at these depths");
     end_scene(scene);
     return;
   }
   aim_scene(app, scene, extent, lowest, highest);
 
-  // The stock, as one plain solid. A pass gets a top face only where the pass
+  // The blank, as one plain solid. A pass gets a top face only where the pass
   // above did not already roof it, or the walls come out banded like a contour
   // map with a lid at every depth.
   std::size_t untriangulated = 0;
   for (std::size_t i = 0; i < levels.size(); ++i) {
-    const cam::LevelPlan& level = levels[i];
+    const cam::EntryLevel& level = levels[i];
     if (level.stock_slice.empty()) continue;
     const Paths64 rings = drawable_region(level.stock_slice, scene.spacing);
     if (rings.empty()) continue;
@@ -1529,35 +1514,29 @@ void draw_entries(App& app) {
   // Each entry front on the surface it actually occupies. A front is a stretch
   // of wall the wave starts from, so it is a ribbon down the pass it belongs
   // to, and the ribbons of one entry stack into a wall down its Z chain.
-  for (std::size_t option = 0; option < app.entries.size(); ++option) {
-    const cam::EntryOption& entry = app.entries[option];
+  for (std::size_t option = 0; option < app.discovery.entries.size(); ++option) {
+    const cam::EntryOption& entry = app.discovery.entries[option];
     const bool highlighted = static_cast<int>(option) == app.hovered_entry;
     float wall[3];
     float face[3];
     ImU32 edge = 0;
     entry_colour(option, entry.muted, highlighted, wall, face, edge);
     const int alpha = entry.muted ? 120 : (highlighted ? 255 : 225);
-    for (const wave::LayerItemId& member : entry.members) {
-      if (member.layer >= levels.size()) continue;
-      const cam::LevelPlan& level = levels[member.layer];
-      const auto& layer = operation.inter_layer.layers[member.layer];
-      if (member.index >= layer.entry_fronts.size()) continue;
-      const std::size_t front = layer.entry_fronts[member.index];
-      if (front >= level.lineage.entry_fronts.size()) continue;
-      const wave::LeadingFront& curve = level.lineage.entry_fronts[front];
+    for (const cam::EntryCurve& curve : entry.curves)
       append_ribbon(scene.facets, scene.pool, curve.path, curve.closed,
-                    level.floor_z, level.floor_z + level.axial_depth,
-                    scene.projection, scene.light, face, alpha);
-    }
+                    curve.bottom_z, curve.top_z, scene.projection, scene.light,
+                    face, alpha);
   }
   paint_scene(scene);
 
   char caption[220];
   std::size_t live = 0;
-  for (const cam::EntryOption& entry : app.entries) live += entry.muted ? 0 : 1;
+  for (const cam::EntryOption& entry : app.discovery.entries)
+    live += entry.muted ? 0 : 1;
   std::snprintf(caption, sizeof caption,
                 "%zu of %zu entry front%s propagating   Left-drag: orbit   Wheel: zoom",
-                live, app.entries.size(), app.entries.size() == 1 ? "" : "s");
+                live, app.discovery.entries.size(),
+                app.discovery.entries.size() == 1 ? "" : "s");
   scene.list->AddText({scene.top_left.x + 12.0f, scene.top_left.y + 10.0f},
                       IM_COL32(130, 142, 158, 255), caption);
   if (live == 0)
@@ -1999,6 +1978,9 @@ void load_meshes(App& app) {
       say(app, "Loaded. Z runs " + std::to_string(low) + " to " + std::to_string(high));
     }
     app.has_plan = false;
+    // The fronts belong to the models that were loaded, not to these.
+    app.discovery = {};
+    app.discovery_signature.clear();
   } catch (const std::exception& error) {
     say(app, error.what(), true);
   }
@@ -2202,107 +2184,114 @@ void feeds_panel(App& app) {
 
 // Recomputes the entry options for the plan in hand, and remembers whether the
 // job is still waiting for a choice about them.
-void refresh_entries(App& app) {
-  app.awaiting_entry_choice = false;
-  app.hovered_entry = -1;
-  if (!app.has_plan || app.plan.operations.empty()) {
-    app.entries.clear();
-    return;
-  }
-  const int index = std::clamp(app.selected_plan_operation, 0,
-                               static_cast<int>(app.plan.operations.size()) - 1);
-  const cam::OperationPlan& plan = app.plan.operations[index];
-  const cam::Operation* operation = nullptr;
-  for (const cam::Operation& candidate : app.job.operations)
-    if (candidate.name == plan.operation_name) operation = &candidate;
-  if (!operation || !plan.ok()) {
-    app.entries.clear();
-    return;
-  }
-  // Folded into what was already on offer rather than replacing it: a declined
-  // entry is not seeded, so it is absent from the plan, and a list rebuilt from
-  // the plan alone could never offer it back.
-  cam::merge_entry_options(app.entries, cam::entry_options(plan, *operation),
-                           operation->entry_front_match_tolerance);
-  // A plan started from scratch while entries were already declined has no
-  // record of them but the operation's own. Put those back on offer, without
-  // the numbers the plan cannot supply for a front it never seeded.
-  const double tolerance = std::max(operation->entry_front_match_tolerance, 0.001);
-  for (const std::vector<wave::Point64>& group : operation->muted_entries) {
-    bool known = false;
-    for (const cam::EntryOption& entry : app.entries)
-      for (const wave::Point64& anchor : entry.anchors)
-        for (const wave::Point64& muted : group)
-          if (std::hypot(wave::to_world(anchor.x - muted.x),
-                         wave::to_world(anchor.y - muted.y)) <= tolerance)
-            known = true;
-    if (known || group.empty()) continue;
-    cam::EntryOption declined;
-    declined.anchors = group;
-    declined.muted = true;
-    app.entries.push_back(std::move(declined));
-  }
-  app.awaiting_entry_choice = !plan.has_toolpaths();
+// Everything an entry front depends on. Which entries are declined is not in
+// it: declining one drops its own seed piece and leaves the others exactly
+// where they were, so the list does not move when the choice does -- which is
+// the whole reason choosing costs nothing.
+std::string entry_signature(const cam::Operation& operation) {
+  char buffer[512];
+  std::snprintf(buffer, sizeof buffer,
+                "%s|%s|%s|%d|%d|%.9g|%.9g|%.9g|%.9g|%.9g|%.9g|%d|%.9g|%.9g",
+                operation.tool_id.c_str(), operation.machine_id.c_str(),
+                operation.material_id.c_str(), static_cast<int>(operation.mode),
+                operation.slice_grid, operation.stepover_ratio, operation.stepdown,
+                operation.radial_stock_to_leave, operation.axial_stock_to_leave,
+                operation.top_z, operation.bottom_z, operation.lead_in ? 1 : 0,
+                operation.stock_deviation, operation.entry_front_match_tolerance);
+  return buffer;
+}
+
+// The operation whose entry fronts are on offer. Only one operation exists for
+// now, so this is simply the selected one.
+cam::Operation* selected_operation(App& app) {
+  if (app.job.operations.empty()) return nullptr;
+  const int index = std::clamp(app.selected_operation, 0,
+                               static_cast<int>(app.job.operations.size()) - 1);
+  return &app.job.operations[index];
+}
+
+// Finds the entry fronts, which needs no plan and produces none. Slicing is the
+// slow part and it is cached, so this is quick once the models have been looked
+// at once.
+void start_discovery(App& app) {
+  cam::Operation* operation = selected_operation(app);
+  if (!operation || app.scout.running()) return;
+  app.discovery_pending = entry_signature(*operation);
+  cam::JobGeometry& geometry = app.geometry;
+  const cam::Operation copy = *operation;
+  cam::ToolLibrary tools = app.tools;
+  cam::MachineLibrary machines = app.machines;
+  cam::MaterialLibrary materials = app.materials;
+  app.scout.start([&geometry, copy, tools = std::move(tools),
+                   machines = std::move(machines),
+                   materials = std::move(materials)](
+                      const cam::ProgressCallback& progress) {
+    cam::EntryDiscovery result;
+    const cam::Tool* tool = tools.find(copy.tool_id);
+    const cam::Machine* machine = machines.find(copy.machine_id);
+    const cam::Material* material = materials.find(copy.material_id);
+    if (!tool) result.error = "Unknown tool: " + copy.tool_id;
+    else if (!machine) result.error = "Unknown machine: " + copy.machine_id;
+    else if (!material) result.error = "Unknown material: " + copy.material_id;
+    else
+      result = cam::discover_entries(geometry, copy, *tool, *machine, *material,
+                                     progress);
+    return result;
+  });
+}
+
+// Runs discovery when what the fronts depend on has changed since the list in
+// hand was found. Toggling an entry is not such a change.
+void ensure_discovery(App& app) {
+  const cam::Operation* operation = selected_operation(app);
+  if (!operation || !app.geometry.has_part() || !app.geometry.has_stock()) return;
+  if (app.scout.running()) return;
+  if (entry_signature(*operation) == app.discovery_signature) return;
+  start_discovery(app);
 }
 
 void start_plan(App& app) {
   app.gcode.clear();
   app.post = {};
-  // A plan started by hand re-offers everything; only a replan from inside the
-  // entry panel keeps the list it is editing.
-  app.entries.clear();
-  app.awaiting_entry_choice = false;
-  app.planner.start(app.geometry, app.job, app.tools, app.machines, app.materials,
-                    app.auto_select_entries ? cam::PlanStage::Toolpaths
-                                            : cam::PlanStage::Wavefronts);
-}
-
-// The operation the entry choice applies to. Only one operation exists for now,
-// so this is the one whose name the selected plan carries.
-cam::Operation* selected_operation(App& app) {
-  if (!app.has_plan || app.plan.operations.empty()) return nullptr;
-  const int index = std::clamp(app.selected_plan_operation, 0,
-                               static_cast<int>(app.plan.operations.size()) - 1);
-  const std::string& name = app.plan.operations[index].operation_name;
-  for (cam::Operation& candidate : app.job.operations)
-    if (candidate.name == name) return &candidate;
-  return nullptr;
-}
-
-// Rebuilds the wavefronts with the current choice, which is the only way to see
-// what declining an entry does: the wave has to run again without it.
-void replan_wavefronts(App& app) {
-  app.planner.start(app.geometry, app.job, app.tools, app.machines, app.materials,
-                    cam::PlanStage::Wavefronts);
-}
-
-void start_toolpaths(App& app) {
-  app.gcode.clear();
-  app.post = {};
-  app.awaiting_entry_choice = false;
-  app.planner.start_toolpaths(std::move(app.plan), app.job, app.tools,
-                              app.machines, app.materials);
-  app.plan = {};
-  app.has_plan = false;
+  cam::JobGeometry& geometry = app.geometry;
+  cam::Job job = app.job;
+  cam::ToolLibrary tools = app.tools;
+  cam::MachineLibrary machines = app.machines;
+  cam::MaterialLibrary materials = app.materials;
+  app.planner.start([&geometry, job = std::move(job), tools = std::move(tools),
+                     machines = std::move(machines),
+                     materials = std::move(materials)](
+                        const cam::ProgressCallback& progress) {
+    return cam::plan_job(geometry, job, tools, machines, materials, progress);
+  });
 }
 
 void entry_panel(App& app) {
   ImGui::SeparatorText("Entry fronts");
-  if (app.entries.empty()) {
-    ImGui::TextDisabled("This operation propagates from no entry front");
-    if (ImGui::Button("Build toolpaths", ImVec2(-1, 0))) start_toolpaths(app);
+  if (app.scout.running()) {
+    ImGui::ProgressBar(static_cast<float>(app.scout.fraction()), ImVec2(-1, 0));
+    ImGui::TextWrapped("%s", app.scout.stage().c_str());
+    return;
+  }
+  if (!app.discovery.error.empty()) {
+    ImGui::TextColored(ImVec4(0.91f, 0.61f, 0.36f, 1.0f), "%s",
+                       app.discovery.error.c_str());
+    return;
+  }
+  if (app.discovery.entries.empty()) {
+    ImGui::TextDisabled("This operation starts from no entry front");
     return;
   }
   ImGui::TextWrapped(
-      "Each entry is a stretch of stock wall the wave starts from. Its colour "
-      "in the stack is the material it reaches. Declining one makes the "
-      "wavefronts run again without it.");
+      "Each entry is a stretch of stock wall the wave starts from. Declining "
+      "one leaves the material only it could have reached standing. Nothing is "
+      "planned until the job is.");
 
   cam::Operation* operation = selected_operation(app);
   bool changed = false;
   app.hovered_entry = -1;
-  for (std::size_t i = 0; i < app.entries.size(); ++i) {
-    cam::EntryOption& entry = app.entries[i];
+  for (std::size_t i = 0; i < app.discovery.entries.size(); ++i) {
+    cam::EntryOption& entry = app.discovery.entries[i];
     float wall[3];
     float face[3];
     ImU32 edge = 0;
@@ -2317,43 +2306,37 @@ void entry_panel(App& app) {
         2.0f);
     ImGui::SameLine();
     bool live = !entry.muted;
+    // No measure of what an entry reaches: reaching is propagation, and this
+    // list deliberately does not propagate. Where a front runs is visible in
+    // the view beside it, which is the question being asked.
     char label[96];
-    if (entry.members.empty())
-      // Declined before this plan ran, so the wave never seeded it and there is
-      // no territory to quote. Turning it back on is what measures it again.
-      std::snprintf(label, sizeof label, "declined##%zu", i);
-    else
-      std::snprintf(label, sizeof label, "%.0f mm2 over %zu pass%s",
-                    entry.territory_area, entry.members.size(),
-                    entry.members.size() == 1 ? "" : "es");
+    std::snprintf(label, sizeof label, "Z %.2f to %.2f mm##%zu", entry.bottom_z,
+                  entry.top_z, i);
     if (ImGui::Checkbox(label, &live)) {
       entry.muted = !live;
       changed = true;
     }
     if (ImGui::IsItemHovered()) {
       app.hovered_entry = static_cast<int>(i);
-      if (entry.members.empty())
-        ImGui::SetTooltip("Turn this back on to see what it reaches");
-      else
-        ImGui::SetTooltip("Z %.2f to %.2f mm", entry.bottom_z, entry.top_z);
+      ImGui::SetTooltip("%zu pass%s", entry.curves.size(),
+                        entry.curves.size() == 1 ? "" : "es");
     }
     ImGui::PopID();
   }
 
+  // The choice is an argument to planning and nothing else, so taking it is a
+  // write to the operation and no work at all. The fronts themselves cannot
+  // move: declining one drops its seed piece and leaves the others where they
+  // were.
   if (changed && operation) {
     operation->muted_entries.clear();
-    for (const cam::EntryOption& entry : app.entries)
+    for (const cam::EntryOption& entry : app.discovery.entries)
       if (entry.muted) operation->muted_entries.push_back(entry.anchors);
-    replan_wavefronts(app);
-    return;
   }
 
   std::size_t live = 0;
-  for (const cam::EntryOption& entry : app.entries) live += entry.muted ? 0 : 1;
-  ImGui::Separator();
-  ImGui::BeginDisabled(live == 0);
-  if (ImGui::Button("Build toolpaths", ImVec2(-1, 0))) start_toolpaths(app);
-  ImGui::EndDisabled();
+  for (const cam::EntryOption& entry : app.discovery.entries)
+    live += entry.muted ? 0 : 1;
   if (live == 0)
     ImGui::TextColored(ImVec4(0.91f, 0.61f, 0.36f, 1.0f),
                        "Leave at least one entry propagating");
@@ -2373,18 +2356,8 @@ void plan_panel(App& app) {
   if (ImGui::Button("Plan job", ImVec2(-1, 0))) start_plan(app);
   ImGui::EndDisabled();
   if (!ready) ImGui::TextDisabled("Load a part and a stock model first");
-  ImGui::Checkbox("Use every entry front", &app.auto_select_entries);
-  ImGui::SetItemTooltip(
-      "Plan straight through to the toolpaths. Turn this off to stop after the "
-      "wavefronts and choose which entry fronts the wave may start from.");
 
   if (!app.has_plan) return;
-
-  if (app.awaiting_entry_choice) {
-    ImGui::Separator();
-    entry_panel(app);
-    return;
-  }
 
   const cam::PlanStats& stats = app.plan.stats;
   ImGui::Separator();
@@ -2654,6 +2627,9 @@ void sidebar(App& app) {
   }
   job_panel(app);
   operations_panel(app);
+  // Beside the view that shows them, since choosing between them is a stage of
+  // its own and not part of setting a plan running.
+  if (app.mode == ViewMode::Entries) entry_panel(app);
   plan_panel(app);
   view_panel(app);
   output_panel(app);
@@ -2727,7 +2703,6 @@ int main(int argc, char** argv) {
       else if (argument == "--view") view_name = value();
       else if (argument == "--at") progress_fraction = std::stod(value());
       else if (argument == "--follow") app.stack_follows_playback = true;
-      else if (argument == "--choose-fronts") app.auto_select_entries = false;
       else if (argument == "--models") {
         const std::string which = value();
         app.models = which == "stock"  ? ModelShow::Stock
@@ -2777,7 +2752,6 @@ int main(int argc, char** argv) {
             "  --screenshot PATH  Render one frame to a binary PPM and exit\n"
             "  --box-stock MM     Use the part's bounding box, grown by MM, as stock\n"
             "  --models stock|part|both   What the plan view shows\n"
-            "  --choose-fronts    Stop after the wavefronts to pick entry fronts\n"
             "  --view models|fronts|pass|result\n"
             "                     Which view a screenshot should capture\n"
             "  --at FRACTION      How far through the pass to place the cutter, 0 to 1\n"
@@ -2980,6 +2954,12 @@ int main(int argc, char** argv) {
         running = false;
     }
 
+    if (app.scout.take(app.discovery)) {
+      app.discovery_signature =
+          app.discovery.ok() ? app.discovery_pending : std::string();
+      app.hovered_entry = -1;
+    }
+
     if (app.planner.take(app.plan)) {
       app.has_plan = app.plan.ok();
       app.selected_level = 0;
@@ -2996,7 +2976,6 @@ int main(int argc, char** argv) {
             std::clamp(progress_fraction, 0.0, 1.0) * level_length(level);
         sync_playback_time(app);
       }
-      refresh_entries(app);
       if (!app.plan.ok()) {
         std::fprintf(stderr, "Planning failed:\n%s\n", app.plan.error.c_str());
         for (const std::string& warning : app.plan.warnings)
@@ -3004,13 +2983,6 @@ int main(int argc, char** argv) {
         say(app, app.plan.error, true);
       } else if (screenshot_pending) {
         // The view was chosen on the command line; leave it alone.
-      } else if (app.awaiting_entry_choice) {
-        // Stop on the choice rather than in front of the finished result: the
-        // toolpaths do not exist yet, so the playback tabs have nothing to show.
-        app.mode = ViewMode::Entries;
-        app.force_tab = 1;
-        say(app, "Wavefronts built. " + std::to_string(app.entries.size()) +
-                     " entry front(s) on offer");
       } else {
         app.force_tab = 3;
         say(app, "Planned " + std::to_string(app.plan.stats.cut_levels) + " passes");
@@ -3055,6 +3027,7 @@ int main(int argc, char** argv) {
       }
       if (ImGui::BeginTabItem("Select fronts", nullptr, flag(1))) {
         app.mode = ViewMode::Entries;
+        ensure_discovery(app);
         draw_entries(app);
         ImGui::EndTabItem();
       }
@@ -3087,8 +3060,9 @@ int main(int argc, char** argv) {
     glClear(GL_COLOR_BUFFER_BIT);
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
-    if (screenshot_pending && app.planner.running()) {
-      // Wait for the plan, so the frame that gets captured has something in it.
+    if (screenshot_pending && (app.planner.running() || app.scout.running())) {
+      // Wait for the plan and the fronts, so the captured frame has something
+      // in it.
     } else if (screenshot_pending && ++screenshot_delay < 3) {
       // One more frame, so the panels have laid out against the finished plan.
     } else if (screenshot_pending) {

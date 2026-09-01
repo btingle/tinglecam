@@ -66,6 +66,20 @@ wave::Path64 box(double x0, double y0, double x1, double y1) {
   return {point(x0, y0), point(x1, y0), point(x1, y1), point(x0, y1)};
 }
 
+// Whether a point stands in a region that may have holes. A one-unit square is
+// intersected with the region rather than each ring being tested in turn, so
+// holes and nested outers are handled by the same fill rule the region was
+// built with.
+bool inside(const wave::Point64& at, const wave::Paths64& region) {
+  const wave::Path64 speck{{at.x, at.y},
+                           {at.x + 1, at.y},
+                           {at.x + 1, at.y + 1},
+                           {at.x, at.y + 1}};
+  return !Clipper2Lib::Intersect(wave::Paths64{speck}, region,
+                                 Clipper2Lib::FillRule::NonZero)
+              .empty();
+}
+
 double area(const wave::Paths64& paths) {
   double signed_area = 0.0;
   for (const auto& path : paths) signed_area += Clipper2Lib::Area(path);
@@ -294,32 +308,30 @@ void check_entry_front_selection() {
           "a subject spanning the stock leaves two separate entries");
   if (lineage.entry_fronts.size() != 2) return;
 
-  const double left_area = area(wave::entry_front_territory(lineage, 0));
-  const double right_area = area(wave::entry_front_territory(lineage, 1));
-  require(left_area > 0.0 && right_area > 0.0,
-          "each entry is answerable for material");
-  require_near(left_area + right_area, area(stock) - area(subject), 1.0,
-               "between them the entries reach everything the wave can");
-
-  // Decline the one whose territory is smaller, and check the wave never starts
-  // there rather than merely being told not to cut there.
-  const std::size_t declined = left_area <= right_area ? 0 : 1;
+  // Decline one, and check the wave never starts there rather than merely being
+  // told not to cut there. The corridors are mirror images, so what the wave
+  // can still reach answers that exactly.
+  const double both = area(all.reached_generations.back());
+  require(both > 0.0, "the wave reaches material from the two entries");
   wave::EntryMute mute;
-  mute.anchors.push_back(
-      wave::representative_point(lineage.entry_fronts[declined]));
+  mute.anchors.push_back(wave::representative_point(lineage.entry_fronts[0]));
   mute.tolerance = wave::to_integer(1.0);
   const auto one = wave::build_wavefront(subject, stock, 1.0, 0.0, 0.0, 2000, mute);
   require(one.muted_entries == 1, "the declined seed piece is dropped");
   const auto reduced = wave::build_front_lineage(one);
   require(reduced.entry_fronts.size() == 1,
           "only the entry that was kept propagates");
-  if (reduced.entry_fronts.empty()) return;
-  const double kept = area(wave::entry_front_territory(reduced, 0));
-  require_near(kept, std::max(left_area, right_area), 1.0,
-               "the surviving entry reaches what it always did and no further");
-  require(kept < left_area + right_area - 1.0,
-          "the corridor behind the declined entry is out of reach, "
-          "since the subject blocks the way round");
+  require_near(area(one.reached_generations.back()), both * 0.5, 1.0,
+               "the corridor behind the declined entry is out of reach, "
+               "since the subject blocks the way round");
+
+  // The entry that was kept is exactly where it was. Nothing about a front
+  // depends on which of its neighbours were declined, which is what lets a
+  // choice be offered without propagating anything.
+  const wave::LeadingFront& before = lineage.entry_fronts[1];
+  const wave::LeadingFront& after = reduced.entry_fronts.front();
+  require(before.path == after.path,
+          "declining one entry leaves the others exactly where they were");
 
   // An anchor that names nothing is not an error and mutes nothing: that is how
   // a selection outlives a change of depth that moves the fronts.
@@ -384,6 +396,163 @@ void check_box_stock(const std::filesystem::path& part_mesh) {
   geometry.clear_stock();
   require(geometry.box_stock(),
           "and dropping it hands the job back to the box");
+}
+
+// The entry fronts are found without planning anything, and finding them does
+// not depend on which of them have been declined. That invariant is what lets a
+// choice be made and unmade for the price of a click.
+void check_entry_discovery(const std::filesystem::path& data,
+                           const std::filesystem::path& part_mesh) {
+  std::cout << "entry discovery\n";
+  const auto materials = cam::load_materials(data / "materials");
+  const auto machines = cam::load_machines(data / "machines");
+  const auto tools = cam::load_tools(data / "starter-tools.json");
+  const cam::Tool* tool = tools.tools.empty() ? nullptr : &tools.tools.front();
+  require(tool != nullptr, "a tool to cut with");
+  if (!tool || tool->cutting_data.empty()) return;
+  const std::string material_id = tool->cutting_data.front().material_id;
+  const cam::Machine* machine = nullptr;
+  for (const auto& candidate : machines.machines)
+    if (candidate.feeds_for(material_id)) machine = &candidate;
+  const cam::Material* material = materials.find(material_id);
+  require(machine != nullptr && material != nullptr,
+          "a machine and a material to cut it in");
+  if (!machine || !material) return;
+
+  cam::JobGeometry geometry;
+  geometry.load_part(part_mesh);
+  geometry.set_box_stock(true, 4.0);
+  double low = 0.0;
+  double high = 0.0;
+  require(geometry.z_range(low, high), "the part has a depth range");
+
+  cam::Operation operation;
+  operation.tool_id = tool->id;
+  operation.machine_id = machine->id;
+  operation.material_id = material_id;
+  operation.top_z = high;
+  // Coarse on purpose: this is about which fronts are found, not about how
+  // finely the part is cut, and a few thick passes say it just as well.
+  operation.bottom_z = high - (high - low) * 0.5;
+  operation.stepdown = std::max((high - low) * 0.25, 0.5);
+
+  const cam::EntryDiscovery found =
+      cam::discover_entries(geometry, operation, *tool, *machine, *material);
+  require(found.ok(), "discovery succeeds: " + found.error);
+  require(!found.entries.empty(), "a blank around a part has somewhere to start");
+  if (found.entries.empty()) return;
+  for (const cam::EntryOption& entry : found.entries) {
+    require(!entry.curves.empty(), "an entry on offer is somewhere in particular");
+    require(entry.anchors.size() == entry.curves.size(),
+            "every appearance has the anchor that names it");
+    require(!entry.muted, "nothing is declined until it is declined");
+  }
+
+  // Decline one, and ask again. The same fronts have to come back in the same
+  // order: a seed piece that is dropped takes nothing with it.
+  operation.muted_entries.push_back(found.entries.front().anchors);
+  const cam::EntryDiscovery again =
+      cam::discover_entries(geometry, operation, *tool, *machine, *material);
+  require(again.ok(), "discovery succeeds with an entry declined");
+  require(again.entries.size() == found.entries.size(),
+          "declining an entry does not remove it from the list");
+  if (again.entries.size() != found.entries.size()) return;
+  for (std::size_t i = 0; i < again.entries.size(); ++i) {
+    require(again.entries[i].anchors == found.entries[i].anchors,
+            "and moves none of the others");
+    require(again.entries[i].muted == (i == 0),
+            "the declined entry, and only it, comes back marked");
+  }
+}
+
+// Declining the entry that is the only way into a depth leaves that depth with
+// nothing to cut -- and nothing may be emitted there. The boundary cleanup
+// contours are derived from the part rather than from the wave, so before they
+// were clipped to what the wave reached they were still emitted at those
+// depths: a finishing pass around a pocket through solid stock that nothing had
+// roughed.
+void check_declined_entry(const std::filesystem::path& data,
+                          const std::filesystem::path& objs) {
+  std::cout << "declined entry\n";
+  const auto materials = cam::load_materials(data / "materials");
+  const auto machines = cam::load_machines(data / "machines");
+  const auto tools = cam::load_tools(data / "starter-tools.json");
+  const cam::Tool* tool = tools.tools.empty() ? nullptr : &tools.tools.front();
+  if (!tool || tool->cutting_data.empty()) return;
+  const std::string material_id = tool->cutting_data.front().material_id;
+  const cam::Machine* machine = nullptr;
+  for (const auto& candidate : machines.machines)
+    if (candidate.feeds_for(material_id)) machine = &candidate;
+  const cam::Material* material = materials.find(material_id);
+  if (!machine || !material) return;
+
+  cam::JobGeometry geometry;
+  geometry.load_part(objs / "final_obj" / "Rs.obj");
+  geometry.load_stock(objs / "stock_obj" / "Rs.obj");
+  double low = 0.0;
+  double high = 0.0;
+  require(geometry.z_range(low, high), "the part and its blank overlap in Z");
+
+  cam::Operation operation;
+  operation.tool_id = tool->id;
+  operation.machine_id = machine->id;
+  operation.material_id = material_id;
+  operation.top_z = high;
+  operation.bottom_z = low;
+  operation.stepdown = std::max((high - low) * 0.2, 0.5);
+
+  const cam::EntryDiscovery found =
+      cam::discover_entries(geometry, operation, *tool, *machine, *material);
+  require(found.ok() && found.entries.size() >= 2,
+          "this blank offers more than one way in");
+  if (!found.ok() || found.entries.size() < 2) return;
+
+  // Decline the one that reaches deepest, so the depths only it opens are left
+  // with no entry at all rather than merely a longer way round.
+  const cam::EntryOption* deepest = &found.entries.front();
+  for (const cam::EntryOption& entry : found.entries)
+    if (entry.bottom_z < deepest->bottom_z) deepest = &entry;
+  operation.muted_entries.push_back(deepest->anchors);
+
+  cam::Job job;
+  job.operations.push_back(operation);
+  const cam::JobPlan plan =
+      cam::plan_job(geometry, job, tools, machines, materials, {});
+  require(plan.ok(), "the job plans with an entry declined: " + plan.error);
+  if (!plan.ok() || plan.operations.empty()) return;
+
+  std::size_t starved = 0;
+  std::size_t emitted = 0;
+  std::size_t outside = 0;
+  std::size_t checked = 0;
+  for (const cam::LevelPlan& level : plan.operations.front().levels) {
+    if (level.stock_slice.empty()) continue;
+    if (level.wave.reached_generations.empty()) {
+      ++starved;
+      if (!level.toolpath.moves.empty()) ++emitted;
+      continue;
+    }
+    const wave::Paths64 reached = Clipper2Lib::InflatePaths(
+        level.wave.reached_generations.back(),
+        wave::boundary_slack(level.wave.stepover), Clipper2Lib::JoinType::Miter,
+        Clipper2Lib::EndType::Polygon);
+    for (const wave::ToolpathMove& move : level.toolpath.moves) {
+      if (move.kind != wave::MoveKind::Cut) continue;
+      for (const wave::Point64& at : move.path) {
+        ++checked;
+        if (!inside(at, reached)) ++outside;
+      }
+    }
+  }
+  require(starved > 0,
+          "declining the deepest entry leaves depths the wave cannot start at");
+  require(emitted == 0,
+          std::to_string(emitted) +
+              " depth(s) with no entry still emit a cutting pass");
+  require(checked > 0, "the depths that keep an entry are still cut");
+  require(outside == 0,
+          std::to_string(outside) + " of " + std::to_string(checked) +
+              " cut points stand in stock the wave never reached");
 }
 
 void check_inter_layer_topology() {
@@ -1011,6 +1180,8 @@ int main(int argc, char** argv) {
     check_post_output();
     if (argc > 1) check_shipped_data(argv[1]);
     if (argc > 2) check_box_stock(argv[2]);
+    if (argc > 2) check_entry_discovery(argv[1], argv[2]);
+    if (argc > 3) check_declined_entry(argv[1], argv[3]);
   } catch (const std::exception& error) {
     std::cerr << "Test threw: " << error.what() << '\n';
     return EXIT_FAILURE;

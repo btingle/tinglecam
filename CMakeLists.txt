@@ -176,7 +176,8 @@ add_test(NAME simulation_tests
 add_executable(cam_tests tests/cam_tests.cpp)
 target_link_libraries(cam_tests PRIVATE tinglecam_core)
 add_test(NAME cam_tests COMMAND cam_tests ${CMAKE_CURRENT_SOURCE_DIR}/data
-         ${CMAKE_CURRENT_SOURCE_DIR}/objs/final_obj/L.obj)
+         ${CMAKE_CURRENT_SOURCE_DIR}/objs/final_obj/L.obj
+         ${CMAKE_CURRENT_SOURCE_DIR}/objs)
 
 add_test(NAME tinglecam_help COMMAND tinglecam --help)
 

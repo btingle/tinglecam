@@ -145,19 +145,10 @@ struct PlanStats {
   double excess_area = 0.0;
 };
 
-// How far a plan has been taken. Wavefronts stop after the entry fronts and
-// their Z chains are known, which is everything needed to choose between them
-// and nothing that depends on that choice.
-enum class PlanStage {
-  Wavefronts,
-  Toolpaths,
-};
-
 struct OperationPlan {
   std::string operation_name;
   std::string tool_id;
   double spindle_rpm = 0.0;
-  PlanStage stage = PlanStage::Toolpaths;
   std::vector<LevelPlan> levels;
   wave::InterLayerTopology inter_layer;
   PlanStats stats;
@@ -165,7 +156,6 @@ struct OperationPlan {
   std::string error;  // non-empty when the operation could not be planned
 
   bool ok() const { return error.empty(); }
-  bool has_toolpaths() const { return stage == PlanStage::Toolpaths; }
 };
 
 struct JobPlan {
@@ -240,9 +230,8 @@ class JobGeometry {
 std::vector<double> level_floors(const Operation& operation);
 
 // Slices, propagates the wave, and builds the lineage and inter-layer topology
-// for every depth. This is the stage that discovers entry fronts: it is where
-// the plan stops when the caller wants to choose between them before paying for
-// the toolpaths and the simulation, which cost several times as much.
+// for every depth. Which entries were declined is an input here, not an output:
+// a declined entry is one the wave is never seeded from.
 OperationPlan plan_wavefronts(const JobGeometry& geometry,
                               const Operation& operation,
                               const Tool& tool,
@@ -253,8 +242,7 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
                               double progress_to = 1.0);
 
 // Carries a wavefront plan the rest of the way: toolpath, simulation, feeds,
-// and the rolled-up statistics. The plan is modified in place and its stage
-// becomes Toolpaths.
+// and the rolled-up statistics. The plan is modified in place.
 void plan_toolpaths(OperationPlan& plan,
                     const Operation& operation,
                     const Tool& tool,
@@ -265,8 +253,7 @@ void plan_toolpaths(OperationPlan& plan,
                     double progress_to = 1.0,
                     double rapid_clearance_height = 10.0);
 
-// Both stages back to back, which is what a caller that does not want to choose
-// entry fronts by hand asks for.
+// Both stages back to back.
 OperationPlan plan_operation(const JobGeometry& geometry,
                              const Operation& operation,
                              const Tool& tool,
@@ -277,53 +264,69 @@ OperationPlan plan_operation(const JobGeometry& geometry,
                              double progress_to = 1.0,
                              double rapid_clearance_height = 10.0);
 
-// The entry fronts on offer in a wavefront plan, one item per Z chain, with
-// single-layer fronts that matched no chain listed on their own. This is the
-// unit the interface offers and the unit `Operation::muted_entries` records.
+// One appearance of an entry front: the curve the wave would start from on one
+// level, and the slab of depth that level stands for.
+struct EntryCurve {
+  wave::Path64 path;
+  bool closed = false;
+  double top_z = 0.0;
+  double bottom_z = 0.0;
+};
+
+// An entry front on offer, gathered down its Z chain. Fronts that matched no
+// chain stand on their own, or a one-level entry could never be declined.
+// This is the unit the interface offers and the unit `Operation::muted_entries`
+// records.
 struct EntryOption {
-  // Layer and index into that layer's `lineage.entry_fronts`.
-  std::vector<wave::LayerItemId> members;
-  // One anchor per member, which is what muting stores.
+  // One anchor per appearance, which is what muting stores. Anchors are matched
+  // by position rather than by index, so a choice survives renumbering.
   std::vector<wave::Point64> anchors;
-  // Union of every member's territory area, in mm^2.
-  double territory_area = 0.0;
+  std::vector<EntryCurve> curves;
   double top_z = 0.0;
   double bottom_z = 0.0;
   bool muted = false;
 };
 
-// Only entries the wave was actually seeded from appear here: a declined one
-// leaves no trace in the plan, because declining it is exactly not seeding it.
-// A caller offering the choice therefore has to remember what it was offered.
-std::vector<EntryOption> entry_options(const OperationPlan& plan,
-                                       const Operation& operation);
+// The blank at one depth, so the fronts can be seen against the material they
+// start from without a plan having been made.
+struct EntryLevel {
+  wave::Paths64 stock_slice;
+  double floor_z = 0.0;
+  double axial_depth = 0.0;
+};
 
-// Folds a fresh reading into the list already on offer. Entries that came back
-// have their territory refreshed; entries that did not are the declined ones
-// and are kept, so a choice can be taken back. Ones never seen before are
-// appended.
-void merge_entry_options(std::vector<EntryOption>& known,
-                         std::vector<EntryOption> fresh,
-                         double match_tolerance);
+struct EntryDiscovery {
+  std::vector<EntryLevel> levels;
+  std::vector<EntryOption> entries;
+  std::vector<std::string> warnings;
+  std::string error;
 
-// `upto` stops the job after the wavefront stage, which is where entry fronts
-// are on offer and nothing yet depends on which of them were chosen.
+  bool ok() const { return error.empty(); }
+};
+
+// Every entry front the operation could start from, found by seeding the wave
+// on each level and stopping there. Seeding is the whole of entry discovery:
+// the fronts are generation zero, which is built before the first propagation
+// step and does not depend on any of them.
+//
+// Nothing here is muted. Declining an entry drops a whole seed component and
+// leaves every other component exactly where it was, so this list is the same
+// list whatever has been declined -- which is what lets a choice be made and
+// unmade without planning anything. `Operation::muted_entries` is matched
+// against it by position and sets the `muted` flags.
+EntryDiscovery discover_entries(const JobGeometry& geometry,
+                                const Operation& operation,
+                                const Tool& tool,
+                                const Machine& machine,
+                                const Material& material,
+                                const ProgressCallback& progress = {});
+
 JobPlan plan_job(const JobGeometry& geometry,
                  const Job& job,
                  const ToolLibrary& tools,
                  const MachineLibrary& machines,
                  const MaterialLibrary& materials,
-                 const ProgressCallback& progress,
-                 PlanStage upto = PlanStage::Toolpaths);
-
-// Carries a job stopped at the wavefront stage the rest of the way. Operations
-// already at Toolpaths, and failed ones, are left alone.
-void plan_job_toolpaths(JobPlan& plan,
-                        const Job& job,
-                        const ToolLibrary& tools,
-                        const MachineLibrary& machines,
-                        const MaterialLibrary& materials,
-                        const ProgressCallback& progress);
+                 const ProgressCallback& progress);
 
 const char* operation_mode_name(OperationMode value);
 

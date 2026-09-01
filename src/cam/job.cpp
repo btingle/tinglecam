@@ -168,12 +168,6 @@ bool resolve_setup(const Operation& operation, const Tool& tool,
   return true;
 }
 
-double absolute_area_mm2(const wave::Paths64& paths) {
-  double signed_area = 0.0;
-  for (const wave::Path64& path : paths) signed_area += Clipper2Lib::Area(path);
-  return std::abs(signed_area) / (wave::kIntegerScale * wave::kIntegerScale);
-}
-
 // The muting the wave is given for one depth: every anchor the operation
 // carries. Anchors that name no seed piece at this depth simply match nothing,
 // which is what happens where an entry does not reach this far down.
@@ -354,7 +348,6 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
   OperationPlan plan;
   plan.operation_name = operation.name;
   plan.tool_id = operation.tool_id;
-  plan.stage = PlanStage::Wavefronts;
 
   if (!geometry.has_part()) {
     plan.error = "No part mesh is loaded";
@@ -483,7 +476,7 @@ void plan_toolpaths(OperationPlan& plan,
                     double progress_from,
                     double progress_to,
                     double rapid_clearance_height) {
-  if (!plan.ok() || plan.has_toolpaths()) return;
+  if (!plan.ok()) return;
   if (!(rapid_clearance_height > 0.0) ||
       !std::isfinite(rapid_clearance_height)) {
     plan.error = "Rapid clearance height must be positive";
@@ -551,10 +544,28 @@ void plan_toolpaths(OperationPlan& plan,
         level.toolpath = wave::build_toolpath(
             level.wave, level.lineage, radius, level.floor_z,
             rapid_clearance_height, rapid_feed(machine), no_engagement_feed);
-        if (operation.rough_boundary_cleanup && !level.part_slice.empty()) {
+        if (operation.rough_boundary_cleanup && !level.part_slice.empty() &&
+            !level.wave.reached_generations.empty()) {
+          // Only where the wave got. A cleanup contour runs along the part at
+          // the same offset the wave was bounded by, so where the wave never
+          // reached -- a pocket whose only entry was declined, or one nothing
+          // can get into -- the contour is a cut through solid stock that
+          // nothing roughed. Clipping to the reached region drops those and
+          // trims the partly reached ones to the part that was.
+          //
+          // The contour lies exactly on the reached region's inner boundary,
+          // both being the same slice offset by the same distance, so the test
+          // has to allow the slack the two roundings differ by. Without it a
+          // contour fails against the region it is drawn on.
+          wave::Paths64 clip = Clipper2Lib::InflatePaths(
+              level.wave.reached_generations.back(),
+              wave::boundary_slack(setup.stepover), Clipper2Lib::JoinType::Miter,
+              Clipper2Lib::EndType::Polygon);
+          if (operation.clip_contours_to_stock)
+            clip = Clipper2Lib::Intersect(clip, level.stock_slice,
+                                          Clipper2Lib::FillRule::NonZero);
           const auto contours = derive_offset_contours(
-              level.part_slice, radius + operation.radial_stock_to_leave,
-              operation.clip_contours_to_stock ? &level.stock_slice : nullptr);
+              level.part_slice, radius + operation.radial_stock_to_leave, &clip);
           auto tasks = contour_traversal_tasks(contours,
                                                operation.contour_direction);
           add_safe_stock_approaches(tasks, level.stock_slice,
@@ -664,7 +675,6 @@ void plan_toolpaths(OperationPlan& plan,
         std::to_string(plan.stats.unreachable_fronts) +
         " front(s) were never reached, so the stock they bound is left standing");
 
-  plan.stage = PlanStage::Toolpaths;
 }
 
 OperationPlan plan_operation(const JobGeometry& geometry,
@@ -686,33 +696,97 @@ OperationPlan plan_operation(const JobGeometry& geometry,
   return plan;
 }
 
-std::vector<EntryOption> entry_options(const OperationPlan& plan,
-                                       const Operation& operation) {
-  std::vector<EntryOption> options;
-  const wave::InterLayerTopology& topology = plan.inter_layer;
-  // A chain gathers one physical entry's appearances down the Z stack, so it is
-  // the thing to offer. A front that matched no chain is its own option rather
-  // than being dropped, or a one-layer entry could never be declined.
-  std::vector<std::vector<bool>> claimed(topology.layers.size());
-  for (std::size_t layer = 0; layer < topology.layers.size(); ++layer)
-    claimed[layer].assign(topology.layers[layer].entry_fronts.size(), false);
+EntryDiscovery discover_entries(const JobGeometry& geometry,
+                                const Operation& operation,
+                                const Tool& tool,
+                                const Machine& machine,
+                                const Material& material,
+                                const ProgressCallback& progress) {
+  EntryDiscovery result;
+  if (!geometry.has_part()) {
+    result.error = "No part mesh is loaded";
+    return result;
+  }
+  if (!geometry.has_stock()) {
+    result.error = "No stock mesh is loaded";
+    return result;
+  }
+  // Finishing propagates no wave, so it starts nowhere and there is nothing to
+  // choose between.
+  if (operation.mode != OperationMode::Roughing) return result;
 
-  auto add_member = [&](EntryOption& option, const wave::LayerItemId& member) {
-    if (member.layer >= plan.levels.size()) return;
-    if (member.layer < claimed.size() && member.index < claimed[member.layer].size())
-      claimed[member.layer][member.index] = true;
-    const LevelPlan& level = plan.levels[member.layer];
-    const wave::LayerTopology& layer = topology.layers[member.layer];
-    if (member.index >= layer.entry_fronts.size()) return;
-    const std::size_t front = layer.entry_fronts[member.index];
-    if (front >= level.lineage.entry_fronts.size()) return;
-    option.members.push_back(member);
-    option.anchors.push_back(
-        wave::representative_point(level.lineage.entry_fronts[front]));
-    option.territory_area +=
-        absolute_area_mm2(wave::entry_front_territory(level.lineage, front));
+  OperationSetup setup;
+  if (!resolve_setup(operation, tool, machine, material, result.error,
+                     &result.warnings, setup))
+    return result;
+
+  std::vector<wave::FrontLineage> lineages;
+  std::vector<std::size_t> lineage_levels;
+  double previous_z = operation.top_z;
+  for (std::size_t index = 0; index < setup.floors.size(); ++index) {
+    const double floor_z = setup.floors[index];
+    if (progress &&
+        !progress(static_cast<double>(index) / setup.floors.size(),
+                  operation.name + ": entries at depth " +
+                      std::to_string(floor_z) + " mm")) {
+      result.error = "Cancelled";
+      return result;
+    }
+    EntryLevel level;
+    level.floor_z = floor_z;
+    level.axial_depth = previous_z - floor_z;
+    previous_z = floor_z;
+    try {
+      level.stock_slice = geometry.stock_outline(floor_z, operation.slice_grid);
+      const wave::Paths64 part_slice =
+          geometry.part_outline(floor_z, operation.slice_grid);
+      if (!level.stock_slice.empty()) {
+        const wave::Paths64 keep_out =
+            part_slice.empty()
+                ? absent_subject(level.stock_slice)
+                : offset_outward(part_slice,
+                                 setup.radius + operation.radial_stock_to_leave);
+        const double lead_in =
+            operation.lead_in ? setup.radius + setup.first_bite_allowance : 0.0;
+        // Seeded and stopped. Generation zero is the whole of what an entry
+        // front is, and it is built before the first propagation step.
+        const wave::WaveResult seeded = wave::seed_wavefront(
+            keep_out, level.stock_slice, setup.stepover, setup.stepover, lead_in);
+        lineages.push_back(wave::build_front_lineage(seeded));
+        lineage_levels.push_back(result.levels.size());
+      }
+    } catch (const std::exception& error) {
+      result.warnings.push_back("Depth " + std::to_string(floor_z) +
+                                " mm, entry discovery: " + error.what());
+    }
+    result.levels.push_back(std::move(level));
+  }
+
+  std::vector<const wave::FrontLineage*> chained;
+  chained.reserve(lineages.size());
+  for (const wave::FrontLineage& lineage : lineages) chained.push_back(&lineage);
+  std::vector<wave::InterLayerChain> chains;
+  try {
+    chains = wave::chain_entry_fronts(chained,
+                                      operation.entry_front_match_tolerance);
+  } catch (const std::exception& error) {
+    result.error = std::string("Entry-front chaining: ") + error.what();
+    return result;
+  }
+
+  // A chain gathers one physical entry's appearances down the Z stack, so it is
+  // the thing to offer.
+  const auto add = [&](EntryOption& option, const wave::LayerItemId& member) {
+    if (member.layer >= lineages.size()) return;
+    const auto& fronts = lineages[member.layer].entry_fronts;
+    if (member.index >= fronts.size()) return;
+    const EntryLevel& level = result.levels[lineage_levels[member.layer]];
+    const wave::LeadingFront& front = fronts[member.index];
+    option.anchors.push_back(wave::representative_point(front));
+    option.curves.push_back({front.path, front.closed,
+                             level.floor_z + level.axial_depth, level.floor_z});
     const double top = level.floor_z + level.axial_depth;
-    if (option.members.size() == 1) {
+    if (option.curves.size() == 1) {
       option.top_z = top;
       option.bottom_z = level.floor_z;
     } else {
@@ -721,23 +795,33 @@ std::vector<EntryOption> entry_options(const OperationPlan& plan,
     }
   };
 
-  for (const wave::InterLayerChain& chain : topology.entry_front_chains) {
+  // A chain is only assembled from two or more appearances, so a front that
+  // stands on one level alone is offered in its own right rather than being
+  // dropped -- otherwise a one-level entry could never be declined.
+  std::vector<std::vector<bool>> claimed(lineages.size());
+  for (std::size_t layer = 0; layer < lineages.size(); ++layer)
+    claimed[layer].assign(lineages[layer].entry_fronts.size(), false);
+  for (const wave::InterLayerChain& chain : chains) {
     EntryOption option;
-    for (const wave::LayerItemId& member : chain.members) add_member(option, member);
-    if (!option.members.empty()) options.push_back(std::move(option));
+    for (const wave::LayerItemId& member : chain.members) {
+      if (member.layer < claimed.size() && member.index < claimed[member.layer].size())
+        claimed[member.layer][member.index] = true;
+      add(option, member);
+    }
+    if (!option.anchors.empty()) result.entries.push_back(std::move(option));
   }
   for (std::size_t layer = 0; layer < claimed.size(); ++layer)
     for (std::size_t index = 0; index < claimed[layer].size(); ++index) {
       if (claimed[layer][index]) continue;
       EntryOption option;
-      add_member(option, {layer, index});
-      if (!option.members.empty()) options.push_back(std::move(option));
+      add(option, {layer, index});
+      if (!option.anchors.empty()) result.entries.push_back(std::move(option));
     }
 
   // Muting is recorded as points rather than indices, so which options are off
   // is answered by asking where those points landed.
   const double tolerance = std::max(operation.entry_front_match_tolerance, 0.001);
-  for (EntryOption& option : options)
+  for (EntryOption& option : result.entries)
     for (const wave::Point64& anchor : option.anchors)
       for (const std::vector<wave::Point64>& group : operation.muted_entries)
         for (const wave::Point64& muted : group)
@@ -745,10 +829,9 @@ std::vector<EntryOption> entry_options(const OperationPlan& plan,
                          wave::to_world(anchor.y - muted.y)) <= tolerance)
             option.muted = true;
 
-  // Ordered by where each entry sits, not by how much it reaches: territory
-  // changes every time another entry is declined, and a list that reshuffles
-  // under the pointer is a list that gets mis-clicked.
-  std::sort(options.begin(), options.end(),
+  // Ordered by where each entry sits, so the list does not reshuffle under the
+  // pointer as the choice changes.
+  std::sort(result.entries.begin(), result.entries.end(),
             [](const EntryOption& a, const EntryOption& b) {
               if (a.anchors.empty() || b.anchors.empty())
                 return a.anchors.size() > b.anchors.size();
@@ -756,44 +839,8 @@ std::vector<EntryOption> entry_options(const OperationPlan& plan,
                 return a.anchors.front().x < b.anchors.front().x;
               return a.anchors.front().y < b.anchors.front().y;
             });
-  return options;
-}
-
-void merge_entry_options(std::vector<EntryOption>& known,
-                         std::vector<EntryOption> fresh,
-                         double match_tolerance) {
-  const double tolerance = std::max(match_tolerance, 0.001);
-  const auto same = [&](const EntryOption& a, const EntryOption& b) {
-    for (const wave::Point64& one : a.anchors)
-      for (const wave::Point64& other : b.anchors)
-        if (std::hypot(wave::to_world(one.x - other.x),
-                       wave::to_world(one.y - other.y)) <= tolerance)
-          return true;
-    return false;
-  };
-  std::vector<bool> claimed(fresh.size(), false);
-  for (EntryOption& entry : known) {
-    bool found = false;
-    for (std::size_t i = 0; i < fresh.size(); ++i) {
-      if (claimed[i] || !same(entry, fresh[i])) continue;
-      claimed[i] = true;
-      found = true;
-      // Keep the anchors that were offered rather than the ones just read: the
-      // anchors are what muting is recorded as, and they must not drift each
-      // time a neighbour is declined and the front grows.
-      entry.members = fresh[i].members;
-      entry.territory_area = fresh[i].territory_area;
-      entry.top_z = fresh[i].top_z;
-      entry.bottom_z = fresh[i].bottom_z;
-      entry.muted = false;
-      break;
-    }
-    // Absent from a plan it was seeded into means it was declined, which is the
-    // only reason a front that exists can fail to appear.
-    if (!found) entry.muted = true;
-  }
-  for (std::size_t i = 0; i < fresh.size(); ++i)
-    if (!claimed[i]) known.push_back(std::move(fresh[i]));
+  if (progress) progress(1.0, "Done");
+  return result;
 }
 
 JobPlan plan_job(const JobGeometry& geometry,
@@ -801,8 +848,7 @@ JobPlan plan_job(const JobGeometry& geometry,
                  const ToolLibrary& tools,
                  const MachineLibrary& machines,
                  const MaterialLibrary& materials,
-                 const ProgressCallback& progress,
-                 PlanStage upto) {
+                 const ProgressCallback& progress) {
   JobPlan plan;
   if (job.operations.empty()) {
     plan.error = "The job has no operations";
@@ -825,14 +871,9 @@ JobPlan plan_job(const JobGeometry& geometry,
     else if (!material) result.error = "Unknown material: " + operation.material_id;
 
     if (result.ok()) {
-      result = upto == PlanStage::Wavefronts
-                   ? plan_wavefronts(geometry, operation, *tool, *machine,
-                                     *material, progress, share * index,
-                                     share * (index + 1))
-                   : plan_operation(geometry, operation, *tool, *machine,
-                                    *material, progress, share * index,
-                                    share * (index + 1),
-                                    job.rapid_clearance_height);
+      result = plan_operation(geometry, operation, *tool, *machine, *material,
+                              progress, share * index, share * (index + 1),
+                              job.rapid_clearance_height);
       if (result.error == "Cancelled") {
         plan.error = "Cancelled";
         return plan;
@@ -854,49 +895,5 @@ JobPlan plan_job(const JobGeometry& geometry,
   finish_job(plan);
   return plan;
 }
-
-void plan_job_toolpaths(JobPlan& plan,
-                        const Job& job,
-                        const ToolLibrary& tools,
-                        const MachineLibrary& machines,
-                        const MaterialLibrary& materials,
-                        const ProgressCallback& progress) {
-  const double share = plan.operations.empty()
-                           ? 1.0
-                           : 1.0 / static_cast<double>(plan.operations.size());
-  plan.stats = {};
-  plan.warnings.clear();
-  plan.error.clear();
-  std::string previous_tool;
-  for (std::size_t index = 0; index < plan.operations.size(); ++index) {
-    OperationPlan& result = plan.operations[index];
-    const Operation* operation = nullptr;
-    for (const Operation& candidate : job.operations)
-      if (candidate.name == result.operation_name) operation = &candidate;
-    const Tool* tool = operation ? tools.find(operation->tool_id) : nullptr;
-    const Machine* machine = operation ? machines.find(operation->machine_id) : nullptr;
-    const Material* material =
-        operation ? materials.find(operation->material_id) : nullptr;
-    if (result.ok() && operation && tool && machine && material) {
-      plan_toolpaths(result, *operation, *tool, *machine, *material, progress,
-                     share * index, share * (index + 1),
-                     job.rapid_clearance_height);
-      if (result.error == "Cancelled") {
-        plan.error = "Cancelled";
-        return;
-      }
-      if (!previous_tool.empty() && previous_tool != operation->tool_id)
-        result.stats.tool_change_minutes +=
-            machine->tool_change == ToolChange::Automatic ? 0.25 : 1.0;
-      previous_tool = operation->tool_id;
-    }
-    accumulate(plan.stats, result.stats);
-    for (const std::string& warning : result.warnings)
-      plan.warnings.push_back(result.operation_name + ": " + warning);
-  }
-  if (progress) progress(1.0, "Done");
-  finish_job(plan);
-}
-
 
 }  // namespace cam

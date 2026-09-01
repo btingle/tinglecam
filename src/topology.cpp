@@ -11,6 +11,17 @@
 #include <vector>
 
 namespace wave {
+// The rings and the bands are separately rounded descriptions of the same
+// walls: the rings come from a boolean on the machinable region, the bands from
+// offsetting. They agree to a couple of grid units, not exactly, and a rail is
+// deliberately laid on the ring. Measuring one against the other any more
+// tightly than a contact was accepted in the first place rejects correct
+// geometry over a micron of rounding.
+double boundary_slack(double stepover) {
+  return std::clamp(static_cast<double>(to_integer(stepover)) * 0.001, 4.0,
+                    100.0);
+}
+
 namespace {
 
 using namespace Clipper2Lib;
@@ -292,17 +303,6 @@ SegmentProjection project_to_segment(const Point64& point, const Point64& a,
 // point on the ring rather than the endpoint itself, equally how far anything
 // built along those rings may be from the propagation bands.
 //
-// The rings and the bands are separately rounded descriptions of the same
-// walls: the rings come from a boolean on the machinable region, the bands from
-// offsetting. They agree to a couple of grid units, not exactly, and a rail is
-// deliberately laid on the ring. Measuring one against the other any more
-// tightly than a contact was accepted in the first place rejects correct
-// geometry over a micron of rounding.
-double boundary_slack(double stepover) {
-  return std::clamp(static_cast<double>(to_integer(stepover)) * 0.001, 4.0,
-                    100.0);
-}
-
 BoundaryContact classify_boundary_contact(const Point64& endpoint,
                                           const Paths64& boundaries,
                                           double tolerance) {
@@ -958,6 +958,61 @@ LayerTopology build_layer_topology(const FrontLineage& lineage) {
   return result;
 }
 
+// Entry identity down the stack, from the entry curves alone. An upper front
+// claims a lower one when the whole of the lower curve falls inside an envelope
+// grown around the upper, and the two are linked only when that claim is
+// mutual and unambiguous -- a front that two others could equally claim starts
+// a chain of its own rather than being assigned to a guess.
+//
+// This asks nothing of the node topology, and nothing of any generation past
+// the first. A wave that has been seeded and not propagated already knows every
+// entry it has, which is what lets an entry be chosen before a plan exists.
+std::vector<InterLayerChain> chain_entry_fronts(
+    const std::vector<const FrontLineage*>& lineages,
+    double entry_front_match_tolerance,
+    std::vector<std::vector<std::size_t>>* chain_ids) {
+  if (!(entry_front_match_tolerance > 0.0) ||
+      !std::isfinite(entry_front_match_tolerance))
+    throw std::invalid_argument("Entry-front match tolerance must be positive");
+  std::vector<std::size_t> sizes;
+  std::vector<std::vector<std::size_t>> next(lineages.size());
+  for (std::size_t layer = 0; layer < lineages.size(); ++layer) {
+    if (!lineages[layer]) throw std::invalid_argument("Inter-layer lineage is null");
+    sizes.push_back(lineages[layer]->entry_fronts.size());
+    next[layer].assign(lineages[layer]->entry_fronts.size(), kNoTopologyId);
+  }
+  const double tolerance = static_cast<double>(
+      std::max<std::int64_t>(1, to_integer(entry_front_match_tolerance)));
+  for (std::size_t layer = 0; layer + 1 < lineages.size(); ++layer) {
+    const auto& upper_fronts = lineages[layer]->entry_fronts;
+    const auto& lower_fronts = lineages[layer + 1]->entry_fronts;
+    std::vector<std::size_t> upper_count(upper_fronts.size(), 0);
+    std::vector<std::size_t> lower_count(lower_fronts.size(), 0);
+    std::vector<std::pair<std::size_t, std::size_t>> candidates;
+    for (std::size_t a = 0; a < upper_fronts.size(); ++a) {
+      const LeadingFront& upper = upper_fronts[a];
+      const Paths64 envelope = InflatePaths(Paths64{upper.path}, tolerance,
+                                             JoinType::Round,
+                                             upper.closed ? EndType::Joined
+                                                          : EndType::Round);
+      for (std::size_t b = 0; b < lower_fronts.size(); ++b) {
+        const LeadingFront& lower = lower_fronts[b];
+        Path64 lower_path = lower.path;
+        if (lower.closed && !lower_path.empty())
+          lower_path.push_back(lower_path.front());
+        if (!whole_open_path_inside(lower_path, envelope)) continue;
+        ++upper_count[a];
+        ++lower_count[b];
+        candidates.push_back({a, b});
+      }
+    }
+    for (const auto& [a, b] : candidates)
+      if (upper_count[a] == 1 && lower_count[b] == 1) next[layer][a] = b;
+  }
+  std::vector<std::vector<std::size_t>> discarded;
+  return assemble_chains(sizes, next, chain_ids ? *chain_ids : discarded);
+}
+
 InterLayerTopology build_inter_layer_topology(
     const std::vector<const FrontLineage*>& lineages,
     double entry_front_match_tolerance) {
@@ -998,44 +1053,8 @@ InterLayerTopology build_inter_layer_topology(
   result.node_chains =
       assemble_chains(node_sizes, node_next, result.node_chain_ids);
 
-  std::vector<std::size_t> entry_sizes;
-  std::vector<std::vector<std::size_t>> entry_next(result.layers.size());
-  for (const LayerTopology& layer : result.layers)
-    entry_sizes.push_back(layer.entry_fronts.size());
-  for (std::size_t layer = 0; layer < result.layers.size(); ++layer)
-    entry_next[layer].assign(result.layers[layer].entry_fronts.size(), kNoTopologyId);
-  const double tolerance = static_cast<double>(
-      std::max<std::int64_t>(1, to_integer(entry_front_match_tolerance)));
-  for (std::size_t layer = 0; layer + 1 < result.layers.size(); ++layer) {
-    const auto& upper_layer = result.layers[layer];
-    const auto& lower_layer = result.layers[layer + 1];
-    std::vector<std::size_t> upper_count(upper_layer.entry_fronts.size(), 0);
-    std::vector<std::size_t> lower_count(lower_layer.entry_fronts.size(), 0);
-    std::vector<std::pair<std::size_t, std::size_t>> candidates;
-    for (std::size_t a = 0; a < upper_layer.entry_fronts.size(); ++a) {
-      const std::size_t upper_id = upper_layer.entry_fronts[a];
-      const LeadingFront& upper = lineages[layer]->entry_fronts[upper_id];
-      const Paths64 envelope = InflatePaths(Paths64{upper.path}, tolerance,
-                                             JoinType::Round,
-                                             upper.closed ? EndType::Joined
-                                                          : EndType::Round);
-      for (std::size_t b = 0; b < lower_layer.entry_fronts.size(); ++b) {
-        const std::size_t lower_id = lower_layer.entry_fronts[b];
-        const LeadingFront& lower = lineages[layer + 1]->entry_fronts[lower_id];
-        Path64 lower_path = lower.path;
-        if (lower.closed && !lower_path.empty())
-          lower_path.push_back(lower_path.front());
-        if (!whole_open_path_inside(lower_path, envelope)) continue;
-        ++upper_count[a];
-        ++lower_count[b];
-        candidates.push_back({a, b});
-      }
-    }
-    for (const auto& [a, b] : candidates)
-      if (upper_count[a] == 1 && lower_count[b] == 1) entry_next[layer][a] = b;
-  }
-  result.entry_front_chains =
-      assemble_chains(entry_sizes, entry_next, result.entry_front_chain_ids);
+  result.entry_front_chains = chain_entry_fronts(lineages, entry_front_match_tolerance,
+                                                 &result.entry_front_chain_ids);
 
   std::vector<std::vector<bool>> scheduled(result.layers.size());
   for (std::size_t layer = 0; layer < result.layers.size(); ++layer)
@@ -1078,45 +1097,6 @@ Path64 boundary_arc(const FrontLineage& lineage,
   return path_length_integer(forward) <= path_length_integer(reverse)
              ? forward
              : reverse;
-}
-
-Paths64 entry_front_territory(const FrontLineage& lineage, std::size_t entry) {
-  if (lineage.generations.empty() ||
-      entry >= lineage.generations.front().fronts.size())
-    return {};
-  // Breadth-first down the generations. A generation is only ever reached from
-  // the one above it, so a single forward sweep with a per-generation frontier
-  // visits every descendant without revisiting any.
-  Paths64 territory;
-  std::vector<std::size_t> frontier{entry};
-  for (std::size_t generation = 0;
-       generation < lineage.generations.size() && !frontier.empty();
-       ++generation) {
-    const FrontGeneration& level = lineage.generations[generation];
-    std::vector<bool> band_taken(level.bands.size(), false);
-    std::vector<bool> next_seen(
-        generation + 1 < lineage.generations.size()
-            ? lineage.generations[generation + 1].fronts.size()
-            : 0,
-        false);
-    std::vector<std::size_t> next;
-    for (const std::size_t index : frontier) {
-      if (index >= level.fronts.size()) continue;
-      const LeadingFront& front = level.fronts[index];
-      if (front.band < level.bands.size() && !band_taken[front.band]) {
-        band_taken[front.band] = true;
-        const Paths64& band = level.bands[front.band];
-        territory.insert(territory.end(), band.begin(), band.end());
-      }
-      for (const std::size_t child : front.children)
-        if (child < next_seen.size() && !next_seen[child]) {
-          next_seen[child] = true;
-          next.push_back(child);
-        }
-    }
-    frontier = std::move(next);
-  }
-  return Union(territory, FillRule::NonZero);
 }
 
 Point64 representative_point(const LeadingFront& front) {
