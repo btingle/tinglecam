@@ -447,7 +447,6 @@ WaveResult seed_wavefront(const Paths64& raw_subject,
                                            EndType::Polygon);
   Paths64 wall = Difference(result.stock, stock_inner, FillRule::NonZero);
   wall = Difference(wall, result.subject, FillRule::NonZero);
-  wall = Union(wall, FillRule::NonZero);
 
   // The lead-in is used exactly as asked for, not rounded up to a whole number
   // of stepovers. Rounding put a front precisely on the stock wall, which left
@@ -492,7 +491,6 @@ WaveResult seed_wavefront(const Paths64& raw_subject,
                                             EndType::Polygon);
   Paths64 reached = Difference(domain, domain_inner, FillRule::NonZero);
   reached = Difference(reached, subject_face, FillRule::NonZero);
-  reached = Union(reached, FillRule::NonZero);
   if (!muted.empty()) reached = drop_muted_seeds(reached, muted, result);
   if (reached.empty()) {
     result.stop_reason = StopReason::Empty;
