@@ -177,6 +177,8 @@ struct PlanningMetrics {
   std::size_t fronts = 0;
   std::size_t toolpath_moves = 0;
   std::size_t simulation_intervals = 0;
+  std::size_t empty_simulation_intervals = 0;
+  std::size_t gouge_bounds_rejections = 0;
 };
 
 struct OperationPlan {

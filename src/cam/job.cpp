@@ -85,6 +85,8 @@ void accumulate(PlanningMetrics& into, const PlanningMetrics& from) {
   into.fronts += from.fronts;
   into.toolpath_moves += from.toolpath_moves;
   into.simulation_intervals += from.simulation_intervals;
+  into.empty_simulation_intervals += from.empty_simulation_intervals;
+  into.gouge_bounds_rejections += from.gouge_bounds_rejections;
 }
 
 // Everything both planning stages need out of the operation, the tool and the
@@ -902,6 +904,10 @@ void plan_toolpaths(OperationPlan& plan,
           elapsed_milliseconds(simulation_start);
       plan.metrics.simulation_intervals +=
           level.simulation.stats.cutting_steps;
+      plan.metrics.empty_simulation_intervals +=
+          level.simulation.stats.empty_cutting_steps;
+      plan.metrics.gouge_bounds_rejections +=
+          level.simulation.stats.gouge_bounds_rejections;
       const auto feeds_start = PlanningClock::now();
       level.feeds = plan_feeds(level.toolpath, level.simulation, machine,
                                full_engagement_feed, no_engagement_feed,

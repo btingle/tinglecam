@@ -38,6 +38,8 @@ struct SimulationStats {
   double gouge_area = 0.0;
   double maximum_load = 0.0;
   std::size_t cutting_steps = 0;
+  std::size_t empty_cutting_steps = 0;
+  std::size_t gouge_bounds_rejections = 0;
   std::size_t gouging_steps = 0;
   std::size_t unsafe_plunges = 0;
   std::size_t unresolved_entries = 0;

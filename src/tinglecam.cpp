@@ -3250,9 +3250,11 @@ int main(int argc, char** argv) {
       std::fprintf(
           stderr,
           "planning_profile_counts wave_generations=%zu fronts=%zu "
-          "toolpath_moves=%zu simulation_intervals=%zu\n",
+          "toolpath_moves=%zu simulation_intervals=%zu "
+          "empty_simulation_intervals=%zu gouge_bounds_rejections=%zu\n",
           m.wave_generations, m.fronts, m.toolpath_moves,
-          m.simulation_intervals);
+          m.simulation_intervals, m.empty_simulation_intervals,
+          m.gouge_bounds_rejections);
     }
     const cam::PostResult post = cam::post_job(plan, app.job, app.tools, app.machines);
     for (const auto& warning : post.warnings)

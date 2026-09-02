@@ -26,6 +26,11 @@ double boolean_result_area(const Paths64& paths) {
   return std::abs(Area(paths)) / (kIntegerScale * kIntegerScale);
 }
 
+bool bounds_overlap(const Rect64& a, const Rect64& b) {
+  return a.left <= b.right && b.left <= a.right && a.top <= b.bottom &&
+         b.top <= a.bottom;
+}
+
 Paths64 tool_sweep(const Point64& from, const Point64& to, double radius) {
   if (from == to)
     return Paths64{Ellipse(from, radius, radius, 48)};
@@ -89,6 +94,7 @@ SimulationResult simulate_material(const Paths64& raw_stock,
 
   Paths64 remaining = result.initial_stock;
   Paths64 gouges;
+  const Rect64 final_subject_bounds = GetBounds(result.final_subject);
   result.moves.resize(toolpath.moves.size());
   result.remaining_after_move.reserve(toolpath.moves.size());
 
@@ -122,8 +128,15 @@ SimulationResult simulate_material(const Paths64& raw_stock,
 
           const Paths64 removed =
               Intersect(remaining, step.sweep, FillRule::NonZero);
-          const Paths64 gouge = Intersect(removed, result.final_subject,
-                                         FillRule::NonZero);
+          Paths64 gouge;
+          if (removed.empty()) {
+            ++result.stats.empty_cutting_steps;
+          } else if (bounds_overlap(GetBounds(removed), final_subject_bounds)) {
+            gouge = Intersect(removed, result.final_subject,
+                              FillRule::NonZero);
+          } else {
+            ++result.stats.gouge_bounds_rejections;
+          }
           step.removed_area = boolean_result_area(removed);
           step.gouge_area = boolean_result_area(gouge);
           step.load = step.removed_area /
@@ -135,7 +148,8 @@ SimulationResult simulate_material(const Paths64& raw_stock,
             gouges.insert(gouges.end(), gouge.begin(), gouge.end());
           }
           ++result.stats.cutting_steps;
-          remaining = Difference(remaining, step.sweep, FillRule::NonZero);
+          if (!removed.empty())
+            remaining = Difference(remaining, step.sweep, FillRule::NonZero);
           simulated.steps.push_back(std::move(step));
         }
         move_distance += length;
