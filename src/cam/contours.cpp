@@ -172,19 +172,33 @@ void add_safe_stock_approaches(
     for (wave::TraversalVariant variant : task.variants) {
       if (variant.path.empty()) continue;
       const wave::Point64 start = variant.path.front();
-      std::optional<wave::Point64> best;
-      double best_distance = std::numeric_limits<double>::infinity();
+      struct Candidate {
+        wave::Point64 point;
+        double distance = 0.0;
+      };
+      std::vector<Candidate> candidates;
       for (const wave::Path64& ring : outside_boundary) {
+        candidates.reserve(candidates.size() + ring.size());
         for (std::size_t i = 0; i < ring.size(); ++i) {
           const wave::Point64 candidate =
               project_segment(start, ring[i], ring[(i + 1) % ring.size()]);
-          const double distance = distance_integer(candidate, start);
-          if (distance >= best_distance ||
-              !segment_avoids_region(candidate, start, protected_centres))
-            continue;
-          best = candidate;
-          best_distance = distance;
+          candidates.push_back(
+              {candidate, distance_integer(candidate, start)});
         }
+      }
+      // Exact intersection is the expensive part. Distance is a lower-cost
+      // complete ordering, so the first legal candidate in this stable order
+      // is the same nearest legal candidate the exhaustive scan selected.
+      std::stable_sort(candidates.begin(), candidates.end(),
+                       [](const Candidate& a, const Candidate& b) {
+                         return a.distance < b.distance;
+                       });
+      std::optional<wave::Point64> best;
+      for (const Candidate& candidate : candidates) {
+        if (!segment_avoids_region(candidate.point, start, protected_centres))
+          continue;
+        best = candidate.point;
+        break;
       }
       if (!best) continue;
       variant.safe_approach = *best == start ? wave::Path64{start}
