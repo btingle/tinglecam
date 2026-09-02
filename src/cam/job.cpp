@@ -21,6 +21,26 @@ double elapsed_milliseconds(PlanningClock::time_point start) {
       .count();
 }
 
+template <typename Function>
+void parallel_for_levels(const std::vector<std::size_t>& levels,
+                         Function&& function) {
+  if (levels.empty()) return;
+  std::atomic<std::size_t> next{0};
+  const std::size_t workers = std::min<std::size_t>(4, levels.size());
+  std::vector<std::thread> threads;
+  threads.reserve(workers);
+  for (std::size_t worker = 0; worker < workers; ++worker) {
+    threads.emplace_back([&] {
+      for (;;) {
+        const std::size_t work = next.fetch_add(1, std::memory_order_relaxed);
+        if (work >= levels.size()) return;
+        function(levels[work]);
+      }
+    });
+  }
+  for (std::thread& thread : threads) thread.join();
+}
+
 using Clipper2Lib::FillRule;
 using Clipper2Lib::InflatePaths;
 using Clipper2Lib::JoinType;
@@ -535,7 +555,11 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
     return plan;
   const wave::EntryMute mute = layer_mute(operation);
 
-  plan.levels.reserve(floors.size());
+  plan.levels.resize(floors.size());
+  std::vector<wave::Paths64> keep_outs(floors.size());
+  std::vector<std::size_t> wave_levels;
+  wave_levels.reserve(floors.size());
+  std::vector<std::exception_ptr> wave_errors(floors.size());
   std::vector<std::string> level_failures;
   double previous_z = z_at_depth(work_top, operation.depth_from);
   const double span = std::max(progress_to - progress_from, 0.0);
@@ -552,7 +576,7 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
       }
     }
 
-    LevelPlan level;
+    LevelPlan& level = plan.levels[index];
     level.floor_z = floor_z;
     level.axial_depth = previous_z - floor_z;
     previous_z = floor_z;
@@ -568,14 +592,13 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
 
       if (level.stock_slice.empty()) {
         level.nothing_to_cut = true;
-        plan.levels.push_back(std::move(level));
         continue;
       }
 
       // The cutter follows a path whose centre must stay a radius clear of the
       // part, plus whatever is being left for a finishing pass.
       const auto preparation_start = PlanningClock::now();
-      const wave::Paths64 keep_out =
+      keep_outs[index] =
           level.part_slice.empty()
               ? absent_subject(level.stock_slice)
               : offset_outward(level.part_slice,
@@ -596,7 +619,6 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
       // would use against the same absent subject.
       if (operation.mode == OperationMode::ContourFinishing &&
           !level.part_slice.empty()) {
-        plan.levels.push_back(std::move(level));
         continue;
       }
 
@@ -607,19 +629,7 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
       // its first pass, and one exactly on size takes very nearly a full one.
       // Without this the run-in landed a front on the wall itself and the pass
       // before it grazed off whatever fraction of a stepover was left over.
-      const double lead_in = operation.lead_in ? radius + first_bite_allowance : 0.0;
-      const auto wavefront_start = PlanningClock::now();
-      level.wave = wave::build_wavefront(keep_out, level.stock_slice, stepover,
-                                         stepover, lead_in, 2000, mute);
-      plan.metrics.wavefront_milliseconds +=
-          elapsed_milliseconds(wavefront_start);
-      plan.metrics.wave_generations += level.wave.generations.size();
-
-      const auto lineage_start = PlanningClock::now();
-      level.lineage = wave::build_front_lineage(level.wave);
-      plan.metrics.lineage_milliseconds += elapsed_milliseconds(lineage_start);
-      for (const wave::FrontGeneration& generation : level.lineage.generations)
-        plan.metrics.fronts += generation.fronts.size();
+      wave_levels.push_back(index);
     } catch (const std::exception& error) {
       const std::string detail =
           "Depth " + std::to_string(floor_z) +
@@ -628,8 +638,57 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
       plan.warnings.push_back(detail);
       level.nothing_to_cut = true;
     }
+  }
 
-    plan.levels.push_back(std::move(level));
+  const double lead_in =
+      operation.lead_in ? radius + first_bite_allowance : 0.0;
+  const auto wavefront_start = PlanningClock::now();
+  parallel_for_levels(wave_levels, [&](std::size_t index) {
+    LevelPlan& level = plan.levels[index];
+    try {
+      level.wave = wave::build_wavefront(
+          keep_outs[index], level.stock_slice, stepover, stepover, lead_in,
+          2000, mute);
+    } catch (...) {
+      wave_errors[index] = std::current_exception();
+    }
+  });
+  plan.metrics.wavefront_milliseconds +=
+      elapsed_milliseconds(wavefront_start);
+
+  std::vector<std::size_t> lineage_levels;
+  lineage_levels.reserve(wave_levels.size());
+  for (const std::size_t index : wave_levels)
+    if (!wave_errors[index]) lineage_levels.push_back(index);
+  const auto lineage_start = PlanningClock::now();
+  parallel_for_levels(lineage_levels, [&](std::size_t index) {
+    try {
+      plan.levels[index].lineage =
+          wave::build_front_lineage(plan.levels[index].wave);
+    } catch (...) {
+      wave_errors[index] = std::current_exception();
+    }
+  });
+  plan.metrics.lineage_milliseconds += elapsed_milliseconds(lineage_start);
+
+  for (const std::size_t index : wave_levels) {
+    LevelPlan& level = plan.levels[index];
+    if (wave_errors[index]) {
+      try {
+        std::rethrow_exception(wave_errors[index]);
+      } catch (const std::exception& error) {
+        const std::string detail =
+            "Depth " + std::to_string(level.floor_z) +
+            " mm, wavefront construction: " + error.what();
+        level_failures.push_back(detail);
+        plan.warnings.push_back(detail);
+      }
+      level.nothing_to_cut = true;
+      continue;
+    }
+    plan.metrics.wave_generations += level.wave.generations.size();
+    for (const wave::FrontGeneration& generation : level.lineage.generations)
+      plan.metrics.fronts += generation.fronts.size();
   }
 
   for (const LevelPlan& level : plan.levels)
