@@ -124,10 +124,10 @@ SimulationResult simulate_material(const Paths64& raw_stock,
           if (!(step_length > 0.0)) continue;
           step.move_distance_begin = move_distance + length * begin_ratio;
           step.move_distance_end = move_distance + length * end_ratio;
-          step.sweep = tool_sweep(step.from, step.to, radius_integer);
+          const Paths64 sweep = tool_sweep(step.from, step.to, radius_integer);
 
           const Paths64 removed =
-              Intersect(remaining, step.sweep, FillRule::NonZero);
+              Intersect(remaining, sweep, FillRule::NonZero);
           Paths64 gouge;
           if (removed.empty()) {
             ++result.stats.empty_cutting_steps;
@@ -149,7 +149,7 @@ SimulationResult simulate_material(const Paths64& raw_stock,
           }
           ++result.stats.cutting_steps;
           if (!removed.empty())
-            remaining = Difference(remaining, step.sweep, FillRule::NonZero);
+            remaining = Difference(remaining, sweep, FillRule::NonZero);
           simulated.steps.push_back(std::move(step));
         }
         move_distance += length;
@@ -203,7 +203,9 @@ Paths64 simulation_stock_at(const SimulationResult& simulation,
   for (const auto& step : move.steps) {
     if (cursor.move_distance <= step.move_distance_begin) break;
     if (cursor.move_distance >= step.move_distance_end) {
-      remaining = Difference(remaining, step.sweep, FillRule::NonZero);
+      remaining = Difference(
+          remaining, tool_sweep(step.from, step.to, radius_integer),
+          FillRule::NonZero);
       continue;
     }
     const double span = step.move_distance_end - step.move_distance_begin;

@@ -15,7 +15,6 @@ namespace wave {
 struct MaterialStep {
   Point64 from;
   Point64 to;
-  Paths64 sweep;
   double move_distance_begin = 0.0;
   double move_distance_end = 0.0;
   double removed_area = 0.0;
