@@ -154,13 +154,6 @@ SimulationResult simulate_material(const Paths64& raw_stock,
         }
         move_distance += length;
       }
-      // Difference already returns a clean, correctly oriented result, so this
-      // only canonicalises the snapshot that is about to be stored and handed
-      // to callers. It used to run after every step, where it re-walked a
-      // polygon that grows more complex with every sweep carved out of it and
-      // cost about 40% of the total simulation time without changing the
-      // outcome by more than boolean rounding noise.
-      remaining = normalized(remaining);
     } else if (move.kind == MoveKind::Retract && !move.path.empty()) {
       const Point64& destination = move.path.back();
       const Paths64 footprint{
