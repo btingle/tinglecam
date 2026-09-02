@@ -84,6 +84,7 @@ add_library(wave_geometry
   src/mesh_slicer.cpp
   src/simulation.cpp
   src/topology.cpp
+  src/routing.cpp
   src/traversal.cpp
   src/toolpath.cpp
 )
@@ -163,6 +164,10 @@ add_executable(wave_geometry_tests tests/geometry_tests.cpp)
 target_link_libraries(wave_geometry_tests PRIVATE wave_geometry)
 add_test(NAME wave_geometry_tests
          COMMAND wave_geometry_tests ${CMAKE_CURRENT_SOURCE_DIR}/wavetest.svg)
+
+add_executable(routing_tests tests/routing_tests.cpp)
+target_link_libraries(routing_tests PRIVATE wave_geometry)
+add_test(NAME routing_tests COMMAND routing_tests)
 
 add_executable(mesh_slicer_tests tests/mesh_slicer_tests.cpp)
 target_link_libraries(mesh_slicer_tests PRIVATE wave_geometry)

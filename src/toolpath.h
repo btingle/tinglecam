@@ -64,6 +64,13 @@ struct ToolpathStats {
 struct Toolpath {
   std::vector<ToolpathMove> moves;
   ToolpathStats stats;
+  // Everywhere the cutter's centre may still be at this depth once the pass is
+  // over: the air around the stock plus everything the pass took out. It is
+  // what the pass has to say about travelling at its own floor, and the caller
+  // that has to get from here to the next pass is the one place that question
+  // is asked -- so it is answered here rather than rebuilt from the outside
+  // out of pieces that would have to be kept in step with this.
+  Paths64 cleared;
 };
 
 // Sequences every stock-touching leading front into a single ordered tool
@@ -79,7 +86,7 @@ struct Toolpath {
 //
 // When the straight segment is blocked, both a detour through the travelable
 // region and a retract/rapid/approach are planned. Their estimated machine time
-// is compared, including the complete trip to the Z0-relative safe plane. A
+// is compared, including the complete trip to the safe plane. A
 // lift sets down in cleared material; only where no cleared landing exists is
 // an entry emitted, and that one has to be ramped. Safe-plane XY motion is
 // direct: a 2D slice is not used to invent the controller's axis trajectory.
@@ -91,9 +98,11 @@ struct Toolpath {
 Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage,
                         double tool_radius = 0.0,
                         double floor_z = 0.0,
-                        double rapid_clearance_height = 10.0,
+                        double rapid_plane = 10.0,
                         double rapid_feed = 2000.0,
-                        double traversal_feed = 1000.0);
+                        double traversal_feed = 1000.0,
+                        // Zero uses `rapid_feed` for the vertical too.
+                        double rapid_feed_z = 0.0);
 
 // Resamples every uninterrupted at-depth cutting path at a uniform travelled
 // distance. Original micro-vertices are not retained; motion-type changes are

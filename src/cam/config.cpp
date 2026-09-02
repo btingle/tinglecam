@@ -113,6 +113,7 @@ json to_json(const Machine& machine) {
               {"specifications_unverified", machine.specifications_unverified},
               {"controller", controller_name(machine.controller)},
               {"rapid_feed", machine.rapid_feed},
+              {"rapid_feed_z", machine.rapid_feed_z},
               {"min_rpm", machine.min_rpm},
               {"max_rpm", machine.max_rpm},
               {"rpm_resolution", machine.rpm_resolution},
@@ -141,6 +142,7 @@ Machine machine_from(const json& node) {
   read(node, "specifications_unverified", machine.specifications_unverified);
   read_enum(node, "controller", machine.controller, controller_from_name);
   read(node, "rapid_feed", machine.rapid_feed);
+  read(node, "rapid_feed_z", machine.rapid_feed_z);
   read(node, "min_rpm", machine.min_rpm);
   read(node, "max_rpm", machine.max_rpm);
   read(node, "rpm_resolution", machine.rpm_resolution);
@@ -221,8 +223,8 @@ json to_json(const Operation& operation) {
               {"stepdown", operation.stepdown},
               {"radial_stock_to_leave", operation.radial_stock_to_leave},
               {"axial_stock_to_leave", operation.axial_stock_to_leave},
-              {"top_z", operation.top_z},
-              {"bottom_z", operation.bottom_z},
+              {"depth_from", operation.depth_from},
+              {"depth_to", operation.depth_to},
               {"lead_in", operation.lead_in},
               {"stock_deviation", operation.stock_deviation},
               {"path_pitch", operation.path_pitch},
@@ -252,8 +254,8 @@ Operation operation_from(const json& node) {
   read(node, "stepdown", operation.stepdown);
   read(node, "radial_stock_to_leave", operation.radial_stock_to_leave);
   read(node, "axial_stock_to_leave", operation.axial_stock_to_leave);
-  read(node, "top_z", operation.top_z);
-  read(node, "bottom_z", operation.bottom_z);
+  read(node, "depth_from", operation.depth_from);
+  read(node, "depth_to", operation.depth_to);
   read(node, "lead_in", operation.lead_in);
   read(node, "stock_deviation", operation.stock_deviation);
   read(node, "path_pitch", operation.path_pitch);

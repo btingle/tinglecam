@@ -194,18 +194,21 @@ void check_path_resampling() {
 void check_level_floors() {
   std::cout << "depth levels\n";
   cam::Operation operation;
-  operation.top_z = 0.0;
-  operation.bottom_z = -5.0;
+  operation.depth_from = 0.0;
+  operation.depth_to = 5.0;
   operation.stepdown = 2.0;
-  const auto floors = cam::level_floors(operation);
+  const auto floors = cam::level_floors(operation, operation.stepdown, 0.0);
   require(floors.size() == 3, "five millimetres in two millimetre steps is three passes");
   if (floors.size() == 3) {
     require_near(floors[0], -2.0, 1e-9, "first pass takes a full step");
     require_near(floors[2], -5.0, 1e-9, "last pass lands on the floor");
   }
   operation.axial_stock_to_leave = 0.5;
-  require_near(cam::level_floors(operation).back(), -4.5, 1e-9,
-               "axial stock allowance raises the final floor");
+  require_near(cam::level_floors(operation, operation.stepdown, 0.0).back(), -4.5,
+               1e-9, "axial stock allowance raises the final floor");
+  // Depths are below the top of the work, so the same operation follows it.
+  require_near(cam::level_floors(operation, operation.stepdown, 12.0).back(),
+               7.5, 1e-9, "and the range hangs off wherever the work tops out");
 }
 
 wave::FrontLineage single_front_lineage(const wave::Path64& front,
@@ -377,7 +380,7 @@ void check_box_stock(const std::filesystem::path& part_mesh) {
   // Every depth gets the same rectangle: it is a prism, not a sliced solid.
   double low = 0.0;
   double high = 0.0;
-  require(geometry.z_range(low, high), "a box blank still has a depth range");
+  require(geometry.work_range(low, high), "a box blank still has a depth range");
   require(geometry.stock_outline(low, 32) == box &&
               geometry.stock_outline(high, 32) == box,
           "the blank is the same at every depth");
@@ -424,16 +427,16 @@ void check_entry_discovery(const std::filesystem::path& data,
   geometry.set_box_stock(true, 4.0);
   double low = 0.0;
   double high = 0.0;
-  require(geometry.z_range(low, high), "the part has a depth range");
+  require(geometry.work_range(low, high), "the part has a depth range");
 
   cam::Operation operation;
   operation.tool_id = tool->id;
   operation.machine_id = machine->id;
   operation.material_id = material_id;
-  operation.top_z = high;
+  operation.depth_from = 0.0;
   // Coarse on purpose: this is about which fronts are found, not about how
   // finely the part is cut, and a few thick passes say it just as well.
-  operation.bottom_z = high - (high - low) * 0.5;
+  operation.depth_to = (high - low) * 0.5;
   operation.stepdown = std::max((high - low) * 0.25, 0.5);
 
   const cam::EntryDiscovery found =
@@ -491,14 +494,14 @@ void check_declined_entry(const std::filesystem::path& data,
   geometry.load_stock(objs / "stock_obj" / "Rs.obj");
   double low = 0.0;
   double high = 0.0;
-  require(geometry.z_range(low, high), "the part and its blank overlap in Z");
+  require(geometry.work_range(low, high), "the part and its blank span a depth");
 
   cam::Operation operation;
   operation.tool_id = tool->id;
   operation.machine_id = machine->id;
   operation.material_id = material_id;
-  operation.top_z = high;
-  operation.bottom_z = low;
+  operation.depth_from = 0.0;
+  operation.depth_to = high - low;
   operation.stepdown = std::max((high - low) * 0.2, 0.5);
 
   const cam::EntryDiscovery found =
@@ -707,7 +710,7 @@ void check_general_traversal_and_contours() {
   settings.cutting_feed = 10.0;
   settings.rapid_feed = 100.0;
   settings.floor_z = -2.0;
-  settings.rapid_clearance_height = 10.0;
+  settings.rapid_plane = 10.0;
   const auto routed = wave::plan_traversal(
       cam::contour_traversal_tasks(contours,
                                    cam::ContourDirectionPolicy::Either),
@@ -719,6 +722,53 @@ void check_general_traversal_and_contours() {
           "disconnected tasks use the safe rapid plane");
   require_near(routed.estimated_minutes, 0.65, 1e-9,
                "routing cost includes initial descent and full retract height");
+
+  // Two contours a short hop apart with a wall between them, which is what a
+  // pair clipped to the same stock looks like: they finish and start on that
+  // wall a few millimetres from each other. Lifting the whole height of the job
+  // to cross it is the wrong answer by an order of magnitude, and until the
+  // connector could go round something it was the only answer available.
+  {
+    const std::vector<cam::DerivedContour> across{
+        {{point(-8.0, -8.0), point(-1.0, 0.0)}, false},
+        {{point(1.0, 0.0), point(8.0, -8.0)}, false},
+    };
+    // Everywhere but a wall standing between the two contours, open only over
+    // the top of it. It has to reach past both contours: allowed to reverse
+    // one, the ordering would otherwise simply connect the pair of ends that
+    // can already see each other.
+    const wave::Paths64 room = Clipper2Lib::Difference(
+        wave::Paths64{box(-20, -20, 20, 20)},
+        wave::Paths64{box(-0.5, -20, 0.5, 0.5)}, Clipper2Lib::FillRule::NonZero);
+    wave::TraversalSettings blocked;
+    blocked.allow_stay_down = true;
+    blocked.stay_down_region = room;
+    blocked.cutting_feed = 1000.0;
+    blocked.rapid_feed = 1000.0;
+    blocked.floor_z = -2.0;
+    blocked.rapid_plane = 200.0;
+
+    const auto lifted = wave::plan_traversal(
+        cam::contour_traversal_tasks(across,
+                                     cam::ContourDirectionPolicy::Either),
+        blocked);
+    require(lifted.toolpath.stats.retract_count == 2,
+            "with no allowance to route within, a blocked connector lifts");
+
+    blocked.stay_down_slack = 40.0;
+    const auto joined = wave::plan_traversal(
+        cam::contour_traversal_tasks(across,
+                                     cam::ContourDirectionPolicy::Either),
+        blocked);
+    require(joined.toolpath.stats.link_count == 1,
+            "given one, it goes round the wall instead");
+    require(joined.toolpath.stats.retract_count == 1,
+            "and the only retract left is the descent that opens the pass");
+    for (const auto& move : joined.toolpath.moves)
+      if (move.kind == wave::MoveKind::Link)
+        require(move.path.size() > 2 && move.length < 12.0,
+                "the way round is a route with corners in it, and a short one");
+  }
 
   const auto offset = cam::derive_offset_contours(
       wave::Paths64{box(0, 0, 10, 10)}, 1.0, nullptr);
@@ -760,7 +810,7 @@ void check_general_traversal_and_contours() {
   cleanup.cutting_feed = 1000.0;
   cleanup.rapid_feed = 2000.0;
   cleanup.floor_z = -1.0;
-  cleanup.rapid_clearance_height = 10.0;
+  cleanup.rapid_plane = 10.0;
   const auto direct_cleanup = wave::plan_traversal({first, second}, cleanup);
   require(direct_cleanup.toolpath.stats.retract_count == 0,
           "legal cleanup connections stay down instead of using safe approaches");
@@ -974,11 +1024,61 @@ void check_schedule_timing() {
             "a cleared cutter descends rapidly only after reaching the next path");
   }
 
+  // A machine whose Z axis is slower than the others. Only the vertical phases
+  // change: a lift is commanded as a rise, a traverse and a descent, never as
+  // one diagonal, so each one is timed at the axis that actually moves it.
+  {
+    cam::Machine slow_z = test_machine();
+    slow_z.rapid_feed_z = 1500.0;
+    const auto slowed = cam::plan_feeds(between_paths, between_simulation,
+                                        slow_z, 500.0, 2000.0, 12000.0, 120.0,
+                                        -2.0, 10.0);
+    require(slowed.motion.size() == transition.motion.size(),
+            "a slower Z axis changes the timing, not the moves");
+    double vertical = 0.0;
+    double lateral = 0.0;
+    for (const cam::MotionPhase& phase : slowed.motion) {
+      if (!phase.rapid) continue;
+      if (phase.from_z != phase.to_z) {
+        vertical += phase.length;
+        require_near(phase.rate, 1500.0, 1e-9,
+                     "a vertical rapid runs at the Z rate");
+      } else {
+        lateral += phase.length;
+        require_near(phase.rate, 6000.0, 1e-9,
+                     "a lateral rapid still runs at the lateral rate");
+      }
+    }
+    require(vertical > 0.0 && lateral > 0.0,
+            "this pass has both a vertical and a lateral rapid to compare");
+    // The vertical distance is unchanged and now takes four times as long.
+    require_near(cam::feed_schedule_seconds(slowed) -
+                     cam::feed_schedule_seconds(transition),
+                 vertical / 1500.0 * 60.0 - vertical / 6000.0 * 60.0, 1e-9,
+                 "the whole of the difference is the vertical, reprised at the "
+                 "Z rate");
+    require_near(slowed.stats.rapid_distance, transition.stats.rapid_distance,
+                 1e-9, "and the cutter travels no further for it");
+  }
+
+  // A profile that names no Z rate is a machine whose Z keeps up, which is what
+  // every profile said before there were two rates.
+  {
+    cam::Machine unstated = test_machine();
+    unstated.rapid_feed_z = 0.0;
+    const auto same = cam::plan_feeds(between_paths, between_simulation,
+                                      unstated, 500.0, 2000.0, 12000.0, 120.0,
+                                      -2.0, 10.0);
+    require_near(cam::feed_schedule_seconds(same),
+                 cam::feed_schedule_seconds(transition), 1e-9,
+                 "an unstated Z rate is the lateral rate");
+  }
+
   // The next pass down starts wherever its own geometry does, which is not
   // where the previous one left the cutter. That leg is the plan's to own.
   const auto arrived = cam::plan_feeds(
       between_paths, between_simulation, test_machine(), 500.0, 2000.0,
-      12000.0, 120.0, -2.0, 10.0, point(0.0, 5.0));
+      12000.0, 120.0, -2.0, 10.0, cam::PassLink{point(0.0, 5.0), 10.0, false});
   require(arrived.motion.size() == transition.motion.size() + 1,
           "arriving from a previous pass adds one phase");
   if (!arrived.motion.empty()) {

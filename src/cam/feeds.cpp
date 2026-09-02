@@ -88,7 +88,7 @@ FeedSchedule plan_feeds(const wave::Toolpath& toolpath,
                         double plunge_feed,
                         double floor_z,
                         double rapid_plane,
-                        std::optional<wave::Point64> arrive_from) {
+                        PassLink link) {
   FeedSchedule schedule;
   if (toolpath.moves.empty()) return schedule;
 
@@ -96,6 +96,7 @@ FeedSchedule plan_feeds(const wave::Toolpath& toolpath,
   const double fast = std::max(no_engagement_feed, slow);
   const double plunge = std::max(plunge_feed, 1.0);
   const double rapid = std::max(rapid_feed(machine), 1.0);
+  const double rapid_z = std::max(rapid_feed_z(machine), 1.0);
   schedule.stats.spindle_rpm = commandable_rpm(machine, spindle_rpm);
 
   std::vector<double> move_start(toolpath.moves.size(), 0.0);
@@ -187,7 +188,10 @@ FeedSchedule plan_feeds(const wave::Toolpath& toolpath,
     phase.path_distance_begin = path_begin;
     phase.path_distance_end = path_end;
     phase.length = std::hypot(distance_mm(from, to), to_z - from_z);
-    phase.rate = rate;
+    // A rapid is commanded as separate moves -- straight up, across the plane,
+    // straight down -- so a phase is one or the other and takes the rate of the
+    // axis that actually moves. A cutting move keeps the rate it was given.
+    phase.rate = is_rapid && to_z != from_z ? rapid_z : rate;
     phase.kind = kind;
     phase.rapid = is_rapid;
     if (phase.length > 0.0) schedule.motion.push_back(phase);
@@ -195,6 +199,11 @@ FeedSchedule plan_feeds(const wave::Toolpath& toolpath,
 
   bool at_depth = false;
   bool rapid_descent = false;
+  // Only the first descent starts from where the previous pass left the cutter.
+  // A retract inside this pass goes to the plane and comes back from it, the
+  // same as it always did.
+  bool first_descent = true;
+  schedule.begins_at_depth = link.from.has_value() && link.from_z != rapid_plane;
   wave::Point64 position{};
   bool have_position = false;
   std::size_t segment_index = 0;
@@ -242,7 +251,9 @@ FeedSchedule plan_feeds(const wave::Toolpath& toolpath,
     const FeedSegment& first = unmerged_segments[first_segment];
     if (!at_depth) {
       const bool use_rapid = rapid_descent && move.kind != wave::MoveKind::Entry;
-      append_motion(first.from, first.from, rapid_plane, floor_z,
+      const double from_z =
+          first_descent && link.from ? link.from_z : rapid_plane;
+      append_motion(first.from, first.from, from_z, floor_z,
                     first.start_distance, first.start_distance,
                     use_rapid ? rapid : plunge,
                     use_rapid ? wave::MoveKind::Retract
@@ -250,6 +261,7 @@ FeedSchedule plan_feeds(const wave::Toolpath& toolpath,
                     use_rapid);
       at_depth = true;
       rapid_descent = false;
+      first_descent = false;
     }
     for (std::size_t i = first_segment; i < segment_index; ++i) {
       const FeedSegment& segment = unmerged_segments[i];
@@ -261,24 +273,29 @@ FeedSchedule plan_feeds(const wave::Toolpath& toolpath,
       have_position = true;
     }
   }
-  if (at_depth && have_position) {
+  if (at_depth && have_position && !link.stay_down_after) {
     const double path_end = wave::toolpath_length(toolpath);
     append_motion(position, position, floor_z, rapid_plane, path_end,
                   path_end, rapid, wave::MoveKind::Retract, true);
   }
+  schedule.ends_at_depth = at_depth && have_position && link.stay_down_after;
 
-  // Whatever ran before this pass left the cutter standing at the rapid plane,
-  // and the descent above starts from wherever this pass happens to begin. The
-  // rapid between the two is a real commanded move, so the schedule carries it
-  // rather than leaving the tool to appear at the new pass out of nowhere. It
-  // covers no path distance, exactly as the descent that follows it does.
-  if (arrive_from && !schedule.motion.empty()) {
+  // Whatever ran before this pass left the cutter standing somewhere, and the
+  // descent above starts from wherever this pass happens to begin. The move
+  // between the two is a real commanded one, so the schedule carries it rather
+  // than leaving the tool to appear at the new pass out of nowhere. It covers
+  // no path distance, exactly as the descent that follows it does.
+  //
+  // A pass reached without lifting has nothing left to cross: the pass before
+  // it already travelled to this one's first point, at depth, as part of its
+  // own geometry. The traverse is then zero length and drops out below.
+  if (link.from && !schedule.motion.empty()) {
     const MotionPhase& opening = schedule.motion.front();
     MotionPhase traverse;
-    traverse.from = *arrive_from;
+    traverse.from = *link.from;
     traverse.to = opening.from;
-    traverse.from_z = rapid_plane;
-    traverse.to_z = rapid_plane;
+    traverse.from_z = link.from_z;
+    traverse.to_z = link.from_z;
     traverse.path_distance_begin = opening.path_distance_begin;
     traverse.path_distance_end = opening.path_distance_begin;
     traverse.length = distance_mm(traverse.from, traverse.to);

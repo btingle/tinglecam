@@ -1,10 +1,14 @@
 #include "traversal.h"
 
+#include "routing.h"
+
 #include <clipper2/clipper.h>
 
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <array>
+#include <map>
 #include <stdexcept>
 #include <utility>
 
@@ -52,7 +56,43 @@ bool legal_segment(const Point64& from, const Point64& to,
 struct Connector {
   bool stay_down = false;
   double minutes = 0.0;
-  Point64 landing;
+  // Where the connector goes, and how. A retract is the two endpoints at the
+  // safe plane; a stay-down is the way across at depth, which is a straight
+  // line where one is legal and a routed one where it is not.
+  Path64 path;
+};
+
+// The ways across at depth, remembered. The ordering search asks about the same
+// pairs of endpoints over and over -- every variant against every other -- and
+// routing one is a good deal more work than measuring it.
+class Crossings {
+ public:
+  // The region is pulled in by what the router may spend before it is asked
+  // for anything. That slack is there to forgive two roundings of one wall
+  // disagreeing, which is what lets a connector run along that wall at all;
+  // spent instead against the part, or against the stock allowance standing in
+  // front of it, it is a cut into the finished surface. Taken off first, a
+  // route that uses all of it still only reaches the edge of where the tool was
+  // allowed. The straight-line test above is untouched by this: it demands the
+  // whole segment inside the region as given, and needs no such margin.
+  Crossings(const Paths64& region, double slack)
+      : router_(slack > 0.0 ? InflatePaths(region, -2.0 * slack,
+                                           JoinType::Miter, EndType::Polygon)
+                            : Paths64{},
+                slack) {}
+
+  const std::optional<Path64>& between(const Point64& from,
+                                       const Point64& to) const {
+    const Key key{from.x, from.y, to.x, to.y};
+    const auto found = cache_.find(key);
+    if (found != cache_.end()) return found->second;
+    return cache_.emplace(key, router_.route(from, to)).first->second;
+  }
+
+ private:
+  using Key = std::array<std::int64_t, 4>;
+  Router router_;
+  mutable std::map<Key, std::optional<Path64>> cache_;
 };
 
 Point64 safe_landing(const TraversalVariant& variant) {
@@ -65,28 +105,49 @@ double approach_length(const TraversalVariant& variant) {
   return variant.safe_approach ? path_length_mm(*variant.safe_approach) : 0.0;
 }
 
+double vertical_rapid(const TraversalSettings& settings) {
+  return settings.rapid_feed_z > 0.0 ? settings.rapid_feed_z
+                                     : settings.rapid_feed;
+}
+
 Connector connector(const Point64& from, const TraversalVariant& variant,
-                    const TraversalSettings& settings) {
+                    const TraversalSettings& settings,
+                    const Crossings& crossings) {
   const Point64& target = variant.path.front();
   const Point64 landing = safe_landing(variant);
   const double vertical =
-      2.0 * std::abs(settings.rapid_clearance_height - settings.floor_z);
+      2.0 * std::abs(settings.rapid_plane - settings.floor_z);
   const double retract =
-      (distance_mm(from, landing) + vertical) / settings.rapid_feed +
+      distance_mm(from, landing) / settings.rapid_feed +
+      vertical / vertical_rapid(settings) +
       approach_length(variant) / settings.cutting_feed;
-  if (settings.allow_stay_down &&
-      legal_segment(from, target, settings.stay_down_region)) {
-    const double stay_down = distance_mm(from, target) / settings.cutting_feed;
-    if (settings.prefer_stay_down_when_legal || stay_down <= retract)
-      return {true, stay_down, target};
+  if (settings.allow_stay_down) {
+    // The straight line first, because it is both the cheapest to test and the
+    // best answer whenever it is available.
+    Path64 across;
+    if (legal_segment(from, target, settings.stay_down_region)) {
+      across = Path64{from, target};
+    } else if (settings.stay_down_slack > 0.0) {
+      // Blocked, which used to end the matter. Two contours clipped to the
+      // same stock can finish and start a few millimetres apart along its wall
+      // with the wall itself between them, and lifting the whole height of the
+      // job to cross that is the wrong answer by an order of magnitude.
+      if (const auto& routed = crossings.between(from, target))
+        across = *routed;
+    }
+    if (across.size() >= 2) {
+      const double stay_down = path_length_mm(across) / settings.cutting_feed;
+      if (settings.prefer_stay_down_when_legal || stay_down <= retract)
+        return {true, stay_down, std::move(across)};
+    }
   }
-  return {false, retract, landing};
+  return {false, retract, Path64{from, landing}};
 }
 
 double initial_entry_minutes(const TraversalVariant& variant,
                              const TraversalSettings& settings) {
-  return std::abs(settings.rapid_clearance_height - settings.floor_z) /
-             settings.rapid_feed +
+  return std::abs(settings.rapid_plane - settings.floor_z) /
+             vertical_rapid(settings) +
          approach_length(variant) / settings.cutting_feed;
 }
 
@@ -98,7 +159,7 @@ struct State {
 
 std::vector<TraversalChoice> exact_order(
     const std::vector<TraversalTask>& tasks,
-    const TraversalSettings& settings) {
+    const TraversalSettings& settings, const Crossings& crossings) {
   const std::size_t count = tasks.size();
   const std::size_t masks = std::size_t{1} << count;
   std::vector<std::vector<std::vector<State>>> states(masks);
@@ -114,7 +175,7 @@ std::vector<TraversalChoice> exact_order(
       const Path64& path = candidate.path;
       const double initial = settings.initial_position
                                  ? connector(*settings.initial_position, candidate,
-                                             settings)
+                                             settings, crossings)
                                        .minutes
                                  : initial_entry_minutes(candidate, settings);
       states[std::size_t{1} << task][task][variant].cost =
@@ -138,7 +199,8 @@ std::vector<TraversalChoice> exact_order(
                 tasks[next].variants[next_variant];
             const Path64& path = next_choice.path;
             const double candidate =
-                current.cost + connector(from, next_choice, settings).minutes +
+                current.cost +
+                connector(from, next_choice, settings, crossings).minutes +
                 path_length_mm(path) / settings.cutting_feed;
             State& destination = states[next_mask][next][next_variant];
             if (candidate >= destination.cost) continue;
@@ -179,7 +241,7 @@ std::vector<TraversalChoice> exact_order(
 
 std::vector<TraversalChoice> greedy_order(
     const std::vector<TraversalTask>& tasks,
-    const TraversalSettings& settings) {
+    const TraversalSettings& settings, const Crossings& crossings) {
   std::vector<bool> used(tasks.size(), false);
   std::vector<TraversalChoice> order;
   order.reserve(tasks.size());
@@ -194,7 +256,7 @@ std::vector<TraversalChoice> greedy_order(
       const double cost = path_length_mm(path) / settings.cutting_feed +
                           (settings.initial_position
                                ? connector(*settings.initial_position, candidate,
-                                           settings)
+                                           settings, crossings)
                                      .minutes
                                : initial_entry_minutes(candidate, settings));
       if (cost < best) {
@@ -214,7 +276,8 @@ std::vector<TraversalChoice> greedy_order(
       for (std::size_t variant = 0; variant < tasks[task].variants.size(); ++variant) {
         const TraversalVariant& candidate = tasks[task].variants[variant];
         const Path64& path = candidate.path;
-        const double cost = connector(previous.back(), candidate, settings).minutes +
+        const double cost =
+            connector(previous.back(), candidate, settings, crossings).minutes +
                             path_length_mm(path) / settings.cutting_feed;
         if (cost < best) {
           best = cost;
@@ -254,10 +317,12 @@ void add_move(Toolpath& toolpath, MoveKind kind, Path64 path) {
 TraversalResult plan_traversal(const std::vector<TraversalTask>& tasks,
                                const TraversalSettings& settings) {
   if (!(settings.cutting_feed > 0.0) || !(settings.rapid_feed > 0.0) ||
+      settings.rapid_feed_z < 0.0 ||
       !std::isfinite(settings.cutting_feed) ||
       !std::isfinite(settings.rapid_feed) ||
+      !std::isfinite(settings.rapid_feed_z) ||
       !std::isfinite(settings.floor_z) ||
-      !std::isfinite(settings.rapid_clearance_height))
+      !std::isfinite(settings.rapid_plane))
     throw std::invalid_argument("Traversal feeds and heights must be finite and positive");
   std::vector<TraversalTask> usable;
   usable.reserve(tasks.size());
@@ -279,9 +344,11 @@ TraversalResult plan_traversal(const std::vector<TraversalTask>& tasks,
   if (usable.empty()) return result;
   std::size_t variant_count = 0;
   for (const TraversalTask& task : usable) variant_count += task.variants.size();
+  const Crossings crossings(settings.stay_down_region,
+                            settings.stay_down_slack);
   result.order = usable.size() <= 10 && variant_count <= 64
-                     ? exact_order(usable, settings)
-                     : greedy_order(usable, settings);
+                     ? exact_order(usable, settings, crossings)
+                     : greedy_order(usable, settings, crossings);
 
   bool have_position = settings.initial_position.has_value();
   Point64 position = settings.initial_position.value_or(Point64(0, 0));
@@ -297,9 +364,9 @@ TraversalResult plan_traversal(const std::vector<TraversalTask>& tasks,
       result.estimated_minutes += initial_entry_minutes(variant, settings);
       have_position = true;
     } else if (position != path.front()) {
-      const Connector link = connector(position, variant, settings);
+      const Connector link = connector(position, variant, settings, crossings);
       add_move(result.toolpath, link.stay_down ? MoveKind::Link : MoveKind::Retract,
-               Path64{position, link.landing});
+               link.path);
       if (!link.stay_down && variant.safe_approach &&
           variant.safe_approach->size() >= 2)
         add_move(result.toolpath, MoveKind::Cut, *variant.safe_approach);

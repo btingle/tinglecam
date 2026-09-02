@@ -176,26 +176,13 @@ PostResult post_job(const JobPlan& plan,
     return result;
   }
 
-  // The one rapid plane has to be above everything the job cuts. A 2D slice
-  // cannot certify a lower traverse, so disconnected moves always use this
-  // Z0-relative plane.
-  double highest_cut = -std::numeric_limits<double>::infinity();
-  for (const OperationPlan& operation : plan.operations)
-    for (const LevelPlan& level : operation.levels)
-      if (!level.nothing_to_cut)
-        highest_cut = std::max(highest_cut, level.floor_z + level.axial_depth);
-
+  // The one rapid plane has to be above everything in the way. A 2D slice
+  // cannot certify a lower traverse, so disconnected moves always use it. It is
+  // taken from the plan rather than worked out here: the planner costs every
+  // lift against this height while choosing whether to lift at all, so the post
+  // must not be the place that forms a second opinion about it.
   Writer writer(*machine, result);
-  double rapid_plane = job.rapid_clearance_height + job.origin_z;
-  if (std::isfinite(highest_cut)) {
-    const double top = highest_cut + job.origin_z;
-    if (rapid_plane < top + 1.0) {
-      result.warnings.push_back(
-          "The rapid clearance plane was at or below the top of the cut; it "
-          "has been raised above it");
-      rapid_plane = top + 10.0;
-    }
-  }
+  const double rapid_plane = plan.rapid_plane + job.origin_z;
   // ---- Preamble ---------------------------------------------------------
   writer.comment(job.name.empty() ? std::string("TingleCAM") : job.name);
   writer.comment(std::string("Machine: ") + machine->name);
@@ -284,15 +271,31 @@ PostResult post_job(const JobPlan& plan,
                                   ": the tool asks for coolant this machine has not got");
     }
 
+    // Carried across the passes rather than reset at each one, because a pass
+    // can now be reached without lifting: the pass above ends over this one's
+    // first point, at its own floor, and the only move between them is the
+    // descent. Where that has not happened these stay exactly as they were --
+    // false at the top of every pass -- and the tool crosses at the plane.
+    bool at_depth = false;
+    bool rapid_descent = false;
+    double depth_z = 0.0;
+    const double plunge_rate = std::max(data ? data->plunge_feed : 100.0, 1.0);
     for (const LevelPlan& level : operation.levels) {
       if (level.nothing_to_cut || level.feeds.segments.empty()) continue;
       const double cut_z = level.floor_z + job.origin_z;
       writer.blank();
-      writer.comment("Depth " + writer.coordinate(level.floor_z) + " mm, cutting " +
+      // The posted depth, not the model's. Every other number in this file is
+      // in the program's coordinates and a comment that is not agrees with
+      // nothing the operator can read off the machine.
+      writer.comment("Depth " + writer.coordinate(cut_z) + " mm, cutting " +
                      writer.coordinate(level.axial_depth) + " mm");
 
-      bool at_depth = false;
-      bool rapid_descent = false;
+      // The opening retract of a pass reached at depth is the one thing that
+      // must not be written out: it exists to prove the descent after it lands
+      // in cleared air, and writing it would lift the tool back to the plane
+      // that staying down was the whole point of avoiding. What it proves is
+      // still taken from it.
+      bool opening_retract = level.feeds.begins_at_depth && at_depth;
       for (const FeedSegment& segment : level.feeds.segments) {
         const double from_x = wave::to_world(segment.from.x) + job.origin_x;
         const double from_y = wave::to_world(segment.from.y) + job.origin_y;
@@ -300,10 +303,14 @@ PostResult post_job(const JobPlan& plan,
         const double to_y = wave::to_world(segment.to.y) + job.origin_y;
 
         if (segment.kind == wave::MoveKind::Retract) {
+          if (opening_retract) {
+            rapid_descent = segment.safe_retract;
+            continue;
+          }
           if (at_depth) {
             // Straight up where it stands, then across. Lifting and traversing
             // together would drag the cutter through the wall it is leaving.
-            writer.rapid(from_x, from_y, cut_z);
+            writer.rapid(from_x, from_y, depth_z);
             writer.rapid(from_x, from_y, rapid_plane);
             at_depth = false;
           }
@@ -311,8 +318,16 @@ PostResult post_job(const JobPlan& plan,
           rapid_descent = segment.safe_retract;
           continue;
         }
+        opening_retract = false;
 
-        if (!at_depth) {
+        if (at_depth && depth_z != cut_z) {
+          // Reached without lifting: the cutter already stands over this pass's
+          // first point, one pass depth above it.
+          if (rapid_descent) writer.rapid(from_x, from_y, cut_z);
+          else writer.feed(from_x, from_y, cut_z, plunge_rate);
+          depth_z = cut_z;
+          rapid_descent = false;
+        } else if (!at_depth) {
           // Across at height first, then straight down. Combining the two into
           // one diagonal rapid would take the tool through whatever stands
           // between where it was and where it is going.
@@ -323,10 +338,10 @@ PostResult post_job(const JobPlan& plan,
             // positioning move rather than a cutting plunge.
             writer.rapid(from_x, from_y, cut_z);
           } else {
-            const double plunge = data ? data->plunge_feed : 100.0;
-            writer.feed(from_x, from_y, cut_z, std::max(plunge, 1.0));
+            writer.feed(from_x, from_y, cut_z, plunge_rate);
           }
           at_depth = true;
+          depth_z = cut_z;
           rapid_descent = false;
         }
 
@@ -337,13 +352,14 @@ PostResult post_job(const JobPlan& plan,
         writer.feed(to_x, to_y, cut_z, segment.rate);
       }
 
-      if (at_depth) {
+      if (at_depth && !level.feeds.ends_at_depth) {
         // Leave the pass by lifting where it finished rather than dragging out.
         const double last_x =
             wave::to_world(level.feeds.segments.back().to.x) + job.origin_x;
         const double last_y =
             wave::to_world(level.feeds.segments.back().to.y) + job.origin_y;
         writer.rapid(last_x, last_y, rapid_plane);
+        at_depth = false;
       }
     }
 

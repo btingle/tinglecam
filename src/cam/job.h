@@ -41,10 +41,15 @@ struct Operation {
   double radial_stock_to_leave = 0.2;
   double axial_stock_to_leave = 0.0;
 
-  // Depth range, in job coordinates. Top is where the cutter starts, bottom is
-  // the deepest floor the operation reaches.
-  double top_z = 0.0;
-  double bottom_z = -5.0;
+  // Depth range, measured downwards from the top of the work -- the taller of
+  // the part and the blank. Depths rather than heights because the top of the
+  // work is the one reference that is neither the part's own (a blank standing
+  // proud of the part would never be cut) nor the origin's (which moves, and
+  // must not move what gets cut). `depth_from` is where the cutter starts,
+  // `depth_to` the deepest floor the operation reaches; loading a model sets
+  // them to the whole of it.
+  double depth_from = 0.0;
+  double depth_to = 5.0;
 
   bool lead_in = true;
   // How much larger than its model the raw blank may be. The run-in is placed
@@ -115,6 +120,11 @@ struct LevelPlan {
   wave::SimulationResult simulation;
   FeedSchedule feeds;
   bool nothing_to_cut = false;
+  // This pass reaches the next one without lifting: `transition` is the way
+  // across at this pass's own floor, ending at the next pass's first point, so
+  // all that separates them is one pass depth of descent.
+  bool stays_down_after = false;
+  wave::Path64 transition;
 };
 
 struct PlanStats {
@@ -163,6 +173,9 @@ struct JobPlan {
   PlanStats stats;
   std::vector<std::string> warnings;
   std::string error;
+  // The safe plane this plan was costed against, in job coordinates. Recorded
+  // rather than recomputed, so the post cannot write a different one.
+  double rapid_plane = 0.0;
 
   bool ok() const { return error.empty(); }
 };
@@ -192,8 +205,12 @@ class JobGeometry {
   bool has_stock() const { return !stock_.empty() || (box_stock_ && !part_.empty()); }
   const wave::MeshSlicer& part() const { return part_; }
   const wave::MeshSlicer& stock() const { return stock_; }
-  // The Z range shared by both meshes, which is what an operation may cover.
-  bool z_range(double& low, double& high) const;
+  // The Z range spanned by either mesh, which is what an operation may cover.
+  // The union rather than the overlap: a blank standing proud of the part is
+  // material to be faced off, and a part reaching below the blank is a hole
+  // the operation still has to descend into. Restricting an operation to the
+  // depths both models occupy silently drops both.
+  bool work_range(double& low, double& high) const;
 
   // Unioned outlines at a depth, remembered between passes. Loading a mesh
   // drops what was remembered for it.
@@ -227,7 +244,11 @@ class JobGeometry {
 // The depths an operation will cut to, deepest last. The first pass takes a
 // full stepdown below the top; the last is trimmed so it lands exactly on the
 // floor rather than overshooting it.
-std::vector<double> level_floors(const Operation& operation);
+// The floors of every pass, in job coordinates, deepest last. `work_top` is the
+// top of the work the operation's depths are measured down from; `stepdown` is
+// the figure after the tool's ceiling has been applied to it.
+std::vector<double> level_floors(const Operation& operation, double stepdown,
+                                 double work_top);
 
 // Slices, propagates the wave, and builds the lineage and inter-layer topology
 // for every depth. Which entries were declined is an input here, not an output:
@@ -241,6 +262,28 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
                               double progress_from = 0.0,
                               double progress_to = 1.0);
 
+// The one plane every disconnected move traverses at, in job coordinates; the
+// post adds origin_z to it. A 2D slice cannot certify a lower traverse, so this
+// is the only height at which a rapid ever crosses the job.
+//
+// `highest` is the top of the tallest thing in the way, part or blank, in model
+// coordinates. The plane is that plus the job's clearance -- a distance over the
+// work rather than a height over the origin, so moving the origin cannot move
+// the plane, and cannot therefore change what a lift costs or oblige a re-plan
+// to say where the job's zero is.
+//
+// The planner resolves it once and `JobPlan::rapid_plane` records it, so the
+// post writes the height every lift was costed against instead of working out
+// a second opinion.
+double job_rapid_plane(const Job& job, double highest);
+
+// The top of the tallest loaded model, or negative infinity if none is loaded.
+// This is what an operation's depths are measured down from.
+double highest_model_z(const JobGeometry& geometry);
+
+// Job-coordinate Z of a depth below the top of the work.
+inline double z_at_depth(double work_top, double depth) { return work_top - depth; }
+
 // Carries a wavefront plan the rest of the way: toolpath, simulation, feeds,
 // and the rolled-up statistics. The plan is modified in place.
 void plan_toolpaths(OperationPlan& plan,
@@ -251,7 +294,7 @@ void plan_toolpaths(OperationPlan& plan,
                     const ProgressCallback& progress,
                     double progress_from = 0.0,
                     double progress_to = 1.0,
-                    double rapid_clearance_height = 10.0);
+                    double rapid_plane = 10.0);
 
 // Both stages back to back.
 OperationPlan plan_operation(const JobGeometry& geometry,
@@ -262,7 +305,7 @@ OperationPlan plan_operation(const JobGeometry& geometry,
                              const ProgressCallback& progress,
                              double progress_from = 0.0,
                              double progress_to = 1.0,
-                             double rapid_clearance_height = 10.0);
+                             double rapid_plane = 10.0);
 
 // One appearance of an entry front: the curve the wave would start from on one
 // level, and the slab of depth that level stands for.

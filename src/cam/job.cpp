@@ -1,5 +1,7 @@
 #include "cam/job.h"
 
+#include "routing.h"
+
 #include <algorithm>
 #include <cmath>
 #include <optional>
@@ -61,6 +63,47 @@ void accumulate(PlanStats& into, const PlanStats& from) {
 // Everything both planning stages need out of the operation, the tool and the
 // machine. Resolving it once keeps the two stages from disagreeing about the
 // engagement they were capped to.
+double distance_mm(const wave::Point64& a, const wave::Point64& b) {
+  return std::hypot(wave::to_world(b.x - a.x), wave::to_world(b.y - a.y));
+}
+
+// How far a move at depth may stray outside the region it travels through.
+// The same figure the toolpath builder holds its own links to, so a link, a
+// finishing connector and a transition between depths are all judged alike.
+double link_slack(double stepover) {
+  return std::clamp(static_cast<double>(wave::to_integer(stepover)) * 0.05,
+                    32.0, 500.0);
+}
+
+// Everywhere the cutter's centre may be at one depth when nothing has been
+// removed there yet: the space beside the stock, minus the part it must not
+// touch. The stock stands in air, so that space is empty whether or not this
+// pass emptied it -- which is the whole of what a finishing pass has to travel
+// through. Its contours are clipped to the stock, so they begin and end on the
+// stock wall, and two of them can finish and start a few millimetres apart
+// along it with only the wall in between.
+wave::Paths64 open_space(const wave::Paths64& stock_slice,
+                         const wave::Paths64& keep_out) {
+  if (stock_slice.empty()) return {};
+  Clipper2Lib::Rect64 world = Clipper2Lib::GetBounds(stock_slice);
+  // Room for the tool to stand clear of the stock, and for a route to go round
+  // the outside of it rather than being pinned against the edge of the box.
+  const std::int64_t margin =
+      std::max<std::int64_t>(16, (world.right - world.left) / 4);
+  world.left -= margin;
+  world.top -= margin;
+  world.right += margin;
+  world.bottom += margin;
+  const wave::Path64 box{
+      wave::Point64(world.left, world.top), wave::Point64(world.right, world.top),
+      wave::Point64(world.right, world.bottom),
+      wave::Point64(world.left, world.bottom)};
+  return Clipper2Lib::Difference(
+      wave::Paths64{box},
+      Clipper2Lib::Union(stock_slice, keep_out, Clipper2Lib::FillRule::NonZero),
+      Clipper2Lib::FillRule::NonZero);
+}
+
 struct OperationSetup {
   const CuttingData* data = nullptr;
   double full_engagement_feed = 0.0;
@@ -68,7 +111,10 @@ struct OperationSetup {
   double radius = 0.0;
   double stepover = 0.0;
   double first_bite_allowance = 0.0;
-  std::vector<double> floors;
+  // After the tool's axial ceiling has been applied to what the operation asked
+  // for. The floors are not resolved here: they need the top of the work, which
+  // only a caller holding the geometry can supply.
+  double stepdown = 0.0;
 };
 
 // `warnings`, when given, receives the notes about engagement that had to be
@@ -158,11 +204,19 @@ bool resolve_setup(const Operation& operation, const Tool& tool,
           " mm, which is as much as this stepover leaves room for");
   }
 
-  Operation effective = operation;
-  effective.stepdown = stepdown;
-  setup.floors = level_floors(effective);
-  if (setup.floors.empty()) {
-    error = "The depth range is empty: the top is not above the floor";
+  setup.stepdown = stepdown;
+  return true;
+}
+
+// The floors the operation's depth range lands on. Separate from the setup
+// above because depths are measured from the top of the work, and only a caller
+// with the geometry in hand knows where that is.
+bool resolve_floors(const Operation& operation, const OperationSetup& setup,
+                    double work_top, std::string& error,
+                    std::vector<double>& floors) {
+  floors = level_floors(operation, setup.stepdown, work_top);
+  if (floors.empty()) {
+    error = "The depth range is empty: it has to start above where it ends";
     return false;
   }
   return true;
@@ -208,6 +262,81 @@ void finish_job(JobPlan& plan) {
       if (!operation.ok())
         plan.warnings.push_back(operation.operation_name + ": " +
                                 operation.error);
+  }
+}
+
+// The way from where one pass finishes to where the next one starts. Lifting to
+// the rapid plane and coming back down always works and always costs the full
+// height of the job twice over -- on a fourteen-pass part that is most of a
+// metre of vertical rapid, spent to cross gaps that are often a few
+// millimetres wide.
+//
+// Where the pass that just finished cleared a way across at its own floor, the
+// cutter can walk it and step down a single pass depth instead. That way is
+// only ever offered when it is quicker, and it is offered by extending the
+// earlier pass rather than by inventing motion between the two: the transition
+// runs at that pass's depth, through what that pass removed, so it is that
+// pass's toolpath that should carry it, and it is that pass's simulation that
+// then checks it like any other move at that depth.
+void stitch_passes(OperationPlan& plan, const OperationSetup& setup,
+                   const Machine& machine, double rapid_plane) {
+  const double rapid = std::max(rapid_feed(machine), 1.0);
+  const double rapid_z = std::max(rapid_feed_z(machine), 1.0);
+  const double travel = std::max(setup.no_engagement_feed, 1.0);
+  // The allowance the toolpath builder grants a link at depth, so a transition
+  // is held to the same standard as the links inside the pass it extends.
+  const double slack = link_slack(setup.stepover);
+
+  LevelPlan* previous = nullptr;
+  for (LevelPlan& level : plan.levels) {
+    if (level.nothing_to_cut || level.toolpath.moves.empty() ||
+        level.toolpath.moves.front().path.empty())
+      continue;
+    LevelPlan* const earlier = previous;
+    previous = &level;
+    if (earlier == nullptr || earlier->toolpath.moves.back().path.empty() ||
+        earlier->toolpath.cleared.empty())
+      continue;
+
+    const wave::Point64 from = earlier->toolpath.moves.back().path.back();
+    const wave::Point64 to = level.toolpath.moves.front().path.front();
+    // Pulled in by what the router may spend before it is asked for a route.
+    // Its slack forgives the disagreement between two roundings of one wall,
+    // which is what lets a route run along that wall at all; spent against the
+    // part instead it is a cut into the finished surface. Taking it off the
+    // region first means a route that uses all of it still only reaches the
+    // edge of what the pass actually cleared. It is not free -- a corridor
+    // narrower than this stops offering a way through, and the transition falls
+    // back to lifting -- but a corridor that narrow is one stepover wide at
+    // most, and worth refusing.
+    const wave::Paths64 room = Clipper2Lib::InflatePaths(
+        earlier->toolpath.cleared, -2.0 * slack, Clipper2Lib::JoinType::Miter,
+        Clipper2Lib::EndType::Polygon);
+    if (room.empty()) continue;
+    const wave::Router router(room, slack);
+    const auto route = router.route(from, to);
+    if (!route) continue;
+
+    double crossing = 0.0;
+    for (std::size_t i = 1; i < route->size(); ++i)
+      crossing += distance_mm((*route)[i - 1], (*route)[i]);
+    const double descent = std::abs(earlier->floor_z - level.floor_z);
+    // Up, across the plane, and back down against across at depth and one step
+    // down. Both are what the machine is actually commanded to do, so the two
+    // are comparable without a fudge factor between them.
+    const double lift = (std::abs(rapid_plane - earlier->floor_z) +
+                         std::abs(rapid_plane - level.floor_z)) / rapid_z +
+                        distance_mm(from, to) / rapid;
+    const double stay = crossing / travel + descent / rapid_z;
+    if (stay >= lift) continue;
+
+    // Kept aside rather than appended here. It joins the pass after the pass
+    // has been resampled, because resampling runs consecutive engaged moves
+    // together and takes its samples across the whole run: fused with the cuts
+    // it extends, a sample interval straddling the join comes out labelled a
+    // cut while lying partly on a transition that crosses open air.
+    earlier->transition = *route;
+    earlier->stays_down_after = true;
   }
 }
 
@@ -293,10 +422,11 @@ const wave::Paths64& JobGeometry::stock_outline(double z, int grid) const {
   return box_;
 }
 
-bool JobGeometry::z_range(double& low, double& high) const {
-  // The overlap, not the union. A depth where only one of the two models exists
-  // has either no stock to remove or no part to protect, and offering it as a
-  // default only produces passes that find nothing to cut.
+bool JobGeometry::work_range(double& low, double& high) const {
+  // The union, not the overlap. Either model on its own is a reason to be at a
+  // depth: blank above the part is material to face off, part below the blank
+  // is a hole to descend into. Taking the overlap quietly clipped both away,
+  // which is how a blank standing proud of its part came to be left standing.
   bool any = false;
   double lowest = 0.0;
   double highest = 0.0;
@@ -310,8 +440,8 @@ bool JobGeometry::z_range(double& low, double& high) const {
       any = true;
       continue;
     }
-    lowest = std::max<double>(lowest, bounds.lower.z);
-    highest = std::min<double>(highest, bounds.upper.z);
+    lowest = std::min<double>(lowest, bounds.lower.z);
+    highest = std::max<double>(highest, bounds.upper.z);
   }
   if (!any || !(highest > lowest)) return false;
   low = lowest;
@@ -319,12 +449,16 @@ bool JobGeometry::z_range(double& low, double& high) const {
   return true;
 }
 
-std::vector<double> level_floors(const Operation& operation) {
+std::vector<double> level_floors(const Operation& operation, double stepdown,
+                                 double work_top) {
   std::vector<double> floors;
-  const double bottom = operation.bottom_z + operation.axial_stock_to_leave;
-  if (!(operation.top_z > bottom)) return floors;
-  const double step = std::max(operation.stepdown, 1e-6);
-  double z = operation.top_z;
+  if (!std::isfinite(work_top)) return floors;
+  const double top = z_at_depth(work_top, operation.depth_from);
+  const double bottom =
+      z_at_depth(work_top, operation.depth_to) + operation.axial_stock_to_leave;
+  if (!(top > bottom)) return floors;
+  const double step = std::max(stepdown, 1e-6);
+  double z = top;
   // A guard rather than a limit: at a sane stepdown no real part gets close.
   for (int guard = 0; guard < 20000; ++guard) {
     z -= step;
@@ -364,12 +498,15 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
   const double radius = setup.radius;
   const double stepover = setup.stepover;
   const double first_bite_allowance = setup.first_bite_allowance;
-  const std::vector<double>& floors = setup.floors;
+  const double work_top = highest_model_z(geometry);
+  std::vector<double> floors;
+  if (!resolve_floors(operation, setup, work_top, plan.error, floors))
+    return plan;
   const wave::EntryMute mute = layer_mute(operation);
 
   plan.levels.reserve(floors.size());
   std::vector<std::string> level_failures;
-  double previous_z = operation.top_z;
+  double previous_z = z_at_depth(work_top, operation.depth_from);
   const double span = std::max(progress_to - progress_from, 0.0);
 
   for (std::size_t index = 0; index < floors.size(); ++index) {
@@ -414,7 +551,15 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
       // offer and nothing to discover here. Its contours are derived from the
       // slices this stage already took, which happens with the rest of the
       // toolpath work.
-      if (operation.mode == OperationMode::ContourFinishing) {
+      //
+      // Except where the part does not reach this depth at all. There is no
+      // surface to finish there because there is no part there -- but there is
+      // stock, and all of it is waste. Skipping the depth leaves that waste
+      // standing and the passes below it cutting into a blank that is still the
+      // wrong shape, so it is cleared instead, by the same wave a roughing pass
+      // would use against the same absent subject.
+      if (operation.mode == OperationMode::ContourFinishing &&
+          !level.part_slice.empty()) {
         plan.levels.push_back(std::move(level));
         continue;
       }
@@ -467,6 +612,33 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
   return plan;
 }
 
+double highest_model_z(const JobGeometry& geometry) {
+  double highest = -std::numeric_limits<double>::infinity();
+  for (const wave::MeshSlicer* slicer : {&geometry.part(), &geometry.stock()}) {
+    if (slicer->empty()) continue;
+    const wave::Bounds3f& bounds = slicer->mesh().bounds;
+    if (bounds.valid) highest = std::max<double>(highest, bounds.upper.z);
+  }
+  // A rectangular blank has no mesh, and stands only as tall as the part it was
+  // built around, so the part above already covers it.
+  return highest;
+}
+
+double job_rapid_plane(const Job& job, double highest) {
+  // A clearance above the work, not a height above the origin. Where the origin
+  // sits is a matter of where it is convenient to measure from, and it moves;
+  // what a traverse has to clear is the tallest thing in the way, and that does
+  // not. Tying the plane to the origin meant moving the origin moved the plane,
+  // which moved what every lift cost, which meant re-planning the job to say
+  // where its zero was.
+  //
+  // The tallest thing in the way is the taller of the part and the blank. Not
+  // the top of the cut: an operation that stops short still has to traverse
+  // over whatever it is leaving above itself.
+  if (!std::isfinite(highest)) return job.rapid_clearance_height;
+  return highest + job.rapid_clearance_height;
+}
+
 void plan_toolpaths(OperationPlan& plan,
                     const Operation& operation,
                     const Tool& tool,
@@ -475,11 +647,10 @@ void plan_toolpaths(OperationPlan& plan,
                     const ProgressCallback& progress,
                     double progress_from,
                     double progress_to,
-                    double rapid_clearance_height) {
+                    double rapid_plane) {
   if (!plan.ok()) return;
-  if (!(rapid_clearance_height > 0.0) ||
-      !std::isfinite(rapid_clearance_height)) {
-    plan.error = "Rapid clearance height must be positive";
+  if (!std::isfinite(rapid_plane)) {
+    plan.error = "Rapid plane must be finite";
     return;
   }
   // The meshes are already sliced into the plan, so this stage wants the
@@ -497,18 +668,21 @@ void plan_toolpaths(OperationPlan& plan,
   std::vector<std::string> level_failures;
   std::size_t level_index = 0;
 
-  // Where the previous pass lifted off, so the next one can rapid across to its
-  // own start instead of appearing there. Passes with nothing to cut are
-  // skipped by the post and by playback alike, so they do not move the cutter
-  // and do not update this.
-  std::optional<wave::Point64> cutter_left_at;
+  // Toolpaths first, for every depth, and only then the seams between them.
+  // Deciding how the cutter gets from one pass to the next takes both passes in
+  // hand at once -- where this one finishes, and where the next one starts --
+  // so nothing downstream of that decision can run until every pass has been
+  // built. Simulation and feeds come last, after the seams have been settled,
+  // which is what keeps a transition an ordinary part of the pass it belongs to
+  // rather than motion that nothing ever checks.
+  const double build_share = 0.7;
   for (LevelPlan& level : plan.levels) {
     const std::size_t index = level_index++;
     if (level.nothing_to_cut) continue;
     if (progress) {
       const double fraction =
           progress_from +
-          span * (static_cast<double>(index) / plan.levels.size());
+          span * build_share * (static_cast<double>(index) / plan.levels.size());
       if (!progress(fraction, operation.name + ": toolpath at depth " +
                                   std::to_string(level.floor_z) + " mm")) {
         plan.error = "Cancelled";
@@ -516,7 +690,11 @@ void plan_toolpaths(OperationPlan& plan,
       }
     }
     try {
-      if (operation.mode == OperationMode::ContourFinishing) {
+      // A depth the part does not reach is cleared rather than finished, in
+      // either mode: see the wavefront stage, which is where the wave for it
+      // was built.
+      const bool clearing = level.part_slice.empty();
+      if (operation.mode == OperationMode::ContourFinishing && !clearing) {
         const wave::Paths64 keep_out =
             level.part_slice.empty()
                 ? absent_subject(level.stock_slice)
@@ -528,22 +706,29 @@ void plan_toolpaths(OperationPlan& plan,
         auto tasks = contour_traversal_tasks(contours,
                                              operation.contour_direction);
         add_safe_stock_approaches(tasks, level.stock_slice, keep_out, radius);
+        const wave::Paths64 travelable =
+            open_space(level.stock_slice, keep_out);
         wave::TraversalSettings traversal;
-        traversal.allow_stay_down = false;
+        traversal.allow_stay_down = true;
+        traversal.stay_down_region = travelable;
+        traversal.stay_down_slack = link_slack(setup.stepover);
         traversal.cutting_feed = no_engagement_feed;
         traversal.rapid_feed = rapid_feed(machine);
+        traversal.rapid_feed_z = rapid_feed_z(machine);
         traversal.floor_z = level.floor_z;
-        traversal.rapid_clearance_height = rapid_clearance_height;
+        traversal.rapid_plane = rapid_plane;
         level.toolpath = wave::plan_traversal(tasks, traversal).toolpath;
+        level.toolpath.cleared = travelable;
         if (level.toolpath.moves.empty()) {
           level.nothing_to_cut = true;
           continue;
         }
       }
-      if (operation.mode == OperationMode::Roughing) {
+      if (operation.mode == OperationMode::Roughing || clearing) {
         level.toolpath = wave::build_toolpath(
             level.wave, level.lineage, radius, level.floor_z,
-            rapid_clearance_height, rapid_feed(machine), no_engagement_feed);
+            rapid_plane, rapid_feed(machine), no_engagement_feed,
+            rapid_feed_z(machine));
         if (operation.rough_boundary_cleanup && !level.part_slice.empty() &&
             !level.wave.reached_generations.empty()) {
           // Only where the wave got. A cleanup contour runs along the part at
@@ -572,12 +757,17 @@ void plan_toolpaths(OperationPlan& plan,
                                     level.wave.subject, radius);
           wave::TraversalSettings traversal;
           traversal.allow_stay_down = true;
-          if (!level.wave.reached_generations.empty())
-            traversal.stay_down_region = level.wave.reached_generations.back();
+          // What the pass has cleared, which is the space beside the stock as
+          // well as the material the wave took out. The reached region on its
+          // own stops at the stock wall, so a cleanup contour ending on that
+          // wall could not be joined to the next one round the outside.
+          traversal.stay_down_region = level.toolpath.cleared;
+          traversal.stay_down_slack = link_slack(setup.stepover);
           traversal.cutting_feed = no_engagement_feed;
           traversal.rapid_feed = rapid_feed(machine);
+          traversal.rapid_feed_z = rapid_feed_z(machine);
           traversal.floor_z = level.floor_z;
-          traversal.rapid_clearance_height = rapid_clearance_height;
+          traversal.rapid_plane = rapid_plane;
           if (!level.toolpath.moves.empty() &&
               !level.toolpath.moves.back().path.empty())
             traversal.initial_position = level.toolpath.moves.back().path.back();
@@ -588,8 +778,60 @@ void plan_toolpaths(OperationPlan& plan,
                                       cleanup.moves.begin(), cleanup.moves.end());
         }
       }
+      if (level.toolpath.moves.empty()) level.nothing_to_cut = true;
+    } catch (const std::exception& error) {
+      const std::string detail =
+          "Depth " + std::to_string(level.floor_z) +
+          " mm, toolpath: " + error.what();
+      level_failures.push_back(detail);
+      plan.warnings.push_back(detail);
+      level.nothing_to_cut = true;
+    }
+  }
+
+  stitch_passes(plan, setup, machine, rapid_plane);
+
+  // ---- Simulation and feeds ---------------------------------------------
+  // Where the previous pass left the cutter, and how high. Passes with nothing
+  // to cut are skipped by the post and by playback alike, so they do not move
+  // the cutter and do not update this.
+  PassLink link;
+  link.from_z = rapid_plane;
+  level_index = 0;
+  for (LevelPlan& level : plan.levels) {
+    const std::size_t index = level_index++;
+    if (level.nothing_to_cut) continue;
+    if (progress) {
+      const double fraction =
+          progress_from + span * build_share +
+          span * (1.0 - build_share) *
+              (static_cast<double>(index) / plan.levels.size());
+      if (!progress(fraction, operation.name + ": feeds at depth " +
+                                  std::to_string(level.floor_z) + " mm")) {
+        plan.error = "Cancelled";
+        return;
+      }
+    }
+    try {
+      link.stay_down_after = level.stays_down_after;
       level.toolpath =
           wave::resample_toolpath(level.toolpath, operation.path_pitch);
+      if (level.stays_down_after && level.transition.size() >= 2) {
+        // Sampled the same way everything else at depth is, so the simulation
+        // sees it in the same steps and can say what it passes over.
+        wave::Toolpath crossing;
+        double length = 0.0;
+        for (std::size_t i = 1; i < level.transition.size(); ++i)
+          length += distance_mm(level.transition[i - 1], level.transition[i]);
+        crossing.moves.push_back(
+            {wave::MoveKind::Link, level.transition, {}, length});
+        crossing = wave::resample_toolpath(crossing, operation.path_pitch);
+        for (wave::ToolpathMove& move : crossing.moves) {
+          level.toolpath.stats.link_length += move.length;
+          ++level.toolpath.stats.link_count;
+          level.toolpath.moves.push_back(std::move(move));
+        }
+      }
       const wave::Paths64 final_subject =
           level.part_slice.empty() ? level.wave.subject : level.part_slice;
       level.simulation = wave::simulate_material(
@@ -598,15 +840,16 @@ void plan_toolpaths(OperationPlan& plan,
       level.feeds = plan_feeds(level.toolpath, level.simulation, machine,
                                full_engagement_feed, no_engagement_feed,
                                data->spindle_rpm, data->plunge_feed,
-                               level.floor_z, rapid_clearance_height,
-                               cutter_left_at);
+                               level.floor_z, rapid_plane, link);
       if (level.toolpath.moves.empty()) level.nothing_to_cut = true;
-      if (!level.nothing_to_cut && !level.feeds.motion.empty())
-        cutter_left_at = level.feeds.motion.back().to;
+      if (!level.nothing_to_cut && !level.feeds.motion.empty()) {
+        link.from = level.feeds.motion.back().to;
+        link.from_z = level.feeds.ends_at_depth ? level.floor_z : rapid_plane;
+      }
     } catch (const std::exception& error) {
       const std::string detail =
           "Depth " + std::to_string(level.floor_z) +
-          " mm, toolpath or simulation: " + error.what();
+          " mm, simulation or feeds: " + error.what();
       level_failures.push_back(detail);
       plan.warnings.push_back(detail);
       level.nothing_to_cut = true;
@@ -685,14 +928,14 @@ OperationPlan plan_operation(const JobGeometry& geometry,
                              const ProgressCallback& progress,
                              double progress_from,
                              double progress_to,
-                             double rapid_clearance_height) {
+                             double rapid_plane) {
   // Wavefronts are the cheaper half; give the toolpaths the larger share of the
   // reported progress so the bar does not stall in the second stage.
   const double seam = progress_from + (progress_to - progress_from) * 0.4;
   OperationPlan plan = plan_wavefronts(geometry, operation, tool, machine,
                                        material, progress, progress_from, seam);
   plan_toolpaths(plan, operation, tool, machine, material, progress, seam,
-                 progress_to, rapid_clearance_height);
+                 progress_to, rapid_plane);
   return plan;
 }
 
@@ -720,13 +963,18 @@ EntryDiscovery discover_entries(const JobGeometry& geometry,
                      &result.warnings, setup))
     return result;
 
+  const double work_top = highest_model_z(geometry);
+  std::vector<double> floors;
+  if (!resolve_floors(operation, setup, work_top, result.error, floors))
+    return result;
+
   std::vector<wave::FrontLineage> lineages;
   std::vector<std::size_t> lineage_levels;
-  double previous_z = operation.top_z;
-  for (std::size_t index = 0; index < setup.floors.size(); ++index) {
-    const double floor_z = setup.floors[index];
+  double previous_z = z_at_depth(work_top, operation.depth_from);
+  for (std::size_t index = 0; index < floors.size(); ++index) {
+    const double floor_z = floors[index];
     if (progress &&
-        !progress(static_cast<double>(index) / setup.floors.size(),
+        !progress(static_cast<double>(index) / floors.size(),
                   operation.name + ": entries at depth " +
                       std::to_string(floor_z) + " mm")) {
       result.error = "Cancelled";
@@ -855,6 +1103,7 @@ JobPlan plan_job(const JobGeometry& geometry,
     return plan;
   }
 
+  plan.rapid_plane = job_rapid_plane(job, highest_model_z(geometry));
   const double share = 1.0 / static_cast<double>(job.operations.size());
   std::string previous_tool;
   for (std::size_t index = 0; index < job.operations.size(); ++index) {
@@ -873,7 +1122,7 @@ JobPlan plan_job(const JobGeometry& geometry,
     if (result.ok()) {
       result = plan_operation(geometry, operation, *tool, *machine, *material,
                               progress, share * index, share * (index + 1),
-                              job.rapid_clearance_height);
+                              plan.rapid_plane);
       if (result.error == "Cancelled") {
         plan.error = "Cancelled";
         return plan;

@@ -2,9 +2,11 @@
 #include "toolpath.h"
 #include "topology.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 
@@ -200,19 +202,20 @@ void check_lead_in() {
       }
   require(saw_outside, "a lead-in should produce fronts of its own");
 
-  // These two generated contours are farther from the stock than a 3 mm
-  // cutter can reach. The next contour is the first to touch stock, and is
-  // retained only as entry geometry: actual cutting starts at its +1 child.
+  // Fronts stand at ten, five and zero units out from the wall. A 3 mm cutter
+  // on the first two reaches nothing, so those cut nothing; on the third it
+  // takes its first bite, and that is where cutting starts. Not the one after:
+  // the caller sizes the run-in to place the first touching front where it
+  // wants the first bite, and passing over that front hands the bite to the one
+  // a whole stepover deeper, which arrives at very nearly a full slot.
   const auto led_toolpath = wave::build_toolpath(led, lineage, 3.0);
-  bool saw_productive_cut = false;
+  std::size_t first_cut = std::numeric_limits<std::size_t>::max();
   for (const auto& move : led_toolpath.moves) {
     if (move.kind != wave::MoveKind::Cut) continue;
-    require(move.front.generation > led.lead_in_generations,
-            "lead-in cutting must start one generation after first contact");
-    saw_productive_cut = true;
+    first_cut = std::min(first_cut, move.front.generation);
   }
-  require(saw_productive_cut,
-          "suppressing the first contact must retain its productive children");
+  require(first_cut == 2,
+          "cutting starts at the first front whose cutter reaches the stock");
 
   // The subject reaches the right face, so that face has no wavefront on it and
   // must get no run-in. The left face is untouched and must still get one.

@@ -1,5 +1,7 @@
 #include "toolpath.h"
 
+#include "routing.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -152,140 +154,10 @@ RingProjection project_onto_ring(const Path64& ring, const Point64& point) {
   return best;
 }
 
-std::vector<double> ring_arc_lengths(const Path64& ring) {
-  std::vector<double> cumulative(ring.size() + 1, 0.0);
-  for (std::size_t i = 0; i < ring.size(); ++i)
-    cumulative[i + 1] =
-        cumulative[i] + distance_world(ring[i], ring[(i + 1) % ring.size()]);
-  return cumulative;
-}
-
-double ring_arc_of(const std::vector<double>& cumulative, const RingProjection& p) {
-  return cumulative[p.segment] +
-         p.t * (cumulative[p.segment + 1] - cumulative[p.segment]);
-}
-
-// The vertices met walking `span` units forward around the ring from `from`,
-// bracketed by the two projected endpoints.
-Path64 walk_ring(const Path64& ring, const std::vector<double>& cumulative,
-                 const RingProjection& from, const RingProjection& to, bool forward,
-                 double span) {
-  const std::size_t count = ring.size();
-  Path64 path;
-  path.push_back(from.point);
-  double travelled =
-      forward ? cumulative[from.segment + 1] - ring_arc_of(cumulative, from)
-              : ring_arc_of(cumulative, from) - cumulative[from.segment];
-  std::size_t vertex = forward ? (from.segment + 1) % count : from.segment;
-  for (std::size_t guard = 0; guard <= count && travelled < span; ++guard) {
-    path.push_back(ring[vertex]);
-    const std::size_t next =
-        forward ? (vertex + 1) % count : (vertex + count - 1) % count;
-    travelled += distance_world(ring[vertex], ring[next]);
-    vertex = next;
-  }
-  path.push_back(to.point);
-  return path;
-}
-
-// Drops vertices closer together than `world_spacing`, so the shortcut pass
-// that follows does a bounded amount of work on a contour that may carry
-// hundreds of offset vertices.
-Path64 decimate(const Path64& path, double world_spacing, std::size_t limit) {
-  if (path.size() <= 2) return path;
-  const double total = path_length_world(path);
-  double spacing = std::max(world_spacing, total / static_cast<double>(limit));
-  Path64 out;
-  out.push_back(path.front());
-  for (std::size_t i = 1; i + 1 < path.size(); ++i)
-    if (distance_world(out.back(), path[i]) >= spacing) out.push_back(path[i]);
-  out.push_back(path.back());
-  return out;
-}
-
 bool stays_clear(const Path64& path, const Paths64& forbidden, double tolerance) {
   for (std::size_t i = 1; i < path.size(); ++i)
     if (!segment_avoids(path[i - 1], path[i], forbidden, tolerance)) return false;
   return true;
-}
-
-// Pulls the walk straight wherever a shortcut stays clear, longest jump first.
-Path64 shorten(const Path64& path, const Paths64& forbidden, double tolerance) {
-  if (path.size() <= 2) return path;
-  Path64 out;
-  out.push_back(path.front());
-  std::size_t i = 0;
-  while (i + 1 < path.size()) {
-    std::size_t next = i + 1;
-    for (std::size_t j = path.size() - 1; j > i + 1; --j) {
-      if (segment_avoids(path[i], path[j], forbidden, tolerance)) {
-        next = j;
-        break;
-      }
-    }
-    out.push_back(path[next]);
-    i = next;
-  }
-  return out;
-}
-
-// Routes from `from` to `to` around whatever blocks the straight segment, by
-// following the boundary of the region the tool may travel through. Returns
-// nothing when no ring carries both ends.
-std::optional<Path64> route_around(const Point64& from, const Point64& to,
-                                   const Paths64& travel, const Paths64& forbidden,
-                                   const Rect64& world, double tolerance) {
-  // `tolerance` is in integer units because it is compared against clipper
-  // output, while the walk is measured in world units; the shortcut spacing has
-  // to be converted or it swallows the whole contour.
-  const double world_spacing = to_world(static_cast<std::int64_t>(tolerance)) * 4.0;
-  std::optional<Path64> best;
-  double best_length = std::numeric_limits<double>::infinity();
-  for (const auto& ring : travel) {
-    if (ring.size() < 3) continue;
-    // `travel` is clipped to a finite box so Clipper can represent the air
-    // outside the stock. Its outer ring is an implementation boundary, not a
-    // physical contour. Following it makes otherwise local transitions run to
-    // arbitrary box corners, and whether that route exists can change with a
-    // tiny variation in slice geometry. Real detours follow stock or obstacle
-    // boundaries (the inner rings), never this synthetic perimeter.
-    const Rect64 bounds = GetBounds(ring);
-    if (bounds.left == world.left && bounds.top == world.top &&
-        bounds.right == world.right && bounds.bottom == world.bottom)
-      continue;
-    const RingProjection start = project_onto_ring(ring, from);
-    const RingProjection finish = project_onto_ring(ring, to);
-    const auto cumulative = ring_arc_lengths(ring);
-    const double total = cumulative.back();
-    if (total <= 0.0) continue;
-    double forward_span = ring_arc_of(cumulative, finish) - ring_arc_of(cumulative, start);
-    if (forward_span < 0.0) forward_span += total;
-    for (const bool forward : {true, false}) {
-      const double span = forward ? forward_span : total - forward_span;
-      // The walk cannot beat what is already in hand even before the ends are
-      // joined on, so skip it rather than build it.
-      if (span + start.distance + finish.distance >= best_length) continue;
-      Path64 walk = walk_ring(ring, cumulative, start, finish, forward, span);
-      walk.insert(walk.begin(), from);
-      walk.push_back(to);
-      // Shortcutting is an optimisation, and it can fail: dropping vertices
-      // along a contour that hugs an obstacle leaves chords cutting straight
-      // through it. Prefer the shortened walk, fall back to the contour, and
-      // check both -- a walk taken from the boundary is not clear by
-      // construction, because a ring of the region can carry a stretch that the
-      // tool may not follow.
-      const Path64 pulled =
-          shorten(decimate(walk, world_spacing, 48), forbidden, tolerance);
-      if (stays_clear(pulled, forbidden, tolerance)) walk = pulled;
-      else if (!stays_clear(walk, forbidden, tolerance)) continue;
-      const double length = path_length_world(walk);
-      if (length < best_length) {
-        best_length = length;
-        best = std::move(walk);
-      }
-    }
-  }
-  return best;
 }
 
 // Non-zero containment across a whole set of rings, so a point sitting in a
@@ -358,14 +230,16 @@ bool cutter_sweep_intersects_stock(const LeadingFront& front,
 
 Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage,
                         double tool_radius, double floor_z,
-                        double rapid_clearance_height, double rapid_feed,
-                        double traversal_feed) {
+                        double rapid_plane, double rapid_feed,
+                        double traversal_feed, double rapid_feed_z) {
   Toolpath toolpath;
   if (lineage.generations.empty()) return toolpath;
   if (lineage.generations.size() != wave.generations.size())
     throw std::invalid_argument("Lineage and wave generations do not match");
-  if (!(rapid_feed > 0.0) || !(traversal_feed > 0.0) ||
-      !std::isfinite(floor_z) || !std::isfinite(rapid_clearance_height))
+  const double vertical_feed = rapid_feed_z > 0.0 ? rapid_feed_z : rapid_feed;
+  if (!(rapid_feed > 0.0) || !(traversal_feed > 0.0) || rapid_feed_z < 0.0 ||
+      !std::isfinite(rapid_feed_z) ||
+      !std::isfinite(floor_z) || !std::isfinite(rapid_plane))
     throw std::invalid_argument("Toolpath routing feeds and heights are invalid");
   const LayerTopology layer_topology = build_layer_topology(lineage);
 
@@ -443,14 +317,29 @@ Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage,
   const Paths64 stock_area =
       wave.stock.empty() ? Paths64{wave.stock_boundary} : wave.stock;
 
-  // Lead-in propagation may contain one or more fronts wholly in the air. The
-  // first front on each branch whose cutter merely begins to overlap stock is
-  // also just entry geometry: start machining at its child (+1) instead of
-  // spending a whole contour on the incidental first contact. All of these
-  // fronts remain in the dependency graph so the child still inherits the
-  // correct entry order.
+  // Lead-in propagation contains fronts wholly in the air, and those emit
+  // nothing. Behind them, a front whose cutter reaches the stock cuts -- the
+  // first one included, because the caller sized the run-in so that the first
+  // touching front is the one taking the designed bite of a stepover less the
+  // stock allowance.
+  //
+  // The seed ring is the exception. It is a one-unit ring on the edge of the
+  // approach region and not a pass at all, and where the subject notches that
+  // region the ring runs along the stock wall itself -- so it would cut, at
+  // very nearly a full slot. Without a lead-in there is no approach and the
+  // seed is the stock wall, which is the pass the operator asked for by
+  // turning the run-in off.
+  //
+  // What stood here instead was a rule skipping the first touching front on
+  // every branch, as incidental contact not worth a whole contour. That held
+  // when the lead-in was rounded up to a whole number of stepovers and first
+  // contact landed wherever the rounding put it; it does not now that the
+  // run-in is honoured exactly. It happened to come to the same thing wherever
+  // a seed piece already lay against the wall, which is most part geometry --
+  // and on a plain blank with none of the part at that depth, where no seed
+  // piece touches, it threw the designed first bite away and handed it to the
+  // front a stepover further in, which took nearly a full slot.
   std::vector<bool> touches_stock(nodes.size(), false);
-  std::vector<bool> stock_reached(nodes.size(), false);
   std::vector<bool> emits_cut(nodes.size(), false);
   std::vector<std::vector<bool>> band_emits_cut(lineage.generations.size());
   for (std::size_t generation = 0; generation < lineage.generations.size();
@@ -464,22 +353,8 @@ Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage,
           lineage.generations[generation].fronts[index];
       touches_stock[node] = cutter_sweep_intersects_stock(
           front, stock_area, effective_tool_radius);
-
-      bool parent_reached_stock = false;
-      if (generation > 0) {
-        for (const std::size_t parent : front.parents) {
-          const std::size_t parent_node =
-              generation_offset[generation - 1] + parent;
-          if (parent_node < stock_reached.size() && stock_reached[parent_node]) {
-            parent_reached_stock = true;
-            break;
-          }
-        }
-      }
-      stock_reached[node] = touches_stock[node] || parent_reached_stock;
-      emits_cut[node] =
-          touches_stock[node] &&
-          (wave.lead_in_generations == 0 || parent_reached_stock);
+      emits_cut[node] = touches_stock[node] &&
+                        (wave.lead_in_generations == 0 || generation > 0);
       if (emits_cut[node] && front.band < band_emits_cut[generation].size())
         band_emits_cut[generation][front.band] = true;
     }
@@ -687,8 +562,15 @@ Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage,
           // cost: it can admit arbitrarily shaped detours and change decisions
           // when a slice moves by a fraction of a unit. Build both realizable
           // alternatives and compare all of the XY motion each one requires.
-          const auto detour = route_around(position, entry, travel,
-                                           travel_forbidden, world, tolerance);
+          //
+          // The travel region is clipped to a finite box so Clipper can hold
+          // the air outside the stock, and that box is an implementation
+          // boundary rather than a physical one. A shortest path cannot be led
+          // astray by it: a route turns only at corners the free space wraps
+          // around, and every corner of the box is convex seen from inside, so
+          // no route ever runs out to one.
+          const Router router(travel, tolerance);
+          const auto detour = router.route(position, entry);
           const double detour_distance =
               detour ? path_length_world(*detour)
                      : std::numeric_limits<double>::infinity();
@@ -707,9 +589,10 @@ Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage,
             } else {
               lift = plan_lift(position, *plunge);
               const double vertical =
-                  2.0 * std::abs(rapid_clearance_height - floor_z);
+                  2.0 * std::abs(rapid_plane - floor_z);
               lift_minutes =
-                  (path_length_world(lift->path) + vertical) / rapid_feed +
+                  path_length_world(lift->path) / rapid_feed +
+                  vertical / vertical_feed +
                   path_length_world(approach) / traversal_feed;
             }
           }
@@ -782,6 +665,7 @@ Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage,
 
   for (const auto& node : nodes)
     if (!node.processed) ++toolpath.stats.unreachable_fronts;
+  toolpath.cleared = std::move(cleared);
   return toolpath;
 }
 
@@ -810,6 +694,7 @@ Toolpath resample_toolpath(const Toolpath& source, double pitch) {
   };
 
   Toolpath result;
+  result.cleared = source.cleared;
   result.stats.detour_count = source.stats.detour_count;
   result.stats.lifts_over_subject = source.stats.lifts_over_subject;
   result.stats.unreachable_fronts = source.stats.unreachable_fronts;

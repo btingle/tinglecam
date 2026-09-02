@@ -30,7 +30,22 @@ of it. Finding them costs a seeding pass and no propagation, so a choice can be
 made and unmade without planning anything.
 
 1. **Plan** shows the part and stock models so the depth range can be set
-   against them.
+   against them. The range is stated as depths below the top of the work -- the
+   taller of the part and the blank -- and defaults to the whole of it. Measured
+   that way rather than as a pair of model Z heights, a blank standing proud of
+   its part is faced off instead of left standing, and where the origin sits
+   never enters into what gets cut. It also carries the origin picker: a place
+   on the blank per axis, applied on a button so a stray click cannot silently
+   move where the program thinks the work is, and applied once as a model loads
+   so the origin starts where the picks say rather than wherever the mesh
+   carries its own zero. The three figures beside it are the origin measured from
+   the bottom-back-left corner of the blank, in the model's own millimetres,
+   because that is the corner an operator can find with an edge finder. They can
+   be typed into directly. What the job carries is the other half of the same
+   statement -- the offset added to every posted coordinate, which is the
+   negative of the point picked -- and no part of planning ever sees this side
+   of it, so moving the origin does not invalidate a plan. Posted coordinates
+   move with it, comments included.
 2. **Select fronts** draws each entry front where it actually is and lets any of
    them be declined. Nothing is planned here: the fronts are generation zero of
    the wave, which is built before the first propagation step, so this asks the
@@ -76,13 +91,22 @@ For every roughing depth, TingleCAM:
    and inter-layer associations.
 4. Sequences the wavefront passes and adds a boundary cleanup contour, clipped
    to what the wave reached.
-5. Resamples each uninterrupted at-depth path at a uniform traveled-distance
+5. Stitches the seams between depths, once every depth has a toolpath, so a
+   transition can be compared against the lift it replaces.
+6. Resamples each uninterrupted at-depth path at a uniform traveled-distance
    pitch.
-6. Simulates the normalized intervals against the remaining stock.
-7. Maps each interval's engagement directly to its configured feed range.
-8. Merges adjacent collinear intervals only when their assigned feeds and
+7. Simulates the normalized intervals against the remaining stock.
+8. Maps each interval's engagement directly to its configured feed range.
+9. Merges adjacent collinear intervals only when their assigned feeds and
    motion types are compatible.
-9. Posts the resulting linear motion.
+10. Posts the resulting linear motion.
+
+A depth the part does not reach is cleared rather than skipped, in either mode.
+There is no surface to finish there because there is no part there, but there is
+stock, and all of it is waste: leaving it standing would leave every pass below
+it cutting into a blank that is still the wrong shape. Such a depth gets the
+same wave a roughing pass would use, propagated against a subject parked outside
+the work so the whole level clears away.
 
 The cleanup contour is derived from the part slice rather than from the wave,
 so on its own it is emitted wherever the part has a boundary -- including
@@ -95,9 +119,16 @@ the same slice offset by the same distance, so the clip allows `boundary_slack`
 -- the same rounding allowance a front's boundary contact is accepted with.
 
 Lead-in wavefronts that remain wholly in air are retained in the lineage graph
-to establish entry ordering, but are not emitted as machining contours. On
-each lead-in branch, the first front whose cutter sweep touches stock is also
-used only as entry geometry; cutting begins at its child generation (+1).
+to establish entry ordering, but are not emitted as machining contours. Behind
+them, cutting begins at the first front whose cutter sweep reaches the stock:
+the run-in is sized at a radius plus the stock allowance precisely so that front
+is the one taking the designed first bite of a stepover less the allowance.
+
+The seed ring is the exception. It is a one-unit ring on the edge of the
+approach region rather than a pass, and where the subject notches that region it
+runs along the stock wall itself, so it would cut at very nearly a full slot.
+With no lead-in there is no approach and the seed is the stock wall, which is
+the pass the operator asked for by turning the run-in off.
 
 Planning failures retain their phase, depth, operation name, and original
 exception text. The full diagnostic is shown in the application banner and
@@ -113,12 +144,68 @@ Each finishing variant includes a checked straight approach from a landing at
 least one cutter radius outside the stock. A variant with no approach that stays
 outside the protected cutter-centre region is rejected.
 
-Disconnected routes use one safe plane at program `Z0 + rapid_clearance_height`
-(10 mm by default). Retract, XY rapid, and descent distance all contribute to
-the traversal cost. A legal already-cleared stay-down connection may be used
-instead. Cutter-clear stock approaches are stored separately from contour
-geometry and are used only for a safe-plane entry, so stay-down cleanup does
-not revisit a shared landing point between contours.
+Disconnected routes use one safe plane, resolved once by `job_rapid_plane`,
+recorded on the plan, and used by the planner, the feed schedule and the post
+alike -- a planner costing lifts against a height the post then disagrees with
+would undercharge every one of them.
+
+It is `rapid_clearance_height` above the tallest thing in the way, part or
+blank, and not above the origin. Where the origin sits is a matter of where it
+is convenient to measure from, and it moves; what a traverse has to clear does
+not. Measured from the origin, moving the origin moved the plane, which moved
+what every lift cost, which meant re-planning a job to say where its zero was.
+The height is over the work, so the plan is the same motion whichever corner
+the numbers are measured from, and only the post ever sees the difference.
+
+Retract, XY rapid, and descent distance all contribute to the traversal cost,
+each at the rate of the axis that moves it. `rapid_feed_z` is the Z rate;
+omitted or zero, the lateral `rapid_feed` covers both. No resolution between
+the two is needed, because no diagonal rapid is ever written: a lift rises
+where it stands, crosses at the plane, and descends, so every rapid moves one
+axis or the other. A slower Z makes lifting dearer and tips more transitions
+into staying down.
+
+A legal already-cleared stay-down connection may be used instead. Cutter-clear
+stock approaches are stored separately from contour geometry and are used only
+for a safe-plane entry, so stay-down cleanup does not revisit a shared landing
+point between contours.
+
+What a connector may travel through is everywhere the cutter may be at that
+depth: the space beside the stock, plus whatever the layer has had removed from
+it by the time the connector is planned. For roughing cleanup that is the wave's
+own cleared region, which includes that space -- the reached region alone stops
+at the stock wall, and a cleanup contour ending on that wall could not then be
+joined to the next one round the outside. For contour finishing nothing has been
+removed yet, and the space beside the stock is the whole of it, which is enough:
+contours clipped to the stock begin and end on its wall, and two of them can
+finish and start a few millimetres apart along it.
+
+Where the straight segment is blocked, the route around it is the Euclidean
+shortest path through the region the tool may travel in, found by Dijkstra over
+a visibility graph of that region's boundary (`src/routing.h`). Following the
+boundary instead answers a different question: getting around an obstacle and
+getting past it are not the same, and a rib standing between two points 40 mm
+apart cost a walk of the whole part outline, which lost to lifting every time.
+The same router serves the wavefront sequencer, the generic traversal planner
+and the seam between depths.
+
+Everywhere a route is asked for, the region is eroded first by the slack the
+router may spend. That slack exists to forgive two separately rounded
+descriptions of one wall disagreeing, which is what lets a route run along that
+wall; spent instead against the part, or against the radial allowance standing
+in front of it, it is a cut into the finished surface. The straight-line test is
+not eroded -- it demands the whole segment inside the region as given.
+
+Between one depth and the next, the cutter lifts only when lifting is quicker.
+Where the pass that just finished cleared a way across at its own floor, the
+transition is routed through it and the tool steps down a single pass depth
+instead of making the full trip to the plane and back. That way across belongs
+to the earlier pass -- it runs at that pass's depth, through what that pass
+removed -- so it extends that pass's toolpath and is simulated with it rather
+than being motion between passes that nothing checks. The region is eroded by
+the router's own allowance first: that slack exists to forgive two roundings of
+one wall disagreeing, and spent against the part it would be a cut into the
+finished surface.
 
 ## Inter-layer analysis
 
@@ -158,6 +245,15 @@ the final lift are animated at their configured machine rates while planar
 stock progress pauses. A descent following a collision-free `Retract` uses
 machine rapid; only an unresolved entry retains the tool's plunge feed.
 Turning **Stock follows the cutter** off shows the completed result instead.
+
+A button in its corner cycles the loaded models over the stack -- none, part,
+blank, both -- so where the passes still stand proud of the finished shape can
+be read directly rather than inferred. The models go into the same depth sort
+as the passes, not over the top of them, or a wall standing in front of the
+part would be painted behind it. The part is drawn warm where every pass is
+cool: the plan view's blue would be the consistent choice and is the wrong one,
+being within a shade of the colour the passes already carry, and telling the
+two apart is the entire question the overlay answers.
 
 Each pass but the first opens with the rapid that carries the cutter from where
 the previous pass lifted off to where this one starts, on the clearance plane.
@@ -239,6 +335,7 @@ timing, and G-code emission:
   "name": "Makera Z1",
   "controller": "smoothieware",
   "rapid_feed": 2000.0,
+  "rapid_feed_z": 800.0,
   "min_rpm": 6000.0,
   "max_rpm": 15000.0,
   "rpm_resolution": 100.0,

@@ -74,6 +74,10 @@ double commandable_rpm(const Machine& machine, double requested) {
 
 double rapid_feed(const Machine& machine) { return machine.rapid_feed; }
 
+double rapid_feed_z(const Machine& machine) {
+  return machine.rapid_feed_z > 0.0 ? machine.rapid_feed_z : machine.rapid_feed;
+}
+
 std::vector<std::string> validate(const Machine& machine) {
   std::vector<std::string> problems;
   const auto require = [&](bool condition, std::string message) {
@@ -82,6 +86,9 @@ std::vector<std::string> validate(const Machine& machine) {
   require(!machine.id.empty(), "The machine needs an identifier");
   require(!machine.name.empty(), "The machine needs a name");
   require(machine.rapid_feed > 0.0, "Rapid feed must be positive");
+  require(machine.rapid_feed_z >= 0.0,
+          "Z rapid feed cannot be negative; leave it at zero to use the "
+          "lateral rate");
   require(machine.max_rpm > machine.min_rpm, "Spindle range is empty");
   require(machine.min_rpm >= 0.0, "Minimum spindle speed cannot be negative");
   require(machine.decimals >= 1 && machine.decimals <= 6,

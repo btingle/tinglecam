@@ -41,6 +41,13 @@ struct Machine {
   Controller controller = Controller::Grbl;
 
   double rapid_feed = 3000.0;
+  // How fast G0 moves the Z axis, which on most machines is not how fast it
+  // moves X and Y. Zero means the axis keeps up with the others and the one
+  // figure above covers it, which is what every profile said before there were
+  // two of them. Nothing needs the two rates resolved against each other: the
+  // post never writes a diagonal rapid -- a lift goes straight up, across at
+  // the plane, and straight back down -- so every rapid is one or the other.
+  double rapid_feed_z = 0.0;
   double min_rpm = 0.0;
   double max_rpm = 0.0;
   double rpm_resolution = 1.0;
@@ -67,6 +74,9 @@ struct Machine {
 
 double commandable_rpm(const Machine& machine, double requested);
 double rapid_feed(const Machine& machine);
+// Falls back to the lateral rate, so a profile that names only one still
+// answers both questions.
+double rapid_feed_z(const Machine& machine);
 
 const char* controller_name(Controller value);
 const char* tool_change_name(ToolChange value);

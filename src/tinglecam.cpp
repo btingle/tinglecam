@@ -148,6 +148,22 @@ const char* model_show_name(ModelShow value) {
   }
   return "Both";
 }
+
+// And which the stacked result superimposes on the passes. A fourth state the
+// plan view has no use for: there the model is the subject, here it is an
+// overlay on something else, so it has to be possible to have neither.
+enum class StackModels { None, Part, Stock, Both };
+
+const char* stack_models_name(StackModels value) {
+  switch (value) {
+    case StackModels::None: return "No model";
+    case StackModels::Part: return "Part";
+    case StackModels::Stock: return "Stock";
+    case StackModels::Both: return "Both";
+  }
+  return "No model";
+}
+
 enum class NodeDebugColouring { None, Node, ZGroup };
 
 struct View {
@@ -220,10 +236,19 @@ struct App {
   // that view draws outlines and can afford both at once, while a solid needs
   // to be told which of two nested bodies is the subject.
   ModelShow models = ModelShow::Both;
+  // What the stacked result draws over the passes. Off to begin with: the
+  // stack is the thing being looked at, and a model over it is a question
+  // asked of that stack rather than the default way to read it.
+  StackModels stack_models = StackModels::None;
   bool show_rapids = true;
   bool show_material = true;
   bool show_toolpath = true;
   NodeDebugColouring node_debug_colouring = NodeDebugColouring::None;
+  // Which corner, edge or centre of the blank the origin picker is aimed at,
+  // one choice per axis: 0 low, 1 middle, 2 high. A pick on its own moves
+  // nothing -- it is applied on the button, so a stray click cannot silently
+  // shift where the program thinks the work is.
+  std::array<int, 3> origin_pick{1, 1, 2};
   bool show_entry_front_chains = false;
   bool show_boundary_contacts = false;
   // Follow the cutter by default so the stacked view and playback describe the
@@ -577,6 +602,26 @@ void fit_view(App& app, ImVec2 canvas) {
   app.view.needs_fit = false;
 }
 
+// The same marker for the flat pass view, which is one depth seen from above:
+// two axes rather than three, since the third points at the reader.
+void draw_origin_marker(const App& app, ImDrawList* list,
+                        const Transform& to_screen) {
+  const ImVec2 centre = to_screen(Point64(
+      wave::to_integer(-app.job.origin_x), wave::to_integer(-app.job.origin_y)));
+  static const ImVec2 kSteps[2] = {{46.0f, 0.0f}, {0.0f, -46.0f}};
+  static const ImU32 kColours[2] = {IM_COL32(232, 96, 92, 255),
+                                    IM_COL32(126, 205, 122, 255)};
+  static const char* const kNames[2] = {"X", "Y"};
+  for (int axis = 0; axis < 2; ++axis) {
+    const ImVec2 end{centre.x + kSteps[axis].x, centre.y + kSteps[axis].y};
+    list->AddLine(centre, end, IM_COL32(12, 14, 18, 200), 3.5f);
+    list->AddLine(centre, end, kColours[axis], 1.7f);
+    list->AddText({end.x + 3.0f, end.y - 6.0f}, kColours[axis], kNames[axis]);
+  }
+  list->AddCircleFilled(centre, 3.5f, IM_COL32(12, 14, 18, 220));
+  list->AddCircleFilled(centre, 2.0f, IM_COL32(238, 240, 245, 255));
+}
+
 void draw_canvas(App& app) {
   ImGui::BeginChild("canvas", ImVec2(0, 0), ImGuiChildFlags_Borders,
                     ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
@@ -782,6 +827,8 @@ void draw_canvas(App& app) {
                    top_left.y + (size.y - extent.y) * 0.5f},
                   IM_COL32(120, 130, 145, 255), text);
   }
+
+  draw_origin_marker(app, list, to_screen);
 
   if (app.fill_failures > 0) {
     char note[128];
@@ -1290,6 +1337,48 @@ void paint_scene(OrbitScene& scene) {
   scene.list->Flags = saved_flags;
 }
 
+// A triad at the program origin, drawn over the scene rather than into it.
+// It is a statement about the coordinates, not a thing standing in the work, so
+// it should not be able to go behind the work and disappear -- the one moment
+// it is wanted is the moment the origin has been put somewhere unexpected,
+// which is very often inside the blank.
+//
+// Sized in pixels, not millimetres. A fixed world length would vanish on a
+// large part and swallow a small one.
+void draw_origin_gizmo(const App& app, const OrbitScene& scene) {
+  const Projection& projection = scene.projection;
+  if (!(projection.scale > 0.0f)) return;
+  // Where the program's zero sits, in the model's own coordinates. The job
+  // carries the offset added to every posted coordinate, which is the negative
+  // of the point it is measured from.
+  const Vec3 at{static_cast<float>(-app.job.origin_x),
+                static_cast<float>(-app.job.origin_y),
+                static_cast<float>(-app.job.origin_z)};
+  const float reach = 46.0f / projection.scale;
+  const ImVec2 centre = projection.point(at);
+
+  static const Vec3 kDirections[3] = {
+      {1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 1.0f}};
+  static const ImU32 kColours[3] = {IM_COL32(232, 96, 92, 255),
+                                    IM_COL32(126, 205, 122, 255),
+                                    IM_COL32(104, 158, 246, 255)};
+  static const char* const kNames[3] = {"X", "Y", "Z"};
+  for (int axis = 0; axis < 3; ++axis) {
+    const Vec3& step = kDirections[axis];
+    const Vec3 tip{at.x + step.x * reach, at.y + step.y * reach,
+                   at.z + step.z * reach};
+    const ImVec2 end = projection.point(tip);
+    // Outlined, because an axis crossing the part it is drawn over is otherwise
+    // the same brightness as what it crosses.
+    scene.list->AddLine(centre, end, IM_COL32(12, 14, 18, 200), 3.5f);
+    scene.list->AddLine(centre, end, kColours[axis], 1.7f);
+    scene.list->AddText({end.x + 3.0f, end.y - 6.0f}, kColours[axis],
+                        kNames[axis]);
+  }
+  scene.list->AddCircleFilled(centre, 3.5f, IM_COL32(12, 14, 18, 220));
+  scene.list->AddCircleFilled(centre, 2.0f, IM_COL32(238, 240, 245, 255));
+}
+
 // ---------------------------------------------------------------------------
 // Stage 1: the models, before there is a plan to look at.
 
@@ -1305,8 +1394,8 @@ void draw_setup(App& app) {
   }
   double low = 0.0;
   double high = 0.0;
-  if (!app.geometry.z_range(low, high)) {
-    scene_message(scene, "The part and the stock do not overlap in Z");
+  if (!app.geometry.work_range(low, high)) {
+    scene_message(scene, "The models have no depth to cut");
     end_scene(scene);
     return;
   }
@@ -1389,6 +1478,7 @@ void draw_setup(App& app) {
     }
   }
   paint_scene(scene);
+  draw_origin_gizmo(app, scene);
 
   // One button cycling the three, rather than two checkboxes that can both be
   // off and leave the view empty.
@@ -1404,8 +1494,11 @@ void draw_setup(App& app) {
   scene.list->AddText({scene.top_left.x + 12.0f, scene.top_left.y + 10.0f},
                       IM_COL32(130, 142, 158, 255), caption);
   if (operation) {
-    std::snprintf(caption, sizeof caption, "This operation cuts Z %.2f to %.2f mm",
-                  operation->bottom_z, operation->top_z);
+    std::snprintf(caption, sizeof caption,
+                  "This operation cuts depth %.2f to %.2f mm (Z %.2f to %.2f)",
+                  operation->depth_from, operation->depth_to,
+                  cam::z_at_depth(high, operation->depth_to),
+                  cam::z_at_depth(high, operation->depth_from));
     scene.list->AddText({scene.top_left.x + 12.0f, scene.top_left.y + 28.0f},
                         IM_COL32(120, 165, 210, 255), caption);
   }
@@ -1528,6 +1621,7 @@ void draw_entries(App& app) {
                     face, alpha);
   }
   paint_scene(scene);
+  draw_origin_gizmo(app, scene);
 
   char caption[220];
   std::size_t live = 0;
@@ -1546,6 +1640,51 @@ void draw_entries(App& app) {
   end_scene(scene);
 }
 
+// The loaded models, drawn into a facet list that already holds something else.
+// Into the same list rather than over the top of it: the models and the passes
+// occupy the same space, so they have to enter the same depth sort or a wall
+// standing in front of the part would be painted behind it.
+//
+// Translucent, because the point of putting a model over the stack is to read
+// one against the other. The part is the more opaque of the two: it is the
+// shape being cut towards, and the blank is mostly a boundary.
+//
+// Warm, where every pass in the stack is cool. The plan view's blue would be
+// the consistent choice and is the wrong one here: it is within a shade of the
+// colour the passes are already drawn in, and the whole question this overlay
+// answers is which of the two a given surface belongs to.
+void append_models(const App& app, StackModels which, std::vector<Facet>& facets,
+                   std::vector<ImVec2>& pool, const Projection& projection,
+                   const Vec3& light, double spacing, int slice_grid) {
+  if (which == StackModels::None) return;
+  const bool want_part = which != StackModels::Stock;
+  const bool want_stock = which != StackModels::Part;
+
+  if (want_part && app.geometry.has_part()) {
+    const float colour[3]{0.82f, 0.62f, 0.34f};
+    append_mesh(facets, pool, app.geometry.part().mesh(), projection, light,
+                colour, 130);
+  }
+  if (!want_stock || !app.geometry.has_stock()) return;
+  const float colour[3]{0.34f, 0.38f, 0.45f};
+  if (!app.geometry.box_stock()) {
+    append_mesh(facets, pool, app.geometry.stock().mesh(), projection, light,
+                colour, 70);
+    return;
+  }
+  // A rectangular blank has no mesh behind it, so it is the prism it is defined
+  // to be, exactly as the plan view draws it.
+  double low = 0.0;
+  double high = 0.0;
+  if (!app.geometry.work_range(low, high)) return;
+  const Paths64 rings =
+      drawable_region(app.geometry.stock_outline(low, slice_grid), spacing);
+  if (rings.empty()) return;
+  const float face[3]{0.40f, 0.44f, 0.52f};
+  append_slab(facets, pool, rings, fill_mesh(rings, nullptr), rings, low, high,
+              projection, light, colour, face, IM_COL32(160, 180, 205, 60), 70);
+}
+
 void draw_result(App& app) {
   ImGui::BeginChild("result", ImVec2(0, 0), ImGuiChildFlags_Borders,
                     ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
@@ -1553,6 +1692,9 @@ void draw_result(App& app) {
   ImVec2 size = ImGui::GetContentRegionAvail();
   size.x = std::max(size.x, 50.0f);
   size.y = std::max(size.y, 50.0f);
+  // The overlay control sits over this canvas, so the canvas has to let a later
+  // item take the mouse where the two meet, or orbiting starts under it.
+  ImGui::SetNextItemAllowOverlap();
   ImGui::InvisibleButton("stack", size, ImGuiButtonFlags_MouseButtonLeft);
   const bool hovered = ImGui::IsItemHovered();
   ImDrawList* list = ImGui::GetWindowDrawList();
@@ -1772,6 +1914,13 @@ void draw_result(App& app) {
         static_cast<float>(cutter_cursor->z + active_tool->flute_length),
         projection, light);
   }
+  append_models(app, app.stack_models, facets, pool, projection, light, spacing,
+                app.job.operations.empty()
+                    ? 32
+                    : app.job.operations[std::clamp(
+                              app.selected_operation, 0,
+                              static_cast<int>(app.job.operations.size()) - 1)]
+                          .slice_grid);
   std::sort(facets.begin(), facets.end(),
             [](const Facet& a, const Facet& b) { return a.depth < b.depth; });
 
@@ -1796,6 +1945,24 @@ void draw_result(App& app) {
                         1.0f);
   }
   list->Flags = saved_flags;
+  // This view builds its own projection and canvas rather than going through
+  // begin_scene, so the gizmo and the corner control are handed one made up on
+  // the spot. Nothing else is ever read out of it.
+  {
+    OrbitScene overlay;
+    overlay.list = list;
+    overlay.projection = projection;
+    overlay.top_left = top_left;
+    overlay.size = size;
+    draw_origin_gizmo(app, overlay);
+    if (scene_button(overlay, stack_models_name(app.stack_models), 10.0f))
+      app.stack_models = app.stack_models == StackModels::None ? StackModels::Part
+                         : app.stack_models == StackModels::Part
+                             ? StackModels::Stock
+                         : app.stack_models == StackModels::Stock
+                             ? StackModels::Both
+                             : StackModels::None;
+  }
 
   char caption[200];
   std::snprintf(caption, sizeof caption,
@@ -1941,12 +2108,18 @@ void tool_builder(App& app) {
 // Panels
 // ---------------------------------------------------------------------------
 
+// Defined below with the origin panel, which is where the box it places the
+// origin against is worked out.
+void apply_origin_pick(App& app);
+
 void depth_defaults(App& app, cam::Operation& operation) {
   double low = 0.0;
   double high = 0.0;
-  if (!app.geometry.z_range(low, high)) return;
-  operation.top_z = high;
-  operation.bottom_z = low;
+  if (!app.geometry.work_range(low, high)) return;
+  // The whole of the work, top to bottom. Depths measured from its top, so the
+  // near end is zero whatever the models' own coordinates say.
+  operation.depth_from = 0.0;
+  operation.depth_to = high - low;
 }
 
 void load_meshes(App& app) {
@@ -1968,15 +2141,12 @@ void load_meshes(App& app) {
     }
     app.geometry.set_box_stock(app.job.box_stock, app.job.box_stock_margin);
     for (auto& operation : app.job.operations) depth_defaults(app, operation);
+    // The blank has changed, so the picked corner of it is somewhere new.
+    apply_origin_pick(app);
     double low = 0.0;
     double high = 0.0;
-    if (app.geometry.z_range(low, high)) {
-      // Put the single safe rapid plane above the work now that there is work
-      // to be above. It is stored relative to program Z0.
-      if (app.job.rapid_clearance_height < high + 1.0)
-        app.job.rapid_clearance_height = high + 10.0;
+    if (app.geometry.work_range(low, high))
       say(app, "Loaded. Z runs " + std::to_string(low) + " to " + std::to_string(high));
-    }
     app.has_plan = false;
     // The fronts belong to the models that were loaded, not to these.
     app.discovery = {};
@@ -1984,6 +2154,170 @@ void load_meshes(App& app) {
   } catch (const std::exception& error) {
     say(app, error.what(), true);
   }
+}
+
+// The box the program origin is placed against: the blank, because the blank is
+// what sits on the machine and what the operator touches off. A rectangular
+// blank has no mesh behind it, so its footprint comes from the outline it is
+// defined by, and its Z from the part it was built around.
+struct JobBounds {
+  double low[3]{};
+  double high[3]{};
+  bool valid = false;
+  const char* what = "stock";
+
+  double size(int axis) const { return high[axis] - low[axis]; }
+  // Where a low/middle/high pick on one axis puts the origin, in model
+  // coordinates.
+  double pick(int axis, int choice) const {
+    if (choice == 0) return low[axis];
+    if (choice == 2) return high[axis];
+    return (low[axis] + high[axis]) * 0.5;
+  }
+};
+
+JobBounds job_bounds(const App& app) {
+  JobBounds result;
+  const auto take = [&](const wave::Bounds3f& box, const char* what) {
+    if (!box.valid) return false;
+    result.low[0] = box.lower.x;
+    result.low[1] = box.lower.y;
+    result.low[2] = box.lower.z;
+    result.high[0] = box.upper.x;
+    result.high[1] = box.upper.y;
+    result.high[2] = box.upper.z;
+    result.what = what;
+    result.valid = true;
+    return true;
+  };
+  if (app.geometry.box_stock()) {
+    // The blank stood in for: the part's own Z, and a footprint this asks the
+    // geometry for rather than recomputing, so the box drawn and the box the
+    // origin is placed against cannot drift apart.
+    double low = 0.0;
+    double high = 0.0;
+    if (!app.geometry.has_part() || !app.geometry.work_range(low, high))
+      return result;
+    const wave::Paths64& outline = app.geometry.stock_outline(low, 32);
+    if (outline.empty()) return result;
+    const Clipper2Lib::Rect64 box = Clipper2Lib::GetBounds(outline);
+    result.low[0] = wave::to_world(box.left);
+    result.low[1] = wave::to_world(box.top);
+    result.low[2] = low;
+    result.high[0] = wave::to_world(box.right);
+    result.high[1] = wave::to_world(box.bottom);
+    result.high[2] = high;
+    result.what = "box stock";
+    result.valid = true;
+    return result;
+  }
+  if (app.geometry.has_stock() &&
+      take(app.geometry.stock().mesh().bounds, "stock"))
+    return result;
+  if (app.geometry.has_part()) take(app.geometry.part().mesh().bounds, "part");
+  return result;
+}
+
+// Put the origin where the picks say, on the blank as it stands now. Called
+// when a model loads as well as from the button, so the origin the gizmo shows
+// is the one the picks describe from the outset rather than wherever the mesh
+// happens to carry its own zero.
+void apply_origin_pick(App& app) {
+  const JobBounds bounds = job_bounds(app);
+  if (!bounds.valid) return;
+  app.job.origin_x = -bounds.pick(0, app.origin_pick[0]);
+  app.job.origin_y = -bounds.pick(1, app.origin_pick[1]);
+  app.job.origin_z = -bounds.pick(2, app.origin_pick[2]);
+}
+
+// Placing the program origin. Everything here is in the model's own
+// coordinates, measured from the bottom-back-left corner of the blank, because
+// that is the corner an operator can find with an edge finder. What the job
+// carries is the other half of the same statement -- the offset added to every
+// posted coordinate, which is the negative of the point picked here -- and none
+// of the planning ever sees this side of it.
+void origin_panel(App& app) {
+  ImGui::SeparatorText("Origin");
+  const JobBounds bounds = job_bounds(app);
+  if (!bounds.valid) {
+    ImGui::TextDisabled("Load a model to place the program origin");
+    return;
+  }
+
+  static const char* const kLabels[3][3] = {
+      {"Left", "Centre *", "Right"},
+      {"Back", "Centre *", "Front"},
+      {"Bottom", "Centre", "Top *"},
+  };
+  static const char* const kAxes[3] = {"-/+X", "-/+Y", "-/+Z"};
+
+  if (ImGui::BeginTable("origin_pick", 4, ImGuiTableFlags_SizingStretchSame)) {
+    ImGui::TableSetupColumn("l", ImGuiTableColumnFlags_WidthStretch);
+    ImGui::TableSetupColumn("m", ImGuiTableColumnFlags_WidthStretch);
+    ImGui::TableSetupColumn("h", ImGuiTableColumnFlags_WidthStretch);
+    ImGui::TableSetupColumn("a", ImGuiTableColumnFlags_WidthFixed);
+    for (int axis = 0; axis < 3; ++axis) {
+      ImGui::TableNextRow();
+      for (int choice = 0; choice < 3; ++choice) {
+        ImGui::TableSetColumnIndex(choice);
+        const bool picked = app.origin_pick[axis] == choice;
+        if (picked)
+          ImGui::PushStyleColor(ImGuiCol_Button,
+                                ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+        ImGui::PushID(axis * 3 + choice);
+        if (ImGui::Button(kLabels[axis][choice], ImVec2(-FLT_MIN, 0.0f)))
+          app.origin_pick[axis] = choice;
+        ImGui::PopID();
+        if (picked) ImGui::PopStyleColor();
+      }
+      ImGui::TableSetColumnIndex(3);
+      ImGui::AlignTextToFramePadding();
+      ImGui::TextDisabled("%s", kAxes[axis]);
+    }
+    ImGui::EndTable();
+  }
+  ImGui::TextDisabled("* the usual choice");
+
+  if (ImGui::Button("Apply")) apply_origin_pick(app);
+  ImGui::SetItemTooltip(
+      "Move the origin to the picked place on the blank. No re-plan: the "
+      "origin is only where the posted numbers are measured from, and the plan "
+      "is the same motion whichever corner that is.");
+
+  // The three figures are the origin itself, stated where it can be checked
+  // against the work rather than in the sign the post wants it in.
+  double offset[3] = {
+      -app.job.origin_x - bounds.low[0],
+      -app.job.origin_y - bounds.low[1],
+      -app.job.origin_z - bounds.low[2],
+  };
+  static const char* const kFields[3] = {"X", "Y", "Z"};
+  bool edited = false;
+  if (ImGui::BeginTable("origin_value", 3, ImGuiTableFlags_SizingStretchSame)) {
+    for (int axis = 0; axis < 3; ++axis) {
+      ImGui::TableNextColumn();
+      ImGui::PushID(axis);
+      // Labelled on the left. ImGui puts a widget's label on its right, which
+      // a full-width field in a table cell pushes off the end of the cell.
+      ImGui::AlignTextToFramePadding();
+      ImGui::TextUnformatted(kFields[axis]);
+      ImGui::SameLine();
+      ImGui::SetNextItemWidth(-FLT_MIN);
+      if (ImGui::InputDouble("##value", &offset[axis], 0.0, 0.0, "%.3f"))
+        edited = true;
+      ImGui::PopID();
+    }
+    ImGui::EndTable();
+  }
+  if (edited) {
+    app.job.origin_x = -(offset[0] + bounds.low[0]);
+    app.job.origin_y = -(offset[1] + bounds.low[1]);
+    app.job.origin_z = -(offset[2] + bounds.low[2]);
+  }
+  ImGui::TextDisabled("From the bottom-back-left corner of the %s",
+                      bounds.what);
+  ImGui::TextDisabled("Bounds %.1f x %.1f x %.1f mm", bounds.size(0),
+                      bounds.size(1), bounds.size(2));
 }
 
 void job_panel(App& app) {
@@ -2009,15 +2343,16 @@ void job_panel(App& app) {
   ImGui::SameLine();
   if (ImGui::Button("Fit view")) app.view.needs_fit = true;
 
-  ImGui::DragScalar("Origin X", ImGuiDataType_Double, &app.job.origin_x, 0.1f);
-  ImGui::DragScalar("Origin Y", ImGuiDataType_Double, &app.job.origin_y, 0.1f);
-  ImGui::DragScalar("Origin Z", ImGuiDataType_Double, &app.job.origin_z, 0.1f);
-  ImGui::DragScalar("Rapid plane Z (above origin)", ImGuiDataType_Double,
+  origin_panel(app);
+
+  ImGui::DragScalar("Rapid plane (above highest)", ImGuiDataType_Double,
                     &app.job.rapid_clearance_height, 0.1f);
   ImGui::SetItemTooltip(
-      "The absolute safe-plane height above program Z0, not the distance of "
-      "each retract. A retract travels from its pass depth to this plane. "
-      "Re-plan after changing it.");
+      "How far the safe plane clears the tallest thing in the way, part or "
+      "blank, not the distance of each retract: a retract travels from its "
+      "pass depth to that one plane. Measured over the work rather than up "
+      "from the origin, so moving the origin cannot move it. Re-plan after "
+      "changing it -- it is what every lift is costed against.");
   text_field("Work offset", app.job.work_offset, 16);
 }
 
@@ -2116,14 +2451,23 @@ void operations_panel(App& app) {
                     &operation.stepover_ratio, 0.005f);
   ImGui::DragScalar("Stepdown (mm)", ImGuiDataType_Double, &operation.stepdown, 0.1f);
   if (tool)
-    ImGui::TextDisabled("= %.3f mm wide, %zu passes", operation.stepover_ratio * tool->diameter,
-                        cam::level_floors(operation).size());
+    ImGui::TextDisabled(
+        "= %.3f mm wide, %zu passes", operation.stepover_ratio * tool->diameter,
+        cam::level_floors(operation, operation.stepdown,
+                          cam::highest_model_z(app.geometry))
+            .size());
   ImGui::DragScalar("Radial stock to leave", ImGuiDataType_Double,
                     &operation.radial_stock_to_leave, 0.02f);
   ImGui::DragScalar("Axial stock to leave", ImGuiDataType_Double,
                     &operation.axial_stock_to_leave, 0.02f);
-  ImGui::DragScalar("Top Z", ImGuiDataType_Double, &operation.top_z, 0.1f);
-  ImGui::DragScalar("Bottom Z", ImGuiDataType_Double, &operation.bottom_z, 0.1f);
+  ImGui::DragScalar("Depth from (mm)", ImGuiDataType_Double,
+                    &operation.depth_from, 0.1f);
+  ImGui::DragScalar("Depth to (mm)", ImGuiDataType_Double, &operation.depth_to,
+                    0.1f);
+  ImGui::SetItemTooltip(
+      "Measured down from the top of the work -- the taller of the part and the "
+      "blank -- so a blank standing proud of the part is faced off rather than "
+      "left standing. Where the origin sits does not enter into it.");
   ImGui::Checkbox("Lead in from the air", &operation.lead_in);
   ImGui::SetItemTooltip(
       "Seeds the wave outside the stock so the cutter arrives at the wall along "
@@ -2196,7 +2540,8 @@ std::string entry_signature(const cam::Operation& operation) {
                 operation.material_id.c_str(), static_cast<int>(operation.mode),
                 operation.slice_grid, operation.stepover_ratio, operation.stepdown,
                 operation.radial_stock_to_leave, operation.axial_stock_to_leave,
-                operation.top_z, operation.bottom_z, operation.lead_in ? 1 : 0,
+                operation.depth_from, operation.depth_to,
+                operation.lead_in ? 1 : 0,
                 operation.stock_deviation, operation.entry_front_match_tolerance);
   return buffer;
 }
@@ -2589,7 +2934,7 @@ void view_panel(App& app) {
                   motion_phase_name(motion), motion.phase_distance,
                   motion.phase_length, motion.rate, app.playback.time_scale);
       ImGui::TextDisabled("Tool Z %.3f mm; rapid plane %.3f mm",
-                          motion.z, app.job.rapid_clearance_height);
+                          motion.z, app.plan.rapid_plane);
       const cam::FeedSegment* segment = nullptr;
       if (!level->feeds.segments.empty())
         segment = &level->feeds.segments[segment_at(level->feeds.segments,
@@ -2745,7 +3090,8 @@ int main(int argc, char** argv) {
             "  --entry-front-tolerance MM\n"
             "                     Whole-curve Z association envelope (default 3)\n"
             "  --rapid-clearance MM\n"
-            "                     Safe rapid height above program Z0 (default 10)\n"
+            "                     Safe rapid height above the tallest of part and\n"
+            "                     blank (default 10)\n"
             "  --full-feed RATE   Manual feed at full engagement, mm/min\n"
             "  --no-feed RATE     Manual feed at zero engagement, mm/min\n"
             "  --gcode PATH       Plan and post without opening a window, then exit\n"

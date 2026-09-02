@@ -86,17 +86,36 @@ struct FeedSchedule {
   std::vector<FeedSegment> segments;
   std::vector<MotionPhase> motion;
   FeedStats stats;
+  // This pass finishes with the cutter still at its own floor. The pass after
+  // it comes down from there rather than across the rapid plane.
+  bool ends_at_depth = false;
+  // And the mirror of it: this pass was reached without lifting, so it opens
+  // standing over its own first point at the depth above, with only the descent
+  // left to make.
+  bool begins_at_depth = false;
+};
+
+// How a pass joins the ones on either side of it. A pass on its own knows only
+// its own depth, so where the cutter comes from and whether it stays down
+// afterwards are both told to it.
+struct PassLink {
+  // Where whatever ran before this pass left the cutter standing. Absent for
+  // the first pass that cuts, which begins wherever it likes.
+  std::optional<wave::Point64> from;
+  // The height it was left at: the rapid plane normally, and the previous
+  // pass's own floor when that pass ended without lifting. This is the whole of
+  // what a stay-down transition between depths costs -- one stepdown of descent
+  // instead of the full trip to the plane and back.
+  double from_z = 0.0;
+  // Leave the cutter at this pass's floor when it finishes, because the pass
+  // after it has already been given a way across at this depth.
+  bool stay_down_after = false;
 };
 
 // Maps simulation engagement directly onto the configured feed range. At full
 // engagement the commanded feed is `full_engagement_feed`; at zero engagement
 // it is `no_engagement_feed`. Collinear pieces are merged only after feeds
 // have been assigned, and only when those feeds are compatible.
-//
-// `arrive_from` is where the cutter was left standing, at the rapid plane, by
-// whatever ran before this pass. Given one, the schedule opens with the rapid
-// that carries the tool across to where this pass starts. Without it the pass
-// is assumed to begin wherever it likes, which is true only of the first one.
 FeedSchedule plan_feeds(const wave::Toolpath& toolpath,
                         const wave::SimulationResult& simulation,
                         const Machine& machine,
@@ -106,7 +125,7 @@ FeedSchedule plan_feeds(const wave::Toolpath& toolpath,
                         double plunge_feed,
                         double floor_z = 0.0,
                         double rapid_plane = 0.0,
-                        std::optional<wave::Point64> arrive_from = std::nullopt);
+                        PassLink link = {});
 
 double feed_schedule_seconds(const FeedSchedule& schedule);
 double feed_motion_length(const FeedSchedule& schedule);
