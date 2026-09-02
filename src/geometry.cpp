@@ -529,7 +529,6 @@ WaveResult build_wavefront(const Paths64& raw_subject,
     Paths64 next = inflate_with_softening(reached, delta, softening_delta);
     next = Intersect(next, result.domain, FillRule::NonZero);
     next = Difference(next, result.subject, FillRule::NonZero);
-    next = Union(next, FillRule::NonZero);
 
     if (next.empty()) {
       result.stop_reason = StopReason::Empty;
@@ -542,7 +541,6 @@ WaveResult build_wavefront(const Paths64& raw_subject,
 
     // Retain just the newly infiltrated area as this generation's visible wave.
     Paths64 wave = Difference(next, reached, FillRule::NonZero);
-    wave = Union(wave, FillRule::NonZero);
     if (wave.empty()) {
       result.stop_reason = StopReason::Unchanged;
       return result;
