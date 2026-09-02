@@ -3068,6 +3068,7 @@ int main(int argc, char** argv) {
   double rapid_clearance = 0.0;
   double full_feed = 0.0;
   double no_feed = 0.0;
+  bool profile_planning = false;
   std::string tool_id;
   std::string machine_id;
   std::string material_id;
@@ -3110,6 +3111,7 @@ int main(int argc, char** argv) {
       else if (argument == "--contour-direction") direction_name = value();
       else if (argument == "--full-feed") full_feed = std::stod(value());
       else if (argument == "--no-feed") no_feed = std::stod(value());
+      else if (argument == "--profile-planning") profile_planning = true;
       else if (argument == "--help" || argument == "-h") {
         std::printf(
             "TingleCAM -- wavefront roughing and contour finishing\n\n"
@@ -3133,6 +3135,7 @@ int main(int argc, char** argv) {
             "  --full-feed RATE   Manual feed at full engagement, mm/min\n"
             "  --no-feed RATE     Manual feed at zero engagement, mm/min\n"
             "  --gcode PATH       Plan and post without opening a window, then exit\n"
+            "  --profile-planning Print planning phase timings and scale counters\n"
             "  --screenshot PATH  Render one frame to a binary PPM and exit\n"
             "  --box-stock MM     Use the part's bounding box, grown by MM, as stock\n"
             "  --models stock|part|both   What the plan view shows\n"
@@ -3229,6 +3232,27 @@ int main(int argc, char** argv) {
     if (!plan.ok()) {
       std::fprintf(stderr, "%s\n", plan.error.c_str());
       return EXIT_FAILURE;
+    }
+    if (profile_planning) {
+      const cam::PlanningMetrics& m = plan.metrics;
+      std::fprintf(
+          stderr,
+          "planning_profile_ms total=%.3f slicing=%.3f preparation=%.3f "
+          "wavefront=%.3f lineage=%.3f inter_layer=%.3f toolpath=%.3f "
+          "cleanup=%.3f stitching=%.3f resampling=%.3f simulation=%.3f "
+          "feeds=%.3f\n",
+          m.total_milliseconds, m.slicing_milliseconds,
+          m.preparation_milliseconds, m.wavefront_milliseconds,
+          m.lineage_milliseconds, m.inter_layer_milliseconds,
+          m.toolpath_milliseconds, m.cleanup_milliseconds,
+          m.stitching_milliseconds, m.resampling_milliseconds,
+          m.simulation_milliseconds, m.feeds_milliseconds);
+      std::fprintf(
+          stderr,
+          "planning_profile_counts wave_generations=%zu fronts=%zu "
+          "toolpath_moves=%zu simulation_intervals=%zu\n",
+          m.wave_generations, m.fronts, m.toolpath_moves,
+          m.simulation_intervals);
     }
     const cam::PostResult post = cam::post_job(plan, app.job, app.tools, app.machines);
     for (const auto& warning : post.warnings)

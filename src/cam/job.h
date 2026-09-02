@@ -155,6 +155,30 @@ struct PlanStats {
   double excess_area = 0.0;
 };
 
+// Wall-clock measurements and scale counters for one planning run. These are
+// deliberately part of the result rather than printed from deep inside the
+// geometry code: command-line benchmarks can report them, while GUI plans and
+// tests remain quiet and can inspect the same authoritative numbers.
+struct PlanningMetrics {
+  double slicing_milliseconds = 0.0;
+  double preparation_milliseconds = 0.0;
+  double wavefront_milliseconds = 0.0;
+  double lineage_milliseconds = 0.0;
+  double inter_layer_milliseconds = 0.0;
+  double toolpath_milliseconds = 0.0;
+  double cleanup_milliseconds = 0.0;
+  double stitching_milliseconds = 0.0;
+  double resampling_milliseconds = 0.0;
+  double simulation_milliseconds = 0.0;
+  double feeds_milliseconds = 0.0;
+  double total_milliseconds = 0.0;
+
+  std::size_t wave_generations = 0;
+  std::size_t fronts = 0;
+  std::size_t toolpath_moves = 0;
+  std::size_t simulation_intervals = 0;
+};
+
 struct OperationPlan {
   std::string operation_name;
   std::string tool_id;
@@ -162,6 +186,7 @@ struct OperationPlan {
   std::vector<LevelPlan> levels;
   wave::InterLayerTopology inter_layer;
   PlanStats stats;
+  PlanningMetrics metrics;
   std::vector<std::string> warnings;
   std::string error;  // non-empty when the operation could not be planned
 
@@ -171,6 +196,7 @@ struct OperationPlan {
 struct JobPlan {
   std::vector<OperationPlan> operations;
   PlanStats stats;
+  PlanningMetrics metrics;
   std::vector<std::string> warnings;
   std::string error;
   // The safe plane this plan was costed against, in job coordinates. Recorded

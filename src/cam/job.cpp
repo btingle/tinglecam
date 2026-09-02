@@ -3,6 +3,7 @@
 #include "routing.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <optional>
 #include <sstream>
@@ -10,6 +11,13 @@
 
 namespace cam {
 namespace {
+
+using PlanningClock = std::chrono::steady_clock;
+
+double elapsed_milliseconds(PlanningClock::time_point start) {
+  return std::chrono::duration<double, std::milli>(PlanningClock::now() - start)
+      .count();
+}
 
 using Clipper2Lib::FillRule;
 using Clipper2Lib::InflatePaths;
@@ -58,6 +66,25 @@ void accumulate(PlanStats& into, const PlanStats& from) {
   into.unreachable_fronts += from.unreachable_fronts;
   into.excess_area += from.excess_area;
   into.maximum_load = std::max(into.maximum_load, from.maximum_load);
+}
+
+void accumulate(PlanningMetrics& into, const PlanningMetrics& from) {
+  into.slicing_milliseconds += from.slicing_milliseconds;
+  into.preparation_milliseconds += from.preparation_milliseconds;
+  into.wavefront_milliseconds += from.wavefront_milliseconds;
+  into.lineage_milliseconds += from.lineage_milliseconds;
+  into.inter_layer_milliseconds += from.inter_layer_milliseconds;
+  into.toolpath_milliseconds += from.toolpath_milliseconds;
+  into.cleanup_milliseconds += from.cleanup_milliseconds;
+  into.stitching_milliseconds += from.stitching_milliseconds;
+  into.resampling_milliseconds += from.resampling_milliseconds;
+  into.simulation_milliseconds += from.simulation_milliseconds;
+  into.feeds_milliseconds += from.feeds_milliseconds;
+  into.total_milliseconds += from.total_milliseconds;
+  into.wave_generations += from.wave_generations;
+  into.fronts += from.fronts;
+  into.toolpath_moves += from.toolpath_moves;
+  into.simulation_intervals += from.simulation_intervals;
 }
 
 // Everything both planning stages need out of the operation, the tool and the
@@ -530,8 +557,10 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
       // The slicer returns the downward envelope: everything at or above this
       // depth, projected. That is exactly the material that has to survive the
       // pass, so no separate rest model is needed for roughing.
+      const auto slice_start = PlanningClock::now();
       level.part_slice = geometry.part_outline(floor_z, operation.slice_grid);
       level.stock_slice = geometry.stock_outline(floor_z, operation.slice_grid);
+      plan.metrics.slicing_milliseconds += elapsed_milliseconds(slice_start);
 
       if (level.stock_slice.empty()) {
         level.nothing_to_cut = true;
@@ -541,11 +570,14 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
 
       // The cutter follows a path whose centre must stay a radius clear of the
       // part, plus whatever is being left for a finishing pass.
+      const auto preparation_start = PlanningClock::now();
       const wave::Paths64 keep_out =
           level.part_slice.empty()
               ? absent_subject(level.stock_slice)
               : offset_outward(level.part_slice,
                                radius + operation.radial_stock_to_leave);
+      plan.metrics.preparation_milliseconds +=
+          elapsed_milliseconds(preparation_start);
 
       // Finishing does not propagate a wave, so it has no entry fronts to
       // offer and nothing to discover here. Its contours are derived from the
@@ -572,9 +604,18 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
       // Without this the run-in landed a front on the wall itself and the pass
       // before it grazed off whatever fraction of a stepover was left over.
       const double lead_in = operation.lead_in ? radius + first_bite_allowance : 0.0;
+      const auto wavefront_start = PlanningClock::now();
       level.wave = wave::build_wavefront(keep_out, level.stock_slice, stepover,
                                          stepover, lead_in, 2000, mute);
+      plan.metrics.wavefront_milliseconds +=
+          elapsed_milliseconds(wavefront_start);
+      plan.metrics.wave_generations += level.wave.generations.size();
+
+      const auto lineage_start = PlanningClock::now();
       level.lineage = wave::build_front_lineage(level.wave);
+      plan.metrics.lineage_milliseconds += elapsed_milliseconds(lineage_start);
+      for (const wave::FrontGeneration& generation : level.lineage.generations)
+        plan.metrics.fronts += generation.fronts.size();
     } catch (const std::exception& error) {
       const std::string detail =
           "Depth " + std::to_string(floor_z) +
@@ -602,8 +643,11 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
     std::vector<const wave::FrontLineage*> lineages;
     lineages.reserve(plan.levels.size());
     for (const LevelPlan& level : plan.levels) lineages.push_back(&level.lineage);
+    const auto inter_layer_start = PlanningClock::now();
     plan.inter_layer = wave::build_inter_layer_topology(
         lineages, operation.entry_front_match_tolerance);
+    plan.metrics.inter_layer_milliseconds +=
+        elapsed_milliseconds(inter_layer_start);
   } catch (const std::exception& error) {
     plan.error = "Inter-layer topology: " + std::string(error.what());
     return plan;
@@ -695,6 +739,7 @@ void plan_toolpaths(OperationPlan& plan,
       // was built.
       const bool clearing = level.part_slice.empty();
       if (operation.mode == OperationMode::ContourFinishing && !clearing) {
+        const auto toolpath_start = PlanningClock::now();
         const wave::Paths64 keep_out =
             level.part_slice.empty()
                 ? absent_subject(level.stock_slice)
@@ -719,18 +764,24 @@ void plan_toolpaths(OperationPlan& plan,
         traversal.rapid_plane = rapid_plane;
         level.toolpath = wave::plan_traversal(tasks, traversal).toolpath;
         level.toolpath.cleared = travelable;
+        plan.metrics.toolpath_milliseconds +=
+            elapsed_milliseconds(toolpath_start);
         if (level.toolpath.moves.empty()) {
           level.nothing_to_cut = true;
           continue;
         }
       }
       if (operation.mode == OperationMode::Roughing || clearing) {
+        const auto toolpath_start = PlanningClock::now();
         level.toolpath = wave::build_toolpath(
             level.wave, level.lineage, radius, level.floor_z,
             rapid_plane, rapid_feed(machine), no_engagement_feed,
             rapid_feed_z(machine));
+        plan.metrics.toolpath_milliseconds +=
+            elapsed_milliseconds(toolpath_start);
         if (operation.rough_boundary_cleanup && !level.part_slice.empty() &&
             !level.wave.reached_generations.empty()) {
+          const auto cleanup_start = PlanningClock::now();
           // Only where the wave got. A cleanup contour runs along the part at
           // the same offset the wave was bounded by, so where the wave never
           // reached -- a pocket whose only entry was declined, or one nothing
@@ -776,8 +827,11 @@ void plan_toolpaths(OperationPlan& plan,
               wave::plan_traversal(tasks, traversal).toolpath;
           level.toolpath.moves.insert(level.toolpath.moves.end(),
                                       cleanup.moves.begin(), cleanup.moves.end());
+          plan.metrics.cleanup_milliseconds +=
+              elapsed_milliseconds(cleanup_start);
         }
       }
+      plan.metrics.toolpath_moves += level.toolpath.moves.size();
       if (level.toolpath.moves.empty()) level.nothing_to_cut = true;
     } catch (const std::exception& error) {
       const std::string detail =
@@ -789,7 +843,10 @@ void plan_toolpaths(OperationPlan& plan,
     }
   }
 
+  const auto stitching_start = PlanningClock::now();
   stitch_passes(plan, setup, machine, rapid_plane);
+  plan.metrics.stitching_milliseconds +=
+      elapsed_milliseconds(stitching_start);
 
   // ---- Simulation and feeds ---------------------------------------------
   // Where the previous pass left the cutter, and how high. Passes with nothing
@@ -814,6 +871,7 @@ void plan_toolpaths(OperationPlan& plan,
     }
     try {
       link.stay_down_after = level.stays_down_after;
+      const auto resampling_start = PlanningClock::now();
       level.toolpath =
           wave::resample_toolpath(level.toolpath, operation.path_pitch);
       if (level.stays_down_after && level.transition.size() >= 2) {
@@ -832,15 +890,24 @@ void plan_toolpaths(OperationPlan& plan,
           level.toolpath.moves.push_back(std::move(move));
         }
       }
+      plan.metrics.resampling_milliseconds +=
+          elapsed_milliseconds(resampling_start);
       const wave::Paths64 final_subject =
           level.part_slice.empty() ? level.wave.subject : level.part_slice;
+      const auto simulation_start = PlanningClock::now();
       level.simulation = wave::simulate_material(
           level.stock_slice, final_subject, level.toolpath, radius,
           operation.simulation_stock_inflation);
+      plan.metrics.simulation_milliseconds +=
+          elapsed_milliseconds(simulation_start);
+      plan.metrics.simulation_intervals +=
+          level.simulation.stats.cutting_steps;
+      const auto feeds_start = PlanningClock::now();
       level.feeds = plan_feeds(level.toolpath, level.simulation, machine,
                                full_engagement_feed, no_engagement_feed,
                                data->spindle_rpm, data->plunge_feed,
                                level.floor_z, rapid_plane, link);
+      plan.metrics.feeds_milliseconds += elapsed_milliseconds(feeds_start);
       if (level.toolpath.moves.empty()) level.nothing_to_cut = true;
       if (!level.nothing_to_cut && !level.feeds.motion.empty()) {
         link.from = level.feeds.motion.back().to;
@@ -929,6 +996,7 @@ OperationPlan plan_operation(const JobGeometry& geometry,
                              double progress_from,
                              double progress_to,
                              double rapid_plane) {
+  const auto planning_start = PlanningClock::now();
   // Wavefronts are the cheaper half; give the toolpaths the larger share of the
   // reported progress so the bar does not stall in the second stage.
   const double seam = progress_from + (progress_to - progress_from) * 0.4;
@@ -936,6 +1004,7 @@ OperationPlan plan_operation(const JobGeometry& geometry,
                                        material, progress, progress_from, seam);
   plan_toolpaths(plan, operation, tool, machine, material, progress, seam,
                  progress_to, rapid_plane);
+  plan.metrics.total_milliseconds = elapsed_milliseconds(planning_start);
   return plan;
 }
 
@@ -1134,6 +1203,7 @@ JobPlan plan_job(const JobGeometry& geometry,
     }
 
     accumulate(plan.stats, result.stats);
+    accumulate(plan.metrics, result.metrics);
     for (const std::string& warning : result.warnings)
       plan.warnings.push_back(operation.name + ": " + warning);
     plan.operations.push_back(std::move(result));
