@@ -67,7 +67,10 @@ class Router {
   double slack_ = 0.0;
   std::vector<Point64> corners_;
   // Lower triangle stored whole for a plain index; corners_.size() is small.
-  std::vector<std::uint8_t> corner_visible_;
+  // 0 = blocked, 1 = visible, 2 = not tested yet. One router may answer more
+  // than one query, so visibility discovered by an earlier search remains
+  // available to the next one without eagerly constructing the dense graph.
+  mutable std::vector<std::uint8_t> corner_visible_;
   // Every edge of `padded_`, flattened, so a visibility test is one pass.
   std::vector<Point64> edge_from_;
   std::vector<Point64> edge_to_;

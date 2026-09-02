@@ -147,13 +147,9 @@ Router::Router(const Paths64& region, double slack)
   outline_ = outline;
 
   const std::size_t count = corners_.size();
-  corner_visible_.assign(count * count, 0);
+  corner_visible_.assign(count * count, 2);
   for (std::size_t i = 0; i < count; ++i)
-    for (std::size_t j = i + 1; j < count; ++j) {
-      const std::uint8_t seen = visible(corners_[i], corners_[j]) ? 1 : 0;
-      corner_visible_[i * count + j] = seen;
-      corner_visible_[j * count + i] = seen;
-    }
+    corner_visible_[i * count + i] = 1;
 
   // Two vertices with a boundary edge between them are joined whatever the
   // visibility test makes of it, because that edge is a legal route by
@@ -260,9 +256,15 @@ std::optional<Path64> Router::route(const Point64& from,
       }
     }
     for (std::size_t next = 0; next < count; ++next) {
-      if (settled[next] || !corner_visible_[node * count + next]) continue;
+      if (settled[next]) continue;
       const double candidate = cost + length_of(corners_[node], corners_[next]);
       if (candidate >= best[next]) continue;
+      std::uint8_t& edge = corner_visible_[node * count + next];
+      if (edge == 2) {
+        edge = visible(corners_[node], corners_[next]) ? 1 : 0;
+        corner_visible_[next * count + node] = edge;
+      }
+      if (!edge) continue;
       best[next] = candidate;
       previous[next] = node;
       queue.push({candidate, next});
