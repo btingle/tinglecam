@@ -1,5 +1,8 @@
 # Toolpath Planning Optimization Plan
 
+Implementation and benchmark outcomes are recorded in
+[`optim_results.md`](optim_results.md).
+
 ## Objective
 
 Reduce end-to-end CAM planning time without weakening geometric correctness, toolpath safety, deterministic output, or final stock-removal validation.

@@ -425,6 +425,7 @@ data:
 --full-feed RATE
 --no-feed RATE
 --gcode PATH
+--profile-planning
 --screenshot PATH
 --view models|fronts|pass|result
 --at FRACTION
@@ -445,6 +446,18 @@ Example:
   --path-pitch 0.2 \
   --gcode L.nc
 ```
+
+`--profile-planning` prints machine-readable per-phase wall times and scale
+counters to stderr during a headless G-code run. The repository benchmark runs
+the regression suite and a representative planning corpus:
+
+```sh
+./benchmark_planning.sh build 3
+```
+
+The optional third argument names an output directory for profiles, posted
+G-code, hashes, and resource measurements. Otherwise a new directory is made
+under `/tmp` and reported at startup.
 
 ## Simulation and safety
 
