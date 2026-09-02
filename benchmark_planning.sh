@@ -24,6 +24,7 @@ run_case() {
   local name=$1
   local part=$2
   local stock=$3
+  local expected_hash=
   shift 3
   for ((run = 1; run <= runs; ++run)); do
     local stem="$output_dir/${name}-${run}"
@@ -39,7 +40,15 @@ run_case() {
       --gcode "$stem.nc" \
       "$@" \
       >"$stem.out" 2>"$stem.err"
-    sha256sum "$stem.nc"
+    local actual_hash
+    actual_hash=$(sha256sum "$stem.nc" | awk '{print $1}')
+    if [[ -z "$expected_hash" ]]; then
+      expected_hash=$actual_hash
+    elif [[ "$actual_hash" != "$expected_hash" ]]; then
+      echo "Non-deterministic G-code for $name: $actual_hash != $expected_hash" >&2
+      exit 1
+    fi
+    echo "$actual_hash  $stem.nc"
     rg '^planning_profile' "$stem.err"
     cat "$stem.time"
   done
