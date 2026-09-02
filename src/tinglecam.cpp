@@ -179,6 +179,11 @@ struct Orbit {
   float yaw = 0.85f;
   float pitch = 0.62f;
   float zoom = 1.0f;
+  // Where the framed centre sits on screen, in pixels from the middle of the
+  // canvas. Held in screen space rather than as a point in the model, because
+  // the gesture is screen space: a drag should move what is under the pointer
+  // by exactly that many pixels whatever the orbit and zoom happen to be.
+  ImVec2 pan{0.0f, 0.0f};
 };
 
 // Playback along one pass. The distance is measured along that pass's toolpath,
@@ -1205,6 +1210,40 @@ struct OrbitScene {
   std::vector<ImVec2> pool;
 };
 
+// Left-drag orbits, right-drag pans, wheel zooms. One reader for every 3D view,
+// so the gesture means the same thing in all of them and a view added later
+// cannot quietly disagree.
+//
+// The pan is in pixels and is not divided by the zoom: the drag moves what is
+// under the pointer by the distance the pointer moved, which is what makes it
+// feel like dragging the model rather than steering a camera at it.
+void orbit_controls(App& app, bool hovered) {
+  if (!hovered) return;
+  const ImGuiIO& io = ImGui::GetIO();
+  if (ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+    app.orbit.yaw += io.MouseDelta.x * 0.009f;
+    app.orbit.pitch =
+        std::clamp(app.orbit.pitch - io.MouseDelta.y * 0.009f, 0.06f, 1.5f);
+  }
+  if (ImGui::IsMouseDragging(ImGuiMouseButton_Right)) {
+    app.orbit.pan.x += io.MouseDelta.x;
+    app.orbit.pan.y += io.MouseDelta.y;
+  }
+  if (io.MouseWheel != 0.0f) {
+    const float before = app.orbit.zoom;
+    app.orbit.zoom =
+        std::clamp(before * std::pow(1.12f, io.MouseWheel), 0.1f, 40.0f);
+    // Scaled by however much the zoom actually moved, clamp included, which
+    // makes the wheel scale the picture about the middle of the canvas. Left
+    // alone, the view expands about a centre that panning has pushed off the
+    // edge, and zooming in after panning throws the model out of shot. The 2D
+    // pass view has always done this; these now agree with it.
+    const float factor = before > 0.0f ? app.orbit.zoom / before : 1.0f;
+    app.orbit.pan.x *= factor;
+    app.orbit.pan.y *= factor;
+  }
+}
+
 // Opens the child window and reads the orbit controls. Returns false when the
 // view has nothing to show, having already drawn `empty_message` and closed up.
 bool begin_scene(App& app, OrbitScene& scene, const char* id) {
@@ -1217,21 +1256,16 @@ bool begin_scene(App& app, OrbitScene& scene, const char* id) {
   // A view may put a control over its own canvas, so the canvas has to let a
   // later item take the mouse where the two overlap.
   ImGui::SetNextItemAllowOverlap();
-  ImGui::InvisibleButton(id, scene.size, ImGuiButtonFlags_MouseButtonLeft);
+  ImGui::InvisibleButton(id, scene.size,
+                         ImGuiButtonFlags_MouseButtonLeft |
+                             ImGuiButtonFlags_MouseButtonRight);
   scene.hovered = ImGui::IsItemHovered();
   scene.list = ImGui::GetWindowDrawList();
   const ImVec2 bottom_right{scene.top_left.x + scene.size.x,
                             scene.top_left.y + scene.size.y};
   scene.list->AddRectFilled(scene.top_left, bottom_right, IM_COL32(14, 17, 22, 255));
   scene.list->PushClipRect(scene.top_left, bottom_right, true);
-  if (scene.hovered && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
-    app.orbit.yaw += ImGui::GetIO().MouseDelta.x * 0.009f;
-    app.orbit.pitch = std::clamp(app.orbit.pitch - ImGui::GetIO().MouseDelta.y * 0.009f,
-                                 0.06f, 1.5f);
-  }
-  if (scene.hovered && ImGui::GetIO().MouseWheel != 0.0f)
-    app.orbit.zoom = std::clamp(app.orbit.zoom * std::pow(1.12f, ImGui::GetIO().MouseWheel),
-                                0.1f, 40.0f);
+  orbit_controls(app, scene.hovered);
   return true;
 }
 
@@ -1282,8 +1316,8 @@ void aim_scene(App& app, OrbitScene& scene, const Clipper2Lib::Rect64& extent,
   const float cp = std::cos(app.orbit.pitch);
   const float sp = std::sin(app.orbit.pitch);
   scene.projection = Projection{
-      {scene.top_left.x + scene.size.x * 0.5f,
-       scene.top_left.y + scene.size.y * 0.5f},
+      {scene.top_left.x + scene.size.x * 0.5f + app.orbit.pan.x,
+       scene.top_left.y + scene.size.y * 0.5f + app.orbit.pan.y},
       centre,
       {-sy, cy, 0.0f},
       {-sp * cy, -sp * sy, cp},
@@ -1310,31 +1344,38 @@ void aim_scene(App& app, OrbitScene& scene, const Clipper2Lib::Rect64& extent,
 }
 
 // Painter's algorithm, then straight into the draw list.
-void paint_scene(OrbitScene& scene) {
-  std::sort(scene.facets.begin(), scene.facets.end(),
+// Depth sorts one body of facets and paints it. A body at a time rather than
+// everything at once, so a caller with two of them can decide that one stands
+// in front of the other outright instead of interleaving the two sorts.
+void paint_facets(ImDrawList* list, std::vector<Facet>& facets,
+                  const std::vector<ImVec2>& pool) {
+  std::sort(facets.begin(), facets.end(),
             [](const Facet& a, const Facet& b) { return a.depth < b.depth; });
   // A wall is one quad per edge of the ring, and an antialiased fill insets
   // every one of them by half a pixel, so the wall would come out ruled with
   // hairlines where the quads meet.
-  const ImDrawListFlags saved_flags = scene.list->Flags;
-  scene.list->Flags &= ~ImDrawListFlags_AntiAliasedFill;
-  for (const Facet& facet : scene.facets) {
+  const ImDrawListFlags saved_flags = list->Flags;
+  list->Flags &= ~ImDrawListFlags_AntiAliasedFill;
+  for (const Facet& facet : facets) {
     if (facet.count < 2) continue;
-    const ImVec2* points = scene.pool.data() + facet.first;
+    const ImVec2* points = pool.data() + facet.first;
     if (facet.fill != 0) {
       // Only ever a triangle from the mesh or a quad from a wall, both convex.
       if (facet.count == 3)
-        scene.list->AddTriangleFilled(points[0], points[1], points[2], facet.fill);
+        list->AddTriangleFilled(points[0], points[1], points[2], facet.fill);
       else
-        scene.list->AddQuadFilled(points[0], points[1], points[2], points[3],
-                                  facet.fill);
+        list->AddQuadFilled(points[0], points[1], points[2], points[3], facet.fill);
     }
     if (facet.edge != 0)
-      scene.list->AddPolyline(points, static_cast<int>(facet.count), facet.edge,
-                              facet.count > 2 ? ImDrawFlags_Closed : ImDrawFlags_None,
-                              1.0f);
+      list->AddPolyline(points, static_cast<int>(facet.count), facet.edge,
+                        facet.count > 2 ? ImDrawFlags_Closed : ImDrawFlags_None,
+                        1.0f);
   }
-  scene.list->Flags = saved_flags;
+  list->Flags = saved_flags;
+}
+
+void paint_scene(OrbitScene& scene) {
+  paint_facets(scene.list, scene.facets, scene.pool);
 }
 
 // A triad at the program origin, drawn over the scene rather than into it.
@@ -1489,7 +1530,8 @@ void draw_setup(App& app) {
 
   char caption[220];
   std::snprintf(caption, sizeof caption,
-                "Part and stock, Z %.2f to %.2f mm   Left-drag: orbit   Wheel: zoom",
+                "Part and stock, Z %.2f to %.2f mm   Drag: orbit   Right-drag: pan   Wheel: "
+                "zoom",
                 low, high);
   scene.list->AddText({scene.top_left.x + 12.0f, scene.top_left.y + 10.0f},
                       IM_COL32(130, 142, 158, 255), caption);
@@ -1628,7 +1670,8 @@ void draw_entries(App& app) {
   for (const cam::EntryOption& entry : app.discovery.entries)
     live += entry.muted ? 0 : 1;
   std::snprintf(caption, sizeof caption,
-                "%zu of %zu entry front%s propagating   Left-drag: orbit   Wheel: zoom",
+                "%zu of %zu entry front%s propagating   Drag: orbit   Right-drag: pan   "
+                "Wheel: zoom",
                 live, app.discovery.entries.size(),
                 app.discovery.entries.size() == 1 ? "" : "s");
   scene.list->AddText({scene.top_left.x + 12.0f, scene.top_left.y + 10.0f},
@@ -1640,14 +1683,21 @@ void draw_entries(App& app) {
   end_scene(scene);
 }
 
-// The loaded models, drawn into a facet list that already holds something else.
-// Into the same list rather than over the top of it: the models and the passes
-// occupy the same space, so they have to enter the same depth sort or a wall
-// standing in front of the part would be painted behind it.
+// The loaded models, as a translucent sheet over a stack that has already been
+// painted. Into a facet list of their own, depth sorted on their own, and drawn
+// after: they are an overlay, not another body in the scene.
 //
-// Translucent, because the point of putting a model over the stack is to read
-// one against the other. The part is the more opaque of the two: it is the
-// shape being cut towards, and the blank is mostly a boundary.
+// Sorting them together with the passes was the obvious thing and is wrong. A
+// simulated pass wall and the part surface it was cut to sit in the same place
+// to within a rounding, so the sort has no real answer for which is in front
+// and picks per facet on centroid depth -- the two then interleave, and the
+// overlay comes out speckled and crawls as the view turns. Nothing in the
+// question the overlay answers needs the model to be occluded by the stack, so
+// the fix is to stop asking: it goes on top, and being see-through is what lets
+// the stack be read through it.
+//
+// The part is the more opaque of the two: it is the shape being cut towards,
+// and the blank is mostly a boundary.
 //
 // Warm, where every pass in the stack is cool. The plan view's blue would be
 // the consistent choice and is the wrong one here: it is within a shade of the
@@ -1663,13 +1713,13 @@ void append_models(const App& app, StackModels which, std::vector<Facet>& facets
   if (want_part && app.geometry.has_part()) {
     const float colour[3]{0.82f, 0.62f, 0.34f};
     append_mesh(facets, pool, app.geometry.part().mesh(), projection, light,
-                colour, 130);
+                colour, 95);
   }
   if (!want_stock || !app.geometry.has_stock()) return;
   const float colour[3]{0.34f, 0.38f, 0.45f};
   if (!app.geometry.box_stock()) {
     append_mesh(facets, pool, app.geometry.stock().mesh(), projection, light,
-                colour, 70);
+                colour, 55);
     return;
   }
   // A rectangular blank has no mesh behind it, so it is the prism it is defined
@@ -1682,7 +1732,7 @@ void append_models(const App& app, StackModels which, std::vector<Facet>& facets
   if (rings.empty()) return;
   const float face[3]{0.40f, 0.44f, 0.52f};
   append_slab(facets, pool, rings, fill_mesh(rings, nullptr), rings, low, high,
-              projection, light, colour, face, IM_COL32(160, 180, 205, 60), 70);
+              projection, light, colour, face, IM_COL32(160, 180, 205, 60), 55);
 }
 
 void draw_result(App& app) {
@@ -1695,21 +1745,16 @@ void draw_result(App& app) {
   // The overlay control sits over this canvas, so the canvas has to let a later
   // item take the mouse where the two meet, or orbiting starts under it.
   ImGui::SetNextItemAllowOverlap();
-  ImGui::InvisibleButton("stack", size, ImGuiButtonFlags_MouseButtonLeft);
+  ImGui::InvisibleButton("stack", size,
+                         ImGuiButtonFlags_MouseButtonLeft |
+                             ImGuiButtonFlags_MouseButtonRight);
   const bool hovered = ImGui::IsItemHovered();
   ImDrawList* list = ImGui::GetWindowDrawList();
   list->AddRectFilled(top_left, ImVec2(top_left.x + size.x, top_left.y + size.y),
                       IM_COL32(14, 17, 22, 255));
   list->PushClipRect(top_left, ImVec2(top_left.x + size.x, top_left.y + size.y), true);
 
-  if (hovered && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
-    app.orbit.yaw += ImGui::GetIO().MouseDelta.x * 0.009f;
-    app.orbit.pitch = std::clamp(app.orbit.pitch - ImGui::GetIO().MouseDelta.y * 0.009f,
-                                 0.06f, 1.5f);
-  }
-  if (hovered && ImGui::GetIO().MouseWheel != 0.0f)
-    app.orbit.zoom = std::clamp(app.orbit.zoom * std::pow(1.12f, ImGui::GetIO().MouseWheel),
-                                0.1f, 40.0f);
+  orbit_controls(app, hovered);
 
   const auto finish = [&](const char* message) {
     const ImVec2 extent = ImGui::CalcTextSize(message);
@@ -1815,7 +1860,8 @@ void draw_result(App& app) {
   const float cp = std::cos(app.orbit.pitch);
   const float sp = std::sin(app.orbit.pitch);
   const Projection projection{
-      {top_left.x + size.x * 0.5f, top_left.y + size.y * 0.5f},
+      {top_left.x + size.x * 0.5f + app.orbit.pan.x,
+       top_left.y + size.y * 0.5f + app.orbit.pan.y},
       centre,
       {-sy, cy, 0.0f},
       {-sp * cy, -sp * sy, cp},
@@ -1914,37 +1960,22 @@ void draw_result(App& app) {
         static_cast<float>(cutter_cursor->z + active_tool->flute_length),
         projection, light);
   }
-  append_models(app, app.stack_models, facets, pool, projection, light, spacing,
-                app.job.operations.empty()
-                    ? 32
-                    : app.job.operations[std::clamp(
-                              app.selected_operation, 0,
-                              static_cast<int>(app.job.operations.size()) - 1)]
-                          .slice_grid);
-  std::sort(facets.begin(), facets.end(),
-            [](const Facet& a, const Facet& b) { return a.depth < b.depth; });
+  paint_facets(list, facets, pool);
 
-  // A wall is one quad per edge of the ring, and an antialiased fill insets
-  // every one of them by half a pixel, so the wall would come out ruled with
-  // hairlines where the quads meet.
-  const ImDrawListFlags saved_flags = list->Flags;
-  list->Flags &= ~ImDrawListFlags_AntiAliasedFill;
-  for (const Facet& facet : facets) {
-    if (facet.count < 2) continue;
-    const ImVec2* points = pool.data() + facet.first;
-    if (facet.fill != 0) {
-      // Only ever a triangle from the mesh or a quad from a wall, both convex.
-      if (facet.count == 3)
-        list->AddTriangleFilled(points[0], points[1], points[2], facet.fill);
-      else
-        list->AddQuadFilled(points[0], points[1], points[2], points[3], facet.fill);
-    }
-    if (facet.edge != 0)
-      list->AddPolyline(points, static_cast<int>(facet.count), facet.edge,
-                        facet.count > 2 ? ImDrawFlags_Closed : ImDrawFlags_None,
-                        1.0f);
+  // And the models over the finished stack, sorted among themselves alone.
+  if (app.stack_models != StackModels::None) {
+    std::vector<Facet> model_facets;
+    std::vector<ImVec2> model_pool;
+    append_models(app, app.stack_models, model_facets, model_pool, projection,
+                  light, spacing,
+                  app.job.operations.empty()
+                      ? 32
+                      : app.job.operations[std::clamp(
+                                app.selected_operation, 0,
+                                static_cast<int>(app.job.operations.size()) - 1)]
+                            .slice_grid);
+    paint_facets(list, model_facets, model_pool);
   }
-  list->Flags = saved_flags;
   // This view builds its own projection and canvas rather than going through
   // begin_scene, so the gizmo and the corner control are handed one made up on
   // the spot. Nothing else is ever read out of it.
@@ -1966,7 +1997,8 @@ void draw_result(App& app) {
 
   char caption[200];
   std::snprintf(caption, sizeof caption,
-                "%zu passes stacked, Z %.2f to %.2f mm   Left-drag: orbit   Wheel: zoom",
+                "%zu passes stacked, Z %.2f to %.2f mm   Drag: orbit   Right-drag: pan   "
+                "Wheel: zoom",
                 levels.size(), material_lowest, material_highest);
   list->AddText({top_left.x + 12.0f, top_left.y + 10.0f}, IM_COL32(130, 142, 158, 255),
                 caption);
@@ -2341,7 +2373,13 @@ void job_panel(App& app) {
   ImGui::EndDisabled();
   if (ImGui::Button("Load models")) load_meshes(app);
   ImGui::SameLine();
-  if (ImGui::Button("Fit view")) app.view.needs_fit = true;
+  if (ImGui::Button("Fit view")) {
+    app.view.needs_fit = true;
+    // The 3D views frame themselves, so there is nothing to fit there -- but a
+    // view panned off into the corner is exactly as lost as one badly zoomed,
+    // and this is the button to reach for.
+    app.orbit.pan = ImVec2(0.0f, 0.0f);
+  }
 
   origin_panel(app);
 

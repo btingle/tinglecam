@@ -238,6 +238,15 @@ and classified boundary contacts are available there as separate overlays.
 Node areas use the same fill path as simulated stock, with an opaque darkened
 version of the node colour beneath a bright boundary outline.
 
+Every view takes the same three gestures: left-drag orbits (the flat pass view,
+having nothing to orbit, ignores it), right-drag pans, and the wheel zooms. Pan
+is in pixels and is not divided by the zoom, so a drag moves what is under the
+pointer by the distance the pointer moved; the wheel scales the pan with it, so
+zooming after panning scales the picture about the middle of the canvas instead
+of about a centre that panning has pushed off the edge. **Fit view** also
+recentres the 3D views, which frame themselves but can still be panned into a
+corner.
+
 The stacked result follows playback by default and draws the active cutter as
 a translucent flute-length cylinder at its commanded XYZ position. Retracts,
 clearance-plane traversals, verified clear descents, unresolved plunges, and
@@ -248,12 +257,17 @@ Turning **Stock follows the cutter** off shows the completed result instead.
 
 A button in its corner cycles the loaded models over the stack -- none, part,
 blank, both -- so where the passes still stand proud of the finished shape can
-be read directly rather than inferred. The models go into the same depth sort
-as the passes, not over the top of them, or a wall standing in front of the
-part would be painted behind it. The part is drawn warm where every pass is
-cool: the plan view's blue would be the consistent choice and is the wrong one,
-being within a shade of the colour the passes already carry, and telling the
-two apart is the entire question the overlay answers.
+be read directly rather than inferred. It is an overlay: the models are sorted
+among themselves and drawn after the stack, not sorted into it. A simulated
+pass wall and the part surface it was cut to occupy the same place to within a
+rounding, so a shared sort has no real answer for which is in front and decides
+per facet on centroid depth; the two then interleave and the overlay speckles
+and crawls as the view turns. Nothing the overlay is for needs the model
+occluded by the stack, so it goes on top, and being see-through is what lets
+the stack be read through it. The part is drawn warm where every pass is cool:
+the plan view's blue would be the consistent choice and is the wrong one, being
+within a shade of the colour the passes already carry, and telling the two
+apart is the entire question the overlay answers.
 
 Each pass but the first opens with the rapid that carries the cutter from where
 the previous pass lifted off to where this one starts, on the clearance plane.
