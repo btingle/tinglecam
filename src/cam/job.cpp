@@ -778,7 +778,10 @@ void plan_toolpaths(OperationPlan& plan,
         level.toolpath = wave::build_toolpath(
             level.wave, level.lineage, radius, level.floor_z,
             rapid_plane, rapid_feed(machine), no_engagement_feed,
-            rapid_feed_z(machine));
+            rapid_feed_z(machine),
+            index < plan.inter_layer.layers.size()
+                ? &plan.inter_layer.layers[index]
+                : nullptr);
         plan.metrics.toolpath_milliseconds +=
             elapsed_milliseconds(toolpath_start);
         if (operation.rough_boundary_cleanup && !level.part_slice.empty() &&

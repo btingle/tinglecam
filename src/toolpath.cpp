@@ -231,7 +231,8 @@ bool cutter_sweep_intersects_stock(const LeadingFront& front,
 Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage,
                         double tool_radius, double floor_z,
                         double rapid_plane, double rapid_feed,
-                        double traversal_feed, double rapid_feed_z) {
+                        double traversal_feed, double rapid_feed_z,
+                        const LayerTopology* existing_topology) {
   Toolpath toolpath;
   if (lineage.generations.empty()) return toolpath;
   if (lineage.generations.size() != wave.generations.size())
@@ -241,7 +242,12 @@ Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage,
       !std::isfinite(rapid_feed_z) ||
       !std::isfinite(floor_z) || !std::isfinite(rapid_plane))
     throw std::invalid_argument("Toolpath routing feeds and heights are invalid");
-  const LayerTopology layer_topology = build_layer_topology(lineage);
+  LayerTopology built_topology;
+  if (!existing_topology) built_topology = build_layer_topology(lineage);
+  const LayerTopology& layer_topology =
+      existing_topology ? *existing_topology : built_topology;
+  if (layer_topology.front_nodes.size() != lineage.generations.size())
+    throw std::invalid_argument("Layer topology and lineage do not match");
 
   // Link tests are run against offset output on the integer grid, so they need
   // the same order of slack the lineage uses when matching fronts.

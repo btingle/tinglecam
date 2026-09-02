@@ -102,7 +102,10 @@ Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage,
                         double rapid_feed = 2000.0,
                         double traversal_feed = 1000.0,
                         // Zero uses `rapid_feed` for the vertical too.
-                        double rapid_feed_z = 0.0);
+                        double rapid_feed_z = 0.0,
+                        // Reuse topology already built for inter-layer
+                        // association when the caller has it.
+                        const LayerTopology* existing_topology = nullptr);
 
 // Resamples every uninterrupted at-depth cutting path at a uniform travelled
 // distance. Original micro-vertices are not retained; motion-type changes are
