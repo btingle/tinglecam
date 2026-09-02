@@ -773,7 +773,6 @@ void plan_toolpaths(OperationPlan& plan,
   const double no_engagement_feed = setup.no_engagement_feed;
   const double span = std::max(progress_to - progress_from, 0.0);
   std::vector<std::string> level_failures;
-  std::size_t level_index = 0;
 
   // Toolpaths first, for every depth, and only then the seams between them.
   // Deciding how the cutter gets from one pass to the next takes both passes in
@@ -783,8 +782,10 @@ void plan_toolpaths(OperationPlan& plan,
   // which is what keeps a transition an ordinary part of the pass it belongs to
   // rather than motion that nothing ever checks.
   const double build_share = 0.7;
-  for (LevelPlan& level : plan.levels) {
-    const std::size_t index = level_index++;
+  std::vector<std::size_t> toolpath_levels;
+  toolpath_levels.reserve(plan.levels.size());
+  for (std::size_t index = 0; index < plan.levels.size(); ++index) {
+    LevelPlan& level = plan.levels[index];
     if (level.nothing_to_cut) continue;
     if (progress) {
       const double fraction =
@@ -796,13 +797,19 @@ void plan_toolpaths(OperationPlan& plan,
         return;
       }
     }
+    toolpath_levels.push_back(index);
+  }
+
+  std::vector<std::exception_ptr> toolpath_errors(plan.levels.size());
+  const auto toolpath_start = PlanningClock::now();
+  parallel_for_levels(toolpath_levels, [&](std::size_t index) {
+    LevelPlan& level = plan.levels[index];
     try {
       // A depth the part does not reach is cleared rather than finished, in
       // either mode: see the wavefront stage, which is where the wave for it
       // was built.
       const bool clearing = level.part_slice.empty();
       if (operation.mode == OperationMode::ContourFinishing && !clearing) {
-        const auto toolpath_start = PlanningClock::now();
         const wave::Paths64 keep_out =
             level.part_slice.empty()
                 ? absent_subject(level.stock_slice)
@@ -827,15 +834,8 @@ void plan_toolpaths(OperationPlan& plan,
         traversal.rapid_plane = rapid_plane;
         level.toolpath = wave::plan_traversal(tasks, traversal).toolpath;
         level.toolpath.cleared = travelable;
-        plan.metrics.toolpath_milliseconds +=
-            elapsed_milliseconds(toolpath_start);
-        if (level.toolpath.moves.empty()) {
-          level.nothing_to_cut = true;
-          continue;
-        }
       }
       if (operation.mode == OperationMode::Roughing || clearing) {
-        const auto toolpath_start = PlanningClock::now();
         level.toolpath = wave::build_toolpath(
             level.wave, level.lineage, radius, level.floor_z,
             rapid_plane, rapid_feed(machine), no_engagement_feed,
@@ -843,70 +843,99 @@ void plan_toolpaths(OperationPlan& plan,
             index < plan.inter_layer.layers.size()
                 ? &plan.inter_layer.layers[index]
                 : nullptr);
-        plan.metrics.toolpath_milliseconds +=
-            elapsed_milliseconds(toolpath_start);
-        if (operation.rough_boundary_cleanup && !level.part_slice.empty() &&
-            !level.wave.reached_generations.empty()) {
-          const auto cleanup_start = PlanningClock::now();
-          // Only where the wave got. A cleanup contour runs along the part at
-          // the same offset the wave was bounded by, so where the wave never
-          // reached -- a pocket whose only entry was declined, or one nothing
-          // can get into -- the contour is a cut through solid stock that
-          // nothing roughed. Clipping to the reached region drops those and
-          // trims the partly reached ones to the part that was.
-          //
-          // The contour lies exactly on the reached region's inner boundary,
-          // both being the same slice offset by the same distance, so the test
-          // has to allow the slack the two roundings differ by. Without it a
-          // contour fails against the region it is drawn on.
-          wave::Paths64 clip = Clipper2Lib::InflatePaths(
-              level.wave.reached_generations.back(),
-              wave::boundary_slack(setup.stepover), Clipper2Lib::JoinType::Miter,
-              Clipper2Lib::EndType::Polygon);
-          if (operation.clip_contours_to_stock)
-            clip = Clipper2Lib::Intersect(clip, level.stock_slice,
-                                          Clipper2Lib::FillRule::NonZero);
-          const auto contours = derive_offset_contours(
-              level.part_slice, radius + operation.radial_stock_to_leave, &clip);
-          auto tasks = contour_traversal_tasks(contours,
-                                               operation.contour_direction);
-          add_safe_stock_approaches(tasks, level.stock_slice,
-                                    level.wave.subject, radius);
-          wave::TraversalSettings traversal;
-          traversal.allow_stay_down = true;
-          // What the pass has cleared, which is the space beside the stock as
-          // well as the material the wave took out. The reached region on its
-          // own stops at the stock wall, so a cleanup contour ending on that
-          // wall could not be joined to the next one round the outside.
-          traversal.stay_down_region = level.toolpath.cleared;
-          traversal.stay_down_slack = link_slack(setup.stepover);
-          traversal.cutting_feed = no_engagement_feed;
-          traversal.rapid_feed = rapid_feed(machine);
-          traversal.rapid_feed_z = rapid_feed_z(machine);
-          traversal.floor_z = level.floor_z;
-          traversal.rapid_plane = rapid_plane;
-          if (!level.toolpath.moves.empty() &&
-              !level.toolpath.moves.back().path.empty())
-            traversal.initial_position = level.toolpath.moves.back().path.back();
-          traversal.prefer_stay_down_when_legal = true;
-          wave::Toolpath cleanup =
-              wave::plan_traversal(tasks, traversal).toolpath;
-          level.toolpath.moves.insert(level.toolpath.moves.end(),
-                                      cleanup.moves.begin(), cleanup.moves.end());
-          plan.metrics.cleanup_milliseconds +=
-              elapsed_milliseconds(cleanup_start);
-        }
       }
-      plan.metrics.toolpath_moves += level.toolpath.moves.size();
-      if (level.toolpath.moves.empty()) level.nothing_to_cut = true;
-    } catch (const std::exception& error) {
-      const std::string detail =
-          "Depth " + std::to_string(level.floor_z) +
-          " mm, toolpath: " + error.what();
-      level_failures.push_back(detail);
-      plan.warnings.push_back(detail);
-      level.nothing_to_cut = true;
+    } catch (...) {
+      toolpath_errors[index] = std::current_exception();
     }
+  });
+  plan.metrics.toolpath_milliseconds += elapsed_milliseconds(toolpath_start);
+
+  std::vector<std::size_t> cleanup_levels;
+  cleanup_levels.reserve(toolpath_levels.size());
+  for (const std::size_t index : toolpath_levels) {
+    LevelPlan& level = plan.levels[index];
+    if (toolpath_errors[index]) continue;
+    if (level.toolpath.moves.empty()) {
+      level.nothing_to_cut = true;
+      continue;
+    }
+    const bool clearing = level.part_slice.empty();
+    if ((operation.mode == OperationMode::Roughing || clearing) &&
+        operation.rough_boundary_cleanup && !level.part_slice.empty() &&
+        !level.wave.reached_generations.empty())
+      cleanup_levels.push_back(index);
+  }
+
+  const auto cleanup_start = PlanningClock::now();
+  parallel_for_levels(cleanup_levels, [&](std::size_t index) {
+    LevelPlan& level = plan.levels[index];
+    try {
+      // Only where the wave got. A cleanup contour runs along the part at
+      // the same offset the wave was bounded by, so where the wave never
+      // reached -- a pocket whose only entry was declined, or one nothing
+      // can get into -- the contour is a cut through solid stock that
+      // nothing roughed. Clipping to the reached region drops those and
+      // trims the partly reached ones to the part that was.
+      //
+      // The contour lies exactly on the reached region's inner boundary,
+      // both being the same slice offset by the same distance, so the test
+      // has to allow the slack the two roundings differ by. Without it a
+      // contour fails against the region it is drawn on.
+      wave::Paths64 clip = Clipper2Lib::InflatePaths(
+          level.wave.reached_generations.back(),
+          wave::boundary_slack(setup.stepover), Clipper2Lib::JoinType::Miter,
+          Clipper2Lib::EndType::Polygon);
+      if (operation.clip_contours_to_stock)
+        clip = Clipper2Lib::Intersect(clip, level.stock_slice,
+                                      Clipper2Lib::FillRule::NonZero);
+      const auto contours = derive_offset_contours(
+          level.part_slice, radius + operation.radial_stock_to_leave, &clip);
+      auto tasks =
+          contour_traversal_tasks(contours, operation.contour_direction);
+      add_safe_stock_approaches(tasks, level.stock_slice, level.wave.subject,
+                                radius);
+      wave::TraversalSettings traversal;
+      traversal.allow_stay_down = true;
+      // What the pass has cleared, which is the space beside the stock as
+      // well as the material the wave took out. The reached region on its
+      // own stops at the stock wall, so a cleanup contour ending on that
+      // wall could not be joined to the next one round the outside.
+      traversal.stay_down_region = level.toolpath.cleared;
+      traversal.stay_down_slack = link_slack(setup.stepover);
+      traversal.cutting_feed = no_engagement_feed;
+      traversal.rapid_feed = rapid_feed(machine);
+      traversal.rapid_feed_z = rapid_feed_z(machine);
+      traversal.floor_z = level.floor_z;
+      traversal.rapid_plane = rapid_plane;
+      if (!level.toolpath.moves.empty() &&
+          !level.toolpath.moves.back().path.empty())
+        traversal.initial_position = level.toolpath.moves.back().path.back();
+      traversal.prefer_stay_down_when_legal = true;
+      wave::Toolpath cleanup = wave::plan_traversal(tasks, traversal).toolpath;
+      level.toolpath.moves.insert(level.toolpath.moves.end(),
+                                  cleanup.moves.begin(), cleanup.moves.end());
+    } catch (...) {
+      toolpath_errors[index] = std::current_exception();
+    }
+  });
+  plan.metrics.cleanup_milliseconds += elapsed_milliseconds(cleanup_start);
+
+  for (const std::size_t index : toolpath_levels) {
+    LevelPlan& level = plan.levels[index];
+    if (toolpath_errors[index]) {
+      try {
+        std::rethrow_exception(toolpath_errors[index]);
+      } catch (const std::exception& error) {
+        const std::string detail =
+            "Depth " + std::to_string(level.floor_z) +
+            " mm, toolpath: " + error.what();
+        level_failures.push_back(detail);
+        plan.warnings.push_back(detail);
+      }
+      level.nothing_to_cut = true;
+      continue;
+    }
+    plan.metrics.toolpath_moves += level.toolpath.moves.size();
   }
 
   const auto stitching_start = PlanningClock::now();
