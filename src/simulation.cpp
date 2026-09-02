@@ -19,6 +19,13 @@ Paths64 normalized(const Paths64& paths) {
   return Union(paths, FillRule::NonZero);
 }
 
+// Clipper Boolean operations already return non-overlapping, correctly
+// oriented rings. Summing those signed rings accounts for holes directly; a
+// second union would only rerun the scanline engine over the same solution.
+double boolean_result_area(const Paths64& paths) {
+  return std::abs(Area(paths)) / (kIntegerScale * kIntegerScale);
+}
+
 Paths64 tool_sweep(const Point64& from, const Point64& to, double radius) {
   if (from == to)
     return Paths64{Ellipse(from, radius, radius, 48)};
@@ -117,8 +124,8 @@ SimulationResult simulate_material(const Paths64& raw_stock,
               Intersect(remaining, step.sweep, FillRule::NonZero);
           const Paths64 gouge = Intersect(removed, result.final_subject,
                                          FillRule::NonZero);
-          step.removed_area = material_area(removed);
-          step.gouge_area = material_area(gouge);
+          step.removed_area = boolean_result_area(removed);
+          step.gouge_area = boolean_result_area(gouge);
           step.load = step.removed_area /
                       (2.0 * tool_radius * step_length);
           result.stats.maximum_load =
@@ -163,10 +170,10 @@ SimulationResult simulate_material(const Paths64& raw_stock,
   result.gouged_subject = normalized(gouges);
   result.excess_material = Difference(remaining, result.final_subject,
                                       FillRule::NonZero);
-  result.stats.initial_stock_area = material_area(result.initial_stock);
-  result.stats.removed_area = material_area(result.removed_material);
-  result.stats.remaining_area = material_area(result.remaining_stock);
-  result.stats.excess_area = material_area(result.excess_material);
+  result.stats.initial_stock_area = boolean_result_area(result.initial_stock);
+  result.stats.removed_area = boolean_result_area(result.removed_material);
+  result.stats.remaining_area = boolean_result_area(result.remaining_stock);
+  result.stats.excess_area = boolean_result_area(result.excess_material);
   result.stats.gouge_area = material_area(result.gouged_subject);
   return result;
 }
