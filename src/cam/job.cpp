@@ -3,11 +3,13 @@
 #include "routing.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 
 namespace cam {
 namespace {
@@ -853,15 +855,14 @@ void plan_toolpaths(OperationPlan& plan,
   plan.metrics.stitching_milliseconds +=
       elapsed_milliseconds(stitching_start);
 
-  // ---- Simulation and feeds ---------------------------------------------
-  // Where the previous pass left the cutter, and how high. Passes with nothing
-  // to cut are skipped by the post and by playback alike, so they do not move
-  // the cutter and do not update this.
-  PassLink link;
-  link.from_z = rapid_plane;
-  level_index = 0;
-  for (LevelPlan& level : plan.levels) {
-    const std::size_t index = level_index++;
+  // ---- Resampling --------------------------------------------------------
+  // Normalize every path before simulation. This remains ordered so progress
+  // callbacks run only on the coordinator thread and cancellation never races
+  // a geometry worker.
+  std::vector<std::size_t> simulated_levels;
+  simulated_levels.reserve(plan.levels.size());
+  for (std::size_t index = 0; index < plan.levels.size(); ++index) {
+    LevelPlan& level = plan.levels[index];
     if (level.nothing_to_cut) continue;
     if (progress) {
       const double fraction =
@@ -875,7 +876,6 @@ void plan_toolpaths(OperationPlan& plan,
       }
     }
     try {
-      link.stay_down_after = level.stays_down_after;
       const auto resampling_start = PlanningClock::now();
       level.toolpath =
           wave::resample_toolpath(level.toolpath, operation.path_pitch);
@@ -897,20 +897,86 @@ void plan_toolpaths(OperationPlan& plan,
       }
       plan.metrics.resampling_milliseconds +=
           elapsed_milliseconds(resampling_start);
-      const wave::Paths64 final_subject =
-          level.part_slice.empty() ? level.wave.subject : level.part_slice;
-      const auto simulation_start = PlanningClock::now();
-      level.simulation = wave::simulate_material(
-          level.stock_slice, final_subject, level.toolpath, radius,
-          operation.simulation_stock_inflation);
-      plan.metrics.simulation_milliseconds +=
-          elapsed_milliseconds(simulation_start);
-      plan.metrics.simulation_intervals +=
-          level.simulation.stats.cutting_steps;
-      plan.metrics.empty_simulation_intervals +=
-          level.simulation.stats.empty_cutting_steps;
-      plan.metrics.gouge_bounds_rejections +=
-          level.simulation.stats.gouge_bounds_rejections;
+      simulated_levels.push_back(index);
+    } catch (const std::exception& error) {
+      const std::string detail =
+          "Depth " + std::to_string(level.floor_z) +
+          " mm, simulation or feeds: " + error.what();
+      level_failures.push_back(detail);
+      plan.warnings.push_back(detail);
+      level.nothing_to_cut = true;
+    }
+  }
+
+  // ---- Simulation --------------------------------------------------------
+  // Depths have independent stock slices and toolpaths. A small fixed bound
+  // captures the available parallelism without multiplying the transient
+  // Clipper working set by the number of levels in a deep job.
+  std::vector<std::exception_ptr> simulation_errors(plan.levels.size());
+  const auto simulation_start = PlanningClock::now();
+  if (!simulated_levels.empty()) {
+    std::atomic<std::size_t> next{0};
+    const std::size_t workers =
+        std::min<std::size_t>(4, simulated_levels.size());
+    std::vector<std::thread> threads;
+    threads.reserve(workers);
+    for (std::size_t worker = 0; worker < workers; ++worker) {
+      threads.emplace_back([&] {
+        for (;;) {
+          const std::size_t work = next.fetch_add(1, std::memory_order_relaxed);
+          if (work >= simulated_levels.size()) return;
+          const std::size_t index = simulated_levels[work];
+          LevelPlan& level = plan.levels[index];
+          try {
+            const wave::Paths64& final_subject =
+                level.part_slice.empty() ? level.wave.subject : level.part_slice;
+            level.simulation = wave::simulate_material(
+                level.stock_slice, final_subject, level.toolpath, radius,
+                operation.simulation_stock_inflation);
+          } catch (...) {
+            simulation_errors[index] = std::current_exception();
+          }
+        }
+      });
+    }
+    for (std::thread& thread : threads) thread.join();
+  }
+  plan.metrics.simulation_milliseconds +=
+      elapsed_milliseconds(simulation_start);
+
+  for (const std::size_t index : simulated_levels) {
+    LevelPlan& level = plan.levels[index];
+    if (simulation_errors[index]) {
+      try {
+        std::rethrow_exception(simulation_errors[index]);
+      } catch (const std::exception& error) {
+        const std::string detail =
+            "Depth " + std::to_string(level.floor_z) +
+            " mm, simulation or feeds: " + error.what();
+        level_failures.push_back(detail);
+        plan.warnings.push_back(detail);
+      }
+      level.nothing_to_cut = true;
+      continue;
+    }
+    plan.metrics.simulation_intervals +=
+        level.simulation.stats.cutting_steps;
+    plan.metrics.empty_simulation_intervals +=
+        level.simulation.stats.empty_cutting_steps;
+    plan.metrics.gouge_bounds_rejections +=
+        level.simulation.stats.gouge_bounds_rejections;
+  }
+
+  // ---- Feeds -------------------------------------------------------------
+  // Feed schedules carry the previous pass position and height, so linking is
+  // intentionally restored in level order after all independent simulations.
+  PassLink link;
+  link.from_z = rapid_plane;
+  for (const std::size_t index : simulated_levels) {
+    LevelPlan& level = plan.levels[index];
+    if (level.nothing_to_cut) continue;
+    try {
+      link.stay_down_after = level.stays_down_after;
       const auto feeds_start = PlanningClock::now();
       level.feeds = plan_feeds(level.toolpath, level.simulation, machine,
                                full_engagement_feed, no_engagement_feed,
