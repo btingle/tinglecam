@@ -29,6 +29,12 @@ struct SimulatedMove {
   bool entry_unresolved = false;
 };
 
+struct SimulationCheckpoint {
+  // Number of complete toolpath moves already reflected in remaining_stock.
+  std::size_t moves_completed = 0;
+  Paths64 remaining_stock;
+};
+
 struct SimulationStats {
   double initial_stock_area = 0.0;
   double removed_area = 0.0;
@@ -52,9 +58,9 @@ struct SimulationResult {
   Paths64 gouged_subject;
   Paths64 excess_material;
   std::vector<SimulatedMove> moves;
-  // Snapshot after every complete toolpath move. This makes animated playback
-  // require only the current move's boolean operations.
-  std::vector<Paths64> remaining_after_move;
+  // Periodic full-stock snapshots. Playback reconstructs the few completed
+  // moves after the nearest checkpoint from their stored step endpoints.
+  std::vector<SimulationCheckpoint> checkpoints;
   double tool_radius = 0.0;
   double stock_inflation = 0.0;
   SimulationStats stats;

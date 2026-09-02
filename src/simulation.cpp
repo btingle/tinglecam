@@ -3,12 +3,15 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <iterator>
 #include <stdexcept>
 
 namespace wave {
 namespace {
 
 using namespace Clipper2Lib;
+
+constexpr std::size_t kCheckpointMoveStride = 4;
 
 bool engaged(MoveKind kind) {
   return kind == MoveKind::Cut || kind == MoveKind::Step ||
@@ -96,7 +99,7 @@ SimulationResult simulate_material(const Paths64& raw_stock,
   Paths64 gouges;
   const Rect64 final_subject_bounds = GetBounds(result.final_subject);
   result.moves.resize(toolpath.moves.size());
-  result.remaining_after_move.reserve(toolpath.moves.size());
+  result.checkpoints.reserve(toolpath.moves.size() / kCheckpointMoveStride);
 
   for (std::size_t move_index = 0; move_index < toolpath.moves.size(); ++move_index) {
     const ToolpathMove& move = toolpath.moves[move_index];
@@ -168,7 +171,8 @@ SimulationResult simulate_material(const Paths64& raw_stock,
       ++result.stats.unresolved_entries;
     }
 
-    result.remaining_after_move.push_back(remaining);
+    if ((move_index + 1) % kCheckpointMoveStride == 0)
+      result.checkpoints.push_back({move_index + 1, remaining});
   }
 
   result.remaining_stock = remaining;
@@ -190,16 +194,34 @@ Paths64 simulation_stock_at(const SimulationResult& simulation,
                             double distance) {
   if (simulation.initial_stock.empty() || toolpath.moves.empty())
     return simulation.initial_stock;
-  if (simulation.moves.size() != toolpath.moves.size() ||
-      simulation.remaining_after_move.size() != toolpath.moves.size())
+  if (simulation.moves.size() != toolpath.moves.size())
     throw std::invalid_argument("Simulation and toolpath moves do not match");
 
   const ToolpathCursor cursor = toolpath_at(toolpath, distance);
-  Paths64 remaining = cursor.move == 0
-                          ? simulation.initial_stock
-                          : simulation.remaining_after_move[cursor.move - 1];
-  const SimulatedMove& move = simulation.moves[cursor.move];
   const double radius_integer = static_cast<double>(to_integer(simulation.tool_radius));
+  Paths64 remaining = simulation.initial_stock;
+  std::size_t first_move = 0;
+  for (auto checkpoint = simulation.checkpoints.rbegin();
+       checkpoint != simulation.checkpoints.rend(); ++checkpoint) {
+    if (checkpoint->moves_completed > cursor.move) continue;
+    remaining = checkpoint->remaining_stock;
+    first_move = checkpoint->moves_completed;
+    break;
+  }
+
+  Paths64 completed_sweeps;
+  for (std::size_t move_index = first_move; move_index < cursor.move;
+       ++move_index)
+    for (const MaterialStep& step : simulation.moves[move_index].steps) {
+      Paths64 sweep = tool_sweep(step.from, step.to, radius_integer);
+      completed_sweeps.insert(completed_sweeps.end(),
+                              std::make_move_iterator(sweep.begin()),
+                              std::make_move_iterator(sweep.end()));
+    }
+  if (!completed_sweeps.empty())
+    remaining = Difference(remaining, completed_sweeps, FillRule::NonZero);
+
+  const SimulatedMove& move = simulation.moves[cursor.move];
   for (const auto& step : move.steps) {
     if (cursor.move_distance <= step.move_distance_begin) break;
     if (cursor.move_distance >= step.move_distance_end) {
