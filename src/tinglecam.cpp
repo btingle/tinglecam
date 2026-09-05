@@ -37,15 +37,15 @@ using Clipper2Lib::Point64;
 
 // The control column. Everything in it is laid out against this, so widening
 // the panel widens the widgets and their labels together.
-constexpr float kSidebarWidth = 520.0f;
+constexpr float kLeftPanelWidth = 440.0f;
+constexpr float kRightPanelWidth = 480.0f;
 
 // ---------------------------------------------------------------------------
 // Background planning
 // ---------------------------------------------------------------------------
 
 // Planning a job of any size takes long enough that doing it on the frame
-// thread would freeze the window, and finding the entry fronts has to slice the
-// models, which is no faster. Both run on their own thread and report back
+// thread would freeze the window. It runs on its own thread and reports back
 // through here. Everything the worker touches is either atomic or under the
 // mutex; the result itself is handed over once, at the end.
 //
@@ -131,10 +131,6 @@ class Background {
 // ---------------------------------------------------------------------------
 
 enum class Colouring { Feed, Limit, Load, Move };
-// The three stages the workflow runs through. Setup and Entries are choices
-// made before there is a toolpath to look at; Pass and Result are the two views
-// of one that exists.
-enum class ViewMode { Setup, Entries, Plan, Result };
 
 // Which body the plan view draws. The stock encloses the part, so showing both
 // means showing the stock through, not showing it on top.
@@ -214,14 +210,6 @@ struct App {
   bool has_plan = false;
 
   Background<cam::JobPlan> planner;
-  // The entry fronts on offer, and the blank they stand on. Found without
-  // planning anything, so declining one costs a click and not a propagation.
-  Background<cam::EntryDiscovery> scout;
-  cam::EntryDiscovery discovery;
-  // What the list in hand was found for, and what the run in flight will make
-  // it. Empty means nothing has been found yet.
-  std::string discovery_signature;
-  std::string discovery_pending;
   std::string banner;
   bool banner_is_error = false;
 
@@ -231,8 +219,6 @@ struct App {
   int selected_level = 0;
   int selected_plan_operation = 0;
   Colouring colouring = Colouring::Feed;
-  ViewMode mode = ViewMode::Setup;
-  int hovered_entry = -1;
   // Set from the command line so a screenshot can be told which view to take.
   int force_tab = -1;
   bool show_stock = true;
@@ -338,6 +324,21 @@ Paths64 thinned(const Paths64& paths, double spacing) {
 // rings, which is what both the triangulator and the difference below need.
 Paths64 drawable_region(const Paths64& region, double spacing) {
   return Clipper2Lib::Union(thinned(region, spacing), Clipper2Lib::FillRule::NonZero);
+}
+
+// A difference between two independently sampled versions of a nominally
+// coincident curve can still contain a few integer-grid crumbs. They are far
+// below the detail this view retains, but a mixture of tiny outer and hole
+// rings can make the triangulator reject the whole otherwise-empty surface.
+Paths64 drawable_surface(const Paths64& region, double spacing) {
+  const double integer_scale2 = wave::kIntegerScale * wave::kIntegerScale;
+  const double minimum_area = spacing * spacing * 0.25 * integer_scale2;
+  Paths64 visible;
+  visible.reserve(region.size());
+  for (const auto& ring : region)
+    if (std::abs(Clipper2Lib::Area(ring)) >= minimum_area)
+      visible.push_back(ring);
+  return drawable_region(visible, spacing);
 }
 
 // The same region cut into triangles by Clipper2's constrained Delaunay.
@@ -561,19 +562,27 @@ void advance_playback(App& app, double seconds) {
       continue;
     }
     int operation = app.selected_plan_operation + 1;
-    while (operation < static_cast<int>(app.plan.operations.size()) &&
-           app.plan.operations[operation].levels.empty())
+    while (operation < static_cast<int>(app.plan.operations.size())) {
+      const auto& next_levels = app.plan.operations[operation].levels;
+      int first_cut = 0;
+      while (first_cut < static_cast<int>(next_levels.size()) &&
+             next_levels[first_cut].nothing_to_cut)
+        ++first_cut;
+      if (first_cut < static_cast<int>(next_levels.size())) {
+        app.selected_plan_operation = operation;
+        app.selected_operation = operation;
+        app.selected_level = first_cut;
+        app.playback.distance = 0.0;
+        app.playback.motion_seconds = 0.0;
+        refresh_material(app);
+        break;
+      }
       ++operation;
-    if (operation < static_cast<int>(app.plan.operations.size())) {
-      app.selected_plan_operation = operation;
-      app.selected_level = 0;
-      app.playback.distance = 0.0;
-      app.playback.motion_seconds = 0.0;
-      refresh_material(app);
-      continue;
     }
-    app.playback.playing = false;
-    return;
+    if (operation >= static_cast<int>(app.plan.operations.size())) {
+      app.playback.playing = false;
+      return;
+    }
   }
 }
 
@@ -1548,141 +1557,6 @@ void draw_setup(App& app) {
 }
 
 // ---------------------------------------------------------------------------
-// Stage 2: which entry fronts the wave may start from.
-
-// Distinct hues per entry, so an option in the list and its territory in the
-// stack are recognisably the same thing.
-void entry_colour(std::size_t index, bool muted, bool highlighted,
-                  float wall[3], float face[3], ImU32& edge) {
-  static const float palette[][3] = {
-      {0.30f, 0.62f, 0.88f}, {0.94f, 0.62f, 0.30f}, {0.42f, 0.80f, 0.52f},
-      {0.86f, 0.44f, 0.70f}, {0.70f, 0.60f, 0.92f}, {0.90f, 0.82f, 0.36f},
-  };
-  const float* base = palette[index % (sizeof palette / sizeof palette[0])];
-  const float lift = highlighted ? 1.22f : 1.0f;
-  for (int i = 0; i < 3; ++i) {
-    // A declined entry keeps its hue but loses its colour, so the stack still
-    // reads as one object rather than going dark in patches.
-    const float grey = 0.34f;
-    face[i] = muted ? grey + (base[i] - grey) * 0.12f
-                    : std::min(base[i] * lift, 1.0f);
-    wall[i] = face[i] * 0.78f;
-  }
-  edge = muted ? IM_COL32(120, 128, 140, 70)
-               : IM_COL32(static_cast<int>(std::min(base[0] * 300.0f, 255.0f)),
-                          static_cast<int>(std::min(base[1] * 300.0f, 255.0f)),
-                          static_cast<int>(std::min(base[2] * 300.0f, 255.0f)),
-                          highlighted ? 220 : 130);
-}
-
-void draw_entries(App& app) {
-  OrbitScene scene;
-  begin_scene(app, scene, "entries");
-  if (app.scout.running()) {
-    scene_message(scene, "Finding the entry fronts");
-    end_scene(scene);
-    return;
-  }
-  if (!app.discovery.error.empty()) {
-    scene_message(scene, app.discovery.error.c_str());
-    end_scene(scene);
-    return;
-  }
-  const std::vector<cam::EntryLevel>& levels = app.discovery.levels;
-  if (app.discovery.entries.empty() || levels.empty()) {
-    scene_message(scene, "This operation starts from no entry front");
-    end_scene(scene);
-    return;
-  }
-
-  Clipper2Lib::Rect64 extent;
-  bool any = false;
-  double lowest = 0.0;
-  double highest = 0.0;
-  for (const cam::EntryLevel& level : levels) {
-    if (level.stock_slice.empty()) continue;
-    const auto bounds = Clipper2Lib::GetBounds(level.stock_slice);
-    if (!any) {
-      extent = bounds;
-      lowest = level.floor_z;
-      highest = level.floor_z + level.axial_depth;
-      any = true;
-      continue;
-    }
-    extent.left = std::min(extent.left, bounds.left);
-    extent.right = std::max(extent.right, bounds.right);
-    extent.top = std::min(extent.top, bounds.top);
-    extent.bottom = std::max(extent.bottom, bounds.bottom);
-    lowest = std::min(lowest, level.floor_z);
-    highest = std::max(highest, level.floor_z + level.axial_depth);
-  }
-  if (!any) {
-    scene_message(scene, "The blank has nothing at these depths");
-    end_scene(scene);
-    return;
-  }
-  aim_scene(app, scene, extent, lowest, highest);
-
-  // The blank, as one plain solid. A pass gets a top face only where the pass
-  // above did not already roof it, or the walls come out banded like a contour
-  // map with a lid at every depth.
-  std::size_t untriangulated = 0;
-  for (std::size_t i = 0; i < levels.size(); ++i) {
-    const cam::EntryLevel& level = levels[i];
-    if (level.stock_slice.empty()) continue;
-    const Paths64 rings = drawable_region(level.stock_slice, scene.spacing);
-    if (rings.empty()) continue;
-    const Paths64 above =
-        i == 0 ? Paths64{} : drawable_region(levels[i - 1].stock_slice, scene.spacing);
-    const Paths64 lid_rings =
-        above.empty() ? rings
-                      : Clipper2Lib::Difference(rings, above,
-                                                Clipper2Lib::FillRule::NonZero);
-    const float wall[3]{0.26f, 0.29f, 0.34f};
-    const float face[3]{0.32f, 0.35f, 0.41f};
-    append_slab(scene.facets, scene.pool, rings,
-                fill_mesh(lid_rings, &untriangulated), lid_rings, level.floor_z,
-                level.floor_z + level.axial_depth, scene.projection, scene.light,
-                wall, face, IM_COL32(110, 122, 140, 60));
-  }
-
-  // Each entry front on the surface it actually occupies. A front is a stretch
-  // of wall the wave starts from, so it is a ribbon down the pass it belongs
-  // to, and the ribbons of one entry stack into a wall down its Z chain.
-  for (std::size_t option = 0; option < app.discovery.entries.size(); ++option) {
-    const cam::EntryOption& entry = app.discovery.entries[option];
-    const bool highlighted = static_cast<int>(option) == app.hovered_entry;
-    float wall[3];
-    float face[3];
-    ImU32 edge = 0;
-    entry_colour(option, entry.muted, highlighted, wall, face, edge);
-    const int alpha = entry.muted ? 120 : (highlighted ? 255 : 225);
-    for (const cam::EntryCurve& curve : entry.curves)
-      append_ribbon(scene.facets, scene.pool, curve.path, curve.closed,
-                    curve.bottom_z, curve.top_z, scene.projection, scene.light,
-                    face, alpha);
-  }
-  paint_scene(scene);
-  draw_origin_gizmo(app, scene);
-
-  char caption[220];
-  std::size_t live = 0;
-  for (const cam::EntryOption& entry : app.discovery.entries)
-    live += entry.muted ? 0 : 1;
-  std::snprintf(caption, sizeof caption,
-                "%zu of %zu entry front%s propagating   Drag: orbit   Right-drag: pan   "
-                "Wheel: zoom",
-                live, app.discovery.entries.size(),
-                app.discovery.entries.size() == 1 ? "" : "s");
-  scene.list->AddText({scene.top_left.x + 12.0f, scene.top_left.y + 10.0f},
-                      IM_COL32(130, 142, 158, 255), caption);
-  if (live == 0)
-    scene.list->AddText({scene.top_left.x + 12.0f, scene.top_left.y + 28.0f},
-                        IM_COL32(232, 156, 92, 255),
-                        "With every entry declined the wave has nowhere to start");
-  end_scene(scene);
-}
-
 // The loaded models, as a translucent sheet over a stack that has already been
 // painted. Into a facet list of their own, depth sorted on their own, and drawn
 // after: they are an overlay, not another body in the scene.
@@ -1895,19 +1769,21 @@ void draw_result(App& app) {
     // through, and the ones below it have not been touched.
     const Paths64* remaining = &level.simulation.remaining_stock;
     if (level.nothing_to_cut) {
-      remaining = &level.stock_slice;
+      remaining = &level.incoming_stock;
     } else if (app.stack_follows_playback) {
-      if (static_cast<int>(i) > app.selected_level) remaining = &level.stock_slice;
+      if (static_cast<int>(i) > app.selected_level)
+        remaining = &level.simulation.initial_stock;
       else if (static_cast<int>(i) == app.selected_level && !app.material.empty())
         remaining = &app.material;
     }
     if (!remaining->empty()) leftover[i] = remaining;
   }
 
-  // Thinned once each, before anything is compared: the rings arrive carrying
-  // thousands of vertices and every boolean below would otherwise pay for them
-  // on every frame. Two passes that leave the same stock thin to the same rings,
-  // so the difference between them still comes out exactly empty.
+  // The walls only need enough vertices for the current display scale. Keep the
+  // exact remaining-stock regions as the source for comparisons, though: two
+  // independently thinned versions of the same curved boundary can retain
+  // different vertices, and subtracting them creates clouds of microscopic
+  // slivers that are not real exposed material.
   std::vector<Paths64> outline(levels.size());
   for (std::size_t i = 0; i < levels.size(); ++i)
     if (leftover[i] != nullptr) outline[i] = drawable_region(*leftover[i], spacing);
@@ -1925,11 +1801,18 @@ void draw_result(App& app) {
     // Only the ring of material this pass exposes gets a top: the rest of it is
     // roofed by the pass above. A run of passes that all leave the same stock
     // then reads as one wall rather than a stack of coincident lids.
-    const Paths64 lid_rings =
-        i == 0 || outline[i - 1].empty()
-            ? walls
-            : Clipper2Lib::Difference(walls, outline[i - 1],
-                                      Clipper2Lib::FillRule::NonZero);
+    Paths64 lid_rings;
+    if (i == 0 || leftover[i - 1] == nullptr || leftover[i - 1]->empty()) {
+      lid_rings = walls;
+    } else if (*leftover[i] != *leftover[i - 1]) {
+      // Compare the canonical simulation geometry first, then reduce only the
+      // actual exposed surface to display resolution. Decimating both operands
+      // before Difference makes coincident curves disagree by sub-pixel wedges.
+      lid_rings = drawable_surface(
+          Clipper2Lib::Difference(*leftover[i], *leftover[i - 1],
+                                  Clipper2Lib::FillRule::NonZero),
+          spacing);
+    }
     const Paths64 lid_mesh = fill_mesh(lid_rings, &untriangulated);
 
     // Tinted by depth so the steps read apart even where two of them meet on a
@@ -2180,9 +2063,6 @@ void load_meshes(App& app) {
     if (app.geometry.work_range(low, high))
       say(app, "Loaded. Z runs " + std::to_string(low) + " to " + std::to_string(high));
     app.has_plan = false;
-    // The fronts belong to the models that were loaded, not to these.
-    app.discovery = {};
-    app.discovery_signature.clear();
   } catch (const std::exception& error) {
     say(app, error.what(), true);
   }
@@ -2394,40 +2274,172 @@ void job_panel(App& app) {
   text_field("Work offset", app.job.work_offset, 16);
 }
 
-void operations_panel(App& app) {
-  ImGui::SeparatorText("Operations");
-  if (app.job.operations.empty()) {
-    cam::Operation operation;
+cam::Operation make_operation(App& app, cam::OperationMode mode) {
+  cam::Operation operation;
+  operation.mode = mode;
+  operation.name = mode == cam::OperationMode::Roughing ? "Rough" : "Contour finish";
+  if (!app.job.operations.empty()) {
+    const cam::Operation& selected = app.job.operations[std::clamp(
+        app.selected_operation, 0,
+        static_cast<int>(app.job.operations.size()) - 1)];
+    operation.tool_id = selected.tool_id;
+    operation.machine_id = selected.machine_id;
+    operation.material_id = selected.material_id;
+    operation.depth_from = selected.depth_from;
+    operation.depth_to = selected.depth_to;
+  } else {
     if (!app.tools.tools.empty()) operation.tool_id = app.tools.tools.front().id;
     if (!app.machines.machines.empty())
       operation.machine_id = app.machines.machines.front().id;
     if (!app.materials.materials.empty())
       operation.material_id = app.materials.materials.front().id;
     depth_defaults(app, operation);
-    app.job.operations.push_back(operation);
+  }
+  if (mode == cam::OperationMode::ContourFinishing) {
+    operation.radial_stock_to_leave = 0.0;
+    operation.rough_boundary_cleanup = false;
   }
 
-  std::vector<const char*> names;
-  for (const auto& operation : app.job.operations) names.push_back(operation.name.c_str());
+  const std::string base = operation.name;
+  int suffix = 2;
+  const auto name_exists = [&](const std::string& name) {
+    return std::any_of(app.job.operations.begin(), app.job.operations.end(),
+                       [&](const cam::Operation& candidate) {
+                         return candidate.name == name;
+                       });
+  };
+  while (name_exists(operation.name))
+    operation.name = base + " " + std::to_string(suffix++);
+  return operation;
+}
+
+void select_operation(App& app, int index) {
+  if (app.job.operations.empty()) {
+    app.selected_operation = 0;
+    return;
+  }
+  index = std::clamp(index, 0,
+                     static_cast<int>(app.job.operations.size()) - 1);
+  app.selected_operation = index;
+  if (!app.has_plan || app.plan.operations.empty()) return;
+
+  app.selected_plan_operation = std::clamp(
+      index, 0, static_cast<int>(app.plan.operations.size()) - 1);
+  const auto& levels = app.plan.operations[app.selected_plan_operation].levels;
+  app.selected_level = 0;
+  while (app.selected_level < static_cast<int>(levels.size()) &&
+         levels[app.selected_level].nothing_to_cut)
+    ++app.selected_level;
+  if (app.selected_level >= static_cast<int>(levels.size()))
+    app.selected_level = 0;
+  app.playback.playing = false;
+  app.playback.distance = 0.0;
+  app.playback.motion_seconds = 0.0;
+  app.material.clear();
+  app.material_distance = -1.0;
+  app.material_level = -1;
+  app.material_operation = -1;
+  app.view.needs_fit = true;
+}
+
+void invalidate_plan(App& app) {
+  app.has_plan = false;
+  app.playback.playing = false;
+  app.gcode.clear();
+  app.post = {};
+  app.material.clear();
+  app.material_distance = -1.0;
+  app.material_level = -1;
+  app.material_operation = -1;
+}
+
+void feeds_panel(App& app);
+
+void operations_list_panel(App& app) {
+  ImGui::SeparatorText("Ordered operations");
+  if (app.job.operations.empty()) {
+    app.job.operations.push_back(
+        make_operation(app, cam::OperationMode::Roughing));
+  }
+
   app.selected_operation =
-      std::clamp(app.selected_operation, 0, static_cast<int>(names.size()) - 1);
-  ImGui::SetNextItemWidth(200.0f);
-  ImGui::Combo("##operation", &app.selected_operation, names.data(),
-               static_cast<int>(names.size()));
+      std::clamp(app.selected_operation, 0,
+                 static_cast<int>(app.job.operations.size()) - 1);
+  if (ImGui::BeginListBox("##operation-order", ImVec2(-FLT_MIN, 190.0f))) {
+    for (std::size_t i = 0; i < app.job.operations.size(); ++i) {
+      const cam::Operation& operation = app.job.operations[i];
+      const std::string label = std::to_string(i + 1) + ". " + operation.name +
+                                "  [" + cam::operation_mode_name(operation.mode) +
+                                "]##" + std::to_string(i);
+      if (ImGui::Selectable(label.c_str(),
+                            static_cast<int>(i) == app.selected_operation))
+        select_operation(app, static_cast<int>(i));
+    }
+    ImGui::EndListBox();
+  }
+
+  if (ImGui::Button("Add roughing")) {
+    invalidate_plan(app);
+    app.job.operations.push_back(
+        make_operation(app, cam::OperationMode::Roughing));
+    select_operation(app, static_cast<int>(app.job.operations.size()) - 1);
+  }
   ImGui::SameLine();
-  if (ImGui::Button("Add")) {
+  if (ImGui::Button("Add contour finish")) {
+    invalidate_plan(app);
+    app.job.operations.push_back(
+        make_operation(app, cam::OperationMode::ContourFinishing));
+    select_operation(app, static_cast<int>(app.job.operations.size()) - 1);
+  }
+  if (ImGui::Button("Duplicate")) {
+    invalidate_plan(app);
     cam::Operation copy = app.job.operations[app.selected_operation];
     copy.name += " copy";
-    app.job.operations.push_back(copy);
-    app.selected_operation = static_cast<int>(app.job.operations.size()) - 1;
+    app.job.operations.insert(app.job.operations.begin() + app.selected_operation + 1,
+                              std::move(copy));
+    select_operation(app, app.selected_operation + 1);
   }
   ImGui::SameLine();
-  ImGui::BeginDisabled(app.job.operations.size() < 2);
-  if (ImGui::Button("Remove")) {
-    app.job.operations.erase(app.job.operations.begin() + app.selected_operation);
-    app.selected_operation = 0;
+  ImGui::BeginDisabled(app.selected_operation == 0);
+  if (ImGui::Button("Move up")) {
+    invalidate_plan(app);
+    std::swap(app.job.operations[app.selected_operation],
+              app.job.operations[app.selected_operation - 1]);
+    select_operation(app, app.selected_operation - 1);
   }
   ImGui::EndDisabled();
+  ImGui::SameLine();
+  ImGui::BeginDisabled(
+      app.selected_operation + 1 >= static_cast<int>(app.job.operations.size()));
+  if (ImGui::Button("Move down")) {
+    invalidate_plan(app);
+    std::swap(app.job.operations[app.selected_operation],
+              app.job.operations[app.selected_operation + 1]);
+    select_operation(app, app.selected_operation + 1);
+  }
+  ImGui::EndDisabled();
+
+  ImGui::BeginDisabled(app.job.operations.size() < 2);
+  if (ImGui::Button("Remove")) {
+    invalidate_plan(app);
+    app.job.operations.erase(app.job.operations.begin() + app.selected_operation);
+    const int next = std::min(app.selected_operation,
+                              static_cast<int>(app.job.operations.size()) - 1);
+    app.selected_operation = -1;
+    select_operation(app, next);
+  }
+  ImGui::EndDisabled();
+  ImGui::TextWrapped(
+      "Operations run from top to bottom. Simulation stock is handed to each "
+      "operation from every operation above it.");
+}
+
+void operation_settings_panel(App& app) {
+  ImGui::SeparatorText("Selected operation");
+  if (app.job.operations.empty()) {
+    ImGui::TextDisabled("Add an operation first");
+    return;
+  }
 
   cam::Operation& operation = app.job.operations[app.selected_operation];
   text_field("Operation name", operation.name);
@@ -2437,18 +2449,21 @@ void operations_panel(App& app) {
   };
   enum_combo("Mode", operation.mode, cam::operation_mode_name, kModes,
              std::size(kModes));
-  static constexpr cam::ContourDirectionPolicy kDirections[]{
-      cam::ContourDirectionPolicy::Either,
-      cam::ContourDirectionPolicy::Climb,
-      cam::ContourDirectionPolicy::Conventional,
-  };
-  enum_combo("Contour direction", operation.contour_direction,
-             cam::contour_direction_name, kDirections,
-             std::size(kDirections));
-  ImGui::Checkbox("Clip contours to stock", &operation.clip_contours_to_stock);
-  if (operation.mode == cam::OperationMode::Roughing)
+  if (operation.mode == cam::OperationMode::ContourFinishing) {
+    static constexpr cam::ContourDirectionPolicy kDirections[]{
+        cam::ContourDirectionPolicy::Either,
+        cam::ContourDirectionPolicy::Climb,
+        cam::ContourDirectionPolicy::Conventional,
+    };
+    enum_combo("Contour direction", operation.contour_direction,
+               cam::contour_direction_name, kDirections,
+               std::size(kDirections));
+    ImGui::Checkbox("Clip contours to nominal stock",
+                    &operation.clip_contours_to_stock);
+  } else {
     ImGui::Checkbox("Boundary cleanup contour",
                     &operation.rough_boundary_cleanup);
+  }
 
   const auto pick = [&](const char* label, std::string& id, const auto& entries,
                         auto name_of) {
@@ -2506,42 +2521,49 @@ void operations_panel(App& app) {
       "Measured down from the top of the work -- the taller of the part and the "
       "blank -- so a blank standing proud of the part is faced off rather than "
       "left standing. Where the origin sits does not enter into it.");
-  ImGui::Checkbox("Lead in from the air", &operation.lead_in);
-  ImGui::SetItemTooltip(
-      "Seeds the wave outside the stock so the cutter arrives at the wall along "
-      "a path rather than at a standstill. Without it the first pass runs down "
-      "the stock wall itself and buries half the cutter.");
-  ImGui::BeginDisabled(!operation.lead_in);
-  ImGui::DragScalar("Stock oversize (mm)", ImGuiDataType_Double,
-                    &operation.stock_deviation, 0.01f);
-  ImGui::SetItemTooltip(
-      "How much larger than its model the blank may be. The run-in is placed so "
-      "the first pass to touch the stock aims for a full stepover less this, "
-      "which leaves that much headroom for an oversize blank.");
-  if (tool) {
-    const double bite = operation.stepover_ratio * tool->diameter;
-    const double first =
-        std::max(bite - std::clamp(operation.stock_deviation, 0.0, bite * 0.9), 0.0);
-    ImGui::TextDisabled("= target first bite %.3f mm, then %.3f mm", first, bite);
+  if (operation.mode == cam::OperationMode::Roughing) {
+    ImGui::Checkbox("Lead in from the air", &operation.lead_in);
+    ImGui::SetItemTooltip(
+        "Seeds the wave outside the stock so the cutter arrives at the wall along "
+        "a path rather than at a standstill. Without it the first pass runs down "
+        "the stock wall itself and buries half the cutter.");
+    ImGui::BeginDisabled(!operation.lead_in);
+    ImGui::DragScalar("Stock oversize (mm)", ImGuiDataType_Double,
+                      &operation.stock_deviation, 0.01f);
+    ImGui::SetItemTooltip(
+        "How much larger than its model the blank may be. The run-in is placed so "
+        "the first pass to touch the stock aims for a full stepover less this, "
+        "which leaves that much headroom for an oversize blank.");
+    if (tool) {
+      const double bite = operation.stepover_ratio * tool->diameter;
+      const double first = std::max(
+          bite - std::clamp(operation.stock_deviation, 0.0, bite * 0.9), 0.0);
+      ImGui::TextDisabled("= target first bite %.3f mm, then %.3f mm", first,
+                          bite);
+    }
+    ImGui::EndDisabled();
   }
-  ImGui::EndDisabled();
 
   ImGui::DragScalar("Simulation/feed pitch (mm)", ImGuiDataType_Double,
                     &operation.path_pitch, 0.01f);
   ImGui::SetItemTooltip(
       "The complete at-depth path is resampled at this travelled-distance "
       "interval before simulation and feed assignment.");
-  ImGui::DragScalar("Entry-front Z match (mm)", ImGuiDataType_Double,
-                    &operation.entry_front_match_tolerance, 0.01f);
-  ImGui::SetItemTooltip(
-      "The complete lower-layer entry curve must fit in this envelope around "
-      "the upper curve. Node-area Z matching remains exact.");
-  ImGui::DragScalar("Tiny split area (stepover^2)", ImGuiDataType_Double,
-                    &operation.tiny_split_area_factor, 0.01f);
-  ImGui::SetItemTooltip(
-      "A terminal split branch smaller than this multiple of stepover squared "
-      "stays in the wave but does not create a separate node. Zero disables "
-      "the filter.");
+  if (operation.mode == cam::OperationMode::Roughing) {
+    ImGui::DragScalar("Entry-front Z match (mm)", ImGuiDataType_Double,
+                      &operation.entry_front_match_tolerance, 0.01f);
+    ImGui::SetItemTooltip(
+        "The complete lower-layer entry curve must fit in this envelope around "
+        "the upper curve. Node-area Z matching remains exact.");
+    ImGui::DragScalar("Tiny split area (stepover^2)", ImGuiDataType_Double,
+                      &operation.tiny_split_area_factor, 0.01f);
+    ImGui::SetItemTooltip(
+        "A terminal split branch smaller than this multiple of stepover squared "
+        "stays in the wave but does not create a separate node. Zero disables "
+        "the filter.");
+  }
+
+  feeds_panel(app);
 }
 
 void feeds_panel(App& app) {
@@ -2570,75 +2592,6 @@ void feeds_panel(App& app) {
   ImGui::EndDisabled();
 }
 
-// Recomputes the entry options for the plan in hand, and remembers whether the
-// job is still waiting for a choice about them.
-// Everything an entry front depends on. Which entries are declined is not in
-// it: declining one drops its own seed piece and leaves the others exactly
-// where they were, so the list does not move when the choice does -- which is
-// the whole reason choosing costs nothing.
-std::string entry_signature(const cam::Operation& operation) {
-  char buffer[512];
-  std::snprintf(buffer, sizeof buffer,
-                "%s|%s|%s|%d|%d|%.9g|%.9g|%.9g|%.9g|%.9g|%.9g|%d|%.9g|%.9g",
-                operation.tool_id.c_str(), operation.machine_id.c_str(),
-                operation.material_id.c_str(), static_cast<int>(operation.mode),
-                operation.slice_grid, operation.stepover_ratio, operation.stepdown,
-                operation.radial_stock_to_leave, operation.axial_stock_to_leave,
-                operation.depth_from, operation.depth_to,
-                operation.lead_in ? 1 : 0,
-                operation.stock_deviation, operation.entry_front_match_tolerance);
-  return buffer;
-}
-
-// The operation whose entry fronts are on offer. Only one operation exists for
-// now, so this is simply the selected one.
-cam::Operation* selected_operation(App& app) {
-  if (app.job.operations.empty()) return nullptr;
-  const int index = std::clamp(app.selected_operation, 0,
-                               static_cast<int>(app.job.operations.size()) - 1);
-  return &app.job.operations[index];
-}
-
-// Finds the entry fronts, which needs no plan and produces none. Slicing is the
-// slow part and it is cached, so this is quick once the models have been looked
-// at once.
-void start_discovery(App& app) {
-  cam::Operation* operation = selected_operation(app);
-  if (!operation || app.scout.running()) return;
-  app.discovery_pending = entry_signature(*operation);
-  cam::JobGeometry& geometry = app.geometry;
-  const cam::Operation copy = *operation;
-  cam::ToolLibrary tools = app.tools;
-  cam::MachineLibrary machines = app.machines;
-  cam::MaterialLibrary materials = app.materials;
-  app.scout.start([&geometry, copy, tools = std::move(tools),
-                   machines = std::move(machines),
-                   materials = std::move(materials)](
-                      const cam::ProgressCallback& progress) {
-    cam::EntryDiscovery result;
-    const cam::Tool* tool = tools.find(copy.tool_id);
-    const cam::Machine* machine = machines.find(copy.machine_id);
-    const cam::Material* material = materials.find(copy.material_id);
-    if (!tool) result.error = "Unknown tool: " + copy.tool_id;
-    else if (!machine) result.error = "Unknown machine: " + copy.machine_id;
-    else if (!material) result.error = "Unknown material: " + copy.material_id;
-    else
-      result = cam::discover_entries(geometry, copy, *tool, *machine, *material,
-                                     progress);
-    return result;
-  });
-}
-
-// Runs discovery when what the fronts depend on has changed since the list in
-// hand was found. Toggling an entry is not such a change.
-void ensure_discovery(App& app) {
-  const cam::Operation* operation = selected_operation(app);
-  if (!operation || !app.geometry.has_part() || !app.geometry.has_stock()) return;
-  if (app.scout.running()) return;
-  if (entry_signature(*operation) == app.discovery_signature) return;
-  start_discovery(app);
-}
-
 void start_plan(App& app) {
   app.gcode.clear();
   app.post = {};
@@ -2653,82 +2606,6 @@ void start_plan(App& app) {
                         const cam::ProgressCallback& progress) {
     return cam::plan_job(geometry, job, tools, machines, materials, progress);
   });
-}
-
-void entry_panel(App& app) {
-  ImGui::SeparatorText("Entry fronts");
-  if (app.scout.running()) {
-    ImGui::ProgressBar(static_cast<float>(app.scout.fraction()), ImVec2(-1, 0));
-    ImGui::TextWrapped("%s", app.scout.stage().c_str());
-    return;
-  }
-  if (!app.discovery.error.empty()) {
-    ImGui::TextColored(ImVec4(0.91f, 0.61f, 0.36f, 1.0f), "%s",
-                       app.discovery.error.c_str());
-    return;
-  }
-  if (app.discovery.entries.empty()) {
-    ImGui::TextDisabled("This operation starts from no entry front");
-    return;
-  }
-  ImGui::TextWrapped(
-      "Each entry is a stretch of stock wall the wave starts from. Declining "
-      "one leaves the material only it could have reached standing. Nothing is "
-      "planned until the job is.");
-
-  cam::Operation* operation = selected_operation(app);
-  bool changed = false;
-  app.hovered_entry = -1;
-  for (std::size_t i = 0; i < app.discovery.entries.size(); ++i) {
-    cam::EntryOption& entry = app.discovery.entries[i];
-    float wall[3];
-    float face[3];
-    ImU32 edge = 0;
-    entry_colour(i, entry.muted, false, wall, face, edge);
-    ImGui::PushID(static_cast<int>(i));
-    const ImVec2 origin = ImGui::GetCursorScreenPos();
-    ImGui::Dummy(ImVec2(14.0f, ImGui::GetTextLineHeight()));
-    ImGui::GetWindowDrawList()->AddRectFilled(
-        {origin.x, origin.y + 3.0f}, {origin.x + 10.0f, origin.y + 13.0f},
-        IM_COL32(static_cast<int>(face[0] * 255), static_cast<int>(face[1] * 255),
-                 static_cast<int>(face[2] * 255), 255),
-        2.0f);
-    ImGui::SameLine();
-    bool live = !entry.muted;
-    // No measure of what an entry reaches: reaching is propagation, and this
-    // list deliberately does not propagate. Where a front runs is visible in
-    // the view beside it, which is the question being asked.
-    char label[96];
-    std::snprintf(label, sizeof label, "Z %.2f to %.2f mm##%zu", entry.bottom_z,
-                  entry.top_z, i);
-    if (ImGui::Checkbox(label, &live)) {
-      entry.muted = !live;
-      changed = true;
-    }
-    if (ImGui::IsItemHovered()) {
-      app.hovered_entry = static_cast<int>(i);
-      ImGui::SetTooltip("%zu pass%s", entry.curves.size(),
-                        entry.curves.size() == 1 ? "" : "es");
-    }
-    ImGui::PopID();
-  }
-
-  // The choice is an argument to planning and nothing else, so taking it is a
-  // write to the operation and no work at all. The fronts themselves cannot
-  // move: declining one drops its seed piece and leaves the others where they
-  // were.
-  if (changed && operation) {
-    operation->muted_entries.clear();
-    for (const cam::EntryOption& entry : app.discovery.entries)
-      if (entry.muted) operation->muted_entries.push_back(entry.anchors);
-  }
-
-  std::size_t live = 0;
-  for (const cam::EntryOption& entry : app.discovery.entries)
-    live += entry.muted ? 0 : 1;
-  if (live == 0)
-    ImGui::TextColored(ImVec4(0.91f, 0.61f, 0.36f, 1.0f),
-                       "Leave at least one entry propagating");
 }
 
 void plan_panel(App& app) {
@@ -2855,21 +2732,17 @@ void library_panel(App& app) {
 }
 
 void view_panel(App& app) {
-  if (!app.has_plan) return;
-  ImGui::SeparatorText("View");
-  std::vector<const char*> operations;
-  for (const auto& operation : app.plan.operations)
-    operations.push_back(operation.operation_name.c_str());
-  if (!operations.empty()) {
-    app.selected_plan_operation =
-        std::clamp(app.selected_plan_operation, 0, static_cast<int>(operations.size()) - 1);
-    if (ImGui::Combo("Operation", &app.selected_plan_operation, operations.data(),
-                     static_cast<int>(operations.size()))) {
-      app.selected_level = 0;
-      app.playback.distance = 0.0;
-      app.playback.motion_seconds = 0.0;
-    }
+  ImGui::SeparatorText("Playback / Display");
+  if (!app.has_plan || app.plan.operations.empty()) {
+    ImGui::TextDisabled("Plan the job to enable playback and result display.");
+    return;
   }
+  app.selected_plan_operation = std::clamp(
+      app.selected_plan_operation, 0,
+      static_cast<int>(app.plan.operations.size()) - 1);
+  ImGui::Text("Operation: %s",
+              app.plan.operations[app.selected_plan_operation]
+                  .operation_name.c_str());
   const auto& levels = app.plan.operations[app.selected_plan_operation].levels;
   if (!levels.empty()) {
     int last = static_cast<int>(levels.size()) - 1;
@@ -3021,7 +2894,21 @@ void view_panel(App& app) {
   }
 }
 
-void sidebar(App& app) {
+void ensure_initial_operation(App& app) {
+  if (app.job.operations.empty())
+    app.job.operations.push_back(
+        make_operation(app, cam::OperationMode::Roughing));
+}
+
+void left_panel(App& app) {
+  ensure_initial_operation(app);
+  const float available = ImGui::GetContentRegionAvail().y;
+  const float operations_height = std::clamp(available * 0.38f, 275.0f, 370.0f);
+  const float program_height = std::max(available - operations_height - 6.0f,
+                                        140.0f);
+
+  ImGui::BeginChild("program-controls", ImVec2(0, program_height),
+                    ImGuiChildFlags_Borders);
   if (!app.banner.empty()) {
     const ImVec4 colour = app.banner_is_error ? ImVec4(1.0f, 0.45f, 0.4f, 1.0f)
                                               : ImVec4(0.55f, 0.85f, 0.65f, 1.0f);
@@ -3030,16 +2917,54 @@ void sidebar(App& app) {
     ImGui::PopStyleColor();
     ImGui::Separator();
   }
-  job_panel(app);
-  operations_panel(app);
-  // Beside the view that shows them, since choosing between them is a stage of
-  // its own and not part of setting a plan running.
-  if (app.mode == ViewMode::Entries) entry_panel(app);
-  plan_panel(app);
+  if (ImGui::BeginTabBar("program-tabs")) {
+    if (ImGui::BeginTabItem("Job / Origin")) {
+      if (ImGui::BeginChild("job-origin-scroll", ImVec2(0, 0),
+                            ImGuiChildFlags_None,
+                            ImGuiWindowFlags_AlwaysVerticalScrollbar)) {
+        job_panel(app);
+        plan_panel(app);
+        output_panel(app);
+      }
+      ImGui::EndChild();
+      ImGui::EndTabItem();
+    }
+    if (ImGui::BeginTabItem("Libraries")) {
+      if (ImGui::BeginChild("libraries-scroll", ImVec2(0, 0),
+                            ImGuiChildFlags_None,
+                            ImGuiWindowFlags_AlwaysVerticalScrollbar))
+        library_panel(app);
+      ImGui::EndChild();
+      ImGui::EndTabItem();
+    }
+    ImGui::EndTabBar();
+  }
+  ImGui::EndChild();
+
+  ImGui::BeginChild("operation-list", ImVec2(0, 0), ImGuiChildFlags_Borders,
+                    ImGuiWindowFlags_AlwaysVerticalScrollbar);
+  operations_list_panel(app);
+  ImGui::EndChild();
+}
+
+void right_panel(App& app) {
+  ensure_initial_operation(app);
+  const float available = ImGui::GetContentRegionAvail().y;
+  const float settings_height = std::max(available * 0.58f, 220.0f);
+
+  ImGui::BeginChild("operation-settings", ImVec2(0, settings_height),
+                    ImGuiChildFlags_Borders,
+                    ImGuiWindowFlags_AlwaysVerticalScrollbar);
+  const std::string settings_before = cam::to_json_text(app.job);
+  operation_settings_panel(app);
+  if (app.has_plan && settings_before != cam::to_json_text(app.job))
+    invalidate_plan(app);
+  ImGui::EndChild();
+
+  ImGui::BeginChild("playback-display", ImVec2(0, 0), ImGuiChildFlags_Borders,
+                    ImGuiWindowFlags_AlwaysVerticalScrollbar);
   view_panel(app);
-  output_panel(app);
-  if (ImGui::CollapsingHeader("Engagement feeds")) feeds_panel(app);
-  if (ImGui::CollapsingHeader("Libraries")) library_panel(app);
+  ImGui::EndChild();
 }
 
 // ---------------------------------------------------------------------------
@@ -3147,7 +3072,7 @@ int main(int argc, char** argv) {
             "  --material ID      Workpiece material\n"
             "  --stepover RATIO   Radial engagement as a fraction of diameter\n"
             "  --stepdown MM      Axial depth per pass\n"
-            "  --path-pitch MM    Simulation/feed sampling interval (default 0.2)\n"
+            "  --path-pitch MM    Simulation/feed sampling interval (default 1.0)\n"
             "  --mode rough|finish\n"
             "                     Roughing or offset-contour finishing\n"
             "  --contour-direction either|climb|conventional\n"
@@ -3167,7 +3092,7 @@ int main(int argc, char** argv) {
             "  --screenshot PATH  Render one frame to a binary PPM and exit\n"
             "  --box-stock MM     Use the part's bounding box, grown by MM, as stock\n"
             "  --models stock|part|both   What the plan view shows\n"
-            "  --view models|fronts|pass|result\n"
+            "  --view models|pass|result\n"
             "                     Which view a screenshot should capture\n"
             "  --at FRACTION      How far through the pass to place the cutter, 0 to 1\n"
             "  -h, --help         Show this help and exit\n\n"
@@ -3183,6 +3108,11 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "%s\n", error.what());
       return EXIT_FAILURE;
     }
+  }
+  if (!view_name.empty() && view_name != "models" && view_name != "pass" &&
+      view_name != "result") {
+    std::fprintf(stderr, "--view must be models, pass, or result\n");
+    return EXIT_FAILURE;
   }
   if (app.part_path[0] != '\0' || app.stock_path[0] != '\0') load_meshes(app);
   app.geometry.set_box_stock(app.job.box_stock, app.job.box_stock_margin);
@@ -3380,10 +3310,9 @@ int main(int argc, char** argv) {
   if (screenshot_pending && app.geometry.has_part() && app.geometry.has_stock())
     start_plan(app);
   if (!view_name.empty()) {
-    if (view_name == "result") app.force_tab = 3;
-    else if (view_name == "fronts") app.force_tab = 1;
+    if (view_name == "result") app.force_tab = 2;
     else if (view_name == "models") app.force_tab = 0;
-    else app.force_tab = 2;
+    else app.force_tab = 1;
   }
   while (running) {
     SDL_Event event;
@@ -3396,16 +3325,9 @@ int main(int argc, char** argv) {
         running = false;
     }
 
-    if (app.scout.take(app.discovery)) {
-      app.discovery_signature =
-          app.discovery.ok() ? app.discovery_pending : std::string();
-      app.hovered_entry = -1;
-    }
-
     if (app.planner.take(app.plan)) {
       app.has_plan = app.plan.ok();
-      app.selected_level = 0;
-      app.selected_plan_operation = 0;
+      select_operation(app, app.selected_operation);
       app.view.needs_fit = true;
       app.playback.distance = 0.0;
       app.playback.motion_seconds = 0.0;
@@ -3426,7 +3348,7 @@ int main(int argc, char** argv) {
       } else if (screenshot_pending) {
         // The view was chosen on the command line; leave it alone.
       } else {
-        app.force_tab = 3;
+        app.force_tab = 2;
         say(app, "Planned " + std::to_string(app.plan.stats.cut_levels) + " passes");
       }
     }
@@ -3447,39 +3369,29 @@ int main(int argc, char** argv) {
     ImGui::Begin("TingleCAM", nullptr,
                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
                      ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus);
-    // Wide enough for "Stepover (of diameter)" and "Feed slew (mm/min per mm)"
-    // to be read whole. ImGui puts a label to the right of its widget and gives
-    // it whatever is left over, so the panel and the item width have to be set
-    // together: at the default two thirds, the labels lost their tails.
-    ImGui::BeginChild("sidebar", ImVec2(kSidebarWidth, 0.0f), ImGuiChildFlags_Borders);
-    ImGui::PushItemWidth(kSidebarWidth * 0.42f);
-    sidebar(app);
+    ImGui::BeginChild("left-panel", ImVec2(kLeftPanelWidth, 0.0f));
+    ImGui::PushItemWidth(kLeftPanelWidth * 0.48f);
+    left_panel(app);
     ImGui::PopItemWidth();
     ImGui::EndChild();
     ImGui::SameLine();
-    ImGui::BeginChild("views", ImVec2(0, 0));
+    const float centre_width = std::max(
+        200.0f, ImGui::GetContentRegionAvail().x - kRightPanelWidth -
+                    ImGui::GetStyle().ItemSpacing.x);
+    ImGui::BeginChild("views", ImVec2(centre_width, 0));
     if (ImGui::BeginTabBar("view-tabs")) {
       const auto flag = [&](int index) -> ImGuiTabItemFlags {
         return app.force_tab == index ? ImGuiTabItemFlags_SetSelected : 0;
       };
       if (ImGui::BeginTabItem("Plan", nullptr, flag(0))) {
-        app.mode = ViewMode::Setup;
         draw_setup(app);
         ImGui::EndTabItem();
       }
-      if (ImGui::BeginTabItem("Select fronts", nullptr, flag(1))) {
-        app.mode = ViewMode::Entries;
-        ensure_discovery(app);
-        draw_entries(app);
-        ImGui::EndTabItem();
-      }
-      if (ImGui::BeginTabItem("Pass", nullptr, flag(2))) {
-        app.mode = ViewMode::Plan;
+      if (ImGui::BeginTabItem("Pass", nullptr, flag(1))) {
         draw_canvas(app);
         ImGui::EndTabItem();
       }
-      if (ImGui::BeginTabItem("Stacked result", nullptr, flag(3))) {
-        app.mode = ViewMode::Result;
+      if (ImGui::BeginTabItem("Stacked result", nullptr, flag(2))) {
         draw_result(app);
         ImGui::EndTabItem();
       }
@@ -3489,6 +3401,12 @@ int main(int argc, char** argv) {
     // the mouse. A screenshot keeps asking, since the view it wants is chosen
     // before there is a plan to show in it.
     if (!screenshot_pending) app.force_tab = -1;
+    ImGui::EndChild();
+    ImGui::SameLine();
+    ImGui::BeginChild("right-panel", ImVec2(0, 0));
+    ImGui::PushItemWidth(kRightPanelWidth * 0.44f);
+    right_panel(app);
+    ImGui::PopItemWidth();
     ImGui::EndChild();
     ImGui::End();
     tool_builder(app);
@@ -3502,9 +3420,8 @@ int main(int argc, char** argv) {
     glClear(GL_COLOR_BUFFER_BIT);
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
-    if (screenshot_pending && (app.planner.running() || app.scout.running())) {
-      // Wait for the plan and the fronts, so the captured frame has something
-      // in it.
+    if (screenshot_pending && app.planner.running()) {
+      // Wait for the plan so the captured frame has something in it.
     } else if (screenshot_pending && ++screenshot_delay < 3) {
       // One more frame, so the panels have laid out against the finished plan.
     } else if (screenshot_pending) {

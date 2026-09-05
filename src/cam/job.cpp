@@ -281,18 +281,6 @@ bool resolve_floors(const Operation& operation, const OperationSetup& setup,
   return true;
 }
 
-// The muting the wave is given for one depth: every anchor the operation
-// carries. Anchors that name no seed piece at this depth simply match nothing,
-// which is what happens where an entry does not reach this far down.
-wave::EntryMute layer_mute(const Operation& operation) {
-  wave::EntryMute mute;
-  for (const std::vector<wave::Point64>& entry : operation.muted_entries)
-    mute.anchors.insert(mute.anchors.end(), entry.begin(), entry.end());
-  mute.tolerance = static_cast<double>(wave::to_integer(
-      std::max(operation.entry_front_match_tolerance, 0.001)));
-  return mute;
-}
-
 // A job is usable when any one operation planned. The rest are reported as
 // warnings rather than hidden, and a job with none at all carries every reason.
 void finish_job(JobPlan& plan) {
@@ -537,10 +525,13 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
                               const Material& material,
                               const ProgressCallback& progress,
                               double progress_from,
-                              double progress_to) {
+                              double progress_to,
+                              const std::vector<OperationPlan>* prior_operations) {
   OperationPlan plan;
   plan.operation_name = operation.name;
   plan.tool_id = operation.tool_id;
+  plan.machine_id = operation.machine_id;
+  plan.material_id = operation.material_id;
 
   if (!geometry.has_part()) {
     plan.error = "No part mesh is loaded";
@@ -561,7 +552,6 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
   std::vector<double> floors;
   if (!resolve_floors(operation, setup, work_top, plan.error, floors))
     return plan;
-  const wave::EntryMute mute = layer_mute(operation);
 
   plan.levels.resize(floors.size());
   std::vector<wave::Paths64> keep_outs(floors.size());
@@ -596,9 +586,14 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
       const auto slice_start = PlanningClock::now();
       level.part_slice = geometry.part_outline(floor_z, operation.slice_grid);
       level.stock_slice = geometry.stock_outline(floor_z, operation.slice_grid);
+      level.incoming_stock =
+          prior_operations == nullptr
+              ? level.stock_slice
+              : stock_after_operations_at_z(level.stock_slice, floor_z,
+                                             *prior_operations);
       plan.metrics.slicing_milliseconds += elapsed_milliseconds(slice_start);
 
-      if (level.stock_slice.empty()) {
+      if (level.stock_slice.empty() || level.incoming_stock.empty()) {
         level.nothing_to_cut = true;
         continue;
       }
@@ -608,7 +603,7 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
       const auto preparation_start = PlanningClock::now();
       keep_outs[index] =
           level.part_slice.empty()
-              ? absent_subject(level.stock_slice)
+              ? absent_subject(level.incoming_stock)
               : offset_outward(level.part_slice,
                                radius + operation.radial_stock_to_leave);
       plan.metrics.preparation_milliseconds +=
@@ -655,8 +650,8 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
     LevelPlan& level = plan.levels[index];
     try {
       wave::WavefrontAnalysis analysis = wave::analyze_wavefront(
-          keep_outs[index], level.stock_slice, stepover, stepover, lead_in,
-          2000, 128, mute, wave::kDefaultSignificantNodeAreaFraction,
+          keep_outs[index], level.incoming_stock, stepover, stepover, lead_in,
+          2000, 128, {}, wave::kDefaultSignificantNodeAreaFraction,
           operation.tiny_split_area_factor);
       wave::CommittedWavefront committed =
           wave::commit_wavefront_analysis(analysis);
@@ -702,14 +697,7 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
     }
   }
 
-  for (const LevelPlan& level : plan.levels)
-    plan.stats.muted_entries += level.wave.muted_entries;
-  if (plan.stats.muted_entries > 0)
-    plan.warnings.push_back(
-        std::to_string(plan.stats.muted_entries) +
-        " entry front(s) were declined, so the wave never started there");
-
-  // Inter-layer associations need every slice at once, so wavefront discovery
+  // Inter-layer associations need every slice at once, so wavefront planning
   // is deliberately complete before any layer is sequenced into tool motion.
   // A known boundary-component mismatch is an internal topology failure and
   // aborts the operation instead of quietly emitting an arbitrary link.
@@ -803,6 +791,12 @@ void plan_toolpaths(OperationPlan& plan,
   for (std::size_t index = 0; index < plan.levels.size(); ++index) {
     LevelPlan& level = plan.levels[index];
     if (level.nothing_to_cut) continue;
+    if (level.incoming_stock.empty()) {
+      // This is a valid result of chaining, not a planning failure: an earlier
+      // operation already removed every bit of stock in this slab.
+      level.nothing_to_cut = true;
+      continue;
+    }
     if (progress) {
       const double fraction =
           progress_from +
@@ -885,8 +879,8 @@ void plan_toolpaths(OperationPlan& plan,
     try {
       // Only where the wave got. A cleanup contour runs along the part at
       // the same offset the wave was bounded by, so where the wave never
-      // reached -- a pocket whose only entry was declined, or one nothing
-      // can get into -- the contour is a cut through solid stock that
+      // reached -- a pocket the wave cannot get into -- the contour is a cut
+      // through solid stock that
       // nothing roughed. Clipping to the reached region drops those and
       // trims the partly reached ones to the part that was.
       //
@@ -899,13 +893,13 @@ void plan_toolpaths(OperationPlan& plan,
           wave::boundary_slack(setup.stepover), Clipper2Lib::JoinType::Miter,
           Clipper2Lib::EndType::Polygon);
       if (operation.clip_contours_to_stock)
-        clip = Clipper2Lib::Intersect(clip, level.stock_slice,
+        clip = Clipper2Lib::Intersect(clip, level.incoming_stock,
                                       Clipper2Lib::FillRule::NonZero);
       const auto contours = derive_offset_contours(
           level.part_slice, radius + operation.radial_stock_to_leave, &clip);
       auto tasks =
           contour_traversal_tasks(contours, operation.contour_direction);
-      add_safe_stock_approaches(tasks, level.stock_slice, level.wave.subject,
+      add_safe_stock_approaches(tasks, level.incoming_stock, level.wave.subject,
                                 radius);
       wave::TraversalSettings traversal;
       traversal.allow_stay_down = true;
@@ -1041,7 +1035,7 @@ void plan_toolpaths(OperationPlan& plan,
             const wave::Paths64& final_subject =
                 level.part_slice.empty() ? level.wave.subject : level.part_slice;
             level.simulation = wave::simulate_material(
-                level.stock_slice, final_subject, level.toolpath, radius,
+                level.incoming_stock, final_subject, level.toolpath, radius,
                 operation.simulation_stock_inflation);
           } catch (...) {
             simulation_errors[index] = std::current_exception();
@@ -1180,169 +1174,48 @@ OperationPlan plan_operation(const JobGeometry& geometry,
                              const ProgressCallback& progress,
                              double progress_from,
                              double progress_to,
-                             double rapid_plane) {
+                             double rapid_plane,
+                             const std::vector<OperationPlan>* prior_operations) {
   const auto planning_start = PlanningClock::now();
   // Wavefronts are the cheaper half; give the toolpaths the larger share of the
   // reported progress so the bar does not stall in the second stage.
   const double seam = progress_from + (progress_to - progress_from) * 0.4;
   OperationPlan plan = plan_wavefronts(geometry, operation, tool, machine,
-                                       material, progress, progress_from, seam);
+                                       material, progress, progress_from, seam,
+                                       prior_operations);
   plan_toolpaths(plan, operation, tool, machine, material, progress, seam,
                  progress_to, rapid_plane);
   plan.metrics.total_milliseconds = elapsed_milliseconds(planning_start);
   return plan;
 }
 
-EntryDiscovery discover_entries(const JobGeometry& geometry,
-                                const Operation& operation,
-                                const Tool& tool,
-                                const Machine& machine,
-                                const Material& material,
-                                const ProgressCallback& progress) {
-  EntryDiscovery result;
-  if (!geometry.has_part()) {
-    result.error = "No part mesh is loaded";
-    return result;
-  }
-  if (!geometry.has_stock()) {
-    result.error = "No stock mesh is loaded";
-    return result;
-  }
-  // Finishing propagates no wave, so it starts nowhere and there is nothing to
-  // choose between.
-  if (operation.mode != OperationMode::Roughing) return result;
+wave::Paths64 stock_after_operations_at_z(
+    const wave::Paths64& nominal_stock, double z,
+    const std::vector<OperationPlan>& operations) {
+  if (nominal_stock.empty()) return {};
 
-  OperationSetup setup;
-  if (!resolve_setup(operation, tool, machine, material, result.error,
-                     &result.warnings, setup))
-    return result;
-
-  const double work_top = highest_model_z(geometry);
-  std::vector<double> floors;
-  if (!resolve_floors(operation, setup, work_top, result.error, floors))
-    return result;
-
-  std::vector<wave::FrontLineage> lineages;
-  std::vector<std::size_t> lineage_levels;
-  double previous_z = z_at_depth(work_top, operation.depth_from);
-  for (std::size_t index = 0; index < floors.size(); ++index) {
-    const double floor_z = floors[index];
-    if (progress &&
-        !progress(static_cast<double>(index) / floors.size(),
-                  operation.name + ": entries at depth " +
-                      std::to_string(floor_z) + " mm")) {
-      result.error = "Cancelled";
-      return result;
+  wave::Paths64 removed;
+  for (const OperationPlan& operation : operations) {
+    if (!operation.ok()) continue;
+    for (const LevelPlan& level : operation.levels) {
+      if (level.nothing_to_cut || level.simulation.removed_material.empty())
+        continue;
+      const double slab_bottom = level.floor_z;
+      const double slab_top = level.floor_z + level.axial_depth;
+      // Include shared slab boundaries. They have zero volume, and including
+      // both adjacent sweeps matches the physical cutter at that exact plane.
+      constexpr double kZEpsilon = 1e-9;
+      if (z < slab_bottom - kZEpsilon || z > slab_top + kZEpsilon) continue;
+      removed.insert(removed.end(), level.simulation.removed_material.begin(),
+                     level.simulation.removed_material.end());
     }
-    EntryLevel level;
-    level.floor_z = floor_z;
-    level.axial_depth = previous_z - floor_z;
-    previous_z = floor_z;
-    try {
-      level.stock_slice = geometry.stock_outline(floor_z, operation.slice_grid);
-      const wave::Paths64 part_slice =
-          geometry.part_outline(floor_z, operation.slice_grid);
-      if (!level.stock_slice.empty()) {
-        const wave::Paths64 keep_out =
-            part_slice.empty()
-                ? absent_subject(level.stock_slice)
-                : offset_outward(part_slice,
-                                 setup.radius + operation.radial_stock_to_leave);
-        const double lead_in =
-            operation.lead_in ? setup.radius + setup.first_bite_allowance : 0.0;
-        // Seeded and stopped. Generation zero is the whole of what an entry
-        // front is, and it is built before the first propagation step.
-        const wave::WaveResult seeded = wave::seed_wavefront(
-            keep_out, level.stock_slice, setup.stepover, setup.stepover, lead_in);
-        lineages.push_back(wave::build_front_lineage(seeded));
-        lineage_levels.push_back(result.levels.size());
-      }
-    } catch (const std::exception& error) {
-      result.warnings.push_back("Depth " + std::to_string(floor_z) +
-                                " mm, entry discovery: " + error.what());
-    }
-    result.levels.push_back(std::move(level));
   }
-
-  std::vector<const wave::FrontLineage*> chained;
-  chained.reserve(lineages.size());
-  for (const wave::FrontLineage& lineage : lineages) chained.push_back(&lineage);
-  std::vector<wave::InterLayerChain> chains;
-  try {
-    chains = wave::chain_entry_fronts(chained,
-                                      operation.entry_front_match_tolerance);
-  } catch (const std::exception& error) {
-    result.error = std::string("Entry-front chaining: ") + error.what();
-    return result;
-  }
-
-  // A chain gathers one physical entry's appearances down the Z stack, so it is
-  // the thing to offer.
-  const auto add = [&](EntryOption& option, const wave::LayerItemId& member) {
-    if (member.layer >= lineages.size()) return;
-    const auto& fronts = lineages[member.layer].entry_fronts;
-    if (member.index >= fronts.size()) return;
-    const EntryLevel& level = result.levels[lineage_levels[member.layer]];
-    const wave::LeadingFront& front = fronts[member.index];
-    option.anchors.push_back(wave::representative_point(front));
-    option.curves.push_back({front.path, front.closed,
-                             level.floor_z + level.axial_depth, level.floor_z});
-    const double top = level.floor_z + level.axial_depth;
-    if (option.curves.size() == 1) {
-      option.top_z = top;
-      option.bottom_z = level.floor_z;
-    } else {
-      option.top_z = std::max(option.top_z, top);
-      option.bottom_z = std::min(option.bottom_z, level.floor_z);
-    }
-  };
-
-  // A chain is only assembled from two or more appearances, so a front that
-  // stands on one level alone is offered in its own right rather than being
-  // dropped -- otherwise a one-level entry could never be declined.
-  std::vector<std::vector<bool>> claimed(lineages.size());
-  for (std::size_t layer = 0; layer < lineages.size(); ++layer)
-    claimed[layer].assign(lineages[layer].entry_fronts.size(), false);
-  for (const wave::InterLayerChain& chain : chains) {
-    EntryOption option;
-    for (const wave::LayerItemId& member : chain.members) {
-      if (member.layer < claimed.size() && member.index < claimed[member.layer].size())
-        claimed[member.layer][member.index] = true;
-      add(option, member);
-    }
-    if (!option.anchors.empty()) result.entries.push_back(std::move(option));
-  }
-  for (std::size_t layer = 0; layer < claimed.size(); ++layer)
-    for (std::size_t index = 0; index < claimed[layer].size(); ++index) {
-      if (claimed[layer][index]) continue;
-      EntryOption option;
-      add(option, {layer, index});
-      if (!option.anchors.empty()) result.entries.push_back(std::move(option));
-    }
-
-  // Muting is recorded as points rather than indices, so which options are off
-  // is answered by asking where those points landed.
-  const double tolerance = std::max(operation.entry_front_match_tolerance, 0.001);
-  for (EntryOption& option : result.entries)
-    for (const wave::Point64& anchor : option.anchors)
-      for (const std::vector<wave::Point64>& group : operation.muted_entries)
-        for (const wave::Point64& muted : group)
-          if (std::hypot(wave::to_world(anchor.x - muted.x),
-                         wave::to_world(anchor.y - muted.y)) <= tolerance)
-            option.muted = true;
-
-  // Ordered by where each entry sits, so the list does not reshuffle under the
-  // pointer as the choice changes.
-  std::sort(result.entries.begin(), result.entries.end(),
-            [](const EntryOption& a, const EntryOption& b) {
-              if (a.anchors.empty() || b.anchors.empty())
-                return a.anchors.size() > b.anchors.size();
-              if (a.anchors.front().x != b.anchors.front().x)
-                return a.anchors.front().x < b.anchors.front().x;
-              return a.anchors.front().y < b.anchors.front().y;
-            });
-  if (progress) progress(1.0, "Done");
-  return result;
+  if (removed.empty())
+    return Clipper2Lib::Union(nominal_stock, Clipper2Lib::FillRule::NonZero);
+  return Clipper2Lib::Difference(
+      nominal_stock,
+      Clipper2Lib::Union(removed, Clipper2Lib::FillRule::NonZero),
+      Clipper2Lib::FillRule::NonZero);
 }
 
 JobPlan plan_job(const JobGeometry& geometry,
@@ -1365,6 +1238,8 @@ JobPlan plan_job(const JobGeometry& geometry,
     OperationPlan result;
     result.operation_name = operation.name;
     result.tool_id = operation.tool_id;
+    result.machine_id = operation.machine_id;
+    result.material_id = operation.material_id;
 
     const Tool* tool = tools.find(operation.tool_id);
     const Machine* machine = machines.find(operation.machine_id);
@@ -1376,15 +1251,17 @@ JobPlan plan_job(const JobGeometry& geometry,
     if (result.ok()) {
       result = plan_operation(geometry, operation, *tool, *machine, *material,
                               progress, share * index, share * (index + 1),
-                              plan.rapid_plane);
+                              plan.rapid_plane, &plan.operations);
       if (result.error == "Cancelled") {
         plan.error = "Cancelled";
         return plan;
       }
-      if (!previous_tool.empty() && previous_tool != operation.tool_id)
-        result.stats.tool_change_minutes +=
-            machine->tool_change == ToolChange::Automatic ? 0.25 : 1.0;
-      previous_tool = operation.tool_id;
+      if (result.ok()) {
+        if (!previous_tool.empty() && previous_tool != operation.tool_id)
+          result.stats.tool_change_minutes +=
+              machine->tool_change == ToolChange::Automatic ? 0.25 : 1.0;
+        previous_tool = operation.tool_id;
+      }
     }
 
     accumulate(plan.stats, result.stats);

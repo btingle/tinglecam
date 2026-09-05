@@ -73,9 +73,13 @@ while Z changes; it is never refitted to an individual slice.
 
 ## Workflow
 
-Which entry fronts the wave may start from is an input to planning, not a stage
-of it. Finding them costs a seeding pass and no propagation, so a choice can be
-made and unmade without planning anything.
+The workspace has three columns. The left column keeps program-wide Job / Origin
+and Libraries controls above an always-visible ordered operation list. The
+centre contains the model and result previews. The right column contains the
+selected operation's settings and playback/display controls. Selecting an
+operation on the left selects its settings, planned passes, and preview together.
+Roughing and contour-finishing operations can be added explicitly, duplicated,
+removed, and moved up or down.
 
 1. **Plan** shows the part and stock models so the depth range can be set
    against them. The range is stated as depths below the top of the work -- the
@@ -94,28 +98,16 @@ made and unmade without planning anything.
    negative of the point picked -- and no part of planning ever sees this side
    of it, so moving the origin does not invalidate a plan. Posted coordinates
    move with it, comments included.
-2. **Select fronts** draws each entry front where it actually is and lets any of
-   them be declined. Nothing is planned here: the fronts are generation zero of
-   the wave, which is built before the first propagation step, so this asks the
-   models for their slices and stops. Slices are cached, so it is quick after
-   the first look.
-3. Planning the job runs the wave without the declined entries, then builds the
-   toolpaths, simulation and feeds. **Pass** and **Stacked result** show what
+2. Planning the job builds each operation in list order, then produces its
+   toolpaths, simulation, and feeds. **Pass** and **Stacked result** show what
    came out.
 
-The list does not move when the choice does. Declining an entry drops its own
-seed piece before propagation begins and leaves every other piece exactly where
-it was, so the fronts on offer are the same fronts whatever has been declined --
-which is what lets a front be declined and reinstated for the price of a click,
-and lets a front be declined that a plan would have failed on.
-
-The choice is recorded on the operation as one group of anchor points per
-declined entry, a point on each layer it appeared at. Anchors are matched
-geometrically rather than by index, so a selection survives a change of stepdown
-or stepover that renumbers everything, and it is saved with the job.
-
-Material only a declined entry could have reached is left standing, and the plan
-says how many entries were declined rather than hiding it.
+Operations run in list order. Each simulated level begins with the nominal stock
+minus the swept material from every successful earlier operation whose axial
+slab crosses that level. Consequently engagement, feeds, plunge checks, and
+playback for a finishing operation see the stock left by roughing instead of a
+fresh copy of the blank. Toolpath geometry is still derived from nominal slices;
+clipping finishing paths to the inherited stock is a separate future step.
 
 ## Stock
 
@@ -137,8 +129,7 @@ For every roughing depth, TingleCAM:
 2. Offsets the protected part by the cutter radius and stock allowance.
 3. Builds the simultaneous wavefront baseline and recursively tests each
    graph-connected entry group. A longest-entry trial is committed only when
-   it produces fewer topology nodes; manual entry selections remain the input
-   constraint on the first layer.
+   it produces fewer topology nodes.
 4. Extracts only the root nodes committed at each recursive layer and sequences
    those stages with one continuous cutter position and cleared-state model.
    The committed stages are also composed into the final per-depth lineage and
@@ -166,10 +157,9 @@ the work so the whole level clears away.
 
 The cleanup contour is derived from the part slice rather than from the wave,
 so on its own it is emitted wherever the part has a boundary -- including
-depths the wave never reached, whether because the only entry into them was
-declined or because nothing can get in at all. Cutting there is a finishing
-pass through solid stock that nothing has roughed, so the contour is clipped to
-the region the wave actually swept. A depth the wave could not start at emits
+depths the wave never reached because nothing can get in at all. Cutting there
+is a finishing pass through solid stock that nothing has roughed, so the contour
+is clipped to the region the wave actually swept. A depth the wave could not start at emits
 nothing. The contour lies exactly on that region's inner boundary, both being
 the same slice offset by the same distance, so the clip allows `boundary_slack`
 -- the same rounding allowance a front's boundary contact is accepted with.
@@ -333,16 +323,6 @@ rather than being a jump between passes. It covers no planar path distance, in
 the same way the descent that follows it does. G-code was always emitting this
 move; what it did not have was a plan that owned it.
 
-The **Select fronts** view draws the stock as one plain solid and each entry
-front as a coloured ribbon along the curve it actually occupies, one per pass,
-stacking down its Z chain. A front is a stretch of wall the wave starts from,
-not a volume, so it is drawn on the surface: giving it thickness would put faces
-inside the stock for the depth sort to fight over and would claim something
-about the material that a front does not say. Where a lead-in stands a front off
-the stock, its ribbon stands off with it -- the same place the pass view's
-entry-front overlay draws that curve. Nothing quantifies what an entry reaches:
-reaching is propagation, and this view deliberately does not propagate.
-
 The **Plan** view shows the loaded meshes themselves, cycling between stock,
 part, and both with the button in its corner. Nothing here is a plan, so nothing
 here looks at the models through a slicer: sampling them at a fixed set of
@@ -362,7 +342,7 @@ layer-based until node-sized path fragments can preserve their simulation and
 safe-entry state when interleaved; the planner does not silently reorder those
 moves using stale engagement data.
 
-The path pitch defaults to 0.2 mm and is configurable per operation. Spacing is
+The path pitch defaults to 1 mm and is configurable per operation. Spacing is
 carried across original Cut, Step, and Link boundaries. Original microscopic
 vertices are not retained merely because they were present in offset output.
 Retracts, entries, and disconnected paths restart the spacing.
@@ -483,7 +463,7 @@ data:
 --gcode PATH
 --profile-planning
 --screenshot PATH
---view models|fronts|pass|result
+--view models|pass|result
 --at FRACTION
 ```
 

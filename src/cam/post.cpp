@@ -157,13 +157,17 @@ PostResult post_job(const JobPlan& plan,
 
   // Every operation must agree on the machine: one program goes to one control.
   const Machine* machine = nullptr;
-  for (const OperationPlan& operation : plan.operations) {
+  for (std::size_t operation_index = 0;
+       operation_index < plan.operations.size(); ++operation_index) {
+    const OperationPlan& operation = plan.operations[operation_index];
     if (!operation.ok()) continue;
-    const Operation* source = nullptr;
-    for (const Operation& candidate : job.operations)
-      if (candidate.name == operation.operation_name) source = &candidate;
-    if (!source) continue;
-    const Machine* found = machines.find(source->machine_id);
+    const std::string machine_id =
+        !operation.machine_id.empty()
+            ? operation.machine_id
+            : (operation_index < job.operations.size()
+                   ? job.operations[operation_index].machine_id
+                   : std::string());
+    const Machine* found = machines.find(machine_id);
     if (!found) continue;
     if (machine && machine->id != found->id) {
       result.error = "The job's operations are for different machines";
@@ -205,7 +209,9 @@ PostResult post_job(const JobPlan& plan,
   bool spindle_running = false;
   bool coolant_running = false;
 
-  for (const OperationPlan& operation : plan.operations) {
+  for (std::size_t operation_index = 0;
+       operation_index < plan.operations.size(); ++operation_index) {
+    const OperationPlan& operation = plan.operations[operation_index];
     if (!operation.ok()) {
       writer.blank();
       writer.comment("Skipped " + operation.operation_name + ": " + operation.error);
@@ -213,12 +219,11 @@ PostResult post_job(const JobPlan& plan,
                                 operation.error);
       continue;
     }
-    const Operation* source = nullptr;
-    for (const Operation& candidate : job.operations)
-      if (candidate.name == operation.operation_name) source = &candidate;
-    if (!source) continue;
+    const Operation* source = operation_index < job.operations.size()
+                                  ? &job.operations[operation_index]
+                                  : nullptr;
     const Tool* tool = tools.find(operation.tool_id);
-    if (!tool) continue;
+    if (!tool || !source) continue;
 
     writer.blank();
     writer.comment("Operation: " + operation.operation_name);
@@ -259,7 +264,10 @@ PostResult post_job(const JobPlan& plan,
       writer.line(buffer);
     }
 
-    const CuttingData* data = tool->data_for(source->material_id);
+    const std::string& material_id = operation.material_id.empty()
+                                         ? source->material_id
+                                         : operation.material_id;
+    const CuttingData* data = tool->data_for(material_id);
     const bool wants_coolant =
         data && (data->coolant == CoolantNeed::Required ||
                  data->coolant == CoolantNeed::Recommended);

@@ -179,40 +179,6 @@ Material material_from(const json& node) {
   return material;
 }
 
-// Anchors go out in millimetres, not in the integer grid: a job file outlives
-// any one build's scale constant.
-json to_json(const std::vector<std::vector<wave::Point64>>& muted) {
-  json out = json::array();
-  for (const std::vector<wave::Point64>& entry : muted) {
-    json points = json::array();
-    for (const wave::Point64& anchor : entry)
-      points.push_back(json{{"x", wave::to_world(anchor.x)},
-                            {"y", wave::to_world(anchor.y)}});
-    out.push_back(std::move(points));
-  }
-  return out;
-}
-
-void read_muted(const json& node, const char* key,
-                std::vector<std::vector<wave::Point64>>& muted) {
-  const auto found = node.find(key);
-  if (found == node.end() || !found->is_array()) return;
-  muted.clear();
-  for (const json& entry : *found) {
-    if (!entry.is_array()) continue;
-    std::vector<wave::Point64> points;
-    for (const json& anchor : entry) {
-      if (!anchor.is_object()) continue;
-      double x = 0.0;
-      double y = 0.0;
-      read(anchor, "x", x);
-      read(anchor, "y", y);
-      points.push_back({wave::to_integer(x), wave::to_integer(y)});
-    }
-    if (!points.empty()) muted.push_back(std::move(points));
-  }
-}
-
 json to_json(const Operation& operation) {
   return json{{"name", operation.name},
               {"mode", operation_mode_name(operation.mode)},
@@ -240,8 +206,7 @@ json to_json(const Operation& operation) {
               {"no_engagement_feed", operation.no_engagement_feed},
               {"slice_grid", operation.slice_grid},
               {"simulation_stock_inflation",
-               operation.simulation_stock_inflation},
-              {"muted_entries", to_json(operation.muted_entries)}};
+               operation.simulation_stock_inflation}};
 }
 
 Operation operation_from(const json& node) {
@@ -273,7 +238,6 @@ Operation operation_from(const json& node) {
   read(node, "slice_grid", operation.slice_grid);
   read(node, "simulation_stock_inflation",
        operation.simulation_stock_inflation);
-  read_muted(node, "muted_entries", operation.muted_entries);
   return operation;
 }
 

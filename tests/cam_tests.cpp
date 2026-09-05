@@ -401,163 +401,103 @@ void check_box_stock(const std::filesystem::path& part_mesh) {
           "and dropping it hands the job back to the box");
 }
 
-// The entry fronts are found without planning anything, and finding them does
-// not depend on which of them have been declined. That invariant is what lets a
-// choice be made and unmade for the price of a click.
-void check_entry_discovery(const std::filesystem::path& data,
-                           const std::filesystem::path& part_mesh) {
-  std::cout << "entry discovery\n";
+// A real roughing-to-roughing-to-finishing plan exercises both operation
+// ordering and the inherited-stock planning and simulation handoff.
+void check_multi_operation_plan(const std::filesystem::path& data,
+                                const std::filesystem::path& part_mesh) {
+  std::cout << "multi-operation planning\n";
   const auto materials = cam::load_materials(data / "materials");
   const auto machines = cam::load_machines(data / "machines");
   const auto tools = cam::load_tools(data / "starter-tools.json");
   const cam::Tool* tool = tools.tools.empty() ? nullptr : &tools.tools.front();
-  require(tool != nullptr, "a tool to cut with");
   if (!tool || tool->cutting_data.empty()) return;
   const std::string material_id = tool->cutting_data.front().material_id;
   const cam::Machine* machine = nullptr;
   for (const auto& candidate : machines.machines)
     if (candidate.feeds_for(material_id)) machine = &candidate;
-  const cam::Material* material = materials.find(material_id);
-  require(machine != nullptr && material != nullptr,
-          "a machine and a material to cut it in");
-  if (!machine || !material) return;
+  if (!machine || !materials.find(material_id)) return;
 
   cam::JobGeometry geometry;
   geometry.load_part(part_mesh);
   geometry.set_box_stock(true, 4.0);
   double low = 0.0;
   double high = 0.0;
-  require(geometry.work_range(low, high), "the part has a depth range");
+  require(geometry.work_range(low, high),
+          "the multi-operation fixture spans a depth range");
+  if (!(high > low)) return;
 
-  cam::Operation operation;
-  operation.tool_id = tool->id;
-  operation.machine_id = machine->id;
-  operation.material_id = material_id;
-  operation.depth_from = 0.0;
-  // Coarse on purpose: this is about which fronts are found, not about how
-  // finely the part is cut, and a few thick passes say it just as well.
-  operation.depth_to = (high - low) * 0.5;
-  operation.stepdown = std::max((high - low) * 0.25, 0.5);
+  cam::Operation rough;
+  rough.name = "Rough first";
+  rough.tool_id = tool->id;
+  rough.machine_id = machine->id;
+  rough.material_id = material_id;
+  rough.depth_from = 0.0;
+  rough.depth_to = std::min(high - low, 2.0);
+  rough.stepdown = rough.depth_to;
+  rough.stepover_ratio = 0.7;
+  rough.path_pitch = 0.5;
 
-  const cam::EntryDiscovery found =
-      cam::discover_entries(geometry, operation, *tool, *machine, *material);
-  require(found.ok(), "discovery succeeds: " + found.error);
-  require(!found.entries.empty(), "a blank around a part has somewhere to start");
-  if (found.entries.empty()) return;
-  for (const cam::EntryOption& entry : found.entries) {
-    require(!entry.curves.empty(), "an entry on offer is somewhere in particular");
-    require(entry.anchors.size() == entry.curves.size(),
-            "every appearance has the anchor that names it");
-    require(!entry.muted, "nothing is declined until it is declined");
-  }
+  cam::Operation rest = rough;
+  rest.name = "Rest rough second";
 
-  // Decline one, and ask again. The same fronts have to come back in the same
-  // order: a seed piece that is dropped takes nothing with it.
-  operation.muted_entries.push_back(found.entries.front().anchors);
-  const cam::EntryDiscovery again =
-      cam::discover_entries(geometry, operation, *tool, *machine, *material);
-  require(again.ok(), "discovery succeeds with an entry declined");
-  require(again.entries.size() == found.entries.size(),
-          "declining an entry does not remove it from the list");
-  if (again.entries.size() != found.entries.size()) return;
-  for (std::size_t i = 0; i < again.entries.size(); ++i) {
-    require(again.entries[i].anchors == found.entries[i].anchors,
-            "and moves none of the others");
-    require(again.entries[i].muted == (i == 0),
-            "the declined entry, and only it, comes back marked");
-  }
-}
-
-// Declining the entry that is the only way into a depth leaves that depth with
-// nothing to cut -- and nothing may be emitted there. The boundary cleanup
-// contours are derived from the part rather than from the wave, so before they
-// were clipped to what the wave reached they were still emitted at those
-// depths: a finishing pass around a pocket through solid stock that nothing had
-// roughed.
-void check_declined_entry(const std::filesystem::path& data,
-                          const std::filesystem::path& objs) {
-  std::cout << "declined entry\n";
-  const auto materials = cam::load_materials(data / "materials");
-  const auto machines = cam::load_machines(data / "machines");
-  const auto tools = cam::load_tools(data / "starter-tools.json");
-  const cam::Tool* tool = tools.tools.empty() ? nullptr : &tools.tools.front();
-  if (!tool || tool->cutting_data.empty()) return;
-  const std::string material_id = tool->cutting_data.front().material_id;
-  const cam::Machine* machine = nullptr;
-  for (const auto& candidate : machines.machines)
-    if (candidate.feeds_for(material_id)) machine = &candidate;
-  const cam::Material* material = materials.find(material_id);
-  if (!machine || !material) return;
-
-  cam::JobGeometry geometry;
-  geometry.load_part(objs / "final_obj" / "Rs.obj");
-  geometry.load_stock(objs / "stock_obj" / "Rs.obj");
-  double low = 0.0;
-  double high = 0.0;
-  require(geometry.work_range(low, high), "the part and its blank span a depth");
-
-  cam::Operation operation;
-  operation.tool_id = tool->id;
-  operation.machine_id = machine->id;
-  operation.material_id = material_id;
-  operation.depth_from = 0.0;
-  operation.depth_to = high - low;
-  operation.stepdown = std::max((high - low) * 0.2, 0.5);
-
-  const cam::EntryDiscovery found =
-      cam::discover_entries(geometry, operation, *tool, *machine, *material);
-  require(found.ok() && found.entries.size() >= 2,
-          "this blank offers more than one way in");
-  if (!found.ok() || found.entries.size() < 2) return;
-
-  // Decline the one that reaches deepest, so the depths only it opens are left
-  // with no entry at all rather than merely a longer way round.
-  const cam::EntryOption* deepest = &found.entries.front();
-  for (const cam::EntryOption& entry : found.entries)
-    if (entry.bottom_z < deepest->bottom_z) deepest = &entry;
-  operation.muted_entries.push_back(deepest->anchors);
+  cam::Operation finish = rest;
+  finish.name = "Finish third";
+  finish.mode = cam::OperationMode::ContourFinishing;
+  finish.stepdown = rough.stepdown * 0.5;
+  finish.radial_stock_to_leave = 0.0;
 
   cam::Job job;
-  job.operations.push_back(operation);
+  job.operations = {rough, rest, finish};
   const cam::JobPlan plan =
       cam::plan_job(geometry, job, tools, machines, materials, {});
-  require(plan.ok(), "the job plans with an entry declined: " + plan.error);
-  if (!plan.ok() || plan.operations.empty()) return;
+  require(plan.ok(), "roughing followed by contour finishing plans: " + plan.error);
+  require(plan.operations.size() == 3,
+          "the ordered operation list is preserved in the plan");
+  if (!plan.ok() || plan.operations.size() != 3) return;
+  require(plan.operations[0].operation_name == rough.name &&
+              plan.operations[1].operation_name == rest.name &&
+              plan.operations[2].operation_name == finish.name,
+          "operation execution order matches the job list");
 
-  std::size_t starved = 0;
-  std::size_t emitted = 0;
-  std::size_t outside = 0;
-  std::size_t checked = 0;
-  for (const cam::LevelPlan& level : plan.operations.front().levels) {
-    if (level.stock_slice.empty()) continue;
-    if (level.wave.reached_generations.empty()) {
-      ++starved;
-      if (!level.toolpath.moves.empty()) ++emitted;
-      continue;
-    }
-    const wave::Paths64 reached = Clipper2Lib::InflatePaths(
-        level.wave.reached_generations.back(),
-        wave::boundary_slack(level.wave.stepover), Clipper2Lib::JoinType::Miter,
-        Clipper2Lib::EndType::Polygon);
-    for (const wave::ToolpathMove& move : level.toolpath.moves) {
-      if (move.kind != wave::MoveKind::Cut) continue;
-      for (const wave::Point64& at : move.path) {
-        ++checked;
-        if (!inside(at, reached)) ++outside;
-      }
-    }
+  bool roughing_inherited_less_stock = false;
+  bool roughing_compared = false;
+  for (const cam::LevelPlan& level : plan.operations[1].levels) {
+    if (level.incoming_stock.empty() || level.wave.stock.empty()) continue;
+    roughing_compared = true;
+    require(wave::paths_equal_canonical(level.wave.stock,
+                                        level.incoming_stock),
+            "downstream roughing wave propagates through inherited stock");
+    if (wave::material_area(level.incoming_stock) + 0.001 <
+        wave::material_area(level.stock_slice))
+      roughing_inherited_less_stock = true;
   }
-  require(starved > 0,
-          "declining the deepest entry leaves depths the wave cannot start at");
-  require(emitted == 0,
-          std::to_string(emitted) +
-              " depth(s) with no entry still emit a cutting pass");
-  require(checked > 0, "the depths that keep an entry are still cut");
-  require(outside == 0,
-          std::to_string(outside) + " of " + std::to_string(checked) +
-              " cut points stand in stock the wave never reached");
+  require(roughing_compared,
+          "the second roughing operation has an inherited planning level");
+  require(roughing_inherited_less_stock,
+          "the second roughing operation inherits the first rougher's removal");
+  require(plan.operations[1].stats.cut_levels == 0,
+          "an identical second roughing operation does not recut cleared air");
+
+  bool inherited_less_stock = false;
+  bool compared = false;
+  for (const cam::LevelPlan& level : plan.operations[2].levels) {
+    if (level.nothing_to_cut || level.simulation.initial_stock.empty()) continue;
+    compared = true;
+    require(wave::paths_equal_canonical(level.incoming_stock,
+                                        level.simulation.initial_stock),
+            "downstream simulation starts with its recorded incoming stock");
+    const double nominal = wave::material_area(level.stock_slice);
+    const double incoming = wave::material_area(level.incoming_stock);
+    require(incoming <= nominal + 0.001,
+            "stock handoff never recreates material outside the nominal blank");
+    if (incoming + 0.001 < nominal) inherited_less_stock = true;
+  }
+  require(compared, "the finishing operation has a simulated cutting level");
+  require(inherited_less_stock,
+          "at least one finishing level inherits material removed by roughing");
 }
 
+// Z associations preserve the wavefront topology between adjacent layers.
 void check_inter_layer_topology() {
   std::cout << "inter-layer topology\n";
   wave::FrontLineage upper = single_front_lineage(
@@ -843,6 +783,8 @@ void check_general_traversal_and_contours() {
 
 void check_serialisation() {
   std::cout << "serialisation\n";
+  require_near(cam::Operation{}.path_pitch, 1.0, 1e-9,
+               "new operations default to a 1 mm simulation pitch");
   const cam::Tool tool = test_tool();
   const cam::Tool tool_back =
       cam::tool_from_json_text(cam::to_json_text(tool));
@@ -869,10 +811,6 @@ void check_serialisation() {
   operation.manual_feed_range = true;
   operation.full_engagement_feed = 450.0;
   operation.no_engagement_feed = 1900.0;
-  // Two declined entries, one of them spanning two depths. The grouping is the
-  // point: it is the only record that a declined entry exists at all.
-  operation.muted_entries = {{point(3.5, -2.25), point(3.5, -2.5)},
-                             {point(-9.125, 4.0)}};
   job.operations.push_back(operation);
   job.rapid_clearance_height = 12.0;
   const cam::Job job_back =
@@ -885,15 +823,6 @@ void check_serialisation() {
             "operation mode survives");
     require_near(job_back.operations[0].entry_front_match_tolerance, 0.12, 1e-9,
                  "entry-front tolerance survives");
-    const auto& muted = job_back.operations[0].muted_entries;
-    require(muted.size() == 2 && muted[0].size() == 2 && muted[1].size() == 1,
-            "declined entry fronts survive with their grouping intact");
-    if (muted.size() == 2 && muted[0].size() == 2 && muted[1].size() == 1) {
-      require(muted[0][0] == point(3.5, -2.25) && muted[0][1] == point(3.5, -2.5),
-              "declined anchors survive to the grid unit");
-      require(muted[1][0] == point(-9.125, 4.0),
-              "a negative anchor survives the millimetre round trip");
-    }
     require(job_back.operations[0].contour_direction ==
                 cam::ContourDirectionPolicy::Climb,
             "contour direction survives");
@@ -909,6 +838,61 @@ void check_serialisation() {
       R"({"id":"x","name":"X","diameter":8.0,"unheard_of":42})");
   require_near(sparse.diameter, 8.0, 1e-9,
                "recognized fields load while unknown fields are ignored");
+}
+
+void check_operation_stock_handoff() {
+  std::cout << "operation stock handoff\n";
+  const wave::Paths64 nominal{box(0.0, 0.0, 10.0, 10.0)};
+
+  cam::OperationPlan shallow;
+  cam::LevelPlan shallow_level;
+  shallow_level.floor_z = -2.0;
+  shallow_level.axial_depth = 1.0;
+  shallow_level.simulation.removed_material =
+      wave::Paths64{box(0.0, 0.0, 2.0, 10.0)};
+  shallow.levels.push_back(shallow_level);
+
+  cam::OperationPlan deep;
+  cam::LevelPlan deep_level;
+  deep_level.floor_z = -4.0;
+  deep_level.axial_depth = 2.0;
+  deep_level.simulation.removed_material =
+      wave::Paths64{box(8.0, 0.0, 10.0, 10.0)};
+  deep.levels.push_back(deep_level);
+
+  const std::vector<cam::OperationPlan> operations{shallow, deep};
+  const wave::Paths64 above =
+      cam::stock_after_operations_at_z(nominal, -0.5, operations);
+  require_near(area(above), 100.0, 0.001,
+               "cuts outside a level's axial slab do not affect that Z");
+
+  const wave::Paths64 shallow_stock =
+      cam::stock_after_operations_at_z(nominal, -1.5, operations);
+  require_near(area(shallow_stock), 80.0, 0.001,
+               "a later operation receives material removed in the shallow slab");
+  require(!inside(point(1.0, 5.0), shallow_stock) &&
+              inside(point(9.0, 5.0), shallow_stock),
+          "the shallow handoff removes only the shallow operation's sweep");
+
+  const wave::Paths64 deep_stock =
+      cam::stock_after_operations_at_z(nominal, -3.0, operations);
+  require_near(area(deep_stock), 80.0, 0.001,
+               "the deeper slab receives its own prior swept material");
+  require(inside(point(1.0, 5.0), deep_stock) &&
+              !inside(point(9.0, 5.0), deep_stock),
+          "stock handoff respects the axial range of each planned level");
+
+  const wave::Paths64 boundary_stock =
+      cam::stock_after_operations_at_z(nominal, -2.0, operations);
+  require_near(area(boundary_stock), 60.0, 0.001,
+               "shared slab boundaries include both physical cutter sweeps");
+
+  cam::OperationPlan failed = shallow;
+  failed.error = "deliberate failure";
+  const wave::Paths64 after_failure =
+      cam::stock_after_operations_at_z(nominal, -1.5, {failed});
+  require_near(area(after_failure), 100.0, 0.001,
+               "a failed operation cannot mutate downstream stock");
 }
 
 void check_schedule_timing() {
@@ -1284,14 +1268,14 @@ int main(int argc, char** argv) {
     check_inter_layer_topology();
     check_general_traversal_and_contours();
     check_serialisation();
+    check_operation_stock_handoff();
     check_schedule_timing();
     check_validation();
     check_planning_error_details();
     check_post_output();
     if (argc > 1) check_shipped_data(argv[1]);
     if (argc > 2) check_box_stock(argv[2]);
-    if (argc > 2) check_entry_discovery(argv[1], argv[2]);
-    if (argc > 3) check_declined_entry(argv[1], argv[3]);
+    if (argc > 2) check_multi_operation_plan(argv[1], argv[2]);
   } catch (const std::exception& error) {
     std::cerr << "Test threw: " << error.what() << '\n';
     return EXIT_FAILURE;

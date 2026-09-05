@@ -59,7 +59,7 @@ struct Operation {
   // first bite back up towards the stepover instead of past it.
   double stock_deviation = 0.2;
   // Uniform distance between samples used by simulation and feed assignment.
-  double path_pitch = 0.2;
+  double path_pitch = 1.0;
   // Entry fronts are associated between adjacent Z layers only when the whole
   // lower curve lies inside this envelope around the upper curve.
   double entry_front_match_tolerance = 3.0;
@@ -78,15 +78,6 @@ struct Operation {
   double no_engagement_feed = 2000.0;
   int slice_grid = 32;
   double simulation_stock_inflation = 0.0;
-  // Entry fronts the wave must not propagate from: one group of anchor points
-  // per declined entry, a point on each layer that entry appeared at. The
-  // wavefront pass discovers what is on offer; this is the answer fed back into
-  // it. Anchors are matched geometrically rather than by index, so a selection
-  // survives a change of stepdown or stepover that renumbers everything. The
-  // grouping is kept because a declined entry is absent from the plan it was
-  // declined out of, so this is the only remaining record that it exists at all.
-  // Empty means every entry propagates.
-  std::vector<std::vector<wave::Point64>> muted_entries;
 };
 
 struct Job {
@@ -118,6 +109,12 @@ struct LevelPlan {
   double axial_depth = 0.0;  // a_p actually taken, which the last pass may trim
   wave::Paths64 part_slice;
   wave::Paths64 stock_slice;
+  // Material present when this operation reaches the level. The nominal stock
+  // slice above is kept for planning and reference; this one has the swept
+  // material from every earlier operation removed and is the stock actually
+  // handed to simulation. It may be empty when an earlier operation already
+  // cleared the whole slab.
+  wave::Paths64 incoming_stock;
   wave::WaveResult wave;
   wave::FrontLineage lineage;
   wave::LayerTopology topology;
@@ -158,8 +155,6 @@ struct PlanStats {
   // Fronts the sequencer never reached. The material they bound is still
   // there when the operation finishes.
   std::size_t unreachable_fronts = 0;
-  // Entry fronts the operation was told not to propagate from.
-  std::size_t muted_entries = 0;
   // Stock still standing that is not part of the finished shape. Roughing
   // always leaves some -- the radial allowance is exactly this -- so it is
   // reported rather than warned about.
@@ -198,6 +193,8 @@ struct PlanningMetrics {
 struct OperationPlan {
   std::string operation_name;
   std::string tool_id;
+  std::string machine_id;
+  std::string material_id;
   double spindle_rpm = 0.0;
   std::vector<LevelPlan> levels;
   wave::InterLayerTopology inter_layer;
@@ -228,10 +225,8 @@ struct JobPlan {
 using ProgressCallback = std::function<bool(double fraction, const std::string& stage)>;
 
 // Holds the sliced meshes so a replan does not rebuild the BVH, and the slices
-// themselves so choosing entry fronts does not re-cut them. Slicing dominates a
-// wavefront pass and depends on nothing the selection can change, so a pass run
-// again for a different set of entries costs only the wave. One instance per
-// job; slicing is not called from more than one thread at a time.
+// themselves so repeated planning does not re-cut them. One instance per job;
+// slicing is not called from more than one thread at a time.
 class JobGeometry {
  public:
   void load_part(const std::filesystem::path& file);
@@ -293,8 +288,9 @@ std::vector<double> level_floors(const Operation& operation, double stepdown,
                                  double work_top);
 
 // Slices, propagates the wave, and builds the lineage and inter-layer topology
-// for every depth. Which entries were declined is an input here, not an output:
-// a declined entry is one the wave is never seeded from.
+// for every depth. When prior operations are supplied, roughing propagates
+// through the stock they actually left instead of reconstructing the original
+// blank for each operation.
 OperationPlan plan_wavefronts(const JobGeometry& geometry,
                               const Operation& operation,
                               const Tool& tool,
@@ -302,7 +298,9 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
                               const Material& material,
                               const ProgressCallback& progress,
                               double progress_from = 0.0,
-                              double progress_to = 1.0);
+                              double progress_to = 1.0,
+                              const std::vector<OperationPlan>* prior_operations =
+                                  nullptr);
 
 // The one plane every disconnected move traverses at, in job coordinates; the
 // post adds origin_z to it. A 2D slice cannot certify a lower traverse, so this
@@ -347,64 +345,18 @@ OperationPlan plan_operation(const JobGeometry& geometry,
                              const ProgressCallback& progress,
                              double progress_from = 0.0,
                              double progress_to = 1.0,
-                             double rapid_plane = 10.0);
+                             double rapid_plane = 10.0,
+                             const std::vector<OperationPlan>* prior_operations =
+                                 nullptr);
 
-// One appearance of an entry front: the curve the wave would start from on one
-// level, and the slab of depth that level stands for.
-struct EntryCurve {
-  wave::Path64 path;
-  bool closed = false;
-  double top_z = 0.0;
-  double bottom_z = 0.0;
-};
-
-// An entry front on offer, gathered down its Z chain. Fronts that matched no
-// chain stand on their own, or a one-level entry could never be declined.
-// This is the unit the interface offers and the unit `Operation::muted_entries`
-// records.
-struct EntryOption {
-  // One anchor per appearance, which is what muting stores. Anchors are matched
-  // by position rather than by index, so a choice survives renumbering.
-  std::vector<wave::Point64> anchors;
-  std::vector<EntryCurve> curves;
-  double top_z = 0.0;
-  double bottom_z = 0.0;
-  bool muted = false;
-};
-
-// The blank at one depth, so the fronts can be seen against the material they
-// start from without a plan having been made.
-struct EntryLevel {
-  wave::Paths64 stock_slice;
-  double floor_z = 0.0;
-  double axial_depth = 0.0;
-};
-
-struct EntryDiscovery {
-  std::vector<EntryLevel> levels;
-  std::vector<EntryOption> entries;
-  std::vector<std::string> warnings;
-  std::string error;
-
-  bool ok() const { return error.empty(); }
-};
-
-// Every entry front the operation could start from, found by seeding the wave
-// on each level and stopping there. Seeding is the whole of entry discovery:
-// the fronts are generation zero, which is built before the first propagation
-// step and does not depend on any of them.
-//
-// Nothing here is muted. Declining an entry drops a whole seed component and
-// leaves every other component exactly where it was, so this list is the same
-// list whatever has been declined -- which is what lets a choice be made and
-// unmade without planning anything. `Operation::muted_entries` is matched
-// against it by position and sets the `muted` flags.
-EntryDiscovery discover_entries(const JobGeometry& geometry,
-                                const Operation& operation,
-                                const Tool& tool,
-                                const Machine& machine,
-                                const Material& material,
-                                const ProgressCallback& progress = {});
+// Resolves the material present at one Z plane after a sequence of operations.
+// A level removes material only through the axial slab it represents. This is
+// deliberately public: pocketing and stock-aware contour clipping can consume
+// the same authoritative handoff as simulation instead of rebuilding a second
+// stock model later.
+wave::Paths64 stock_after_operations_at_z(
+    const wave::Paths64& nominal_stock, double z,
+    const std::vector<OperationPlan>& operations);
 
 JobPlan plan_job(const JobGeometry& geometry,
                  const Job& job,
