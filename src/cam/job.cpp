@@ -105,6 +105,9 @@ void accumulate(PlanningMetrics& into, const PlanningMetrics& from) {
   into.total_milliseconds += from.total_milliseconds;
   into.wave_generations += from.wave_generations;
   into.fronts += from.fronts;
+  into.analysis_layers += from.analysis_layers;
+  into.analysis_trials += from.analysis_trials;
+  into.accepted_analysis_trials += from.accepted_analysis_trials;
   into.toolpath_moves += from.toolpath_moves;
   into.simulation_intervals += from.simulation_intervals;
   into.empty_simulation_intervals += from.empty_simulation_intervals;
@@ -211,6 +214,11 @@ bool resolve_setup(const Operation& operation, const Tool& tool,
   if (!(operation.entry_front_match_tolerance > 0.0) ||
       !std::isfinite(operation.entry_front_match_tolerance)) {
     error = "Entry-front Z match tolerance must be positive";
+    return false;
+  }
+  if (operation.tiny_split_area_factor < 0.0 ||
+      !std::isfinite(operation.tiny_split_area_factor)) {
+    error = "Tiny split area factor must be nonnegative";
     return false;
   }
 
@@ -646,30 +654,27 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
   parallel_for_levels(wave_levels, [&](std::size_t index) {
     LevelPlan& level = plan.levels[index];
     try {
-      level.wave = wave::build_wavefront(
+      wave::WavefrontAnalysis analysis = wave::analyze_wavefront(
           keep_outs[index], level.stock_slice, stepover, stepover, lead_in,
-          2000, mute);
+          2000, 128, mute, wave::kDefaultSignificantNodeAreaFraction,
+          operation.tiny_split_area_factor);
+      wave::CommittedWavefront committed =
+          wave::commit_wavefront_analysis(analysis);
+      level.wave_stages = std::move(committed.stages);
+      level.wave = std::move(committed.wave);
+      level.lineage = std::move(committed.lineage);
+      level.topology = std::move(committed.topology);
+      for (const wave::WavefrontDecisionLayer& decision : analysis.layers)
+        for (const wave::WavefrontStrategyTrial& trial : decision.trials) {
+          ++level.analysis_trials;
+          if (trial.accepted) ++level.accepted_analysis_trials;
+        }
     } catch (...) {
       wave_errors[index] = std::current_exception();
     }
   });
   plan.metrics.wavefront_milliseconds +=
       elapsed_milliseconds(wavefront_start);
-
-  std::vector<std::size_t> lineage_levels;
-  lineage_levels.reserve(wave_levels.size());
-  for (const std::size_t index : wave_levels)
-    if (!wave_errors[index]) lineage_levels.push_back(index);
-  const auto lineage_start = PlanningClock::now();
-  parallel_for_levels(lineage_levels, [&](std::size_t index) {
-    try {
-      plan.levels[index].lineage =
-          wave::build_front_lineage(plan.levels[index].wave);
-    } catch (...) {
-      wave_errors[index] = std::current_exception();
-    }
-  });
-  plan.metrics.lineage_milliseconds += elapsed_milliseconds(lineage_start);
 
   for (const std::size_t index : wave_levels) {
     LevelPlan& level = plan.levels[index];
@@ -686,9 +691,15 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
       level.nothing_to_cut = true;
       continue;
     }
-    plan.metrics.wave_generations += level.wave.generations.size();
-    for (const wave::FrontGeneration& generation : level.lineage.generations)
-      plan.metrics.fronts += generation.fronts.size();
+    plan.metrics.analysis_layers += level.wave_stages.size();
+    plan.metrics.analysis_trials += level.analysis_trials;
+    plan.metrics.accepted_analysis_trials +=
+        level.accepted_analysis_trials;
+    for (const wave::WavefrontStage& stage : level.wave_stages) {
+      plan.metrics.wave_generations += stage.lineage.generations.size();
+      for (const wave::FrontGeneration& generation : stage.lineage.generations)
+        plan.metrics.fronts += generation.fronts.size();
+    }
   }
 
   for (const LevelPlan& level : plan.levels)
@@ -704,11 +715,16 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
   // aborts the operation instead of quietly emitting an arbitrary link.
   try {
     std::vector<const wave::FrontLineage*> lineages;
+    std::vector<const wave::LayerTopology*> topologies;
     lineages.reserve(plan.levels.size());
-    for (const LevelPlan& level : plan.levels) lineages.push_back(&level.lineage);
+    topologies.reserve(plan.levels.size());
+    for (const LevelPlan& level : plan.levels) {
+      lineages.push_back(&level.lineage);
+      topologies.push_back(&level.topology);
+    }
     const auto inter_layer_start = PlanningClock::now();
     plan.inter_layer = wave::build_inter_layer_topology(
-        lineages, operation.entry_front_match_tolerance);
+        lineages, operation.entry_front_match_tolerance, topologies);
     plan.metrics.inter_layer_milliseconds +=
         elapsed_milliseconds(inter_layer_start);
   } catch (const std::exception& error) {
@@ -837,12 +853,8 @@ void plan_toolpaths(OperationPlan& plan,
       }
       if (operation.mode == OperationMode::Roughing || clearing) {
         level.toolpath = wave::build_toolpath(
-            level.wave, level.lineage, radius, level.floor_z,
-            rapid_plane, rapid_feed(machine), no_engagement_feed,
-            rapid_feed_z(machine),
-            index < plan.inter_layer.layers.size()
-                ? &plan.inter_layer.layers[index]
-                : nullptr);
+            level.wave_stages, radius, level.floor_z, rapid_plane,
+            rapid_feed(machine), no_engagement_feed, rapid_feed_z(machine));
       }
     } catch (...) {
       toolpath_errors[index] = std::current_exception();
@@ -866,6 +878,7 @@ void plan_toolpaths(OperationPlan& plan,
       cleanup_levels.push_back(index);
   }
 
+  std::vector<std::exception_ptr> cleanup_errors(plan.levels.size());
   const auto cleanup_start = PlanningClock::now();
   parallel_for_levels(cleanup_levels, [&](std::size_t index) {
     LevelPlan& level = plan.levels[index];
@@ -915,7 +928,7 @@ void plan_toolpaths(OperationPlan& plan,
       level.toolpath.moves.insert(level.toolpath.moves.end(),
                                   cleanup.moves.begin(), cleanup.moves.end());
     } catch (...) {
-      toolpath_errors[index] = std::current_exception();
+      cleanup_errors[index] = std::current_exception();
     }
   });
   plan.metrics.cleanup_milliseconds += elapsed_milliseconds(cleanup_start);
@@ -934,6 +947,15 @@ void plan_toolpaths(OperationPlan& plan,
       }
       level.nothing_to_cut = true;
       continue;
+    }
+    if (cleanup_errors[index]) {
+      try {
+        std::rethrow_exception(cleanup_errors[index]);
+      } catch (const std::exception& error) {
+        plan.warnings.push_back(
+            "Depth " + std::to_string(level.floor_z) +
+            " mm, optional boundary cleanup skipped: " + error.what());
+      }
     }
     plan.metrics.toolpath_moves += level.toolpath.moves.size();
   }

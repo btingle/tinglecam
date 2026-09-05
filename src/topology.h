@@ -11,6 +11,12 @@ namespace wave {
 
 constexpr std::size_t kNoTopologyId = std::numeric_limits<std::size_t>::max();
 
+// A split is below the propagation resolution when it has at most one
+// substantial branch and every extra branch terminates without another event
+// after occupying less than this many square stepovers. Its fronts remain in
+// the lineage, but it does not break propagation into separate topology nodes.
+inline constexpr double kDefaultTinySplitAreaFactor = 0.5;
+
 struct BoundaryContact {
   bool valid = false;
   // Connected ring of the final propagation-domain or protected-subject
@@ -53,6 +59,11 @@ struct FrontGeneration {
 enum class LineageEventKind {
   Split,
   Merge,
+  // Two or more fronts consumed the material between them during the same
+  // propagation step. There is no surviving current front, but topologically
+  // this is still a merge: build_layer_topology represents it with an empty
+  // terminal node.
+  MergeTermination,
   Termination,
   Birth,
 };
@@ -68,6 +79,11 @@ struct LineageEvent {
 struct FrontLineage {
   std::vector<FrontGeneration> generations;
   std::vector<LineageEvent> events;
+  // Geometrically detected splits deliberately kept inside one propagation
+  // node because every extra branch fell below the local area resolution.
+  // Kept separate from events so debug/event consumers see only accepted
+  // topology while node construction has an explicit contraction record.
+  std::vector<LineageEvent> rejected_splits;
   // Stable connected boundary rings used by BoundaryContact::component.
   Paths64 boundary_components;
   // Connected propagation-source curves from generation zero. These retain
@@ -78,8 +94,18 @@ struct FrontLineage {
 };
 
 struct FrontNode {
+  enum class Kind {
+    Propagation,
+    // A graph sink created by a MergeTermination event. It has parents but no
+    // fronts, footprint, entry front, or children.
+    MergeTermination,
+  };
+
+  Kind kind = Kind::Propagation;
   std::size_t evaluation_order = 0;
   std::vector<FrontId2D> fronts;
+  std::vector<std::size_t> parents;
+  std::vector<std::size_t> children;
   // One validated closed component. Stable open runs are bounded by their
   // first/last fronts and endpoint rails. Runs whose fronts attach to or detach
   // from a static boundary use their connected swept-band boundary instead.
@@ -92,6 +118,18 @@ struct LayerTopology {
   std::vector<std::vector<std::size_t>> front_nodes;
   // Indices into FrontLineage::entry_fronts.
   std::vector<std::size_t> entry_fronts;
+};
+
+// The first front of a propagation node at one node-evaluation layer. Source
+// entries are the subset at layer zero; later entries are produced by split or
+// merge events. Empty merge-termination sinks have no entry.
+struct NodeEntry {
+  std::size_t node = kNoTopologyId;
+  FrontId2D front;
+};
+
+struct NodeEntryGroup {
+  std::vector<NodeEntry> entries;
 };
 
 struct LayerItemId {
@@ -120,14 +158,25 @@ struct InterLayerTopology {
 // Extracts the reached/unreached interface from each vector wave band, then
 // associates consecutive front components using the same stepover offset as
 // the wave propagation.
-FrontLineage build_front_lineage(const WaveResult& wave);
+FrontLineage build_front_lineage(
+    const WaveResult& wave,
+    double tiny_split_area_factor = kDefaultTinySplitAreaFactor);
 
 // Collapses maximal 1-child -> 1-parent runs. A split front therefore remains
 // upstream, a merge front remains downstream, and a many-to-many front is a
 // singleton. Conflicting known endpoint-boundary components on a collapsed
 // edge, or any footprint that does not close as one connected component, are
 // internal topology errors. Validated attach/detach transitions are retained.
-LayerTopology build_layer_topology(const FrontLineage& lineage);
+// Analysis-only rollouts may skip footprint construction while keeping the
+// identical node DAG and evaluation orders.
+LayerTopology build_layer_topology(const FrontLineage& lineage,
+                                   bool build_footprints = true);
+
+// Entries at `evaluation_order`, partitioned solely by the node DAG: entries
+// share a group when any of their descendants converge at an ordinary merge or
+// at an empty merge-termination node.
+std::vector<NodeEntryGroup> group_node_entries(
+    const LayerTopology& topology, std::size_t evaluation_order);
 
 // Entry identity down the stack, from the entry curves alone. An upper front
 // claims a lower one when the whole of the lower curve falls inside an envelope
@@ -141,13 +190,22 @@ std::vector<InterLayerChain> chain_entry_fronts(
     double entry_front_match_tolerance,
     std::vector<std::vector<std::size_t>>* chain_ids = nullptr);
 
-// Builds exact node-area chains and tolerant entry-front chains between
-// adjacent Z layers. Area containment has deliberately no geometric tolerance.
-// Entry fronts use a strong whole-curve containment test inside the configured
-// envelope, and both association types accept only reciprocal unique matches.
+// Small allowance for separately reconstructed node footprints on adjacent Z
+// slices. It is intentionally much smaller than a machining allowance or the
+// entry-front association envelope: it only prevents a visually continuous
+// node from breaking its Z chain over a tiny contour discrepancy.
+inline constexpr double kNodeZAssociationTolerance = 0.05;
+
+// Builds slightly tolerant node-area chains and tolerant entry-front chains
+// between adjacent Z layers. Entry fronts use a strong whole-curve containment
+// test inside the configured envelope, and both association types accept only
+// reciprocal unique matches.
 InterLayerTopology build_inter_layer_topology(
     const std::vector<const FrontLineage*>& layers,
-    double entry_front_match_tolerance);
+    double entry_front_match_tolerance,
+    // When supplied, associate these already-finalized per-depth topologies
+    // instead of rebuilding topology from the lineages.
+    const std::vector<const LayerTopology*>& topologies = {});
 
 // Shorter walk between two classified positions on one closed boundary ring.
 // Throws when the contacts do not name the same valid component.

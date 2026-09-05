@@ -43,6 +43,16 @@ struct EntryMute {
   bool empty() const { return anchors.empty(); }
 };
 
+// An explicit propagation source used when analysis resumes at a node layer.
+// The source curve is the independently selectable identity. `initial_region`
+// records the swept state behind it, which supplies direction without turning
+// every other boundary of a shared connected band back into an active source.
+struct WaveSeed {
+  Path64 path;
+  bool closed = false;
+  Paths64 initial_region;
+};
+
 struct WaveResult {
   Paths64 subject;
   Paths64 stock;
@@ -65,6 +75,14 @@ struct WaveResult {
   // stages bound the wave with this rather than with the stock, or the run-in
   // has nothing ahead of it to lead into and no outer wall to start from.
   Paths64 domain;
+  // Optional physical boundary provenance for a wave resumed inside a smaller
+  // remaining domain. When empty, topology derives it from domain - subject.
+  // A cleared-prefix cut is a seed interface, not a new static wall.
+  Paths64 static_boundaries;
+  // When present, these are the only leading fronts allowed in generation
+  // zero. This lets a resumed analysis retain its complete cached reached area
+  // while activating only a subset of the entry curves on its boundary.
+  std::vector<WaveSeed> explicit_entry_fronts;
   std::vector<Paths64> generations;
   std::vector<Paths64> reached_generations;
   // Seed pieces an EntryMute removed before propagation.
@@ -106,6 +124,21 @@ WaveResult seed_wavefront(const Paths64& raw_subject,
                           double softening = 0.0,
                           double lead_in = 0.0,
                           const EntryMute& muted = {});
+
+// Propagates through an already isolated remaining domain from explicit node
+// entry curves. With `cached_reached`, all entry bands remain in the copied
+// state but only the supplied curves may produce the next wave; this is the
+// later-generation counterpart of dropping an unselected generation-zero seed
+// component. Without cached state, each curve is expanded into an ordinary
+// standalone seed region.
+WaveResult build_wavefront_from_seeds(
+    const Paths64& raw_domain,
+    const std::vector<WaveSeed>& seeds,
+    double stepover,
+    double softening = 0.0,
+    std::size_t max_iterations = 2000,
+    const Paths64& static_boundaries = {},
+    const Paths64& cached_reached = {});
 
 bool paths_equal_canonical(const Paths64& lhs, const Paths64& rhs);
 double to_world(std::int64_t value);

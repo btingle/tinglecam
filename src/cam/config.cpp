@@ -230,6 +230,7 @@ json to_json(const Operation& operation) {
               {"path_pitch", operation.path_pitch},
               {"entry_front_match_tolerance",
                operation.entry_front_match_tolerance},
+              {"tiny_split_area_factor", operation.tiny_split_area_factor},
               {"clip_contours_to_stock", operation.clip_contours_to_stock},
               {"contour_direction",
                contour_direction_name(operation.contour_direction)},
@@ -261,6 +262,7 @@ Operation operation_from(const json& node) {
   read(node, "path_pitch", operation.path_pitch);
   read(node, "entry_front_match_tolerance",
        operation.entry_front_match_tolerance);
+  read(node, "tiny_split_area_factor", operation.tiny_split_area_factor);
   read(node, "clip_contours_to_stock", operation.clip_contours_to_stock);
   read_enum(node, "contour_direction", operation.contour_direction,
             contour_direction_from_name);

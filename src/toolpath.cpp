@@ -228,13 +228,13 @@ bool cutter_sweep_intersects_stock(const LeadingFront& front,
 
 }  // namespace
 
-Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage,
-                        double tool_radius, double floor_z,
-                        double rapid_plane, double rapid_feed,
-                        double traversal_feed, double rapid_feed_z,
-                        const LayerTopology* existing_topology) {
-  Toolpath toolpath;
-  if (lineage.generations.empty()) return toolpath;
+static void append_toolpath(Toolpath& toolpath, const WaveResult& wave,
+                            const FrontLineage& lineage, double tool_radius,
+                            double floor_z, double rapid_plane,
+                            double rapid_feed, double traversal_feed,
+                            double rapid_feed_z,
+                            const LayerTopology* existing_topology) {
+  if (lineage.generations.empty()) return;
   if (lineage.generations.size() != wave.generations.size())
     throw std::invalid_argument("Lineage and wave generations do not match");
   const double vertical_feed = rapid_feed_z > 0.0 ? rapid_feed_z : rapid_feed;
@@ -286,7 +286,7 @@ Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage,
       nodes.push_back({generation, index, fronts[index].parents.size(), false});
   }
   generation_offset.back() = nodes.size();
-  if (nodes.empty()) return toolpath;
+  if (nodes.empty()) return;
 
   // A band ring is only credited as cleared once every front sharing it has
   // been cut, so a link is never routed through material a sibling front still
@@ -381,12 +381,21 @@ Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage,
                    tolerance * 2.0, JoinType::Miter, EndType::Polygon),
       FillRule::NonZero);
 
-  Paths64 cleared = air;
+  Paths64 cleared = toolpath.cleared.empty()
+                        ? air
+                        : Union(toolpath.cleared, air, FillRule::NonZero);
   // Rebuilt whenever `cleared` grows, which is once per front rather than once
   // per link.
   Paths64 cleared_forbidden = forbidden_region(cleared, world, tolerance);
   Point64 position;
   bool has_position = false;
+  for (auto move = toolpath.moves.rbegin(); move != toolpath.moves.rend();
+       ++move) {
+    if (move->path.empty()) continue;
+    position = move->path.back();
+    has_position = true;
+    break;
+  }
   std::optional<FrontId> previous_front;
 
   struct LiftPlan { Path64 path; };
@@ -672,6 +681,29 @@ Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage,
   for (const auto& node : nodes)
     if (!node.processed) ++toolpath.stats.unreachable_fronts;
   toolpath.cleared = std::move(cleared);
+}
+
+Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage,
+                        double tool_radius, double floor_z,
+                        double rapid_plane, double rapid_feed,
+                        double traversal_feed, double rapid_feed_z,
+                        const LayerTopology* existing_topology) {
+  Toolpath toolpath;
+  append_toolpath(toolpath, wave, lineage, tool_radius, floor_z, rapid_plane,
+                  rapid_feed, traversal_feed, rapid_feed_z,
+                  existing_topology);
+  return toolpath;
+}
+
+Toolpath build_toolpath(const std::vector<WavefrontStage>& stages,
+                        double tool_radius, double floor_z,
+                        double rapid_plane, double rapid_feed,
+                        double traversal_feed, double rapid_feed_z) {
+  Toolpath toolpath;
+  for (const WavefrontStage& stage : stages)
+    append_toolpath(toolpath, stage.wave, stage.lineage, tool_radius, floor_z,
+                    rapid_plane, rapid_feed, traversal_feed, rapid_feed_z,
+                    &stage.topology);
   return toolpath;
 }
 

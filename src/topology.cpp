@@ -221,6 +221,103 @@ std::vector<LeadingFront> extract_leading_fronts(const std::vector<Paths64>& ban
   return fronts;
 }
 
+std::vector<std::vector<double>> front_responsibility_areas(
+    const FrontLineage& lineage) {
+  std::vector<std::vector<double>> result(lineage.generations.size());
+  for (std::size_t generation = 0; generation < lineage.generations.size();
+       ++generation) {
+    const FrontGeneration& item = lineage.generations[generation];
+    result[generation].assign(item.fronts.size(), 0.0);
+    std::vector<std::vector<std::size_t>> owners(item.bands.size());
+    for (std::size_t front = 0; front < item.fronts.size(); ++front)
+      if (item.fronts[front].band < owners.size())
+        owners[item.fronts[front].band].push_back(front);
+
+    for (std::size_t band = 0; band < item.bands.size(); ++band) {
+      if (owners[band].empty()) continue;
+      const double area = std::abs(Area(item.bands[band])) /
+                          (kIntegerScale * kIntegerScale);
+      double total_length = 0.0;
+      for (const std::size_t front : owners[band])
+        total_length += front_length(item.fronts[front]);
+      if (total_length > 0.0) {
+        for (const std::size_t front : owners[band])
+          result[generation][front] +=
+              area * front_length(item.fronts[front]) / total_length;
+      } else {
+        const double share = area / owners[band].size();
+        for (const std::size_t front : owners[band])
+          result[generation][front] += share;
+      }
+    }
+  }
+  return result;
+}
+
+// Returns infinity when the branch reaches another split or merge: a narrow
+// opening into a later substantial region is real topology, not a tiny spur.
+// Only an unambiguous 1:1 chain ending in termination can be dismissed.
+double terminal_branch_area(
+    const FrontLineage& lineage,
+    const std::vector<std::vector<double>>& areas,
+    std::size_t generation, std::size_t front) {
+  double result = 0.0;
+  while (generation < lineage.generations.size() &&
+         front < lineage.generations[generation].fronts.size()) {
+    const LeadingFront& item = lineage.generations[generation].fronts[front];
+    if (item.parents.size() != 1 || generation >= areas.size() ||
+        front >= areas[generation].size())
+      return std::numeric_limits<double>::infinity();
+    result += areas[generation][front];
+    if (item.children.empty()) return result;
+    if (item.children.size() != 1 ||
+        generation + 1 >= lineage.generations.size())
+      return std::numeric_limits<double>::infinity();
+    const std::size_t child = item.children.front();
+    if (child >= lineage.generations[generation + 1].fronts.size() ||
+        lineage.generations[generation + 1].fronts[child].parents.size() != 1)
+      return std::numeric_limits<double>::infinity();
+    ++generation;
+    front = child;
+  }
+  return std::numeric_limits<double>::infinity();
+}
+
+void reject_tiny_splits(FrontLineage& lineage, double area_factor) {
+  if (!(area_factor > 0.0) || lineage.events.empty()) return;
+  const double threshold = area_factor * lineage.stepover * lineage.stepover;
+  const std::vector<std::vector<double>> areas =
+      front_responsibility_areas(lineage);
+  std::vector<LineageEvent> accepted;
+  accepted.reserve(lineage.events.size());
+  for (LineageEvent& event : lineage.events) {
+    bool reject = false;
+    if (event.kind == LineageEventKind::Split &&
+        event.generation < lineage.generations.size() &&
+        event.current_fronts.size() >= 2) {
+      std::size_t substantial = 0;
+      std::size_t tiny = 0;
+      for (const std::size_t child : event.current_fronts) {
+        const double area = terminal_branch_area(
+            lineage, areas, event.generation, child);
+        if (area < threshold)
+          ++tiny;
+        else
+          ++substantial;
+      }
+      // Keep a real fork whenever two branches survive the local scale. With
+      // only one substantial branch, the others are terminal ripples and the
+      // parent remains one topological propagation node.
+      reject = tiny > 0 && substantial <= 1;
+    }
+    if (reject)
+      lineage.rejected_splits.push_back(std::move(event));
+    else
+      accepted.push_back(std::move(event));
+  }
+  lineage.events = std::move(accepted);
+}
+
 Paths64 front_reach(const LeadingFront& front, double distance,
                     double softening) {
   if (front.path.size() < 2) return {};
@@ -255,6 +352,24 @@ double open_intersection_length(const LeadingFront& front, const Paths64& clips)
     }
   }
   return length;
+}
+
+// Whether two pieces of the newly swept band are the same terminal contact.
+// This is deliberately evaluated here, beside ordinary lineage matching: once
+// the geometry has been reduced to a graph, a pair of fronts which consumed
+// one another is otherwise indistinguishable from two unrelated terminations.
+bool terminal_reaches_touch(const Paths64& lhs, const Paths64& rhs,
+                            double tolerance) {
+  if (lhs.empty() || rhs.empty()) return false;
+  const Rect64 a = GetBounds(lhs);
+  const Rect64 b = GetBounds(rhs);
+  if (a.right + tolerance < b.left || b.right + tolerance < a.left ||
+      a.bottom + tolerance < b.top || b.bottom + tolerance < a.top)
+    return false;
+  if (!Intersect(lhs, rhs, FillRule::NonZero).empty()) return true;
+  const Paths64 guard = InflatePaths(lhs, tolerance, JoinType::Round,
+                                     EndType::Polygon);
+  return !Intersect(guard, rhs, FillRule::NonZero).empty();
 }
 
 Point64 average_points(const std::vector<Point64>& points) {
@@ -378,9 +493,16 @@ bool whole_open_path_inside(const Path64& path, const Paths64& region) {
   return inside + 1.0 >= total;
 }
 
-bool exact_area_contains(const Paths64& upper, const Paths64& lower) {
+bool area_contains_with_tolerance(const Paths64& upper, const Paths64& lower,
+                                  double tolerance) {
   if (upper.empty() || lower.empty()) return false;
-  return Difference(lower, upper, FillRule::NonZero).empty();
+  Paths64 envelope = upper;
+  if (tolerance > 0.0)
+    envelope = InflatePaths(
+        Union(upper, FillRule::NonZero),
+        static_cast<double>(std::max<std::int64_t>(1, to_integer(tolerance))),
+        JoinType::Round, EndType::Polygon);
+  return Difference(lower, envelope, FillRule::NonZero).empty();
 }
 
 double absolute_area(const Paths64& paths) {
@@ -660,12 +782,15 @@ std::vector<InterLayerChain> assemble_chains(
 
 }  // namespace
 
-FrontLineage build_front_lineage(const WaveResult& wave) {
+FrontLineage build_front_lineage(const WaveResult& wave,
+                                 double tiny_split_area_factor) {
   if (!(wave.stepover > 0.0)) throw std::invalid_argument("Stepover must be positive");
   if (wave.softening < 0.0 || wave.softening > wave.stepover)
     throw std::invalid_argument("Softening must be between zero and stepover");
   if (wave.generations.size() != wave.reached_generations.size())
     throw std::invalid_argument("Wave bands and cumulative reached sets do not match");
+  if (!std::isfinite(tiny_split_area_factor) || tiny_split_area_factor < 0.0)
+    throw std::invalid_argument("Tiny split area factor must be nonnegative");
   FrontLineage result;
   result.stepover = wave.stepover;
   if (wave.generations.empty()) return result;
@@ -681,7 +806,9 @@ FrontLineage build_front_lineage(const WaveResult& wave) {
   // Contact identity belongs to the final machinable region, not to whichever
   // input polygon happened to contribute an edge. Using concatenated subject
   // and domain rings gives one physical boundary two IDs where inputs touch.
-  const Paths64 static_boundaries = free_space;
+  const Paths64 static_boundaries = wave.static_boundaries.empty()
+                                         ? free_space
+                                         : wave.static_boundaries;
   result.boundary_components = static_boundaries;
   result.generations.reserve(wave.generations.size());
 
@@ -690,8 +817,32 @@ FrontLineage build_front_lineage(const WaveResult& wave) {
                                    FillRule::NonZero);
     unreached = Union(unreached, FillRule::NonZero);
     std::vector<Paths64> bands = band_components(wave.generations[generation]);
-    auto fronts = extract_leading_fronts(bands, unreached, static_boundaries);
     const double contact_tolerance = boundary_slack(wave.stepover);
+    std::vector<LeadingFront> fronts;
+    if (generation == 0 && !wave.explicit_entry_fronts.empty()) {
+      std::vector<Paths64> band_guards;
+      band_guards.reserve(bands.size());
+      for (const Paths64& band : bands)
+        band_guards.push_back(InflatePaths(
+            band, contact_tolerance, JoinType::Miter, EndType::Polygon));
+      for (const WaveSeed& seed : wave.explicit_entry_fronts) {
+        if (seed.path.size() < 2 || bands.empty()) continue;
+        LeadingFront front;
+        front.path = seed.path;
+        front.closed = seed.closed;
+        double best_overlap = -1.0;
+        for (std::size_t band = 0; band < band_guards.size(); ++band) {
+          const double overlap = open_intersection_length(front, band_guards[band]);
+          if (overlap > best_overlap) {
+            best_overlap = overlap;
+            front.band = band;
+          }
+        }
+        fronts.push_back(std::move(front));
+      }
+    } else {
+      fronts = extract_leading_fronts(bands, unreached, static_boundaries);
+    }
     classify_front_contacts(fronts, static_boundaries, contact_tolerance);
     result.generations.push_back({std::move(fronts), std::move(bands)});
   }
@@ -717,16 +868,55 @@ FrontLineage build_front_lineage(const WaveResult& wave) {
     auto& current = result.generations[generation].fronts;
     Paths64 band_guard = InflatePaths(wave.generations[generation], tolerance,
                                       JoinType::Miter, EndType::Polygon);
+    std::vector<Paths64> terminal_reaches(previous.size());
     for (std::size_t parent = 0; parent < previous.size(); ++parent) {
       Paths64 candidate = front_reach(previous[parent], stepover_integer + tolerance,
                                       softening_integer);
       candidate = Intersect(candidate, band_guard, FillRule::NonZero);
       if (candidate.empty()) continue;
+      // Retain only the material actually infiltrated during this transition
+      // for terminal-contact classification. The enlarged band_guard is useful
+      // when matching a child curve, but would make unrelated terminal reaches
+      // look as though they overlap.
+      terminal_reaches[parent] = Intersect(
+          candidate, wave.generations[generation], FillRule::NonZero);
       for (std::size_t child = 0; child < current.size(); ++child) {
         if (open_intersection_length(current[child], candidate) <= tolerance) continue;
         previous[parent].children.push_back(child);
         current[child].parents.push_back(parent);
       }
+    }
+
+    // A merge normally leaves a current front carrying all of its parents.
+    // When the parents consume the last material between them there is no
+    // current front, so classify the contact from their swept regions and emit
+    // a merge into an empty terminal node instead of unrelated terminations.
+    DisjointSet terminal_sets(previous.size());
+    for (std::size_t a = 0; a < previous.size(); ++a) {
+      if (!previous[a].children.empty() || terminal_reaches[a].empty()) continue;
+      for (std::size_t b = a + 1; b < previous.size(); ++b) {
+        if (!previous[b].children.empty() || terminal_reaches[b].empty()) continue;
+        if (terminal_reaches_touch(terminal_reaches[a], terminal_reaches[b],
+                                   tolerance))
+          terminal_sets.join(a, b);
+      }
+    }
+    std::vector<std::vector<std::size_t>> terminal_groups(previous.size());
+    for (std::size_t parent = 0; parent < previous.size(); ++parent) {
+      if (!previous[parent].children.empty()) continue;
+      terminal_groups[terminal_sets.find(parent)].push_back(parent);
+    }
+    std::vector<bool> merged_terminal(previous.size(), false);
+    for (const auto& group : terminal_groups) {
+      if (group.size() < 2) continue;
+      std::vector<Point64> points;
+      points.reserve(group.size());
+      for (const std::size_t parent : group) {
+        merged_terminal[parent] = true;
+        points.push_back(representative_point(previous[parent]));
+      }
+      result.events.push_back({LineageEventKind::MergeTermination, generation,
+                               group, {}, average_points(points)});
     }
 
     for (std::size_t parent = 0; parent < previous.size(); ++parent) {
@@ -738,7 +928,7 @@ FrontLineage build_front_lineage(const WaveResult& wave) {
           points.push_back(representative_point(current[child]));
         result.events.push_back({LineageEventKind::Split, generation,
                                  {parent}, children, average_points(points)});
-      } else if (children.empty()) {
+      } else if (children.empty() && !merged_terminal[parent]) {
         result.events.push_back({LineageEventKind::Termination, generation,
                                  {parent}, {}, representative_point(previous[parent])});
       }
@@ -758,10 +948,12 @@ FrontLineage build_front_lineage(const WaveResult& wave) {
       }
     }
   }
+  reject_tiny_splits(result, tiny_split_area_factor);
   return result;
 }
 
-LayerTopology build_layer_topology(const FrontLineage& lineage) {
+LayerTopology build_layer_topology(const FrontLineage& lineage,
+                                   bool build_footprints) {
   LayerTopology result;
   result.front_nodes.resize(lineage.generations.size());
   std::vector<std::size_t> offsets(lineage.generations.size() + 1, 0);
@@ -776,16 +968,41 @@ LayerTopology build_layer_topology(const FrontLineage& lineage) {
   if (total == 0) return result;
 
   DisjointSet sets(total);
+  std::vector<std::vector<bool>> rejected_splits(
+      lineage.generations.size());
+  for (std::size_t generation = 0; generation < lineage.generations.size();
+       ++generation)
+    rejected_splits[generation].assign(
+        lineage.generations[generation].fronts.size(), false);
+  for (const LineageEvent& event : lineage.rejected_splits) {
+    if (event.kind != LineageEventKind::Split || event.generation == 0 ||
+        event.generation > rejected_splits.size())
+      continue;
+    for (const std::size_t parent : event.previous_fronts)
+      if (parent < rejected_splits[event.generation - 1].size())
+        rejected_splits[event.generation - 1][parent] = true;
+  }
   for (std::size_t generation = 0; generation + 1 < lineage.generations.size();
        ++generation) {
     const auto& parents = lineage.generations[generation].fronts;
     const auto& children = lineage.generations[generation + 1].fronts;
     for (std::size_t parent = 0; parent < parents.size(); ++parent) {
-      if (parents[parent].children.size() != 1) continue;
-      const std::size_t child = parents[parent].children.front();
-      if (child >= children.size() || children[child].parents.size() != 1) continue;
-      sets.join(offsets[generation] + parent,
-                offsets[generation + 1] + child);
+      if (parents[parent].children.size() == 1) {
+        const std::size_t child = parents[parent].children.front();
+        if (child >= children.size() || children[child].parents.size() != 1)
+          continue;
+        sets.join(offsets[generation] + parent,
+                  offsets[generation + 1] + child);
+      } else if (parents[parent].children.size() > 1 &&
+                 rejected_splits[generation][parent]) {
+        // The geometric fronts and their dependencies remain intact. Joining
+        // them here says only that a below-resolution terminal spur does not
+        // start a new propagation node.
+        for (const std::size_t child : parents[parent].children)
+          if (child < children.size() && children[child].parents.size() == 1)
+            sets.join(offsets[generation] + parent,
+                      offsets[generation + 1] + child);
+      }
     }
   }
 
@@ -804,8 +1021,10 @@ LayerTopology build_layer_topology(const FrontLineage& lineage) {
     }
   }
 
-  const double half_pitch = std::max<double>(1.0, to_integer(lineage.stepover) * 0.5);
-  for (FrontNode& node : result.nodes) {
+  if (build_footprints) {
+    const double half_pitch =
+        std::max<double>(1.0, to_integer(lineage.stepover) * 0.5);
+    for (FrontNode& node : result.nodes) {
     const FrontId2D last_id = *std::max_element(
         node.fronts.begin(), node.fronts.end(),
         [](const FrontId2D& a, const FrontId2D& b) {
@@ -814,6 +1033,24 @@ LayerTopology build_layer_topology(const FrontLineage& lineage) {
     const LeadingFront& last_front =
         lineage.generations[last_id.generation].fronts[last_id.index];
     const bool terminal = last_front.children.empty();
+    bool has_rejected_split = false;
+    for (std::size_t i = 1; i < node.fronts.size(); ++i)
+      if (node.fronts[i - 1].generation == node.fronts[i].generation) {
+        has_rejected_split = true;
+        break;
+      }
+    if (!has_rejected_split)
+      for (const FrontId2D id : node.fronts) {
+        const LeadingFront& front =
+            lineage.generations[id.generation].fronts[id.index];
+        if (front.children.size() > 1 &&
+            id.generation < rejected_splits.size() &&
+            id.index < rejected_splits[id.generation].size() &&
+            rejected_splits[id.generation][id.index]) {
+          has_rejected_split = true;
+          break;
+        }
+      }
     if (node.fronts.size() == 1 && !terminal) {
       // A singleton has no preceding/following fronts with which to enclose an
       // area, so a non-terminal singleton alone receives the half-pitch local
@@ -836,6 +1073,11 @@ LayerTopology build_layer_topology(const FrontLineage& lineage) {
     }
 
     const Paths64 swept = member_bands(lineage, node);
+    if (has_rejected_split) {
+      node.footprint = one_closed_component(
+          swept, "Node containing a rejected tiny split");
+      continue;
+    }
     std::vector<OrientedFront> open_fronts;
     std::vector<Path64> closed_fronts;
     bool has_open = false;
@@ -908,10 +1150,18 @@ LayerTopology build_layer_topology(const FrontLineage& lineage) {
     if (terminal) {
       const auto& contacts = open_fronts.back().contacts;
       if (contacts[0].valid && contacts[1].valid &&
-          contacts[0].component == contacts[1].component)
-        node.footprint = terminal_open_footprint(lineage, open_fronts,
-                                                 rails, swept);
-      else
+          contacts[0].component == contacts[1].component) {
+        try {
+          node.footprint = terminal_open_footprint(lineage, open_fronts,
+                                                   rails, swept);
+        } catch (const std::runtime_error& error) {
+          throw std::runtime_error(
+              "Terminal node " +
+              std::to_string(static_cast<std::size_t>(&node -
+                                                       result.nodes.data())) +
+              ": " + error.what());
+        }
+      } else
         node.footprint = one_closed_component(
             swept, "Terminal node footprint without a static-boundary cap");
       continue;
@@ -927,15 +1177,21 @@ LayerTopology build_layer_topology(const FrontLineage& lineage) {
     append_path(boundary, first_return);
     node.footprint = one_closed_component(
         Paths64{boundary}, "Open non-terminal node footprint");
-  }
+    }
 
-  for (const FrontNode& node : result.nodes) {
-    if (node.footprint.empty())
-      throw std::runtime_error("A node footprint has no closed boundary");
+    for (const FrontNode& node : result.nodes) {
+      if (node.footprint.empty())
+        throw std::runtime_error("A node footprint has no closed boundary");
+    }
   }
 
   // The node graph is already in generation order, so a single forward pass
   // computes its topological evaluation depth.
+  const auto append_unique = [](std::vector<std::size_t>& values,
+                                std::size_t value) {
+    if (std::find(values.begin(), values.end(), value) == values.end())
+      values.push_back(value);
+  };
   for (std::size_t generation = 0; generation + 1 < lineage.generations.size();
        ++generation) {
     for (std::size_t parent = 0;
@@ -946,6 +1202,8 @@ LayerTopology build_layer_topology(const FrontLineage& lineage) {
         if (child >= result.front_nodes[generation + 1].size()) continue;
         const std::size_t child_node = result.front_nodes[generation + 1][child];
         if (child_node == parent_node) continue;
+        append_unique(result.nodes[parent_node].children, child_node);
+        append_unique(result.nodes[child_node].parents, parent_node);
         result.nodes[child_node].evaluation_order =
             std::max(result.nodes[child_node].evaluation_order,
                      result.nodes[parent_node].evaluation_order + 1);
@@ -953,8 +1211,88 @@ LayerTopology build_layer_topology(const FrontLineage& lineage) {
     }
   }
 
+  // Material consumed between converging fronts has no leading front of its
+  // own. Preserve that real topological merge as an empty terminal sink. It is
+  // part of wave complexity and descendant association, but deliberately has
+  // no footprint or entry front.
+  for (const LineageEvent& event : lineage.events) {
+    if (event.kind != LineageEventKind::MergeTermination ||
+        event.generation == 0 || event.previous_fronts.size() < 2)
+      continue;
+    FrontNode terminal;
+    terminal.kind = FrontNode::Kind::MergeTermination;
+    for (const std::size_t front : event.previous_fronts) {
+      if (front >= result.front_nodes[event.generation - 1].size()) continue;
+      const std::size_t parent =
+          result.front_nodes[event.generation - 1][front];
+      append_unique(terminal.parents, parent);
+    }
+    if (terminal.parents.size() < 2) continue;
+    const std::size_t terminal_id = result.nodes.size();
+    for (const std::size_t parent : terminal.parents) {
+      append_unique(result.nodes[parent].children, terminal_id);
+      terminal.evaluation_order =
+          std::max(terminal.evaluation_order,
+                   result.nodes[parent].evaluation_order + 1);
+    }
+    result.nodes.push_back(std::move(terminal));
+  }
+
   result.entry_fronts.resize(lineage.entry_fronts.size());
   std::iota(result.entry_fronts.begin(), result.entry_fronts.end(), 0);
+  return result;
+}
+
+std::vector<NodeEntryGroup> group_node_entries(
+    const LayerTopology& topology, std::size_t evaluation_order) {
+  std::vector<NodeEntry> entries;
+  for (std::size_t node = 0; node < topology.nodes.size(); ++node) {
+    const FrontNode& candidate = topology.nodes[node];
+    if (candidate.kind != FrontNode::Kind::Propagation ||
+        candidate.evaluation_order != evaluation_order ||
+        candidate.fronts.empty())
+      continue;
+    entries.push_back({node, candidate.fronts.front()});
+  }
+  if (entries.empty()) return {};
+
+  DisjointSet groups(entries.size());
+  std::vector<std::vector<std::size_t>> labels(topology.nodes.size());
+  for (std::size_t entry = 0; entry < entries.size(); ++entry)
+    labels[entries[entry].node].push_back(entry);
+
+  std::vector<std::size_t> order(topology.nodes.size());
+  std::iota(order.begin(), order.end(), 0);
+  std::stable_sort(order.begin(), order.end(), [&](std::size_t a,
+                                                    std::size_t b) {
+    return topology.nodes[a].evaluation_order <
+           topology.nodes[b].evaluation_order;
+  });
+  for (const std::size_t node : order) {
+    auto& incoming = labels[node];
+    std::sort(incoming.begin(), incoming.end());
+    incoming.erase(std::unique(incoming.begin(), incoming.end()),
+                   incoming.end());
+    if (incoming.size() > 1)
+      for (std::size_t i = 1; i < incoming.size(); ++i)
+        groups.join(incoming.front(), incoming[i]);
+    for (const std::size_t child : topology.nodes[node].children) {
+      if (child >= labels.size()) continue;
+      labels[child].insert(labels[child].end(), incoming.begin(),
+                           incoming.end());
+    }
+  }
+
+  std::vector<std::size_t> root_to_group(entries.size(), kNoTopologyId);
+  std::vector<NodeEntryGroup> result;
+  for (std::size_t entry = 0; entry < entries.size(); ++entry) {
+    const std::size_t root = groups.find(entry);
+    if (root_to_group[root] == kNoTopologyId) {
+      root_to_group[root] = result.size();
+      result.push_back({});
+    }
+    result[root_to_group[root]].entries.push_back(entries[entry]);
+  }
   return result;
 }
 
@@ -1015,15 +1353,30 @@ std::vector<InterLayerChain> chain_entry_fronts(
 
 InterLayerTopology build_inter_layer_topology(
     const std::vector<const FrontLineage*>& lineages,
-    double entry_front_match_tolerance) {
+    double entry_front_match_tolerance,
+    const std::vector<const LayerTopology*>& topologies) {
   if (!(entry_front_match_tolerance > 0.0) ||
       !std::isfinite(entry_front_match_tolerance))
     throw std::invalid_argument("Entry-front match tolerance must be positive");
   InterLayerTopology result;
   result.layers.reserve(lineages.size());
-  for (const FrontLineage* lineage : lineages) {
+  if (!topologies.empty() && topologies.size() != lineages.size())
+    throw std::invalid_argument(
+        "Inter-layer topology and lineage counts do not match");
+  for (std::size_t layer = 0; layer < lineages.size(); ++layer) {
+    const FrontLineage* lineage = lineages[layer];
     if (!lineage) throw std::invalid_argument("Inter-layer lineage is null");
-    result.layers.push_back(build_layer_topology(*lineage));
+    if (topologies.empty())
+      result.layers.push_back(build_layer_topology(*lineage));
+    else {
+      if (!topologies[layer])
+        throw std::invalid_argument("Inter-layer topology is null");
+      if (topologies[layer]->front_nodes.size() !=
+          lineage->generations.size())
+        throw std::invalid_argument(
+            "Inter-layer topology and lineage generations do not match");
+      result.layers.push_back(*topologies[layer]);
+    }
   }
 
   std::vector<std::size_t> node_sizes;
@@ -1041,8 +1394,12 @@ InterLayerTopology build_inter_layer_topology(
     std::vector<std::pair<std::size_t, std::size_t>> candidates;
     for (std::size_t a = 0; a < upper.size(); ++a)
       for (std::size_t b = 0; b < lower.size(); ++b)
-        if (upper[a].evaluation_order == lower[b].evaluation_order &&
-            exact_area_contains(upper[a].footprint, lower[b].footprint)) {
+        if (upper[a].kind == FrontNode::Kind::Propagation &&
+            lower[b].kind == FrontNode::Kind::Propagation &&
+            upper[a].evaluation_order == lower[b].evaluation_order &&
+            area_contains_with_tolerance(
+                upper[a].footprint, lower[b].footprint,
+                kNodeZAssociationTolerance)) {
           ++upper_count[a];
           ++lower_count[b];
           candidates.push_back({a, b});
@@ -1067,6 +1424,11 @@ InterLayerTopology build_inter_layer_topology(
              result.layers[layer].nodes[b].evaluation_order;
     });
     for (const std::size_t node : order) {
+      if (result.layers[layer].nodes[node].kind ==
+          FrontNode::Kind::MergeTermination) {
+        scheduled[layer][node] = true;
+        continue;
+      }
       if (scheduled[layer][node]) continue;
       const std::size_t chain = result.node_chain_ids[layer][node];
       if (chain == kNoTopologyId) {
@@ -1142,6 +1504,7 @@ const char* lineage_event_kind_name(LineageEventKind kind) {
   switch (kind) {
     case LineageEventKind::Split: return "split";
     case LineageEventKind::Merge: return "merge";
+    case LineageEventKind::MergeTermination: return "merge termination";
     case LineageEventKind::Termination: return "termination";
     case LineageEventKind::Birth: return "birth (unexpected)";
   }

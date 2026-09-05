@@ -571,15 +571,25 @@ void check_inter_layer_topology() {
   require(joined.entry_front_chains.size() == 1,
           "a whole entry curve inside the tolerance envelope forms a Z chain");
 
-  wave::FrontLineage lower_outside = single_front_lineage(
-      {point(-0.001, 5.1), point(9.0, 5.1)},
-      box(-0.001, 4.2, 9.0, 5.8));
-  auto exact = wave::build_inter_layer_topology(
-      {&upper, &lower_outside}, 0.2);
-  require(exact.node_chains.empty(),
-          "area matching does not inflate the upper footprint by even one grid unit");
-  require(exact.entry_front_chains.size() == 1,
+  wave::FrontLineage lower_near = single_front_lineage(
+      {point(-0.025, 5.1), point(9.0, 5.1)},
+      box(-0.025, 4.2, 9.0, 5.8));
+  auto tolerant = wave::build_inter_layer_topology(
+      {&upper, &lower_near}, 0.2);
+  require(tolerant.node_chains.size() == 1,
+          "a 0.025 mm area discrepancy retains its node Z association");
+  require(tolerant.entry_front_chains.size() == 1,
           "entry-front matching remains independently tolerant");
+
+  wave::FrontLineage lower_far = single_front_lineage(
+      {point(-0.075, 5.1), point(9.0, 5.1)},
+      box(-0.075, 4.2, 9.0, 5.8));
+  auto outside_tolerance = wave::build_inter_layer_topology(
+      {&upper, &lower_far}, 0.2);
+  require(outside_tolerance.node_chains.empty(),
+          "a discrepancy over 0.05 mm still breaks the node Z association");
+  require(outside_tolerance.entry_front_chains.size() == 1,
+          "the entry-front envelope remains independent of node tolerance");
 
   wave::FrontLineage split;
   split.stepover = 0.5;

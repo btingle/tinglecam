@@ -5,6 +5,7 @@
 #include "cam/machine.h"
 #include "cam/material.h"
 #include "cam/tooling.h"
+#include "analysis.h"
 #include "geometry.h"
 #include "mesh_slicer.h"
 #include "simulation.h"
@@ -62,6 +63,9 @@ struct Operation {
   // Entry fronts are associated between adjacent Z layers only when the whole
   // lower curve lies inside this envelope around the upper curve.
   double entry_front_match_tolerance = 3.0;
+  // A terminal split branch below this many square stepovers remains part of
+  // the propagated wave but does not introduce a lineage/node boundary.
+  double tiny_split_area_factor = wave::kDefaultTinySplitAreaFactor;
   // Contour derivation is independent of routing. In finishing mode the
   // already-sliced subject is offset to the cutter centre and may be clipped
   // against the available stock before the generic traversal planner sees it.
@@ -116,6 +120,13 @@ struct LevelPlan {
   wave::Paths64 stock_slice;
   wave::WaveResult wave;
   wave::FrontLineage lineage;
+  wave::LayerTopology topology;
+  // The recursively committed wave layers used for actual roughing motion.
+  // `wave`, `lineage`, and `topology` above are their combined final result for
+  // topology/debug consumers.
+  std::vector<wave::WavefrontStage> wave_stages;
+  std::size_t analysis_trials = 0;
+  std::size_t accepted_analysis_trials = 0;
   wave::Toolpath toolpath;
   wave::SimulationResult simulation;
   FeedSchedule feeds;
@@ -175,6 +186,9 @@ struct PlanningMetrics {
 
   std::size_t wave_generations = 0;
   std::size_t fronts = 0;
+  std::size_t analysis_layers = 0;
+  std::size_t analysis_trials = 0;
+  std::size_t accepted_analysis_trials = 0;
   std::size_t toolpath_moves = 0;
   std::size_t simulation_intervals = 0;
   std::size_t empty_simulation_intervals = 0;

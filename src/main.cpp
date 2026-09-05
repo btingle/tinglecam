@@ -1,7 +1,6 @@
+#include "analysis.h"
 #include "geometry.h"
 #include "mesh_slicer.h"
-#include "simulation.h"
-#include "toolpath.h"
 #include "topology.h"
 
 #include <SDL.h>
@@ -42,6 +41,12 @@ struct OrbitState {
   float zoom = 1.0f;
 };
 
+struct DecisionEntryView {
+  wave::WaveSeed seed;
+  std::size_t group = 0;
+  bool retained = true;
+};
+
 struct AppState {
   wave::SvgGeometry svg;
   Paths64 subject_paths;
@@ -52,6 +57,14 @@ struct AppState {
   wave::MeshSlice stock_slice;
   wave::WaveResult result;
   wave::FrontLineage lineage;
+  wave::LayerTopology topology;
+  wave::WaveResult standard_result;
+  wave::FrontLineage standard_lineage;
+  wave::LayerTopology standard_topology;
+  wave::WavefrontAnalysis analysis;
+  // Full-subject XY bounds used by the automatic rectangular stock. Unlike
+  // subject_paths, this never changes as a mesh is sliced at different Zs.
+  std::optional<wave::Rect64> auto_stock_subject_bounds;
   // The boundaries as sliced, before inflation, so an offset can be seen
   // against what it was applied to.
   Paths64 raw_subject_outline;
@@ -64,11 +77,10 @@ struct AppState {
   int query_grid = 32;
   float allowance = 150.0f;
   float stepover = 80.0f;
-  float softening_percent = 100.0f;
+  bool rounded_waves = true;
   float subject_inflation = 0.0f;
   float stock_inflation = 0.0f;
-  float simulation_stock_inflation = 0.0f;
-  float tool_radius = 40.0f;
+  float lead_in_distance = 40.0f;
   bool lead_in = true;
   int selected_iteration = -1;
   bool show_all_iterations = true;
@@ -76,24 +88,27 @@ struct AppState {
   bool show_stock = true;
   bool show_leading_fronts = true;
   bool show_original_boundaries = true;
-  bool show_toolpath = true;
-  bool show_simulation = true;
-  bool show_load = false;
-  bool show_gouges = true;
-  bool toolpath_play = true;
-  // World units per second, and how far the tool has travelled along the path.
-  float toolpath_speed = 40.0f;
-  float toolpath_progress = 0.0f;
   bool show_parent_links = true;
   bool show_event_markers = true;
+  bool show_nodes = true;
+  bool show_entry_choices = true;
+  bool show_remaining_domain = true;
   bool animate = false;
-  wave::Toolpath toolpath;
-  wave::SimulationResult simulation;
+  bool decision_play = false;
+  bool analysis_dirty = true;
+  int decision_step = 0;
+  float decision_speed = 1.0f;
+  int max_analysis_layers = 128;
+  float tiny_split_area_factor =
+      static_cast<float>(wave::kDefaultTinySplitAreaFactor);
+  std::string decision_caption;
+  std::vector<DecisionEntryView> decision_entries;
+  Paths64 decision_domain;
   float animation_speed = 4.0f;
   ViewState view;
   OrbitState orbit;
   std::string error;
-  std::string simulation_error;
+  std::string analysis_error;
 };
 
 Paths64 offset_boundaries(const Paths64& input, float amount,
@@ -102,7 +117,7 @@ Paths64 offset_boundaries(const Paths64& input, float amount,
   const std::int64_t delta = wave::to_integer(amount);
   if (delta != 0) {
     result = Clipper2Lib::InflatePaths(
-        result, static_cast<double>(delta), Clipper2Lib::JoinType::Miter,
+        result, static_cast<double>(delta), Clipper2Lib::JoinType::Round,
         Clipper2Lib::EndType::Polygon);
     result = Clipper2Lib::Union(result, Clipper2Lib::FillRule::NonZero);
   }
@@ -112,9 +127,8 @@ Paths64 offset_boundaries(const Paths64& input, float amount,
   return result;
 }
 
-Paths64 allowance_stock(const Paths64& subject, float allowance) {
+Paths64 allowance_stock(const wave::Rect64& bounds, float allowance) {
   if (!(allowance > 0.0f)) throw std::runtime_error("Allowance must be positive");
-  const auto bounds = Clipper2Lib::GetBounds(subject);
   const std::int64_t margin = std::max<std::int64_t>(1, wave::to_integer(allowance));
   return Paths64{{
       {bounds.left - margin, bounds.top - margin},
@@ -124,15 +138,45 @@ Paths64 allowance_stock(const Paths64& subject, float allowance) {
   }};
 }
 
-void recompute_simulation(AppState& app) {
+wave::Rect64 automatic_stock_bounds(const AppState& app) {
+  if (app.auto_stock_subject_bounds) return *app.auto_stock_subject_bounds;
+  throw std::runtime_error(
+      "Automatic stock has no fixed full-subject XY bounds");
+}
+
+wave::Rect64 mesh_xy_bounds(const wave::Mesh& mesh) {
+  wave::Rect64 result;
+  result.left = wave::to_integer(mesh.bounds.lower.x);
+  result.top = wave::to_integer(mesh.bounds.lower.y);
+  result.right = wave::to_integer(mesh.bounds.upper.x);
+  result.bottom = wave::to_integer(mesh.bounds.upper.y);
+  return result;
+}
+
+wave::LayerTopology display_topology(const wave::FrontLineage& lineage) {
   try {
-    app.simulation = wave::simulate_material(
-        app.raw_stock_outline, app.raw_subject_outline, app.toolpath,
-        app.tool_radius, app.simulation_stock_inflation);
-    app.simulation_error.clear();
-  } catch (const std::exception& error) {
-    app.simulation = {};
-    app.simulation_error = error.what();
+    return wave::build_layer_topology(lineage);
+  } catch (const std::runtime_error&) {
+    // A rejected split can put parallel fronts in one node, for which endpoint
+    // rails are not unique. The swept bands are still the exact region that
+    // node owns and make the more useful diagnostic highlight.
+    wave::LayerTopology topology = wave::build_layer_topology(lineage, false);
+    for (wave::FrontNode& node : topology.nodes) {
+      wave::Paths64 footprint;
+      for (const wave::FrontId2D id : node.fronts) {
+        if (id.generation >= lineage.generations.size()) continue;
+        const wave::FrontGeneration& generation =
+            lineage.generations[id.generation];
+        if (id.index >= generation.fronts.size()) continue;
+        const std::size_t band = generation.fronts[id.index].band;
+        if (band >= generation.bands.size()) continue;
+        footprint.insert(footprint.end(), generation.bands[band].begin(),
+                         generation.bands[band].end());
+      }
+      node.footprint =
+          Clipper2Lib::Union(footprint, Clipper2Lib::FillRule::NonZero);
+    }
+    return topology;
   }
 }
 
@@ -147,10 +191,19 @@ ImU32 iteration_color(int index, int count, int alpha = 225) {
       alpha / 255.0f));
 }
 
+ImU32 node_color(std::size_t index, int alpha = 230) {
+  const float hue = std::fmod(static_cast<float>(index) * 0.61803398875f, 1.0f);
+  ImVec4 color = ImColor::HSV(hue, 0.60f, 0.95f);
+  color.w = alpha / 255.0f;
+  return ImGui::ColorConvertFloat4ToU32(color);
+}
+
 ImU32 event_color(wave::LineageEventKind kind, int alpha = 255) {
   switch (kind) {
     case wave::LineageEventKind::Split: return IM_COL32(255, 91, 177, alpha);
     case wave::LineageEventKind::Merge: return IM_COL32(72, 229, 139, alpha);
+    case wave::LineageEventKind::MergeTermination:
+      return IM_COL32(94, 174, 255, alpha);
     case wave::LineageEventKind::Termination: return IM_COL32(255, 92, 73, alpha);
     case wave::LineageEventKind::Birth: return IM_COL32(255, 205, 74, alpha);
   }
@@ -161,10 +214,111 @@ const char* event_short_name(wave::LineageEventKind kind) {
   switch (kind) {
     case wave::LineageEventKind::Split: return "S";
     case wave::LineageEventKind::Merge: return "M";
+    case wave::LineageEventKind::MergeTermination: return "MT";
     case wave::LineageEventKind::Termination: return "T";
     case wave::LineageEventKind::Birth: return "B";
   }
   return "?";
+}
+
+int decision_frame_count(const AppState& app) {
+  std::size_t count = 1;
+  for (const wave::WavefrontDecisionLayer& layer : app.analysis.layers)
+    count += layer.trials.size() + 2;
+  return static_cast<int>(std::min<std::size_t>(
+      count, static_cast<std::size_t>(std::numeric_limits<int>::max())));
+}
+
+void set_decision_layer(AppState& app,
+                        const wave::WavefrontDecisionLayer& layer,
+                        const std::vector<std::size_t>* retained) {
+  app.decision_domain = layer.remaining_domain;
+  app.decision_entries.clear();
+  app.decision_entries.reserve(layer.entries.size());
+
+  std::vector<std::size_t> entry_nodes;
+  for (std::size_t node = 0; node < layer.baseline_topology.nodes.size(); ++node) {
+    const wave::FrontNode& item = layer.baseline_topology.nodes[node];
+    if (item.kind == wave::FrontNode::Kind::Propagation &&
+        item.evaluation_order == 0 && !item.fronts.empty())
+      entry_nodes.push_back(node);
+  }
+  std::vector<std::size_t> entry_groups(layer.entries.size());
+  for (std::size_t entry = 0; entry < entry_groups.size(); ++entry)
+    entry_groups[entry] = entry;
+  for (std::size_t group = 0; group < layer.groups.size(); ++group)
+    for (const wave::NodeEntry& member : layer.groups[group].entries) {
+      const auto found = std::find(entry_nodes.begin(), entry_nodes.end(),
+                                   member.node);
+      if (found != entry_nodes.end())
+        entry_groups[static_cast<std::size_t>(found - entry_nodes.begin())] =
+            group;
+    }
+
+  for (std::size_t entry = 0; entry < layer.entries.size(); ++entry) {
+    const bool keep = !retained ||
+                      std::find(retained->begin(), retained->end(), entry) !=
+                          retained->end();
+    app.decision_entries.push_back(
+        {layer.entries[entry], entry_groups[entry], keep});
+  }
+}
+
+std::string apply_decision_frame(AppState& app) {
+  const int count = decision_frame_count(app);
+  app.decision_step = std::clamp(app.decision_step, 0, std::max(0, count - 1));
+  if (app.decision_step == 0 || app.analysis.layers.empty()) {
+    app.result = app.standard_result;
+    app.lineage = app.standard_lineage;
+    app.topology = app.standard_topology;
+    app.decision_entries.clear();
+    app.decision_domain = app.standard_result.domain;
+    return "Initial simultaneous analysis";
+  }
+  std::size_t cursor = static_cast<std::size_t>(app.decision_step - 1);
+  for (const wave::WavefrontDecisionLayer& layer : app.analysis.layers) {
+    if (cursor == 0) {
+      app.result = layer.baseline_wave;
+      app.lineage = layer.baseline_lineage;
+      app.topology = layer.baseline_topology;
+      set_decision_layer(app, layer, nullptr);
+      return "Layer " + std::to_string(layer.layer) +
+             ": simultaneous baseline (" +
+             std::to_string(layer.baseline_topology.nodes.size()) + " nodes)";
+    }
+    --cursor;
+    if (cursor < layer.trials.size()) {
+      const wave::WavefrontStrategyTrial& trial = layer.trials[cursor];
+      app.result = trial.wave;
+      app.lineage = trial.lineage;
+      app.topology = trial.topology;
+      set_decision_layer(app, layer, &trial.retained_entries);
+      return "Layer " + std::to_string(layer.layer) +
+             ": longest entry per connected group (" +
+             std::to_string(trial.candidate_significant_node_count) + " vs " +
+             std::to_string(trial.previous_significant_node_count) +
+             " significant; " + std::to_string(trial.candidate_node_count) +
+             " vs " + std::to_string(trial.previous_node_count) + " raw, " +
+             (trial.accepted ? "accepted" : "rejected") + ")";
+    }
+    cursor -= layer.trials.size();
+    if (cursor == 0) {
+      app.result = layer.selected_wave;
+      app.lineage = layer.selected_lineage;
+      app.topology = layer.selected_topology;
+      set_decision_layer(app, layer, &layer.retained_entries);
+      return "Layer " + std::to_string(layer.layer) +
+             ": selected strategy (" +
+             std::to_string(layer.selected_topology.nodes.size()) + " nodes)";
+    }
+    --cursor;
+  }
+  app.result = app.standard_result;
+  app.lineage = app.standard_lineage;
+  app.topology = app.standard_topology;
+  app.decision_entries.clear();
+  app.decision_domain = app.standard_result.domain;
+  return "Initial simultaneous analysis";
 }
 
 void recompute(AppState& app) {
@@ -174,7 +328,8 @@ void recompute(AppState& app) {
     const Paths64 subject = offset_boundaries(
         app.subject_paths, app.subject_inflation, "Subject");
     Paths64 stock;
-    if (app.stock_slicer.empty()) stock = allowance_stock(app.subject_paths, app.allowance);
+    if (app.stock_slicer.empty())
+      stock = allowance_stock(automatic_stock_bounds(app), app.allowance);
     else {
       if (app.sliced_stock.empty()) throw std::runtime_error("The current stock slice is empty");
       stock = app.sliced_stock;
@@ -183,17 +338,49 @@ void recompute(AppState& app) {
     app.raw_subject_outline =
         Clipper2Lib::Union(app.subject_paths, Clipper2Lib::FillRule::NonZero);
     stock = offset_boundaries(stock, app.stock_inflation, "Stock");
-    const double softening =
-        std::min<double>(app.stepover * app.softening_percent * 0.01, app.stepover);
-    // One radius of lead-in is what it takes a cutter to go from standing clear
-    // of the stock wall to fully across it, so that is the distance over which
-    // the first passes have to take up their bite.
-    const double lead_in = app.lead_in ? app.tool_radius : 0.0;
-    app.result = wave::build_wavefront(subject, stock, app.stepover, softening, lead_in);
-    app.lineage = wave::build_front_lineage(app.result);
-    app.toolpath = wave::build_toolpath(app.result, app.lineage, app.tool_radius);
-    recompute_simulation(app);
-    app.toolpath_progress = 0.0f;
+    const double softening = app.rounded_waves ? app.stepover : 0.0;
+    const double lead_in = app.lead_in ? app.lead_in_distance : 0.0;
+    const auto build_standard_fallback = [&] {
+      app.standard_result =
+          wave::build_wavefront(subject, stock, app.stepover, softening, lead_in);
+      app.standard_lineage = wave::build_front_lineage(
+          app.standard_result, app.tiny_split_area_factor);
+      app.standard_topology = display_topology(app.standard_lineage);
+    };
+    try {
+      app.analysis = wave::analyze_wavefront(subject, stock, app.stepover,
+                                             softening, lead_in, 2000,
+                                             static_cast<std::size_t>(
+                                                 app.max_analysis_layers), {},
+                                             wave::kDefaultSignificantNodeAreaFraction,
+                                             app.tiny_split_area_factor);
+      if (app.analysis.layers.empty()) {
+        build_standard_fallback();
+      } else {
+        // Layer zero is the same all-entry propagation the viewer previously
+        // built separately. Reuse it, restoring the input metadata omitted by
+        // the isolated-domain rollout, and build footprints only for this
+        // primary display graph.
+        const wave::WavefrontDecisionLayer& first = app.analysis.layers.front();
+        app.standard_result = first.baseline_wave;
+        app.standard_result.subject = app.analysis.seed.subject;
+        app.standard_result.stock = app.analysis.seed.stock;
+        app.standard_result.stock_boundary = app.analysis.seed.stock_boundary;
+        app.standard_result.domain = app.analysis.seed.domain;
+        app.standard_result.lead_in = app.analysis.seed.lead_in;
+        app.standard_result.lead_in_generations =
+            app.analysis.seed.lead_in_generations;
+        app.standard_lineage = first.baseline_lineage;
+        app.standard_topology = display_topology(app.standard_lineage);
+      }
+      app.analysis_error.clear();
+    } catch (const std::exception& error) {
+      app.analysis = {};
+      app.analysis_error = error.what();
+      app.decision_step = 0;
+      build_standard_fallback();
+    }
+    app.decision_caption = apply_decision_frame(app);
     if (app.selected_iteration < 0 && !app.lineage.events.empty())
       app.selected_iteration = static_cast<int>(app.lineage.events.front().generation);
     else
@@ -201,6 +388,7 @@ void recompute(AppState& app) {
           app.selected_iteration, 0,
           std::max(0, static_cast<int>(app.result.generations.size()) - 1));
     app.error.clear();
+    app.analysis_dirty = false;
   } catch (const std::exception& error) {
     app.error = error.what();
     // The previous slice's analysis no longer describes what is on screen, and
@@ -208,14 +396,40 @@ void recompute(AppState& app) {
     // geometry against indices that no longer exist.
     app.result = {};
     app.lineage = {};
+    app.topology = {};
+    app.standard_result = {};
+    app.standard_lineage = {};
+    app.standard_topology = {};
+    app.analysis = {};
+    app.analysis_error.clear();
+    app.decision_step = 0;
+    app.decision_caption.clear();
     app.raw_subject_outline.clear();
     app.raw_stock_outline.clear();
-    app.toolpath = {};
-    app.simulation = {};
-    app.simulation_error.clear();
-    app.toolpath_progress = 0.0f;
     app.selected_iteration = -1;
+    app.analysis_dirty = true;
   }
+}
+
+void update_preview_outlines(AppState& app) {
+  if (app.subject_paths.empty()) return;
+  app.raw_subject_outline =
+      Clipper2Lib::Union(app.subject_paths, Clipper2Lib::FillRule::NonZero);
+  const Paths64 stock = app.stock_slicer.empty()
+                            ? allowance_stock(automatic_stock_bounds(app),
+                                              app.allowance)
+                            : app.sliced_stock;
+  app.raw_stock_outline =
+      Clipper2Lib::Union(stock, Clipper2Lib::FillRule::NonZero);
+}
+
+void reslice(AppState& app, bool analyze);
+
+void build_analysis(AppState& app) {
+  if (!app.subject_slicer.empty() || !app.stock_slicer.empty())
+    reslice(app, /*analyze=*/false);
+  update_preview_outlines(app);
+  recompute(app);
 }
 
 void update_slice_range(AppState& app, bool center_height) {
@@ -241,10 +455,9 @@ void update_slice_range(AppState& app, bool center_height) {
   app.slice_z = std::clamp(app.slice_z, app.slice_min, app.slice_max);
 }
 
-// `analyze` is false while startup is still assembling its inputs. Slicing is
-// cheap and its results are needed to pick sensible defaults, but the wavefront,
-// lineage, toolpath and material simulation are not worth building for
-// parameters that the next few lines are about to overwrite.
+// Slicing and preview-outline refresh are cheap. Recursive wave analysis is
+// optional so interactive edits can be collected for the explicit Build
+// button instead of rebuilding on every slider tick.
 void reslice(AppState& app, bool analyze = true) {
   try {
     if (!app.subject_slicer.empty()) {
@@ -263,6 +476,7 @@ void reslice(AppState& app, bool analyze = true) {
     }
     app.selected_iteration = -1;
     app.view.needs_fit = true;
+    update_preview_outlines(app);
     if (analyze) recompute(app);
   } catch (const std::exception& error) {
     app.error = error.what();
@@ -283,12 +497,9 @@ void load_mesh(AppState& app, bool stock, bool analyze = true) {
       if (span > 0.0f) {
         app.allowance = span * 0.05f;
         app.stepover = span * 0.025f;
-        // The stepover just moved, so the radius derived from it has to move
-        // with it. Left behind, it keeps whatever the previous subject implied,
-        // and loading a small part after a large one leaves a tool wider than
-        // the stock it is meant to cut.
-        app.tool_radius = app.stepover * 0.5f;
+        app.lead_in_distance = app.stepover * 0.5f;
       }
+      app.auto_stock_subject_bounds = mesh_xy_bounds(slicer.mesh());
     }
     update_slice_range(app, true);
     reslice(app, analyze);
@@ -354,96 +565,8 @@ void draw_path(ImDrawList* draw_list, const Path64& path,
   draw_paths(draw_list, Paths64{path}, transform, color, width);
 }
 
-// Toolpath moves are open runs, including the cuts: a closed front is emitted
-// with an explicit repeated endpoint, so nothing here may wrap around.
-void draw_polyline(ImDrawList* draw_list, const Path64& path,
-                   const CanvasTransform& transform, ImU32 color, float width) {
-  for (std::size_t i = 1; i < path.size(); ++i)
-    draw_list->AddLine(transform.point(path[i - 1]), transform.point(path[i]),
-                       color, width);
-}
-
-// Draws only the first `limit` world units of a polyline, so a move in progress
-// stops at the tool rather than running ahead of it.
-void draw_polyline_to(ImDrawList* draw_list, const Path64& path,
-                      const CanvasTransform& transform, ImU32 color, float width,
-                      double limit) {
-  double remaining = limit;
-  for (std::size_t i = 1; i < path.size() && remaining > 0.0; ++i) {
-    const double segment = std::hypot(wave::to_world(path[i].x - path[i - 1].x),
-                                      wave::to_world(path[i].y - path[i - 1].y));
-    const ImVec2 from = transform.point(path[i - 1]);
-    ImVec2 to = transform.point(path[i]);
-    if (segment > remaining) {
-      const float t = static_cast<float>(remaining / segment);
-      to = {from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t};
-    }
-    draw_list->AddLine(from, to, color, width);
-    remaining -= segment;
-  }
-}
-
-ImU32 fade(ImU32 color, float alpha) {
-  const ImU32 scaled = static_cast<ImU32>(((color >> IM_COL32_A_SHIFT) & 0xFF) * alpha);
-  return (color & ~IM_COL32_A_MASK) | (scaled << IM_COL32_A_SHIFT);
-}
-
-ImU32 move_color(wave::MoveKind kind) {
-  switch (kind) {
-    // White rather than another green: the cut runs along a leading front, which
-    // the generation contours already draw in the cyan ramp, and the overlay is
-    // only legible if it does not land in the same colour family.
-    case wave::MoveKind::Cut: return IM_COL32(246, 249, 253, 240);
-    case wave::MoveKind::Step: return IM_COL32(255, 196, 61, 255);
-    case wave::MoveKind::Link: return IM_COL32(96, 190, 255, 255);
-    case wave::MoveKind::Retract: return IM_COL32(255, 92, 118, 255);
-    case wave::MoveKind::Entry: return IM_COL32(255, 110, 220, 255);
-  }
-  return IM_COL32(232, 236, 241, 255);
-}
-
-ImU32 load_color(double load, bool gouge, int alpha = 255) {
-  if (gouge) return IM_COL32(255, 44, 108, alpha);
-  const float t = static_cast<float>(std::clamp(load, 0.0, 1.0));
-  const ImVec4 low{0.12f, 0.62f, 1.00f, alpha / 255.0f};
-  const ImVec4 middle{0.25f, 0.92f, 0.47f, alpha / 255.0f};
-  const ImVec4 high{1.00f, 0.28f, 0.08f, alpha / 255.0f};
-  if (t <= 0.5f) {
-    const float u = t * 2.0f;
-    return ImGui::ColorConvertFloat4ToU32(
-        {low.x + (middle.x - low.x) * u,
-         low.y + (middle.y - low.y) * u,
-         low.z + (middle.z - low.z) * u, low.w});
-  }
-  const float u = (t - 0.5f) * 2.0f;
-  return ImGui::ColorConvertFloat4ToU32(
-      {middle.x + (high.x - middle.x) * u,
-       middle.y + (high.y - middle.y) * u,
-       middle.z + (high.z - middle.z) * u, middle.w});
-}
-
-void draw_load_steps(ImDrawList* draw_list,
-                     const wave::SimulatedMove& move,
-                     const CanvasTransform& transform, double limit,
-                     float width) {
-  for (const auto& step : move.steps) {
-    if (limit <= step.move_distance_begin) break;
-    const ImVec2 from = transform.point(step.from);
-    ImVec2 to = transform.point(step.to);
-    if (limit < step.move_distance_end) {
-      const double span = step.move_distance_end - step.move_distance_begin;
-      const float ratio = span > 0.0
-                              ? static_cast<float>((limit - step.move_distance_begin) / span)
-                              : 0.0f;
-      to = {from.x + (to.x - from.x) * ratio,
-            from.y + (to.y - from.y) * ratio};
-    }
-    draw_list->AddLine(from, to,
-                       load_color(step.load, step.gouge_area > 0.0), width);
-    if (limit < step.move_distance_end) break;
-  }
-}
-
+// Open fronts stop at their endpoints; closed fronts wrap through their first
+// point so their complete contour remains visible.
 void draw_front(ImDrawList* draw_list, const wave::LeadingFront& front,
                 const CanvasTransform& transform, ImU32 color, float width) {
   if (front.path.size() < 2) return;
@@ -470,7 +593,12 @@ std::optional<std::size_t> selected_generation(const AppState& app) {
 }
 
 void fit_view(AppState& app, ImVec2 canvas_size) {
-  const auto bounds = Clipper2Lib::GetBounds(app.result.stock);
+  const Paths64& stock = !app.standard_result.stock.empty()
+                             ? app.standard_result.stock
+                         : !app.result.stock.empty() ? app.result.stock
+                                                     : app.raw_stock_outline;
+  if (stock.empty()) return;
+  const auto bounds = Clipper2Lib::GetBounds(stock);
   const float width = static_cast<float>(wave::to_world(bounds.right - bounds.left));
   const float height = static_cast<float>(wave::to_world(bounds.bottom - bounds.top));
   if (width <= 0.0f || height <= 0.0f) return;
@@ -534,32 +662,19 @@ void draw_canvas(AppState& app) {
     draw_list->AddLine({canvas_min.x, y}, {canvas_max.x, y}, IM_COL32(48, 57, 68, 100));
 
   if (app.show_stock) {
-    draw_paths(draw_list, app.result.stock, transform, IM_COL32(125, 138, 152, 190), 2.0f);
+    const Paths64& stock = !app.standard_result.stock.empty()
+                               ? app.standard_result.stock
+                           : !app.result.stock.empty() ? app.result.stock
+                                                       : app.raw_stock_outline;
+    draw_paths(draw_list, stock, transform, IM_COL32(125, 138, 152, 190), 2.0f);
     if (app.show_original_boundaries && app.stock_inflation != 0.0f)
       draw_paths_dashed(draw_list, app.raw_stock_outline, transform,
                         IM_COL32(125, 138, 152, 130), 1.5f);
   }
 
-  Paths64 simulated_stock_now;
-  Paths64 gouges_now;
-  if (app.show_simulation && !app.simulation.initial_stock.empty()) {
-    simulated_stock_now = wave::simulation_stock_at(
-        app.simulation, app.toolpath, app.toolpath_progress);
-    draw_paths_dashed(draw_list, app.simulation.initial_stock, transform,
-                      IM_COL32(83, 210, 230, 105), 1.5f);
-    draw_paths(draw_list, simulated_stock_now, transform,
-               IM_COL32(83, 210, 230, 225), 3.0f);
-    if (app.show_gouges) {
-      const Paths64 removed_now = Clipper2Lib::Difference(
-          app.simulation.initial_stock, simulated_stock_now,
-          Clipper2Lib::FillRule::NonZero);
-      gouges_now = Clipper2Lib::Intersect(
-          removed_now, app.simulation.final_subject,
-          Clipper2Lib::FillRule::NonZero);
-      draw_paths(draw_list, gouges_now, transform,
-                 IM_COL32(255, 44, 108, 255), 5.0f);
-    }
-  }
+  if (app.show_remaining_domain && !app.decision_domain.empty())
+    draw_paths_dashed(draw_list, app.decision_domain, transform,
+                      IM_COL32(101, 188, 255, 135), 2.0f, 9.0f);
 
   const int count = static_cast<int>(app.result.generations.size());
   if (app.show_all_iterations) {
@@ -575,10 +690,40 @@ void draw_canvas(AppState& app) {
   }
 
   if (app.show_subject) {
-    draw_paths(draw_list, app.result.subject, transform, IM_COL32(252, 226, 89, 255), 3.0f);
+    const Paths64& subject = !app.standard_result.subject.empty()
+                                 ? app.standard_result.subject
+                             : !app.result.subject.empty() ? app.result.subject
+                                                           : app.raw_subject_outline;
+    draw_paths(draw_list, subject, transform, IM_COL32(252, 226, 89, 255), 3.0f);
     if (app.show_original_boundaries && app.subject_inflation != 0.0f)
       draw_paths_dashed(draw_list, app.raw_subject_outline, transform,
                         IM_COL32(252, 226, 89, 150), 1.5f);
+  }
+
+
+  if (app.show_nodes) {
+    for (std::size_t node = 0; node < app.topology.nodes.size(); ++node) {
+      const wave::FrontNode& topology_node = app.topology.nodes[node];
+      if (topology_node.kind == wave::FrontNode::Kind::MergeTermination)
+        continue;
+      bool selected = false;
+      for (const wave::FrontId2D front : topology_node.fronts)
+        selected |= static_cast<int>(front.generation) == app.selected_iteration;
+      const ImU32 color = node_color(node, selected ? 255 : 115);
+      if (!topology_node.footprint.empty()) {
+        draw_paths(draw_list, topology_node.footprint, transform, color,
+                   selected ? 4.0f : 2.0f);
+      } else {
+        for (const wave::FrontId2D id : topology_node.fronts) {
+          if (id.generation >= app.lineage.generations.size() ||
+              id.index >= app.lineage.generations[id.generation].fronts.size())
+            continue;
+          draw_front(draw_list,
+                     app.lineage.generations[id.generation].fronts[id.index],
+                     transform, color, selected ? 4.0f : 2.0f);
+        }
+      }
+    }
   }
 
   const auto canvas_generation = selected_generation(app);
@@ -612,76 +757,6 @@ void draw_canvas(AppState& app) {
     }
   }
 
-  if (app.show_toolpath && !app.toolpath.moves.empty()) {
-    const auto cursor = wave::toolpath_at(app.toolpath, app.toolpath_progress);
-    // Everything is laid down faded first and the finished portion painted over
-    // it, so the whole path stays legible while the completed part reads clearly
-    // against it. Retracts go last within each pass so a lift stays visible
-    // where it overlaps the front it leaves.
-    for (int pass = 0; pass < 2; ++pass) {
-      const bool done = pass == 1;
-      std::vector<const wave::ToolpathMove*> retracts;
-      for (std::size_t i = 0; i < app.toolpath.moves.size(); ++i) {
-        const auto& move = app.toolpath.moves[i];
-        if (done && i > cursor.move) break;
-        // Cuts that have not happened yet are left out: they follow leading
-        // fronts, which are already on screen. Transitions have nothing else
-        // drawing them, so those stay visible ahead of the tool.
-        if (!done && move.kind == wave::MoveKind::Cut) continue;
-        const ImU32 color = done ? move_color(move.kind) : fade(move_color(move.kind), 0.30f);
-        if (done && app.show_load && i < app.simulation.moves.size() &&
-            !app.simulation.moves[i].steps.empty()) {
-          const double limit = i == cursor.move
-                                   ? cursor.move_distance
-                                   : std::numeric_limits<double>::infinity();
-          draw_load_steps(draw_list, app.simulation.moves[i], transform,
-                          limit, 4.0f);
-          continue;
-        }
-        if (move.kind == wave::MoveKind::Retract || move.kind == wave::MoveKind::Entry) {
-          retracts.push_back(&move);
-          continue;
-        }
-        const float width = move.kind == wave::MoveKind::Cut ? 2.5f : 3.5f;
-        if (done && i == cursor.move)
-          draw_polyline_to(draw_list, move.path, transform, color, width,
-                           cursor.move_distance);
-        else
-          draw_polyline(draw_list, move.path, transform, color, width);
-      }
-      for (const auto* move : retracts) {
-        if (move->path.size() < 2) continue;
-        const ImU32 color = done ? move_color(move->kind) : fade(move_color(move->kind), 0.30f);
-        const ImVec2 from = transform.point(move->path.front());
-        const ImVec2 to = transform.point(move->path.back());
-        draw_list->AddLine(from, to, color, 2.0f);
-        draw_list->AddCircle(to, 6.0f, color, 0, 2.0f);
-      }
-    }
-
-    if (app.show_simulation) {
-      for (std::size_t i = 0; i < app.simulation.moves.size(); ++i) {
-        const auto& simulated = app.simulation.moves[i];
-        if (simulated.plunge_collision.empty()) continue;
-        const bool occurred = i <= cursor.move;
-        const ImU32 color = occurred ? IM_COL32(255, 52, 64, 255)
-                                     : IM_COL32(255, 52, 64, 85);
-        const ImVec2 point = transform.point(app.toolpath.moves[i].path.back());
-        draw_list->AddCircleFilled(point, 8.0f, IM_COL32(20, 12, 15, 230));
-        draw_list->AddCircle(point, 9.0f, color, 0, 3.0f);
-        draw_list->AddLine({point.x - 5.0f, point.y - 5.0f},
-                           {point.x + 5.0f, point.y + 5.0f}, color, 2.0f);
-        draw_list->AddLine({point.x + 5.0f, point.y - 5.0f},
-                           {point.x - 5.0f, point.y + 5.0f}, color, 2.0f);
-      }
-    }
-
-    const ImVec2 tool = transform.point(cursor.position);
-    draw_list->AddCircleFilled(tool, 8.0f, IM_COL32(14, 18, 24, 245));
-    draw_list->AddCircleFilled(tool, 5.5f, move_color(cursor.kind));
-    draw_list->AddCircle(tool, 9.5f, IM_COL32(240, 244, 250, 220), 0, 1.75f);
-  }
-
   if (app.show_event_markers) {
     for (const auto& event : app.lineage.events) {
       const ImVec2 position = transform.point(event.position);
@@ -690,6 +765,28 @@ void draw_canvas(AppState& app) {
       draw_list->AddCircle(position, 9.0f, color, 0, 3.0f);
       draw_list->AddText({position.x - 3.5f, position.y - 7.0f}, color,
                          event_short_name(event.kind));
+    }
+  }
+
+  if (app.show_entry_choices) {
+    for (const DecisionEntryView& entry : app.decision_entries) {
+      wave::LeadingFront front;
+      front.path = entry.seed.path;
+      front.closed = entry.seed.closed;
+      const ImU32 color = entry.retained
+                              ? node_color(entry.group, 255)
+                              : IM_COL32(120, 126, 136, 210);
+      draw_front(draw_list, front, transform, color,
+                 entry.retained ? 6.0f : 3.0f);
+      const ImVec2 marker = transform.point(wave::representative_point(front));
+      if (entry.retained)
+        draw_list->AddCircleFilled(marker, 5.0f, color);
+      else {
+        draw_list->AddLine({marker.x - 5.0f, marker.y - 5.0f},
+                           {marker.x + 5.0f, marker.y + 5.0f}, color, 2.0f);
+        draw_list->AddLine({marker.x - 5.0f, marker.y + 5.0f},
+                           {marker.x + 5.0f, marker.y - 5.0f}, color, 2.0f);
+      }
     }
   }
 
@@ -844,7 +941,7 @@ void draw_mesh_viewer(AppState& app) {
 }
 
 void controls(AppState& app, const std::filesystem::path& input) {
-  ImGui::TextUnformatted("GPU mesh slicer + contour wave");
+  ImGui::TextUnformatted("Wavefront analysis viewer");
   ImGui::TextDisabled("2D fallback: %s", input.filename().string().c_str());
   draw_mesh_viewer(app);
 
@@ -852,25 +949,36 @@ void controls(AppState& app, const std::filesystem::path& input) {
   ImGui::SetNextItemWidth(-1.0f);
   ImGui::InputTextWithHint("##subject-mesh", "Subject .obj or .stl",
                            app.subject_mesh_path.data(), app.subject_mesh_path.size());
-  if (ImGui::Button("Load subject mesh")) load_mesh(app, false);
+  if (ImGui::Button("Load subject mesh")) {
+    load_mesh(app, false, /*analyze=*/false);
+    app.analysis_dirty = true;
+  }
   if (!app.subject_slicer.empty()) {
     ImGui::SameLine();
     if (ImGui::Button("Use SVG subject")) {
       app.subject_slicer = wave::MeshSlicer{};
+      app.auto_stock_subject_bounds = app.svg.bounds;
       update_slice_range(app, false);
-      reslice(app);
+      reslice(app, /*analyze=*/false);
+      update_preview_outlines(app);
+      app.analysis_dirty = true;
     }
   }
   ImGui::SetNextItemWidth(-1.0f);
   ImGui::InputTextWithHint("##stock-mesh", "Optional stock .obj or .stl",
                            app.stock_mesh_path.data(), app.stock_mesh_path.size());
-  if (ImGui::Button("Load stock mesh")) load_mesh(app, true);
+  if (ImGui::Button("Load stock mesh")) {
+    load_mesh(app, true, /*analyze=*/false);
+    app.analysis_dirty = true;
+  }
   if (!app.stock_slicer.empty()) {
     ImGui::SameLine();
     if (ImGui::Button("Use allowance stock")) {
       app.stock_slicer = wave::MeshSlicer{};
       update_slice_range(app, false);
-      reslice(app);
+      reslice(app, /*analyze=*/false);
+      update_preview_outlines(app);
+      app.analysis_dirty = true;
     }
   }
 
@@ -878,7 +986,7 @@ void controls(AppState& app, const std::filesystem::path& input) {
     bool slice_changed = ImGui::SliderFloat("Slice Z", &app.slice_z,
                                             app.slice_min, app.slice_max, "%.4f");
     slice_changed |= ImGui::SliderInt("BVH query grid", &app.query_grid, 1, 128);
-    if (slice_changed) reslice(app);
+    if (slice_changed) app.analysis_dirty = true;
   }
 
   ImGui::SeparatorText("Wave analysis");
@@ -892,17 +1000,35 @@ void controls(AppState& app, const std::filesystem::path& input) {
   changed |= ImGui::DragFloat("Stock inflation", &app.stock_inflation, 0.1f,
                               -100000.0f, 100000.0f, "%+.3f");
   changed |= ImGui::DragFloat("Stepover", &app.stepover, 1.0f, 0.001f, 100000.0f, "%.3f");
-  changed |= ImGui::SliderFloat("Wave softening", &app.softening_percent,
-                                0.0f, 100.0f, "%.1f%%");
+  changed |= ImGui::Checkbox("Rounded waves", &app.rounded_waves);
   changed |= ImGui::Checkbox("Lead in from the air", &app.lead_in);
+  if (app.lead_in)
+    changed |= ImGui::DragFloat("Lead-in distance", &app.lead_in_distance,
+                                0.1f, 0.0f, 100000.0f, "%.3f");
+  changed |= ImGui::SliderInt("Maximum decision layers",
+                              &app.max_analysis_layers, 1, 128);
+  changed |= ImGui::DragFloat("Tiny split area (stepover^2)",
+                              &app.tiny_split_area_factor, 0.01f, 0.0f, 10.0f,
+                              "%.3f");
   if (changed) {
     app.view.needs_fit = true;
-    recompute(app);
+    app.analysis_dirty = true;
   }
 
-  if (ImGui::Button("Recompute")) recompute(app);
+  if (ImGui::Button(app.standard_result.generations.empty()
+                        ? "Build analysis"
+                        : "Rebuild analysis"))
+    build_analysis(app);
   ImGui::SameLine();
   if (ImGui::Button("Fit view")) app.view.needs_fit = true;
+  if (app.analysis_dirty) {
+    if (app.standard_result.generations.empty())
+      ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.30f, 1.0f),
+                         "Analysis has not been built.");
+    else
+      ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.30f, 1.0f),
+                         "Options changed; showing the previous build.");
+  }
 
   if (!app.error.empty()) {
     ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 100, 100, 255));
@@ -910,6 +1036,45 @@ void controls(AppState& app, const std::filesystem::path& input) {
     ImGui::PopStyleColor();
     return;
   }
+
+  ImGui::SeparatorText("Decision process");
+  const int decision_count = decision_frame_count(app);
+  bool decision_changed = false;
+  if (ImGui::Button("|<##decision") && app.decision_step > 0) {
+    --app.decision_step;
+    app.decision_play = false;
+    decision_changed = true;
+  }
+  ImGui::SameLine();
+  if (ImGui::Button(app.decision_play ? "Pause##decision"
+                                      : "Play##decision"))
+    app.decision_play = !app.decision_play;
+  ImGui::SameLine();
+  if (ImGui::Button(">|##decision") &&
+      app.decision_step + 1 < decision_count) {
+    ++app.decision_step;
+    app.decision_play = false;
+    decision_changed = true;
+  }
+  decision_changed |= ImGui::SliderInt("Analysis step", &app.decision_step,
+                                       0, std::max(0, decision_count - 1));
+  if (app.decision_play)
+    ImGui::SliderFloat("Decision speed", &app.decision_speed, 0.25f, 5.0f,
+                       "%.2f step/s");
+  if (decision_changed) {
+    app.decision_caption = apply_decision_frame(app);
+    app.selected_iteration = std::clamp(
+        app.selected_iteration, 0,
+        std::max(0, static_cast<int>(app.result.generations.size()) - 1));
+    app.view.needs_fit = true;
+  }
+  ImGui::TextWrapped("%s", app.decision_caption.c_str());
+  if (!app.analysis_error.empty())
+    ImGui::TextColored(ImVec4(1.0f, 0.42f, 0.35f, 1.0f),
+                       "Recursive analysis: %s", app.analysis_error.c_str());
+  ImGui::TextDisabled("%zu recursive layer%s recorded",
+                      app.analysis.layers.size(),
+                      app.analysis.layers.size() == 1 ? "" : "s");
 
   const int count = static_cast<int>(app.result.generations.size());
   if (count > 0) {
@@ -922,6 +1087,11 @@ void controls(AppState& app, const std::filesystem::path& input) {
   if (app.subject_inflation != 0.0f || app.stock_inflation != 0.0f)
     ImGui::Checkbox("Show uninflated boundaries", &app.show_original_boundaries);
   ImGui::Checkbox("Show leading fronts", &app.show_leading_fronts);
+  ImGui::Checkbox("Show node boundaries", &app.show_nodes);
+  ImGui::Checkbox("Show remaining-domain boundary",
+                  &app.show_remaining_domain);
+  if (!app.decision_entries.empty())
+    ImGui::Checkbox("Show entry choices", &app.show_entry_choices);
   if (app.show_leading_fronts)
     ImGui::Checkbox("Show parent links", &app.show_parent_links);
   ImGui::Checkbox("Show event markers", &app.show_event_markers);
@@ -933,8 +1103,10 @@ void controls(AppState& app, const std::filesystem::path& input) {
     ImGui::Text("Subject: SVG (%zu source paths)", app.svg.source_path_count);
   else
     ImGui::Text("Subject: %s", app.subject_slicer.mesh().source.filename().string().c_str());
-  ImGui::Text("Union paths: %zu", app.result.subject.size());
+  ImGui::Text("Union paths: %zu", app.standard_result.subject.size());
   ImGui::Text("Generations: %d", count);
+  ImGui::Text("Front nodes: %zu", app.topology.nodes.size());
+  ImGui::Text("Events: %zu", app.lineage.events.size());
   ImGui::Text("Stopped on: %s", wave::stop_reason_name(app.result.stop_reason));
   if (count > 0)
     ImGui::Text("Selected contours: %zu",
@@ -943,8 +1115,7 @@ void controls(AppState& app, const std::filesystem::path& input) {
   if (!app.subject_slicer.empty()) {
     const auto& stats = app.subject_slicer.stats();
     ImGui::SeparatorText("Subject slice statistics");
-    ImGui::Text("BVH: %s, %.3f ms", stats.gpu_accelerated ? "cuBQL GPU" : "CPU fallback",
-                stats.build_milliseconds);
+    ImGui::Text("BVH: cuBQL GPU, %.3f ms", stats.build_milliseconds);
     ImGui::Text("Triangles: %zu input, %zu pruned", stats.input_triangles,
                 stats.pruned_triangles);
     ImGui::Text("Query: %zu candidates, %.3f ms", app.subject_slice.candidate_triangles,
@@ -956,160 +1127,11 @@ void controls(AppState& app, const std::filesystem::path& input) {
   if (!app.stock_slicer.empty()) {
     const auto& stats = app.stock_slicer.stats();
     ImGui::SeparatorText("Stock slice statistics");
-    ImGui::Text("BVH: %s, %.3f ms", stats.gpu_accelerated ? "cuBQL GPU" : "CPU fallback",
-                stats.build_milliseconds);
+    ImGui::Text("BVH: cuBQL GPU, %.3f ms", stats.build_milliseconds);
     ImGui::Text("Triangles: %zu input, %zu pruned", stats.input_triangles,
                 stats.pruned_triangles);
     ImGui::Text("Query: %zu candidates, %.3f ms", app.stock_slice.candidate_triangles,
                 app.stock_slice.query_milliseconds);
-  }
-
-  ImGui::SeparatorText("Toolpath");
-  ImGui::Checkbox("Show toolpath", &app.show_toolpath);
-  {
-    const double total = wave::toolpath_length(app.toolpath);
-    const auto cursor = wave::toolpath_at(app.toolpath, app.toolpath_progress);
-    const bool have_path = !app.toolpath.moves.empty();
-
-    ImGui::BeginDisabled(!have_path);
-    if (ImGui::Button(app.toolpath_play ? "Pause" : "Play"))
-      app.toolpath_play = !app.toolpath_play;
-    ImGui::SameLine();
-    // Stepping lands on the start of the neighbouring move, which is what you
-    // want when a single transition looks wrong and you need to sit on it.
-    if (ImGui::Button("|<") && cursor.move > 0) {
-      app.toolpath_progress =
-          static_cast<float>(wave::toolpath_move_start(app.toolpath, cursor.move - 1));
-      app.toolpath_play = false;
-    }
-    ImGui::SameLine();
-    if (ImGui::Button(">|")) {
-      app.toolpath_progress = static_cast<float>(
-          wave::toolpath_move_start(app.toolpath, cursor.move + 1));
-      app.toolpath_play = false;
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Rewind")) app.toolpath_progress = 0.0f;
-    ImGui::SliderFloat("Speed##toolpath", &app.toolpath_speed, 1.0f, 400.0f,
-                       "%.0f units/s", ImGuiSliderFlags_Logarithmic);
-    if (ImGui::SliderFloat("Progress", &app.toolpath_progress, 0.0f,
-                           static_cast<float>(total), "%.1f units"))
-      app.toolpath_play = false;
-    ImGui::EndDisabled();
-
-    if (have_path) {
-      ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(move_color(cursor.kind)),
-                         "Move %zu/%zu: %s", cursor.move + 1,
-                         app.toolpath.moves.size(),
-                         wave::move_kind_name(cursor.kind));
-      if (app.toolpath.moves[cursor.move].kind == wave::MoveKind::Cut) {
-        const auto& front = app.toolpath.moves[cursor.move].front;
-        ImGui::SameLine();
-        ImGui::Text("(generation %zu, front %zu)", front.generation, front.index);
-      }
-    }
-
-    const auto& stats = app.toolpath.stats;
-    ImGui::Text("Cut:     %8.1f units in %zu moves", stats.cut_length, stats.cut_count);
-    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(move_color(wave::MoveKind::Step)),
-                       "Step:    %8.1f units in %zu moves", stats.step_length,
-                       stats.step_count);
-    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(move_color(wave::MoveKind::Link)),
-                       "Link:    %8.1f units in %zu moves", stats.link_length,
-                       stats.link_count);
-    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(move_color(wave::MoveKind::Retract)),
-                       "Retract: %8.1f units in %zu moves", stats.retract_length,
-                       stats.retract_count);
-    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(move_color(wave::MoveKind::Entry)),
-                       "Entry:   %8.1f units in %zu moves", stats.entry_length,
-                       stats.entry_count);
-    ImGui::Text("%zu transition%s routed around an obstruction", stats.detour_count,
-                stats.detour_count == 1 ? "" : "s");
-    if (stats.unreachable_fronts > 0)
-      ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%zu front(s) never reached",
-                         stats.unreachable_fronts);
-  }
-
-  ImGui::SeparatorText("Material simulation");
-  // The radius is no longer a simulation figure alone. The planner sizes the
-  // lead-in and every plunge clearance from it, so moving it has to rebuild the
-  // toolpath rather than sweep a differently sized tool along the old one.
-  if (ImGui::DragFloat("Tool radius", &app.tool_radius, 0.1f, 0.001f, 100000.0f,
-                       "%.3f")) {
-    recompute(app);
-  }
-  if (ImGui::DragFloat("Simulation stock inflation", &app.simulation_stock_inflation,
-                       0.1f, -100000.0f, 100000.0f, "%+.3f")) {
-    recompute_simulation(app);
-  }
-  ImGui::Checkbox("Show material simulation", &app.show_simulation);
-  ImGui::Checkbox("Color completed path by cutter load", &app.show_load);
-  ImGui::Checkbox("Show gouges", &app.show_gouges);
-
-  if (!app.simulation_error.empty()) {
-    ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 100, 100, 255));
-    ImGui::TextWrapped("Simulation: %s", app.simulation_error.c_str());
-    ImGui::PopStyleColor();
-  } else {
-    const auto& stats = app.simulation.stats;
-    ImGui::Text("Stock:    %10.2f -> %10.2f square units",
-                stats.initial_stock_area, stats.remaining_area);
-    ImGui::Text("Removed:  %10.2f square units", stats.removed_area);
-    ImGui::Text("Excess:   %10.2f square units", stats.excess_area);
-    if (stats.gouge_area > 0.0) {
-      ImGui::TextColored(ImVec4(1.0f, 0.22f, 0.42f, 1.0f),
-                         "Gouged:   %.3f square units in %zu step%s",
-                         stats.gouge_area, stats.gouging_steps,
-                         stats.gouging_steps == 1 ? "" : "s");
-    } else {
-      ImGui::TextColored(ImVec4(0.35f, 0.92f, 0.55f, 1.0f),
-                         "No final-subject gouges detected");
-    }
-    if (stats.unsafe_plunges > 0) {
-      if (stats.unsafe_plunges == 1)
-        ImGui::TextColored(ImVec4(1.0f, 0.25f, 0.25f, 1.0f),
-                           "1 retract plunge collides with remaining stock");
-      else
-        ImGui::TextColored(ImVec4(1.0f, 0.25f, 0.25f, 1.0f),
-                           "%zu retract plunges collide with remaining stock",
-                           stats.unsafe_plunges);
-    } else {
-      ImGui::TextColored(ImVec4(0.35f, 0.92f, 0.55f, 1.0f),
-                         "All retract plunges land in cleared space");
-    }
-    if (stats.unresolved_entries > 0)
-      ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.25f, 1.0f),
-                         "%zu entry move%s unresolved without Z geometry",
-                         stats.unresolved_entries,
-                         stats.unresolved_entries == 1 ? " is" : "s are");
-    ImGui::Text("Peak cutter load proxy: %.1f%% of full slot",
-                stats.maximum_load * 100.0);
-    if (!app.toolpath.moves.empty()) {
-      const auto cursor = wave::toolpath_at(app.toolpath, app.toolpath_progress);
-      if (cursor.move < app.simulation.moves.size()) {
-        for (const auto& step : app.simulation.moves[cursor.move].steps) {
-          if (cursor.move_distance < step.move_distance_begin ||
-              cursor.move_distance > step.move_distance_end)
-            continue;
-          ImGui::Text("Current load: %.1f%%, removing %.3f square units this step",
-                      step.load * 100.0, step.removed_area);
-          break;
-        }
-      }
-    }
-    if (app.show_load) {
-      ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(load_color(0.0, false)),
-                         "low");
-      ImGui::SameLine();
-      ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(load_color(0.5, false)),
-                         "medium");
-      ImGui::SameLine();
-      ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(load_color(1.0, false)),
-                         "full slot");
-      ImGui::SameLine();
-      ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(load_color(0.0, true)),
-                         "gouge");
-    }
   }
 
   ImGui::SeparatorText("Front lineage");
@@ -1143,6 +1165,29 @@ void controls(AppState& app, const std::filesystem::path& input) {
     }
     ImGui::TreePop();
   }
+  if (ImGui::TreeNode("Node graph")) {
+    for (std::size_t node = 0; node < app.topology.nodes.size(); ++node) {
+      const wave::FrontNode& item = app.topology.nodes[node];
+      ImGui::PushID(static_cast<int>(node));
+      if (!item.fronts.empty()) {
+        if (ImGui::SmallButton("Go"))
+          app.selected_iteration =
+              static_cast<int>(item.fronts.front().generation);
+        ImGui::SameLine();
+      }
+      ImGui::TextColored(
+          ImGui::ColorConvertU32ToFloat4(node_color(node)),
+          "node %zu: %s, layer %zu, %zu front%s, %zu -> %zu", node,
+          item.kind == wave::FrontNode::Kind::MergeTermination
+              ? "merge termination"
+              : "propagation",
+          item.evaluation_order, item.fronts.size(),
+          item.fronts.size() == 1 ? "" : "s", item.parents.size(),
+          item.children.size());
+      ImGui::PopID();
+    }
+    ImGui::TreePop();
+  }
 
   ImGui::Spacing();
   ImGui::TextColored(ImVec4(0.99f, 0.89f, 0.35f, 1.0f), "Subject");
@@ -1156,10 +1201,17 @@ void controls(AppState& app, const std::filesystem::path& input) {
       "act as wave sources.");
   ImGui::TextWrapped(
       "Selected leading fronts: violet = previous, green = current. White links "
-      "show parentage. Event markers: S split, M merge, T termination, B unexpected birth.");
+      "show parentage. Node boundaries have stable distinct colours. Event markers: "
+      "S split, M merge, T termination, MT merge-termination, B unexpected birth.");
   ImGui::TextWrapped(
-      "Wave softening rounds a fraction of each stepover step. Its effect "
-      "accumulates over successive generations; 0%% preserves sharp mitered waves.");
+      "During a decision frame, thick coloured fronts are retained entries; grey "
+      "fronts marked with an X are muted. Matching colours identify entries in the "
+      "same graph-derived remaining volume. The dashed blue outline is the cached "
+      "remaining domain for that recursive layer.");
+  ImGui::TextWrapped(
+      "Rounded waves use round offset joins; disabling them uses sharp miter "
+      "joins. Rounded propagation is the normal mode, while mitered propagation "
+      "is useful for faster topology diagnostics.");
 }
 
 struct StartupInputs {
@@ -1169,15 +1221,18 @@ struct StartupInputs {
   std::filesystem::path screenshot;
   std::optional<float> subject_inflation;
   std::optional<float> stock_inflation;
-  std::optional<float> simulation_stock_inflation;
-  std::optional<float> tool_radius;
+  std::optional<float> lead_in_distance;
   std::optional<bool> lead_in;
   std::optional<float> allowance;
   std::optional<float> stepover;
-  std::optional<float> softening_percent;
+  std::optional<bool> rounded_waves;
   std::optional<float> slice_z;
   std::optional<int> query_grid;
+  std::optional<int> analysis_step;
+  std::optional<int> analysis_layers;
+  std::optional<float> tiny_split_area_factor;
   bool help = false;
+  bool dump_analysis = false;
 };
 
 StartupInputs resolve_inputs(int argc, char** argv) {
@@ -1215,22 +1270,29 @@ StartupInputs resolve_inputs(int argc, char** argv) {
       return value;
     };
     if (argument == "--help" || argument == "-h") result.help = true;
+    else if (argument == "--dump-analysis") result.dump_analysis = true;
     else if (argument == "--svg") result.svg = value_after(argument);
     else if (argument == "--subject-mesh") result.subject_mesh = value_after(argument);
     else if (argument == "--stock-mesh") result.stock_mesh = value_after(argument);
     else if (argument == "--screenshot") result.screenshot = value_after(argument);
     else if (argument == "--subject-inflate") result.subject_inflation = float_after(argument);
     else if (argument == "--stock-inflate") result.stock_inflation = float_after(argument);
-    else if (argument == "--simulation-stock-inflate")
-      result.simulation_stock_inflation = float_after(argument);
-    else if (argument == "--tool-radius") result.tool_radius = float_after(argument);
+    else if (argument == "--lead-in-distance")
+      result.lead_in_distance = float_after(argument);
     else if (argument == "--lead-in") result.lead_in = true;
     else if (argument == "--no-lead-in") result.lead_in = false;
     else if (argument == "--allowance") result.allowance = float_after(argument);
     else if (argument == "--stepover") result.stepover = float_after(argument);
-    else if (argument == "--softening-percent") result.softening_percent = float_after(argument);
+    else if (argument == "--round-waves") result.rounded_waves = true;
+    else if (argument == "--mitered-waves") result.rounded_waves = false;
     else if (argument == "--slice-z") result.slice_z = float_after(argument);
     else if (argument == "--query-grid") result.query_grid = int_after(argument);
+    else if (argument == "--analysis-step")
+      result.analysis_step = int_after(argument);
+    else if (argument == "--analysis-layers")
+      result.analysis_layers = int_after(argument);
+    else if (argument == "--tiny-split-area-factor")
+      result.tiny_split_area_factor = float_after(argument);
     else if (!argument.starts_with("--") && result.svg.empty()) result.svg = argument;
     else throw std::runtime_error("Unknown command-line argument: " + std::string(argument));
   }
@@ -1248,7 +1310,7 @@ StartupInputs resolve_inputs(int argc, char** argv) {
 void print_help(const char* executable) {
   std::cout
       << "Usage: " << executable << " [SVG] [options]\n\n"
-      << "GPU downward-prism mesh slicing and Clipper2 wavefront analysis.\n\n"
+      << "Mesh/SVG slicing and Clipper2 wavefront topology analysis.\n\n"
       << "Input options:\n"
       << "  --svg PATH              2D fallback subject (default: wavetest.svg)\n"
       << "  --subject-mesh PATH     Load an OBJ or STL subject mesh\n"
@@ -1258,16 +1320,21 @@ void print_help(const char* executable) {
       << "  --query-grid N          GPU query grid resolution, 1..256 (default: 32)\n"
       << "  --subject-inflate VALUE Signed subject boundary offset (default: 0)\n"
       << "  --stock-inflate VALUE   Signed stock boundary offset (default: 0)\n"
-      << "  --simulation-stock-inflate VALUE\n"
-      << "                           Signed simulation-only stock offset (default: 0)\n"
-      << "  --tool-radius VALUE     Cutter radius, for lead-in and plunge clearance\n"
-      << "                           and for the simulation (default: half stepover)\n"
-      << "  --lead-in, --no-lead-in Seed the wave one tool radius out in the air,\n"
+      << "  --lead-in-distance VALUE\n"
+      << "                           Distance to seed in front of the stock wall\n"
+      << "  --lead-in, --no-lead-in Enable or disable that exterior seed distance\n"
       << "                           so the first passes engage gradually (default: on)\n"
       << "  --allowance VALUE       Fallback stock allowance when no stock mesh is loaded\n"
       << "  --stepover VALUE        Wave propagation distance per generation\n"
-      << "  --softening-percent P   Rounded fraction of each step, 0..100 (default: 100)\n\n"
+      << "  --round-waves           Use round offset joins (default)\n"
+      << "  --mitered-waves         Use sharp miter offset joins\n\n"
       << "Other options:\n"
+      << "  --dump-analysis        Print the recorded decision process and exit\n"
+      << "  --analysis-step N      Initially display recorded decision frame N\n"
+      << "  --analysis-layers N    Maximum recursive decision layers\n"
+      << "  --tiny-split-area-factor VALUE\n"
+      << "                         Ignore terminal split branches below VALUE *"
+         " stepover^2 (default: 0.5)\n"
       << "  --screenshot PATH       Render one frame to a binary PPM file and exit\n"
       << "  -h, --help              Show this help and exit\n\n"
       << "Positive inflation expands a boundary; negative inflation contracts it.\n";
@@ -1298,12 +1365,13 @@ int main(int argc, char** argv) {
     AppState app;
     app.svg = wave::load_svg_closed_paths(input);
     app.subject_paths = app.svg.paths;
+    app.auto_stock_subject_bounds = app.svg.bounds;
     const double span = std::max(
         wave::to_world(app.svg.bounds.right - app.svg.bounds.left),
         wave::to_world(app.svg.bounds.bottom - app.svg.bounds.top));
     app.allowance = static_cast<float>(span * 0.05);
     app.stepover = static_cast<float>(span * 0.025);
-    app.tool_radius = app.stepover * 0.5f;
+    app.lead_in_distance = app.stepover * 0.5f;
     // Every analysis below would be thrown away: the mesh loads redefine the
     // subject, the command line then redefines the parameters, and the tail of
     // this function analyses the result. So load the meshes, resolve the
@@ -1323,12 +1391,21 @@ int main(int argc, char** argv) {
         throw std::runtime_error("--query-grid must be between 1 and 256");
       app.query_grid = *inputs.query_grid;
     }
+    if (inputs.analysis_layers) {
+      if (*inputs.analysis_layers < 1 || *inputs.analysis_layers > 128)
+        throw std::runtime_error("--analysis-layers must be between 1 and 128");
+      app.max_analysis_layers = *inputs.analysis_layers;
+    }
+    if (inputs.tiny_split_area_factor) {
+      if (*inputs.tiny_split_area_factor < 0.0f)
+        throw std::runtime_error(
+            "--tiny-split-area-factor must be nonnegative");
+      app.tiny_split_area_factor = *inputs.tiny_split_area_factor;
+    }
     if (inputs.lead_in) app.lead_in = *inputs.lead_in;
     if (inputs.slice_z) app.slice_z = *inputs.slice_z;
     if (inputs.subject_inflation) app.subject_inflation = *inputs.subject_inflation;
     if (inputs.stock_inflation) app.stock_inflation = *inputs.stock_inflation;
-    if (inputs.simulation_stock_inflation)
-      app.simulation_stock_inflation = *inputs.simulation_stock_inflation;
     if (inputs.allowance) {
       if (!(*inputs.allowance > 0.0f))
         throw std::runtime_error("--allowance must be positive");
@@ -1338,20 +1415,135 @@ int main(int argc, char** argv) {
       if (!(*inputs.stepover > 0.0f))
         throw std::runtime_error("--stepover must be positive");
       app.stepover = *inputs.stepover;
-      if (!inputs.tool_radius) app.tool_radius = app.stepover * 0.5f;
+      if (!inputs.lead_in_distance)
+        app.lead_in_distance = app.stepover * 0.5f;
     }
-    if (inputs.tool_radius) {
-      if (!(*inputs.tool_radius > 0.0f))
-        throw std::runtime_error("--tool-radius must be positive");
-      app.tool_radius = *inputs.tool_radius;
+    if (inputs.lead_in_distance) {
+      if (!(*inputs.lead_in_distance >= 0.0f))
+        throw std::runtime_error("--lead-in-distance must not be negative");
+      app.lead_in_distance = *inputs.lead_in_distance;
     }
-    if (inputs.softening_percent) {
-      if (*inputs.softening_percent < 0.0f || *inputs.softening_percent > 100.0f)
-        throw std::runtime_error("--softening-percent must be between 0 and 100");
-      app.softening_percent = *inputs.softening_percent;
+    if (inputs.rounded_waves) app.rounded_waves = *inputs.rounded_waves;
+    if (!app.subject_slicer.empty() || !app.stock_slicer.empty())
+      reslice(app, /*analyze=*/false);
+    else
+      update_preview_outlines(app);
+
+    // Interactive startup only prepares the input preview. Headless requests
+    // necessarily need a completed analysis before they can dump or render it.
+    const bool build_immediately =
+        inputs.dump_analysis || !inputs.screenshot.empty() ||
+        inputs.analysis_step.has_value();
+    if (build_immediately) recompute(app);
+    if (inputs.analysis_step) {
+      app.decision_step = *inputs.analysis_step;
+      app.decision_caption = apply_decision_frame(app);
+      app.view.needs_fit = true;
     }
-    if (!app.subject_slicer.empty() || !app.stock_slicer.empty()) reslice(app);
-    else recompute(app);
+
+    if (inputs.dump_analysis) {
+      if (!app.error.empty())
+        throw std::runtime_error(app.error);
+      std::cout << "initial nodes " << app.standard_topology.nodes.size()
+                << ", recursive layers " << app.analysis.layers.size() << '\n';
+      const wave::Rect64 stock_bounds =
+          Clipper2Lib::GetBounds(app.standard_result.stock);
+      std::cout << "stock bounds " << wave::to_world(stock_bounds.left) << ','
+                << wave::to_world(stock_bounds.top) << " -> "
+                << wave::to_world(stock_bounds.right) << ','
+                << wave::to_world(stock_bounds.bottom) << '\n';
+      if (!app.analysis_error.empty())
+        std::cout << "analysis error: " << app.analysis_error << '\n';
+      for (const wave::WavefrontDecisionLayer& layer : app.analysis.layers) {
+        std::cout << "layer " << layer.layer << ": "
+                  << layer.entries.size() << " entries in "
+                  << layer.groups.size() << " groups, baseline "
+                  << layer.baseline_topology.nodes.size() << " nodes, "
+                  << layer.remaining_domain.size() << " domain rings, "
+                  << layer.cached_reached.size() << " cached-state rings, "
+                  << layer.baseline_wave.generations.size()
+                  << " generations" << '\n';
+        for (const wave::WavefrontStrategyTrial& trial : layer.trials) {
+          const std::size_t candidate_entries = std::count_if(
+              trial.topology.nodes.begin(), trial.topology.nodes.end(),
+              [](const wave::FrontNode& node) {
+                return node.kind == wave::FrontNode::Kind::Propagation &&
+                       node.evaluation_order == 0;
+              });
+          std::cout << "  longest entry per connected group: "
+                    << trial.candidate_node_count << " vs "
+                    << trial.previous_node_count << " raw nodes, "
+                    << trial.candidate_significant_node_count << " vs "
+                    << trial.previous_significant_node_count
+                    << " significant nodes (>= "
+                    << trial.minimum_significant_node_area << " mm^2), "
+                    << trial.retained_entries.size() << " retained / "
+                    << candidate_entries << " resulting entries, "
+                    << (trial.accepted ? "accepted" : "rejected") << '\n';
+          auto print_areas = [](const char* label,
+                                const std::vector<double>& areas) {
+            std::vector<double> sorted = areas;
+            std::sort(sorted.begin(), sorted.end(), std::greater<double>());
+            std::cout << "    " << label << " areas:";
+            for (double area : sorted) std::cout << ' ' << area;
+            std::cout << " mm^2\n";
+          };
+          print_areas("baseline", trial.previous_node_areas);
+          print_areas("candidate", trial.candidate_node_areas);
+        }
+        std::cout << "  selected " << layer.selected_topology.nodes.size()
+                  << " nodes" << '\n';
+        std::vector<std::size_t> order_counts;
+        for (const wave::FrontNode& node : layer.selected_topology.nodes) {
+          if (node.evaluation_order >= order_counts.size())
+            order_counts.resize(node.evaluation_order + 1, 0);
+          ++order_counts[node.evaluation_order];
+        }
+        std::cout << "  node layers";
+        for (std::size_t order = 0; order < order_counts.size(); ++order)
+          std::cout << ' ' << order << ':' << order_counts[order];
+        std::size_t mixed_order_bands = 0;
+        for (std::size_t generation = 0;
+             generation < layer.selected_lineage.generations.size();
+             ++generation) {
+          const wave::FrontGeneration& fronts =
+              layer.selected_lineage.generations[generation];
+          std::vector<std::size_t> band_orders(fronts.bands.size(),
+                                                wave::kNoTopologyId);
+          for (std::size_t front = 0; front < fronts.fronts.size(); ++front) {
+            const std::size_t node =
+                layer.selected_topology.front_nodes[generation][front];
+            const std::size_t order =
+                layer.selected_topology.nodes[node].evaluation_order;
+            std::size_t& band_order = band_orders[fronts.fronts[front].band];
+            if (band_order == wave::kNoTopologyId)
+              band_order = order;
+            else if (band_order != order)
+              band_order = std::numeric_limits<std::size_t>::max() - 1;
+          }
+          mixed_order_bands += static_cast<std::size_t>(std::count(
+              band_orders.begin(), band_orders.end(),
+              std::numeric_limits<std::size_t>::max() - 1));
+        }
+        std::cout << ", " << mixed_order_bands << " mixed-order bands\n";
+      }
+      const std::vector<wave::WavefrontStage> committed =
+          wave::committed_wavefront_stages(app.analysis);
+      std::size_t committed_fronts = 0;
+      for (const wave::WavefrontStage& stage : committed) {
+        std::size_t fronts = 0;
+        for (const wave::FrontGeneration& generation : stage.lineage.generations)
+          fronts += generation.fronts.size();
+        committed_fronts += fronts;
+        std::cout << "committed layer " << stage.analysis_layer << ": "
+                  << stage.topology.nodes.size() << " nodes, " << fronts
+                  << " fronts, " << stage.lineage.generations.size()
+                  << " generations" << '\n';
+      }
+      std::cout << "committed total: " << committed.size() << " layers, "
+                << committed_fronts << " fronts" << '\n';
+      return 0;
+    }
 
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) != 0)
       throw std::runtime_error(std::string("SDL initialization failed: ") + SDL_GetError());
@@ -1363,7 +1555,7 @@ int main(int argc, char** argv) {
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 0);
     SDL_Window* window = SDL_CreateWindow(
-        "Clipper2 contour wave", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+        "Wavefront analysis viewer", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         1500, 900, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
     if (!window) throw std::runtime_error(std::string("Window creation failed: ") + SDL_GetError());
     SDL_GLContext gl_context = SDL_GL_CreateContext(window);
@@ -1383,6 +1575,7 @@ int main(int argc, char** argv) {
     bool running = true;
     bool screenshot_pending = !inputs.screenshot.empty();
     double animation_accumulator = 0.0;
+    double decision_accumulator = 0.0;
     auto previous_time = std::chrono::steady_clock::now();
     while (running) {
       SDL_Event event;
@@ -1398,10 +1591,21 @@ int main(int argc, char** argv) {
       const auto now = std::chrono::steady_clock::now();
       const double elapsed = std::chrono::duration<double>(now - previous_time).count();
       previous_time = now;
-      if (app.toolpath_play && !app.toolpath.moves.empty()) {
-        const double total = wave::toolpath_length(app.toolpath);
-        app.toolpath_progress += static_cast<float>(elapsed * app.toolpath_speed);
-        if (app.toolpath_progress > total) app.toolpath_progress = 0.0f;
+      if (app.decision_play) {
+        decision_accumulator += elapsed * app.decision_speed;
+        while (decision_accumulator >= 1.0 && app.decision_play) {
+          if (app.decision_step + 1 >= decision_frame_count(app)) {
+            app.decision_play = false;
+            decision_accumulator = 0.0;
+            break;
+          }
+          ++app.decision_step;
+          app.decision_caption = apply_decision_frame(app);
+          app.selected_iteration = std::clamp(
+              app.selected_iteration, 0,
+              std::max(0, static_cast<int>(app.result.generations.size()) - 1));
+          decision_accumulator -= 1.0;
+        }
       }
       if (app.animate && !app.result.generations.empty()) {
         animation_accumulator += elapsed * app.animation_speed;
@@ -1419,7 +1623,7 @@ int main(int argc, char** argv) {
       const ImGuiViewport* viewport = ImGui::GetMainViewport();
       ImGui::SetNextWindowPos(viewport->WorkPos);
       ImGui::SetNextWindowSize(viewport->WorkSize);
-      ImGui::Begin("Clipper2 wave workspace", nullptr,
+      ImGui::Begin("Wavefront analysis", nullptr,
                    ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
                        ImGuiWindowFlags_NoSavedSettings);
       ImGui::BeginChild("Controls", ImVec2(365.0f, 0.0f), ImGuiChildFlags_Borders);

@@ -2536,6 +2536,12 @@ void operations_panel(App& app) {
   ImGui::SetItemTooltip(
       "The complete lower-layer entry curve must fit in this envelope around "
       "the upper curve. Node-area Z matching remains exact.");
+  ImGui::DragScalar("Tiny split area (stepover^2)", ImGuiDataType_Double,
+                    &operation.tiny_split_area_factor, 0.01f);
+  ImGui::SetItemTooltip(
+      "A terminal split branch smaller than this multiple of stepover squared "
+      "stays in the wave but does not create a separate node. Zero disables "
+      "the filter.");
 }
 
 void feeds_panel(App& app) {
@@ -2892,6 +2898,22 @@ void view_panel(App& app) {
   if (ImGui::TreeNode("Debug view")) {
     const auto& topology =
         app.plan.operations[app.selected_plan_operation].inter_layer;
+    if (!levels.empty()) {
+      const cam::LevelPlan& selected = levels[app.selected_level];
+      ImGui::TextDisabled(
+          "%zu recursive wave layer%s, %zu/%zu trial%s accepted",
+          selected.wave_stages.size(),
+          selected.wave_stages.size() == 1 ? "" : "s",
+          selected.accepted_analysis_trials, selected.analysis_trials,
+          selected.analysis_trials == 1 ? "" : "s");
+      ImGui::TextDisabled(
+          "%zu current node%s, %zu current entr%s; overlays use the combined "
+          "committed result.",
+          selected.topology.nodes.size(),
+          selected.topology.nodes.size() == 1 ? "" : "s",
+          selected.lineage.entry_fronts.size(),
+          selected.lineage.entry_fronts.size() == 1 ? "y" : "ies");
+    }
     ImGui::TextDisabled("%zu node Z-group%s, %zu entry-front Z-group%s",
                         topology.node_chains.size(),
                         topology.node_chains.size() == 1 ? "" : "s",
@@ -3065,6 +3087,7 @@ int main(int argc, char** argv) {
   double stepover = 0.0;
   double path_pitch = 0.0;
   double entry_front_tolerance = 0.0;
+  std::optional<double> tiny_split_area_factor;
   double rapid_clearance = 0.0;
   double full_feed = 0.0;
   double no_feed = 0.0;
@@ -3106,6 +3129,8 @@ int main(int argc, char** argv) {
       else if (argument == "--path-pitch") path_pitch = std::stod(value());
       else if (argument == "--entry-front-tolerance")
         entry_front_tolerance = std::stod(value());
+      else if (argument == "--tiny-split-area-factor")
+        tiny_split_area_factor = std::stod(value());
       else if (argument == "--rapid-clearance") rapid_clearance = std::stod(value());
       else if (argument == "--mode") mode_name = value();
       else if (argument == "--contour-direction") direction_name = value();
@@ -3129,6 +3154,9 @@ int main(int argc, char** argv) {
             "                     Permitted contour traversal direction\n"
             "  --entry-front-tolerance MM\n"
             "                     Whole-curve Z association envelope (default 3)\n"
+            "  --tiny-split-area-factor VALUE\n"
+            "                     Ignore terminal split branches below VALUE *\n"
+            "                     stepover^2 (default 0.5; zero disables)\n"
             "  --rapid-clearance MM\n"
             "                     Safe rapid height above the tallest of part and\n"
             "                     blank (default 10)\n"
@@ -3181,6 +3209,8 @@ int main(int argc, char** argv) {
     if (path_pitch > 0.0) operation.path_pitch = path_pitch;
     if (entry_front_tolerance > 0.0)
       operation.entry_front_match_tolerance = entry_front_tolerance;
+    if (tiny_split_area_factor)
+      operation.tiny_split_area_factor = *tiny_split_area_factor;
     if (rapid_clearance > 0.0)
       app.job.rapid_clearance_height = rapid_clearance;
     if (!mode_name.empty()) {
@@ -3250,9 +3280,11 @@ int main(int argc, char** argv) {
       std::fprintf(
           stderr,
           "planning_profile_counts wave_generations=%zu fronts=%zu "
+          "analysis_layers=%zu analysis_trials=%zu analysis_accepted=%zu "
           "toolpath_moves=%zu simulation_intervals=%zu "
           "empty_simulation_intervals=%zu gouge_bounds_rejections=%zu\n",
-          m.wave_generations, m.fronts, m.toolpath_moves,
+          m.wave_generations, m.fronts, m.analysis_layers, m.analysis_trials,
+          m.accepted_analysis_trials, m.toolpath_moves,
           m.simulation_intervals, m.empty_simulation_intervals,
           m.gouge_bounds_rejections);
     }

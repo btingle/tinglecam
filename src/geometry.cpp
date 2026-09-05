@@ -276,6 +276,19 @@ Paths64 inflate_with_softening(const Paths64& paths, double distance,
   return InflatePaths(expanded, softening, JoinType::Round, EndType::Polygon);
 }
 
+Paths64 seed_reach(const WaveSeed& seed, double distance, double softening) {
+  if (seed.path.size() < 2) return {};
+  const EndType end = seed.closed ? EndType::Joined : EndType::Square;
+  if (softening <= 0.0)
+    return InflatePaths(Paths64{seed.path}, distance, JoinType::Miter, end);
+  if (softening >= distance)
+    return InflatePaths(Paths64{seed.path}, distance, JoinType::Round, end);
+  Paths64 expanded = InflatePaths(Paths64{seed.path}, distance - softening,
+                                  JoinType::Miter, end);
+  return InflatePaths(expanded, softening, JoinType::Round,
+                      EndType::Polygon);
+}
+
 // Shortest distance from a point to a closed ring, in integer units.
 double distance_to_ring(const Point64& point, const Path64& ring) {
   if (ring.empty()) return std::numeric_limits<double>::max();
@@ -519,7 +532,6 @@ WaveResult build_wavefront(const Paths64& raw_subject,
   const double softening_delta = static_cast<double>(
       std::clamp<std::int64_t>(to_integer(softening), 0,
                                static_cast<std::int64_t>(delta)));
-
   for (std::size_t iteration = 0; iteration < max_iterations; ++iteration) {
     // Expand only geometry already reached from the box. Clipping to the domain
     // keeps the expansion inward; subtracting the subject blocks colliding
@@ -548,6 +560,101 @@ WaveResult build_wavefront(const Paths64& raw_subject,
     result.reached_generations.push_back(reached);
   }
 
+  result.stop_reason = StopReason::IterationLimit;
+  return result;
+}
+
+WaveResult build_wavefront_from_seeds(
+    const Paths64& raw_domain, const std::vector<WaveSeed>& seeds,
+    double stepover, double softening, std::size_t max_iterations,
+    const Paths64& static_boundaries, const Paths64& cached_reached) {
+  if (raw_domain.empty()) throw std::invalid_argument("Remaining domain is empty");
+  if (seeds.empty()) throw std::invalid_argument("Explicit wave seeds are empty");
+  if (!(stepover > 0.0)) throw std::invalid_argument("Stepover must be positive");
+  if (softening < 0.0 || softening > stepover)
+    throw std::invalid_argument("Softening must be between zero and stepover");
+  if (max_iterations == 0)
+    throw std::invalid_argument("Iteration limit must be positive");
+
+  WaveResult result;
+  result.domain = Union(raw_domain, FillRule::NonZero);
+  result.static_boundaries = static_boundaries;
+  result.stock = result.domain;
+  result.stock_boundary = result.stock.front();
+  result.stepover = stepover;
+  result.softening = softening;
+  if (!cached_reached.empty()) result.explicit_entry_fronts = seeds;
+  const double delta = static_cast<double>(
+      std::max<std::int64_t>(1, to_integer(stepover)));
+  const double softening_delta = static_cast<double>(
+      std::clamp<std::int64_t>(to_integer(softening), 0,
+                               static_cast<std::int64_t>(delta)));
+  // A front is a curve, while the morphology operates on closed regions. A
+  // cached entry therefore supplies its exact existing band. Standalone curve
+  // seeds get a full-stepped region; a hairline ribbon left quantization
+  // slivers and created spurious reverse-propagating fronts. In cached mode the
+  // complete reached state is retained below, while `seed_reach` gates the
+  // first expansion so an inactive sibling on the same band cannot restart.
+  Paths64 seed_regions;
+  for (const WaveSeed& seed : seeds) {
+    if (!seed.initial_region.empty()) {
+      seed_regions.insert(seed_regions.end(), seed.initial_region.begin(),
+                          seed.initial_region.end());
+      continue;
+    }
+    if (seed.path.size() < 2) continue;
+    const double seed_tolerance = std::clamp(delta * 0.001, 4.0, 100.0);
+    const Path64 seed_path = SimplifyPath(seed.path, seed_tolerance,
+                                          seed.closed);
+    if (seed_path.size() < 2) continue;
+    WaveSeed simplified_seed{seed_path, seed.closed, {}};
+    Paths64 ribbon = seed_reach(simplified_seed, delta, softening_delta);
+    seed_regions.insert(seed_regions.end(), ribbon.begin(), ribbon.end());
+  }
+  Paths64 active = Intersect(Union(seed_regions, FillRule::NonZero),
+                             result.domain, FillRule::NonZero);
+  Paths64 reached = cached_reached.empty()
+                        ? active
+                        : Intersect(Union(cached_reached, FillRule::NonZero),
+                                    result.domain, FillRule::NonZero);
+  if (active.empty() || reached.empty()) {
+    result.stop_reason = StopReason::Empty;
+    return result;
+  }
+  result.generations.push_back(active);
+  result.reached_generations.push_back(reached);
+
+  for (std::size_t iteration = 0; iteration < max_iterations; ++iteration) {
+    Paths64 next = inflate_with_softening(reached, delta, softening_delta);
+    next = Intersect(next, result.domain, FillRule::NonZero);
+    Paths64 wave = Difference(next, reached, FillRule::NonZero);
+    if (!cached_reached.empty()) {
+      Paths64 influence;
+      if (iteration == 0) {
+        for (const WaveSeed& seed : seeds) {
+          Paths64 reach = seed_reach(seed, delta, softening_delta);
+          influence.insert(influence.end(), reach.begin(), reach.end());
+        }
+        influence = Union(influence, FillRule::NonZero);
+      } else {
+        influence = inflate_with_softening(active, delta, softening_delta);
+      }
+      wave = Intersect(wave, influence, FillRule::NonZero);
+      next = Union(reached, wave, FillRule::NonZero);
+    }
+    if (paths_equal_canonical(next, reached)) {
+      result.stop_reason = StopReason::Unchanged;
+      return result;
+    }
+    if (wave.empty()) {
+      result.stop_reason = StopReason::Unchanged;
+      return result;
+    }
+    result.generations.push_back(std::move(wave));
+    reached = std::move(next);
+    result.reached_generations.push_back(reached);
+    active = result.generations.back();
+  }
   result.stop_reason = StopReason::IterationLimit;
   return result;
 }

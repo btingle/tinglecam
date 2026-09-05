@@ -1,7 +1,6 @@
 #pragma once
 
-#include "geometry.h"
-#include "topology.h"
+#include "analysis.h"
 
 #include <cstddef>
 #include <vector>
@@ -106,6 +105,17 @@ Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage,
                         // Reuse topology already built for inter-layer
                         // association when the caller has it.
                         const LayerTopology* existing_topology = nullptr);
+
+// Sequences the committed layers of an optimized wave analysis in recursive
+// order. Cutter position and cleared material are shared across stage
+// boundaries, so the abstraction does not introduce artificial re-entries.
+Toolpath build_toolpath(const std::vector<WavefrontStage>& stages,
+                        double tool_radius = 0.0,
+                        double floor_z = 0.0,
+                        double rapid_plane = 10.0,
+                        double rapid_feed = 2000.0,
+                        double traversal_feed = 1000.0,
+                        double rapid_feed_z = 0.0);
 
 // Resamples every uninterrupted at-depth cutting path at a uniform travelled
 // distance. Original micro-vertices are not retained; motion-type changes are

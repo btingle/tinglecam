@@ -7,7 +7,9 @@ G-code.
 
 ## Build
 
-Requirements include CMake 3.20+, a C++20 compiler, SDL2, and OpenGL.
+Requirements include CMake 3.20+, a C++20 compiler, SDL2, OpenGL, a CUDA-capable
+GPU, and the CUDA toolkit. Mesh preprocessing always uses the cuBQL CUDA BVH;
+there is no CPU fallback.
 
 ```sh
 cmake -S . -B build
@@ -15,13 +17,59 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-CUDA mesh slicing is enabled when a suitable toolkit is available. Disable it
-explicitly with `-DWAVE_ENABLE_CUDA=OFF`.
-
 The build produces:
 
 - `tinglecam`: the CAM application and headless G-code command.
 - `clipper2_wave_demo`: the wavefront geometry diagnostic viewer.
+
+## Wavefront analysis viewer
+
+`clipper2_wave_demo` is intentionally limited to wave propagation and its
+topology; it does not build toolpaths or run material-removal simulation. It
+records the recursive entry-selection analysis and lets the result be replayed
+one decision frame at a time:
+
+- the simultaneous baseline for a node layer;
+- the trial retaining only the longest entry in each graph-connected remaining
+  volume; and
+- the accepted strategy. Nodes below 0.5% of the incumbent strategy's largest
+  approximate node area remain in the result but do not affect selection;
+  strictly fewer significant nodes wins, and ties retain the baseline.
+
+The canvas can overlay generations, leading-front parentage, node boundaries,
+and split, merge, termination, or merge-termination events. During decision
+playback, entries in the same graph-derived volume share a colour; retained
+entries are thick, while muted entries are grey and crossed out. A dashed blue
+outline shows the cached remaining domain used by that layer.
+
+Before nodes are built, a split is rejected when every extra branch terminates
+without another split or merge and covers less than half a square stepover.
+The fronts and swept bands remain in the result; only the below-resolution
+split event and resulting node boundary are omitted. The viewer exposes this
+as **Tiny split area (stepover^2)**, and zero disables the filter.
+
+Run it interactively with `./build/clipper2_wave_demo`, or inspect the same
+recorded decisions without a window:
+
+```sh
+./build/clipper2_wave_demo --dump-analysis
+./build/clipper2_wave_demo --analysis-step 4
+```
+
+The viewer uses rounded wave offsets by default. Disable **Rounded waves** in
+the UI, or pass `--mitered-waves`, to use the faster sharp-mitered geometry for
+topology diagnostics. `--round-waves` selects the normal rounded mode
+explicitly.
+
+Interactive startup prepares only the subject/stock preview. Geometry options
+are collected without triggering analysis on every slider tick; press **Build
+analysis** (or **Rebuild analysis**) when the inputs are ready. Analysis dumps,
+requested decision frames, and screenshots still build automatically because
+their output requires a completed analysis.
+
+When no stock mesh is loaded, the diagnostic rectangle is derived from the
+full subject model's XY bounds plus the configured allowance. It remains fixed
+while Z changes; it is never refitted to an individual slice.
 
 ## Workflow
 
@@ -87,19 +135,27 @@ For every roughing depth, TingleCAM:
 
 1. Slices the part and stock meshes.
 2. Offsets the protected part by the cutter radius and stock allowance.
-3. Builds the wavefront passes, endpoint boundary provenance, per-layer nodes,
-   and inter-layer associations.
-4. Sequences the wavefront passes and adds a boundary cleanup contour, clipped
+3. Builds the simultaneous wavefront baseline and recursively tests each
+   graph-connected entry group. A longest-entry trial is committed only when
+   it produces fewer topology nodes; manual entry selections remain the input
+   constraint on the first layer.
+4. Extracts only the root nodes committed at each recursive layer and sequences
+   those stages with one continuous cutter position and cleared-state model.
+   The committed stages are also composed into the final per-depth lineage and
+   node topology used by node highlighting, entry-front display, cleanup
+   clipping, and inter-layer Z association; the discarded simultaneous suffix
+   is not exposed as the planned result.
+5. Adds a boundary cleanup contour, clipped
    to what the wave reached.
-5. Stitches the seams between depths, once every depth has a toolpath, so a
+6. Stitches the seams between depths, once every depth has a toolpath, so a
    transition can be compared against the lift it replaces.
-6. Resamples each uninterrupted at-depth path at a uniform traveled-distance
+7. Resamples each uninterrupted at-depth path at a uniform traveled-distance
    pitch.
-7. Simulates the normalized intervals against the remaining stock.
-8. Maps each interval's engagement directly to its configured feed range.
-9. Merges adjacent collinear intervals only when their assigned feeds and
+8. Simulates the normalized intervals against the remaining stock.
+9. Maps each interval's engagement directly to its configured feed range.
+10. Merges adjacent collinear intervals only when their assigned feeds and
    motion types are compatible.
-10. Posts the resulting linear motion.
+11. Posts the resulting linear motion.
 
 A depth the part does not reach is cleared rather than skipped, in either mode.
 There is no surface to finish there because there is no part there, but there is

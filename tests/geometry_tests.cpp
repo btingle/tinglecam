@@ -1,10 +1,13 @@
+#include "analysis.h"
 #include "geometry.h"
+#include "mesh_slicer.h"
 #include "toolpath.h"
 #include "topology.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <filesystem>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -42,6 +45,65 @@ wave::WaveResult two_band_sweep(bool notched) {
       Clipper2Lib::Union(wave::Paths64{first, second},
                          Clipper2Lib::FillRule::NonZero)};
   return wave_result;
+}
+
+// Two sources sweep a rectangular channel from opposite ends. Their last
+// fronts consume the middle band together and leave no surviving front, which
+// is a merge into an empty terminal node rather than two independent deaths.
+wave::WaveResult opposing_terminal_sweep() {
+  wave::WaveResult result;
+  const wave::Path64 stock{
+      {0, 0}, {20000, 0}, {20000, 10000}, {0, 10000}};
+  const wave::Path64 left_seed{
+      {0, 0}, {1000, 0}, {1000, 10000}, {0, 10000}};
+  const wave::Path64 right_seed{
+      {19000, 0}, {20000, 0}, {20000, 10000}, {19000, 10000}};
+  const wave::Path64 left_step{
+      {1000, 0}, {6000, 0}, {6000, 10000}, {1000, 10000}};
+  const wave::Path64 right_step{
+      {14000, 0}, {19000, 0}, {19000, 10000}, {14000, 10000}};
+  const wave::Path64 terminal_band{
+      {6000, 0}, {14000, 0}, {14000, 10000}, {6000, 10000}};
+  result.stock = {stock};
+  result.stock_boundary = stock;
+  result.domain = {stock};
+  result.stepover = 5.0;
+  result.generations = {{left_seed, right_seed},
+                        {left_step, right_step},
+                        {terminal_band}};
+  result.reached_generations = {
+      {left_seed, right_seed},
+      Clipper2Lib::Union({left_seed, right_seed, left_step, right_step},
+                         Clipper2Lib::FillRule::NonZero),
+      {stock},
+  };
+  return result;
+}
+
+// Two fronts also terminate on the same transition, but in disconnected
+// regions. Coincident timing alone must not turn them into a merge.
+wave::WaveResult independent_terminal_sweeps() {
+  wave::WaveResult result;
+  const wave::Path64 lower{
+      {0, 0}, {10000, 0}, {10000, 5000}, {0, 5000}};
+  const wave::Path64 upper{
+      {0, 30000}, {10000, 30000}, {10000, 35000}, {0, 35000}};
+  const wave::Path64 lower_seed{
+      {0, 0}, {1000, 0}, {1000, 5000}, {0, 5000}};
+  const wave::Path64 upper_seed{
+      {0, 30000}, {1000, 30000}, {1000, 35000}, {0, 35000}};
+  const wave::Path64 lower_finish{
+      {1000, 0}, {10000, 0}, {10000, 5000}, {1000, 5000}};
+  const wave::Path64 upper_finish{
+      {1000, 30000}, {10000, 30000}, {10000, 35000}, {1000, 35000}};
+  result.stock = {lower, upper};
+  result.stock_boundary = lower;
+  result.domain = result.stock;
+  result.stepover = 10.0;
+  result.generations = {{lower_seed, upper_seed},
+                        {lower_finish, upper_finish}};
+  result.reached_generations = {{lower_seed, upper_seed}, {lower, upper}};
+  return result;
 }
 
 // Two disconnected cuts can each meet the air outside the stock within the
@@ -145,6 +207,213 @@ bool region_covers(const wave::Paths64& region, double x, double y) {
   const wave::Paths64 probe{test_box(x - 0.05, y - 0.05, x + 0.05, y + 0.05)};
   return !Clipper2Lib::Intersect(probe, region, Clipper2Lib::FillRule::NonZero)
               .empty();
+}
+
+std::size_t front_count(const wave::FrontLineage& lineage) {
+  std::size_t result = 0;
+  for (const wave::FrontGeneration& generation : lineage.generations)
+    result += generation.fronts.size();
+  return result;
+}
+
+void check_committed_fronts(const wave::WavefrontAnalysis& analysis) {
+  const auto committed = wave::committed_wavefront_stages(analysis);
+  require(committed.size() == analysis.layers.size(),
+          "every recursive decision should produce one committed stage");
+  if (committed.size() != analysis.layers.size()) return;
+  for (std::size_t layer = 0; layer < committed.size(); ++layer) {
+    const auto& decision = analysis.layers[layer];
+    const auto& stage = committed[layer];
+    std::vector<const wave::LeadingFront*> expected;
+    for (std::size_t generation = 0;
+         generation < decision.selected_lineage.generations.size();
+         ++generation)
+      for (std::size_t front = 0;
+           front < decision.selected_lineage.generations[generation].fronts.size();
+           ++front) {
+        const std::size_t node =
+            decision.selected_topology.front_nodes[generation][front];
+        if (decision.selected_topology.nodes[node].kind ==
+                wave::FrontNode::Kind::Propagation &&
+            decision.selected_topology.nodes[node].evaluation_order == 0)
+          expected.push_back(
+              &decision.selected_lineage.generations[generation].fronts[front]);
+      }
+    std::vector<const wave::LeadingFront*> actual;
+    for (const wave::FrontGeneration& generation : stage.lineage.generations)
+      for (const wave::LeadingFront& front : generation.fronts)
+        actual.push_back(&front);
+    require(actual.size() == expected.size(),
+            "committing a layer must neither omit nor duplicate root fronts");
+    for (std::size_t front = 0;
+         front < std::min(actual.size(), expected.size()); ++front)
+      require(actual[front]->path == expected[front]->path &&
+                  actual[front]->closed == expected[front]->closed,
+              "a committed front must retain the selected geometry exactly");
+  }
+
+  const wave::CommittedWavefront final =
+      wave::commit_wavefront_analysis(analysis);
+  require(front_count(final.lineage) == [&] {
+            std::size_t count = 0;
+            for (const wave::WavefrontStage& stage : committed)
+              count += front_count(stage.lineage);
+            return count;
+          }(),
+          "the combined result should contain every committed front once");
+  std::size_t node_offset = 0;
+  std::size_t expected_entries = 0;
+  wave::Paths64 expected_reached;
+  for (const wave::WavefrontStage& stage : committed) {
+    expected_entries += stage.lineage.entry_fronts.size();
+    for (std::size_t node = 0; node < stage.topology.nodes.size(); ++node) {
+      require(node_offset + node < final.topology.nodes.size(),
+              "the combined result should contain every committed node");
+      if (node_offset + node >= final.topology.nodes.size()) continue;
+      const wave::FrontNode& combined = final.topology.nodes[node_offset + node];
+      require(combined.evaluation_order == stage.analysis_layer,
+              "a final node should retain its recursive analysis layer");
+      require(!combined.footprint.empty(),
+              "a final node should have a highlightable footprint");
+      expected_reached.insert(expected_reached.end(),
+                              stage.topology.nodes[node].footprint.begin(),
+                              stage.topology.nodes[node].footprint.end());
+    }
+    node_offset += stage.topology.nodes.size();
+  }
+  require(final.topology.nodes.size() == node_offset,
+          "the combined result should contain no obsolete baseline nodes");
+  expected_reached = Clipper2Lib::Union(
+      expected_reached, Clipper2Lib::FillRule::NonZero);
+  require(!final.wave.reached_generations.empty(),
+          "the final committed wave should retain reached geometry");
+  if (!final.wave.reached_generations.empty()) {
+    const wave::Paths64& actual = final.wave.reached_generations.back();
+    require(Clipper2Lib::Difference(expected_reached, actual,
+                                    Clipper2Lib::FillRule::NonZero).empty(),
+            "committing recursive layers must retain terminal swept bands");
+  }
+  require(final.lineage.entry_fronts.size() == expected_entries &&
+              final.topology.entry_fronts.size() == expected_entries,
+          "the combined result should expose every committed node entry");
+  const std::vector<const wave::FrontLineage*> lineages{&final.lineage,
+                                                         &final.lineage};
+  const std::vector<const wave::LayerTopology*> topologies{&final.topology,
+                                                            &final.topology};
+  const wave::InterLayerTopology inter_layer =
+      wave::build_inter_layer_topology(lineages, 1.0, topologies);
+  require(inter_layer.layers.size() == 2 &&
+              inter_layer.layers.front().nodes.size() ==
+                  final.topology.nodes.size(),
+          "Z grouping should consume the supplied committed topology");
+  for (std::size_t node = 0; node < final.topology.nodes.size(); ++node)
+    require(inter_layer.layers.front().nodes[node].evaluation_order ==
+                final.topology.nodes[node].evaluation_order,
+            "Z grouping should retain recursive node evaluation order");
+}
+
+void check_lsjig_reconstruction(const std::filesystem::path& mesh_path) {
+  wave::MeshSlicer slicer;
+  slicer.set_mesh(wave::load_triangle_mesh(mesh_path));
+  const wave::Bounds3f& bounds = slicer.mesh().bounds;
+  const wave::Paths64 stock{test_box(bounds.lower.x - 5.0,
+                                     bounds.lower.y - 5.0,
+                                     bounds.upper.x + 5.0,
+                                     bounds.upper.y + 5.0)};
+  const auto subject_at = [&](float z) {
+    const wave::Paths64 raw = slicer.slice(z, 32).polygons;
+    return Clipper2Lib::InflatePaths(
+        Clipper2Lib::Union(raw, Clipper2Lib::FillRule::NonZero),
+        static_cast<double>(wave::to_integer(3.2)),
+        Clipper2Lib::JoinType::Round, Clipper2Lib::EndType::Polygon);
+  };
+  const wave::Paths64 subject = subject_at(5.0f);
+  const wave::WavefrontAnalysis analysis = wave::analyze_wavefront(
+      subject, stock, 2.4, 2.4, 3.2);
+  check_committed_fronts(analysis);
+  const auto committed = wave::committed_wavefront_stages(analysis);
+  require(committed.size() == 2,
+          "LsJig1 at the representative CAM depth has two recursive layers");
+  std::size_t fronts = 0;
+  std::size_t generations = 0;
+  for (const wave::WavefrontStage& stage : committed) {
+    fronts += front_count(stage.lineage);
+    generations += stage.lineage.generations.size();
+  }
+  require(fronts == 26 && generations == 17,
+          "LsJig1 committed geometry should match the CAM analysis totals");
+  const wave::Toolpath toolpath = wave::build_toolpath(committed, 3.0);
+  require(toolpath.stats.unreachable_fronts == 0,
+          "LsJig1 committed stages should retain every dependency");
+
+  // At this height the one-entry strategy creates a terminal split branch of
+  // only a few square millimetres. Rejecting that event should collapse the
+  // branch into its continuing node without deleting any wavefront geometry.
+  const wave::Paths64 tie_subject = subject_at(15.0f);
+  const wave::WavefrontAnalysis scored = wave::analyze_wavefront(
+      tie_subject, stock, 2.4, 2.4, 3.2);
+  require(scored.layers.size() >= 2 &&
+              scored.layers[1].trials.size() == 1,
+          "LsJig1 Z15 should expose the raw node-count tie");
+  if (scored.layers.size() >= 2 && !scored.layers[1].trials.empty()) {
+    const wave::WavefrontStrategyTrial& trial =
+        scored.layers[1].trials.front();
+    require(trial.candidate_node_count == 4 &&
+                trial.previous_node_count == 6,
+            "the microscopic LsJig1 split should not create candidate nodes");
+    require(trial.candidate_significant_node_count == 2 &&
+                trial.previous_significant_node_count == 4 && trial.accepted,
+            "the split-filtered LsJig1 strategy should win selection");
+    require(trial.minimum_significant_node_area > 9.0 &&
+                trial.minimum_significant_node_area < 10.5,
+            "the LsJig1 significance threshold should use 0.5% of its largest node");
+  }
+
+  const wave::WavefrontAnalysis area_only = wave::analyze_wavefront(
+      tie_subject, stock, 2.4, 2.4, 3.2, 2000, 128, {},
+      wave::kDefaultSignificantNodeAreaFraction, 0.0);
+  require(area_only.layers.size() >= 2 &&
+              area_only.layers[1].trials.size() == 1,
+          "unfiltered LsJig1 comparison should expose the same trial");
+  if (area_only.layers.size() >= 2 &&
+      !area_only.layers[1].trials.empty()) {
+    const wave::WavefrontStrategyTrial& filtered =
+        scored.layers[1].trials.front();
+    const wave::WavefrontStrategyTrial& unfiltered =
+        area_only.layers[1].trials.front();
+    require(unfiltered.candidate_node_count == 6 &&
+                unfiltered.previous_node_count == 6 && unfiltered.accepted,
+            "area scoring should still resolve the unfiltered raw node tie");
+    require(front_count(filtered.lineage) == front_count(unfiltered.lineage),
+            "rejecting a tiny split must retain every propagated front");
+    const auto split_count = [](const wave::FrontLineage& lineage) {
+      return std::count_if(
+          lineage.events.begin(), lineage.events.end(),
+          [](const wave::LineageEvent& event) {
+            return event.kind == wave::LineageEventKind::Split;
+          });
+    };
+    require(split_count(filtered.lineage) + 1 ==
+                split_count(unfiltered.lineage),
+            "the terminal microscopic branch should lose exactly one split event");
+    require(filtered.lineage.rejected_splits.size() == 1 &&
+                unfiltered.lineage.rejected_splits.empty(),
+            "rejected split contraction should be explicit in the lineage");
+  }
+
+  const wave::WavefrontAnalysis raw_counted = wave::analyze_wavefront(
+      tie_subject, stock, 2.4, 2.4, 3.2, 2000, 128, {}, 0.0, 0.0);
+  require(raw_counted.layers.size() >= 2 &&
+              raw_counted.layers[1].trials.size() == 1,
+          "raw LsJig1 comparison should expose the same trial");
+  if (raw_counted.layers.size() >= 2 &&
+      !raw_counted.layers[1].trials.empty()) {
+    const wave::WavefrontStrategyTrial& trial =
+        raw_counted.layers[1].trials.front();
+    require(trial.candidate_significant_node_count == 6 &&
+                trial.previous_significant_node_count == 6 && !trial.accepted,
+            "a zero area fraction should preserve raw node-count behavior");
+  }
 }
 
 // A square part centred in square stock, so every stock face is open, against
@@ -259,7 +528,7 @@ void check_plunge_clearance() {
 
 int main(int argc, char** argv) {
   try {
-    require(argc == 2, "expected SVG filename argument");
+    require(argc >= 2, "expected SVG filename argument");
     const auto svg = wave::load_svg_closed_paths(argv[1]);
     require(svg.source_path_count == 5, "wavetest.svg should contain five closed paths");
     require(std::abs(wave::to_world(svg.bounds.left) + 1500.0) < 0.01,
@@ -319,6 +588,58 @@ int main(int argc, char** argv) {
               "lineage event has an unexpected kind");
     }
 
+    const auto analysis = wave::analyze_wavefront(
+        svg.paths, result.stock, 75.0, 0.0, 0.0, 2000, 8);
+    require(!analysis.layers.empty(),
+            "recursive wave analysis should evaluate its root layer");
+    require(!analysis.layers.front().entries.empty() &&
+                !analysis.layers.front().selected_topology.nodes.empty(),
+            "a decision layer should retain entries and a selected node graph");
+    require(analysis.layers.size() >= 2,
+            "the sample should expose a later recursive decision layer");
+    if (analysis.layers.size() >= 2) {
+      const auto& decision = analysis.layers[1];
+      require(decision.entries.size() == 2 && decision.groups.size() == 1,
+              "the later sample entries should share one graph-derived volume");
+      require(decision.trials.size() == 1 &&
+                  decision.trials.front().retained_entries.size() == 1,
+              "the connected volume should receive one longest-entry trial");
+      const std::size_t candidate_roots = std::count_if(
+          decision.trials.front().topology.nodes.begin(),
+          decision.trials.front().topology.nodes.end(),
+          [](const wave::FrontNode& node) {
+            return node.kind == wave::FrontNode::Kind::Propagation &&
+                   node.evaluation_order == 0;
+          });
+      require(candidate_roots == 1,
+              "later-layer muting should activate only the retained entry front");
+      require(decision.trials.front().accepted,
+              "the sample's one-entry strategy should win on node count");
+    }
+    const auto committed = wave::committed_wavefront_stages(analysis);
+    check_committed_fronts(analysis);
+    require(committed.size() == analysis.layers.size(),
+            "every recursive decision should produce one committed stage");
+    std::size_t committed_fronts = 0;
+    for (const wave::WavefrontStage& stage : committed) {
+      require(stage.topology.front_nodes.size() == stage.lineage.generations.size(),
+              "committed topology should match its filtered lineage");
+      for (std::size_t generation = 0;
+           generation < stage.lineage.generations.size(); ++generation) {
+        require(stage.topology.front_nodes[generation].size() ==
+                    stage.lineage.generations[generation].fronts.size(),
+                "every committed front should retain a topology node");
+        committed_fronts += stage.lineage.generations[generation].fronts.size();
+      }
+    }
+    const auto committed_toolpath = wave::build_toolpath(committed);
+    require(committed_toolpath.stats.unreachable_fronts == 0,
+            "committed stages should preserve their internal dependencies");
+    require(committed_toolpath.stats.cut_count == committed_fronts,
+            "the staged sequencer should cut every committed front once");
+    require(committed_toolpath.stats.retract_count >= 1,
+            "staged sequencing still needs its initial descent");
+
     for (const bool notched : {false, true}) {
       const auto sweep = wave::build_front_lineage(two_band_sweep(notched));
       require(sweep.generations.size() == 2, "the sweep should cover both bands");
@@ -337,6 +658,60 @@ int main(int argc, char** argv) {
       require(sweep_path.stats.link_count == 1,
               "the feed in from the air beside the stock cuts nothing");
 
+    }
+
+    {
+      const wave::FrontLineage collision =
+          wave::build_front_lineage(opposing_terminal_sweep());
+      require(collision.events.size() == 1,
+              "opposing terminal fronts should produce one event");
+      require(collision.events.front().kind ==
+                  wave::LineageEventKind::MergeTermination,
+              "opposing terminal fronts should merge into termination");
+      require(collision.events.front().previous_fronts.size() == 2 &&
+                  collision.events.front().current_fronts.empty(),
+              "a merge termination has parents and no surviving front");
+      const wave::LayerTopology nodes =
+          wave::build_layer_topology(collision);
+      require(nodes.nodes.size() == 3,
+              "two propagation nodes should feed one empty terminal node");
+      const wave::FrontNode& terminal = nodes.nodes.back();
+      require(terminal.kind ==
+                  wave::FrontNode::Kind::MergeTermination &&
+                  terminal.fronts.empty() && terminal.footprint.empty() &&
+                  terminal.parents.size() == 2 && terminal.children.empty(),
+              "the terminal merge node should be an empty graph sink");
+      const auto groups = wave::group_node_entries(nodes, 0);
+      require(groups.size() == 1 && groups.front().entries.size() == 2,
+              "the empty terminal node should graph-group its two entries");
+    }
+    {
+      const wave::FrontLineage independent =
+          wave::build_front_lineage(independent_terminal_sweeps());
+      require(independent.events.size() == 2,
+              "disconnected terminal fronts should remain separate events");
+      require(std::all_of(independent.events.begin(), independent.events.end(),
+                          [](const wave::LineageEvent& event) {
+                            return event.kind ==
+                                   wave::LineageEventKind::Termination;
+                          }),
+              "simultaneous but geometrically separate deaths are not a merge");
+    }
+    {
+      const wave::Paths64 remaining{
+          {{1000, 0}, {19000, 0}, {19000, 10000}, {1000, 10000}}};
+      const wave::WaveSeed left{{{1000, 0}, {1000, 10000}}, false};
+      const wave::WaveSeed right{{{19000, 10000}, {19000, 0}}, false};
+      const auto both = wave::build_wavefront_from_seeds(
+          remaining, {left, right}, 5.0, 0.0);
+      const auto left_only = wave::build_wavefront_from_seeds(
+          remaining, {left}, 5.0, 0.0);
+      const auto both_lineage = wave::build_front_lineage(both);
+      const auto left_lineage = wave::build_front_lineage(left_only);
+      const auto both_nodes = wave::build_layer_topology(both_lineage);
+      const auto left_nodes = wave::build_layer_topology(left_lineage);
+      require(both_nodes.nodes.size() > left_nodes.nodes.size(),
+              "one explicit later-layer seed should simplify the opposing sweep");
     }
 
 
@@ -443,6 +818,8 @@ int main(int argc, char** argv) {
     }
     require(previous_move + 1 == toolpath.moves.size(),
             "sampling the whole length should reach the final move");
+
+    if (argc > 2) check_lsjig_reconstruction(argv[2]);
 
     std::cout << "Loaded " << svg.source_path_count << " paths and generated "
               << result.generations.size() << " non-empty wavefronts and "
