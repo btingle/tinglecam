@@ -437,13 +437,17 @@ WaveResult seed_wavefront(const Paths64& raw_subject,
                           double stepover,
                           double softening,
                           double lead_in,
-                          const EntryMute& muted) {
+                          const EntryMute& muted,
+                          double exterior_stock_reach) {
   if (raw_subject.empty()) throw std::invalid_argument("Subject is empty");
   if (raw_stock.empty()) throw std::invalid_argument("Stock is empty");
   if (!(stepover > 0.0)) throw std::invalid_argument("Stepover must be positive");
   if (softening < 0.0 || softening > stepover)
     throw std::invalid_argument("Softening must be between zero and stepover");
   if (lead_in < 0.0) throw std::invalid_argument("Lead-in must not be negative");
+  if (exterior_stock_reach < 0.0 || !std::isfinite(exterior_stock_reach))
+    throw std::invalid_argument(
+        "Exterior stock reach must be finite and nonnegative");
 
   WaveResult result;
   result.subject = Union(raw_subject, FillRule::NonZero);
@@ -453,9 +457,10 @@ WaveResult seed_wavefront(const Paths64& raw_subject,
   if (result.stock.empty()) throw std::invalid_argument("Stock union is empty");
   result.stock_boundary = result.stock.front();
 
-  // The stock wall the wave starts from: a one-integer-unit ring at the stock
-  // boundary. The subject is deliberately not part of it, so its boundaries can
-  // never become independent wave sources.
+  // The physical stock wall. Only the part not hidden by the protected subject
+  // receives the ordinary lead-in; the optional contact domain below is what
+  // admits thinner boundary stock without manufacturing a full run-in from the
+  // part face.
   const Paths64 stock_inner = InflatePaths(result.stock, -1.0, JoinType::Miter,
                                            EndType::Polygon);
   Paths64 wall = Difference(result.stock, stock_inner, FillRule::NonZero);
@@ -478,7 +483,18 @@ WaveResult seed_wavefront(const Paths64& raw_subject,
   // rather than from the stock solid: only boundary the wave actually starts
   // from gets a run-in, so stock the subject occludes contributes none. Growing
   // the solid instead would have manufactured a lead-in running along the part.
+  // Propagation normally occupies physical stock. For stock-aware subdivision
+  // passes it may additionally occupy nearby exterior air in which the cutter
+  // can still reach stock. The physical stock remains separately recorded in
+  // `result.stock`, so air-only fronts are still filtered from the toolpath.
   Paths64 domain = result.stock;
+  if (exterior_stock_reach > 0.0) {
+    const std::int64_t reach = to_integer(exterior_stock_reach);
+    if (reach > 0)
+      domain = Union(InflatePaths(result.stock, static_cast<double>(reach),
+                                  JoinType::Round, EndType::Polygon),
+                     FillRule::NonZero);
+  }
   if (result.lead_in_generations > 0 && !wall.empty()) {
     Paths64 approach = InflatePaths(
         wall, static_cast<double>(std::max<std::int64_t>(1, to_integer(result.lead_in))),

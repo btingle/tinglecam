@@ -130,6 +130,13 @@ double link_slack(double stepover) {
                     32.0, 500.0);
 }
 
+double subdivision_cleanup_reach(const Operation& operation, double radius,
+                                 bool finishing_subdivision) {
+  return finishing_subdivision
+             ? std::clamp(radius - operation.cleanup_tolerance, 0.0, radius)
+             : 0.0;
+}
+
 // Everywhere the cutter's centre may be at one depth when nothing has been
 // removed there yet: the space beside the stock, minus the part it must not
 // touch. The stock stands in air, so that space is empty whether or not this
@@ -225,6 +232,11 @@ bool resolve_setup(const Operation& operation, const Tool& tool,
   if (operation.tiny_split_area_factor < 0.0 ||
       !std::isfinite(operation.tiny_split_area_factor)) {
     error = "Tiny split area factor must be nonnegative";
+    return false;
+  }
+  if (operation.cleanup_tolerance < 0.0 ||
+      !std::isfinite(operation.cleanup_tolerance)) {
+    error = "Boundary cleanup tolerance must be finite and nonnegative";
     return false;
   }
 
@@ -610,6 +622,8 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
     return plan;
   const double radius = setup.radius;
   const double stepover = setup.stepover;
+  const double exterior_stock_reach = subdivision_cleanup_reach(
+      operation, radius, prior_subdivisions != nullptr);
   const double first_bite_allowance = setup.first_bite_allowance;
   const double work_top = highest_model_z(geometry);
   std::vector<double> floors;
@@ -718,7 +732,7 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
       wave::WavefrontAnalysis analysis = wave::analyze_wavefront(
           keep_outs[index], level.incoming_stock, stepover, stepover, lead_in,
           2000, 128, {}, wave::kDefaultSignificantNodeAreaFraction,
-          operation.tiny_split_area_factor);
+          operation.tiny_split_area_factor, exterior_stock_reach);
       wave::CommittedWavefront committed =
           wave::commit_wavefront_analysis(analysis);
       level.wave_stages = std::move(committed.stages);
@@ -824,7 +838,8 @@ void plan_toolpaths(OperationPlan& plan,
                     const ProgressCallback& progress,
                     double progress_from,
                     double progress_to,
-                    double rapid_plane) {
+                    double rapid_plane,
+                    bool finishing_subdivision) {
   if (!plan.ok()) return;
   if (!std::isfinite(rapid_plane)) {
     plan.error = "Rapid plane must be finite";
@@ -839,6 +854,8 @@ void plan_toolpaths(OperationPlan& plan,
     return;
   const CuttingData* data = setup.data;
   const double radius = setup.radius;
+  const double cleanup_reach =
+      subdivision_cleanup_reach(operation, radius, finishing_subdivision);
   const double full_engagement_feed = setup.full_engagement_feed;
   const double no_engagement_feed = setup.no_engagement_feed;
   const double span = std::max(progress_to - progress_from, 0.0);
@@ -927,14 +944,11 @@ void plan_toolpaths(OperationPlan& plan,
   for (const std::size_t index : toolpath_levels) {
     LevelPlan& level = plan.levels[index];
     if (toolpath_errors[index]) continue;
-    if (level.toolpath.moves.empty()) {
-      level.nothing_to_cut = true;
-      continue;
-    }
     const bool clearing = level.part_slice.empty();
     if ((operation.mode == OperationMode::Roughing || clearing) &&
         operation.rough_boundary_cleanup && !level.part_slice.empty() &&
-        !level.wave.reached_generations.empty())
+        (cleanup_reach > 0.0 ||
+         !level.wave.reached_generations.empty()))
       cleanup_levels.push_back(index);
   }
 
@@ -943,24 +957,32 @@ void plan_toolpaths(OperationPlan& plan,
   parallel_for_levels(cleanup_levels, [&](std::size_t index) {
     LevelPlan& level = plan.levels[index];
     try {
-      // Only where the wave got. A cleanup contour runs along the part at
-      // the same offset the wave was bounded by, so where the wave never
-      // reached -- a pocket the wave cannot get into -- the contour is a cut
-      // through solid stock that
-      // nothing roughed. Clipping to the reached region drops those and
-      // trims the partly reached ones to the part that was.
-      //
-      // The contour lies exactly on the reached region's inner boundary,
-      // both being the same slice offset by the same distance, so the test
-      // has to allow the slack the two roundings differ by. Without it a
-      // contour fails against the region it is drawn on.
-      wave::Paths64 clip = Clipper2Lib::InflatePaths(
-          level.wave.reached_generations.back(),
-          wave::boundary_slack(setup.stepover), Clipper2Lib::JoinType::Miter,
-          Clipper2Lib::EndType::Polygon);
-      if (operation.clip_contours_to_stock)
-        clip = Clipper2Lib::Intersect(clip, level.incoming_stock,
-                                      Clipper2Lib::FillRule::NonZero);
+      // A centreline inside stock is safe only where the wave opened a route to
+      // it. The optional tolerance shell also admits a centreline just outside
+      // stock, where the cut approaches the edge from air. Keeping those cases
+      // separate admits thin subdivision remnants without authorizing a
+      // full-width cleanup through an unopened pocket.
+      wave::Paths64 clip;
+      if (!level.wave.reached_generations.empty()) {
+        // The contour lies exactly on the reached region's inner boundary,
+        // both being the same slice offset by the same distance, so allow the
+        // small disagreement introduced by their independent rounding.
+        clip = Clipper2Lib::InflatePaths(
+            level.wave.reached_generations.back(),
+            wave::boundary_slack(setup.stepover), Clipper2Lib::JoinType::Miter,
+            Clipper2Lib::EndType::Polygon);
+      }
+      if (operation.clip_contours_to_stock) {
+        const wave::Paths64 reached_stock = Clipper2Lib::Intersect(
+            clip, level.incoming_stock, Clipper2Lib::FillRule::NonZero);
+        clip = cleanup_reach > 0.0
+                   ? Clipper2Lib::Union(
+                         reached_stock,
+                         stock_exterior_tolerance(level.incoming_stock,
+                                                  cleanup_reach),
+                         Clipper2Lib::FillRule::NonZero)
+                   : reached_stock;
+      }
       const auto contours = derive_offset_contours(
           level.part_slice, radius + operation.radial_stock_to_leave, &clip);
       auto tasks =
@@ -1016,6 +1038,15 @@ void plan_toolpaths(OperationPlan& plan,
             "Depth " + std::to_string(level.floor_z) +
             " mm, optional boundary cleanup skipped: " + error.what());
       }
+    }
+    // A subdivision may leave less than one wavefront stepover against the
+    // boundary. In that case the propagated wave has no cutting contour, but
+    // the optional exterior tolerance shell can still authorize edge cleanup
+    // from air.
+    // Decide that the whole level is empty only after cleanup had that chance.
+    if (level.toolpath.moves.empty()) {
+      level.nothing_to_cut = true;
+      continue;
     }
     plan.metrics.toolpath_moves += level.toolpath.moves.size();
   }
@@ -1251,7 +1282,7 @@ OperationPlan plan_operation(const JobGeometry& geometry,
                                        material, progress, progress_from, seam,
                                        prior_operations, prior_subdivisions);
   plan_toolpaths(plan, operation, tool, machine, material, progress, seam,
-                 progress_to, rapid_plane);
+                 progress_to, rapid_plane, prior_subdivisions != nullptr);
   plan.metrics.total_milliseconds = elapsed_milliseconds(planning_start);
   return plan;
 }

@@ -202,6 +202,7 @@ json to_json(const Operation& operation) {
               {"contour_direction",
                contour_direction_name(operation.contour_direction)},
               {"rough_boundary_cleanup", operation.rough_boundary_cleanup},
+              {"cleanup_tolerance", operation.cleanup_tolerance},
               {"manual_feed_range", operation.manual_feed_range},
               {"full_engagement_feed", operation.full_engagement_feed},
               {"no_engagement_feed", operation.no_engagement_feed},
@@ -234,6 +235,7 @@ Operation operation_from(const json& node) {
   read_enum(node, "contour_direction", operation.contour_direction,
             contour_direction_from_name);
   read(node, "rough_boundary_cleanup", operation.rough_boundary_cleanup);
+  read(node, "cleanup_tolerance", operation.cleanup_tolerance);
   read(node, "manual_feed_range", operation.manual_feed_range);
   read(node, "full_engagement_feed", operation.full_engagement_feed);
   read(node, "no_engagement_feed", operation.no_engagement_feed);

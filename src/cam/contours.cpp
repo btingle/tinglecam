@@ -80,6 +80,20 @@ bool segment_avoids_region(const wave::Point64& from,
 
 }  // namespace
 
+wave::Paths64 stock_exterior_tolerance(const wave::Paths64& stock,
+                                       double tolerance) {
+  if (tolerance < 0.0 || !std::isfinite(tolerance))
+    throw std::invalid_argument("Stock tolerance must be finite and nonnegative");
+  const wave::Paths64 material = Union(stock, FillRule::NonZero);
+  const std::int64_t distance = wave::to_integer(tolerance);
+  if (material.empty() || distance == 0) return {};
+  const wave::Paths64 contact = Union(
+      InflatePaths(material, static_cast<double>(distance), JoinType::Round,
+                   EndType::Polygon),
+      FillRule::NonZero);
+  return Difference(contact, material, FillRule::NonZero);
+}
+
 std::vector<DerivedContour> derive_offset_contours(
     const wave::Paths64& sliced_boundaries, double outward_offset,
     const wave::Paths64* stock_clip) {

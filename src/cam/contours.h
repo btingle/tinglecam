@@ -19,6 +19,12 @@ struct DerivedContour {
   bool closed = false;
 };
 
+// The exterior shell no farther than `tolerance` from stock. A tool centreline
+// clipped to this region stays in air while remaining close enough to warrant
+// an edge-cleanup pass.
+wave::Paths64 stock_exterior_tolerance(const wave::Paths64& stock,
+                                       double tolerance);
+
 // Geometry only: offset the existing slice boundaries, then optionally clip
 // their centre-lines to the supplied stock region. No ordering or linking is
 // performed here.

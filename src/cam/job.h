@@ -76,6 +76,10 @@ struct Operation {
   bool clip_contours_to_stock = true;
   ContourDirectionPolicy contour_direction = ContourDirectionPolicy::Either;
   bool rough_boundary_cleanup = true;
+  // Numerical allowance excluded from the cutter radius when deciding how far
+  // outside remaining stock a later subdivision's cleanup centreline may run.
+  // Planning clamps the effective distance to zero at the cutter radius.
+  double cleanup_tolerance = 0.15;
   // When false, use the selected machine's range for this material.
   bool manual_feed_range = false;
   double full_engagement_feed = 500.0;
@@ -351,7 +355,8 @@ void plan_toolpaths(OperationPlan& plan,
                     const ProgressCallback& progress,
                     double progress_from = 0.0,
                     double progress_to = 1.0,
-                    double rapid_plane = 10.0);
+                    double rapid_plane = 10.0,
+                    bool finishing_subdivision = false);
 
 // Both stages back to back.
 OperationPlan plan_operation(const JobGeometry& geometry,

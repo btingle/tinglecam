@@ -551,6 +551,108 @@ void check_multi_operation_plan(const std::filesystem::path& data,
           "at least one finishing level inherits material removed by roughing");
 }
 
+void check_lsjig_subdivision_cleanup(const std::filesystem::path& data,
+                                     const std::filesystem::path& part_mesh) {
+  std::cout << "LsJig subdivision cleanup\n";
+  const cam::ToolLibrary tools = cam::load_tools(data / "starter-tools.json");
+  const cam::MachineLibrary machines = cam::load_machines(data / "machines");
+  const cam::MaterialLibrary materials = cam::load_materials(data / "materials");
+  const cam::Tool* tool = tools.find("6mm-3f-alu");
+  const cam::Machine* machine = machines.find("grbl-router");
+  const cam::Material* material = materials.find("aluminium-6082");
+  require(tool && machine && material,
+          "the LsJig cleanup fixture profiles are available");
+  if (!tool || !machine || !material) return;
+
+  cam::JobGeometry geometry;
+  geometry.load_part(part_mesh);
+  geometry.set_box_stock(true, 5.0);
+  double low = 0.0;
+  double high = 0.0;
+  require(geometry.work_range(low, high),
+          "the LsJig cleanup fixture spans a depth range");
+  if (!(high > low)) return;
+
+  cam::Operation operation;
+  operation.tool_id = tool->id;
+  operation.machine_id = machine->id;
+  operation.material_id = material->id;
+  operation.depth_to = high - low;
+  operation.finishing_subdivisions = 4;
+  operation.cleanup_tolerance = tool->diameter * 0.5;
+  cam::Job job;
+  job.box_stock = true;
+  job.box_stock_margin = 5.0;
+  job.operations = {operation};
+
+  const cam::JobPlan strict_plan =
+      cam::plan_job(geometry, job, tools, machines, materials, {});
+  require(strict_plan.ok(),
+          "the strict LsJig subdivision fixture plans: " + strict_plan.error);
+  if (!strict_plan.ok() || strict_plan.operations.empty()) return;
+  std::size_t strict_cutting_layers = 0;
+  for (const cam::LevelPlan& level : strict_plan.operations.front().levels)
+    if (!level.nothing_to_cut && level.simulation.stats.removed_area > 0.0)
+      ++strict_cutting_layers;
+  require(strict_plan.operations.front().levels.size() == 68 &&
+              strict_cutting_layers == 45,
+          "a cutter-radius cleanup tolerance retains the checkpoint's 45/68 "
+          "layers");
+  const cam::OperationPlan& strict_rough = strict_plan.operations.front();
+  std::size_t strict_later_cutting = 0;
+  std::size_t strict_later_reached = 0;
+  for (std::size_t subdivision = 1;
+       subdivision < strict_rough.subdivisions.size(); ++subdivision) {
+    const cam::OperationSubdivision& range =
+        strict_rough.subdivisions[subdivision];
+    for (std::size_t local = 0; local < range.level_count; ++local) {
+      const cam::LevelPlan& level =
+          strict_rough.levels[range.first_level + local];
+      if (!level.wave.reached_generations.empty()) ++strict_later_reached;
+      if (!level.nothing_to_cut && level.simulation.stats.removed_area > 0.0)
+        ++strict_later_cutting;
+    }
+  }
+
+  job.operations.front().cleanup_tolerance = 0.15;
+  const cam::JobPlan plan =
+      cam::plan_job(geometry, job, tools, machines, materials, {});
+  require(plan.ok(), "the LsJig subdivision cleanup plans: " + plan.error);
+  if (!plan.ok() || plan.operations.empty()) return;
+
+  const cam::OperationPlan& rough = plan.operations.front();
+  require(rough.subdivisions.size() == 4,
+          "the LsJig cleanup fixture retains four subdivisions");
+  if (rough.subdivisions.size() != 4) return;
+  std::size_t later_layers = 0;
+  std::size_t cutting_layers = 0;
+  std::size_t reached_layers = 0;
+  for (std::size_t subdivision = 1; subdivision < rough.subdivisions.size();
+       ++subdivision) {
+    const cam::OperationSubdivision& range = rough.subdivisions[subdivision];
+    for (std::size_t local = 0; local < range.level_count; ++local) {
+      ++later_layers;
+      const cam::LevelPlan& level = rough.levels[range.first_level + local];
+      if (!level.wave.reached_generations.empty()) ++reached_layers;
+      if (!level.nothing_to_cut && level.simulation.stats.removed_area > 0.0)
+        ++cutting_layers;
+    }
+  }
+  require(later_layers == 51,
+          "the LsJig fixture has 51 layers after its first subdivision");
+  require(reached_layers > strict_later_reached,
+          "exterior cutter reach seeds more later LsJig roughing layers");
+  require(cutting_layers > strict_later_cutting,
+          "exterior cutter reach removes stock on more later LsJig layers");
+  require(rough.stats.unsafe_plunges == 0 &&
+              rough.stats.unresolved_entries == 0 &&
+              rough.stats.lifts_over_subject == 0 &&
+              rough.stats.unreachable_fronts == 0,
+          "exterior-domain roughing introduces no unsafe or unresolved motion");
+  require_near(rough.stats.gouge_area, strict_rough.stats.gouge_area, 1e-6,
+               "exterior-domain roughing introduces no additional gouge area");
+}
+
 // Z associations preserve the wavefront topology between adjacent layers.
 void check_inter_layer_topology() {
   std::cout << "inter-layer topology\n";
@@ -785,6 +887,32 @@ void check_general_traversal_and_contours() {
   for (const auto& contour : clipped)
     require(!contour.closed, "a stock-clipped contour may be open");
 
+  const wave::Paths64 edge_stock{box(0, 0, 11, 10)};
+  const wave::Paths64 strict_edge_access =
+      cam::stock_exterior_tolerance(edge_stock, 2.0);
+  require(cam::derive_offset_contours(
+              wave::Paths64{box(0, 0, 10, 10)}, 3.2,
+              &strict_edge_access)
+              .empty(),
+          "cleanup outside the selected stock tolerance is rejected");
+  const wave::Paths64 edge_access =
+      cam::stock_exterior_tolerance(edge_stock, 3.0);
+  const auto edge_cleanup = cam::derive_offset_contours(
+      wave::Paths64{box(0, 0, 10, 10)}, 3.2, &edge_access);
+  require(!edge_cleanup.empty(),
+          "an air-side cutter centre may clean stock with its cutting edge");
+  for (const auto& contour : edge_cleanup)
+    for (const wave::Point64& centre : contour.path)
+      require(!inside(centre, edge_stock),
+              "air-side cleanup never places its cutter centre in stock");
+  const wave::Paths64 unopened_stock{box(-10, -10, 20, 20)};
+  const wave::Paths64 unopened_access =
+      cam::stock_exterior_tolerance(unopened_stock, 3.0);
+  require(cam::derive_offset_contours(
+              wave::Paths64{box(0, 0, 10, 10)}, 3.2, &unopened_access)
+              .empty(),
+          "air-side eligibility does not authorize a contour buried in stock");
+
   auto approached = cam::contour_traversal_tasks(
       offset, cam::ContourDirectionPolicy::Either, 4);
   const std::size_t contour_point_count =
@@ -841,6 +969,8 @@ void check_serialisation() {
                "new operations default to a 1 mm simulation pitch");
   require(cam::Operation{}.finishing_subdivisions == 1,
           "roughing defaults to one finishing subdivision");
+  require_near(cam::Operation{}.cleanup_tolerance, 0.15, 1e-9,
+               "roughing defaults to a small cleanup tolerance");
   const cam::Tool tool = test_tool();
   const cam::Tool tool_back =
       cam::tool_from_json_text(cam::to_json_text(tool));
@@ -862,6 +992,7 @@ void check_serialisation() {
   cam::Operation operation;
   operation.path_pitch = 0.15;
   operation.finishing_subdivisions = 4;
+  operation.cleanup_tolerance = 0.2;
   operation.mode = cam::OperationMode::ContourFinishing;
   operation.entry_front_match_tolerance = 0.12;
   operation.contour_direction = cam::ContourDirectionPolicy::Climb;
@@ -878,6 +1009,8 @@ void check_serialisation() {
                  "path pitch survives");
     require(job_back.operations[0].finishing_subdivisions == 4,
             "finishing subdivisions survive");
+    require_near(job_back.operations[0].cleanup_tolerance, 0.2, 1e-9,
+                 "cleanup tolerance survives");
     require(job_back.operations[0].mode == cam::OperationMode::ContourFinishing,
             "operation mode survives");
     require_near(job_back.operations[0].entry_front_match_tolerance, 0.12, 1e-9,
@@ -1335,6 +1468,9 @@ int main(int argc, char** argv) {
     if (argc > 1) check_shipped_data(argv[1]);
     if (argc > 2) check_box_stock(argv[2]);
     if (argc > 2) check_multi_operation_plan(argv[1], argv[2]);
+    if (argc > 3)
+      check_lsjig_subdivision_cleanup(
+          argv[1], std::filesystem::path(argv[3]) / "LsJig1.obj");
   } catch (const std::exception& error) {
     std::cerr << "Test threw: " << error.what() << '\n';
     return EXIT_FAILURE;

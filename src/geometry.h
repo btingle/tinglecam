@@ -70,10 +70,10 @@ struct WaveResult {
   // wave seeded on the stock wall.
   double lead_in = 0.0;
   std::size_t lead_in_generations = 0;
-  // Everything the wave propagates through: the stock, plus the air in front of
-  // it a lead-in opens up. With no lead-in this is the stock exactly. Downstream
-  // stages bound the wave with this rather than with the stock, or the run-in
-  // has nothing ahead of it to lead into and no outer wall to start from.
+  // Everything the wave propagates through: the stock, plus air opened by a
+  // lead-in or an explicit exterior cutter-reach allowance. Downstream stages
+  // bound the wave with this rather than with physical stock, or exterior
+  // centreline motion has no domain in which to exist.
   Paths64 domain;
   // Optional physical boundary provenance for a wave resumed inside a smaller
   // remaining domain. When empty, topology derives it from domain - subject.
@@ -117,13 +117,16 @@ WaveResult build_wavefront(const Paths64& raw_subject,
 // The wave before it has propagated at all: the domain, and generation zero
 // seeded on its boundary. The entry fronts are exactly the connected pieces of
 // that seed, so this answers what a wave could start from without paying for
-// where it would then go. `build_wavefront` begins with precisely this.
+// where it would then go. `exterior_stock_reach` expands only the propagation
+// domain; `WaveResult::stock` remains the physical material used to decide
+// whether a front cuts. `build_wavefront` begins with precisely this.
 WaveResult seed_wavefront(const Paths64& raw_subject,
                           const Paths64& raw_stock,
                           double stepover,
                           double softening = 0.0,
                           double lead_in = 0.0,
-                          const EntryMute& muted = {});
+                          const EntryMute& muted = {},
+                          double exterior_stock_reach = 0.0);
 
 // Propagates through an already isolated remaining domain from explicit node
 // entry curves. With `cached_reached`, all entry bands remain in the copied

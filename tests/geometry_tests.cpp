@@ -496,6 +496,37 @@ void check_lead_in() {
           "stock the subject occludes must not be led into");
 }
 
+void check_exterior_stock_reach() {
+  const wave::Paths64 subject{test_box(-10, -10, 10, 10)};
+  const wave::Paths64 stock{test_box(8, -2, 9.8, 2)};
+
+  const auto strict =
+      wave::seed_wavefront(subject, stock, 1.0, 1.0, 0.0, {}, 0.15);
+  require(strict.generations.empty(),
+          "stock farther inside the keepout than the exterior reach stays "
+          "ineligible");
+
+  const auto reached =
+      wave::seed_wavefront(subject, stock, 1.0, 1.0, 0.0, {}, 0.25);
+  require(!reached.generations.empty(),
+          "exterior cutter reach should seed stock just inside the keepout");
+  require(wave::paths_equal_canonical(reached.stock, stock),
+          "exterior reach must not inflate the physical stock record");
+  require(region_covers(reached.domain, 10.03, 0.0),
+          "the propagation domain should include nearby exterior air");
+  require(!region_covers(reached.stock, 10.03, 0.0),
+          "nearby exterior air must not be reported as physical stock");
+
+  const auto lineage = wave::build_front_lineage(reached);
+  const auto air_only = wave::build_toolpath(reached, lineage, 0.1);
+  require(air_only.stats.cut_count == 0,
+          "a front touching only the expanded domain must remain an air pass");
+  const auto contacting = wave::build_toolpath(reached, lineage, 0.3);
+  require(contacting.stats.cut_count > 0,
+          "the same exterior front should cut when the physical cutter reaches "
+          "stock");
+}
+
 // A plunge lands in material that is already gone, so it has to stand at least
 // one tool radius clear of everything that is not. Before the radius reached
 // the planner this was half a stepover regardless of the cutter, which put the
@@ -565,6 +596,7 @@ int main(int argc, char** argv) {
             "canonical comparison should ignore winding");
 
     check_lead_in();
+    check_exterior_stock_reach();
     check_plunge_clearance();
 
     const auto lineage = wave::build_front_lineage(result);

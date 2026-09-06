@@ -2562,6 +2562,24 @@ void operation_settings_panel(App& app) {
     ImGui::SetItemTooltip(
         "Runs this roughing operation repeatedly at evenly interleaved depth "
         "offsets. Each pass receives the stock left by the preceding pass.");
+    const double minimum_cleanup_tolerance = 0.0;
+    const double maximum_cleanup_tolerance =
+        tool ? tool->diameter * 0.5 : 10.0;
+    ImGui::BeginDisabled(!operation.rough_boundary_cleanup);
+    if (ImGui::SliderScalar(
+            "Cleanup tolerance (mm)", ImGuiDataType_Double,
+            &operation.cleanup_tolerance, &minimum_cleanup_tolerance,
+            &maximum_cleanup_tolerance, "%.3f"))
+      operation.cleanup_tolerance = std::clamp(
+          operation.cleanup_tolerance, minimum_cleanup_tolerance,
+          maximum_cleanup_tolerance);
+    ImGui::SetItemTooltip(
+        "Numerical allowance excluded from the cutter radius when deciding "
+        "whether a finishing-subdivision cleanup contour is close enough to "
+        "remaining stock. The effective distance is cutter radius minus this "
+        "value; setting it to the cutter radius keeps the strict wave-only "
+        "rule.");
+    ImGui::EndDisabled();
   }
   if (tool) {
     const std::string preview_layers =

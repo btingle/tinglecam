@@ -164,14 +164,19 @@ it cutting into a blank that is still the wrong shape. Such a depth gets the
 same wave a roughing pass would use, propagated against a subject parked outside
 the work so the whole level clears away.
 
-The cleanup contour is derived from the part slice rather than from the wave,
-so on its own it is emitted wherever the part has a boundary -- including
-depths the wave never reached because nothing can get in at all. Cutting there
-is a finishing pass through solid stock that nothing has roughed, so the contour
-is clipped to the region the wave actually swept. A depth the wave could not start at emits
-nothing. The contour lies exactly on that region's inner boundary, both being
-the same slice offset by the same distance, so the clip allows `boundary_slack`
--- the same rounding allowance a front's boundary contact is accepted with.
+The cleanup contour is derived from the part slice rather than from the wave.
+Portions whose cutter centre lies inside stock are accepted only where the wave
+actually reached, with `boundary_slack` allowing for independently rounded
+geometry. On later finishing subdivisions the planner also allows the cutter
+centre into the exterior air beside remaining stock by the cutter radius minus
+the roughing operation's cleanup tolerance. The tolerance defaults to 0.15 mm
+to exclude small numerical remnants while still admitting meaningful edge
+stock. This exterior region is part of the roughing wave's centreline domain as
+well as the cleanup contour's eligibility region, while the simulation retains
+the uninflated physical stock. Setting the tolerance to the cutter radius
+retains the strict stock-only wave rule. This lets a subdivision rough and clean
+accessible edge remnants without authorizing motion through the protected part
+or treating nearby air as material.
 
 Lead-in wavefronts that remain wholly in air are retained in the lineage graph
 to establish entry ordering, but are not emitted as machining contours. Behind

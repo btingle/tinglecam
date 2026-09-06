@@ -92,7 +92,9 @@ struct CommittedWavefront {
 // significance is measured against the incumbent graph's largest approximate
 // node area. Descendants remain simultaneous, and only the winning root layer
 // is committed before the next recursive analysis. Set the area fraction to
-// zero to restore raw node-count comparison.
+// zero to restore raw node-count comparison. `exterior_stock_reach` permits
+// propagation through nearby air without changing the physical stock used by
+// toolpath engagement tests.
 WavefrontAnalysis analyze_wavefront(
     const Paths64& raw_subject,
     const Paths64& raw_stock,
@@ -104,7 +106,8 @@ WavefrontAnalysis analyze_wavefront(
     const EntryMute& muted = {},
     double significant_node_area_fraction =
         kDefaultSignificantNodeAreaFraction,
-    double tiny_split_area_factor = kDefaultTinySplitAreaFactor);
+    double tiny_split_area_factor = kDefaultTinySplitAreaFactor,
+    double exterior_stock_reach = 0.0);
 
 // Discards the speculative suffixes and returns exactly the node layer chosen
 // at each recursive decision. The returned stages are suitable for sequencing
