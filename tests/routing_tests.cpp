@@ -155,6 +155,100 @@ void check_noisy_boundary() {
           "and it is the way around, not a tour of the region");
 }
 
+// The lobed obstacle of the previous case, as a region to route around.
+Paths64 lobed_free_space() {
+  Path64 lobed;
+  const int steps = 720;
+  for (int i = 0; i < steps; ++i) {
+    const double angle = 2.0 * 3.14159265358979 * i / steps;
+    const double radius = 18.0 + 2.0 * std::sin(5.0 * angle);
+    lobed.push_back(mm(50.0 + radius * std::cos(angle),
+                       50.0 + radius * std::sin(angle)));
+  }
+  Paths64 solid = Clipper2Lib::InflatePaths(Paths64{lobed}, 2000.0,
+                                            Clipper2Lib::JoinType::Round,
+                                            Clipper2Lib::EndType::Polygon);
+  solid = Clipper2Lib::InflatePaths(solid, -2000.0, Clipper2Lib::JoinType::Round,
+                                    Clipper2Lib::EndType::Polygon);
+  return Clipper2Lib::Difference(Paths64{box(0.0, 0.0, 100.0, 100.0)}, solid,
+                                 FillRule::NonZero);
+}
+
+// The case that took the subdivision passes apart, and the reason
+// `routable_region` exists.
+//
+// A caller that needs its routes to stay inside the region even after they have
+// spent the slack erodes the region by that allowance first. But the points a
+// route has to start and finish at -- the end of one contour, the start of the
+// next -- lie on the region's own boundary, and eroding is an opening: it pulls
+// the boundary away from them. A router cannot see out of a point it places
+// outside itself, so every query from one comes back empty and the caller lifts
+// to the rapid plane instead of travelling at depth. Nothing about that reads as
+// a failure from the outside, which is how it survived: the region is fat around
+// those points on an ordinary pass and thin around them on a subdivision.
+void check_anchors_survive_the_erosion() {
+  // A working allowance rather than the token one the cases above use, because
+  // what is under test is what the erosion does to the region.
+  constexpr double kWorkingSlack = 250.0;
+  const Paths64 free = lobed_free_space();
+  // Taken off the region itself, so they lie exactly on its boundary the way
+  // the ends of a clipped contour do. The inner ring is the obstacle's wall.
+  const Path64* wall = nullptr;
+  for (const Path64& ring : free)
+    if (ring.size() > 100) wall = &ring;
+  require(wall != nullptr, "the lobed obstacle should bound the region");
+  const Point64 from = (*wall)[0];
+  const Point64 to = (*wall)[wall->size() / 2];
+
+  // Non-zero across the whole set, so a point in the obstacle's hole reads as
+  // outside rather than as inside the box that bounds it.
+  const auto holds = [](const Paths64& region, const Point64& point) {
+    int winding = 0;
+    for (const Path64& ring : region) {
+      if (ring.size() < 3) continue;
+      const auto where = Clipper2Lib::PointInPolygon(point, ring);
+      if (where == Clipper2Lib::PointInPolygonResult::IsOn) return true;
+      if (where == Clipper2Lib::PointInPolygonResult::IsInside)
+        winding += Clipper2Lib::Area(ring) >= 0.0 ? 1 : -1;
+    }
+    return winding != 0;
+  };
+
+  const Paths64 eroded = Clipper2Lib::InflatePaths(
+      free, -2.0 * kWorkingSlack, Clipper2Lib::JoinType::Miter,
+      Clipper2Lib::EndType::Polygon);
+  require(!holds(eroded, from) && !holds(eroded, to),
+          "eroding on its own is what strands the ends of the route");
+
+  const Paths64 routable = wave::routable_region(free, kWorkingSlack, {from, to});
+  require(holds(routable, from) && holds(routable, to),
+          "restoring the region around the ends puts them back inside it");
+
+  const auto route = wave::Router(routable, kWorkingSlack).route(from, to);
+  require(route.has_value(),
+          "and a router built on it can find the way round the obstacle");
+  require(route->size() > 2, "which is round the obstacle, not a line through it");
+
+  // The exemption is local: away from the anchors the erosion still governs, so
+  // what comes back is never more than the caller vouched for.
+  const Paths64 beyond = Clipper2Lib::Difference(routable, free, FillRule::NonZero);
+  double leaked = 0.0;
+  for (const Path64& ring : beyond) leaked += std::abs(Clipper2Lib::Area(ring));
+  require(leaked < 1.0, "a routable region never reaches outside the region given");
+}
+
+void check_anchorless_region_is_just_eroded() {
+  const Paths64 free = lobed_free_space();
+  const Paths64 routable = wave::routable_region(free, kSlack, {});
+  const Paths64 eroded = Clipper2Lib::InflatePaths(
+      free, -2.0 * kSlack, Clipper2Lib::JoinType::Miter,
+      Clipper2Lib::EndType::Polygon);
+  const Paths64 difference = Clipper2Lib::Xor(routable, eroded, FillRule::NonZero);
+  double area = 0.0;
+  for (const Path64& ring : difference) area += std::abs(Clipper2Lib::Area(ring));
+  require(area < 1.0, "with nothing to keep reachable, the erosion stands alone");
+}
+
 void check_empty_region() {
   const wave::Router router(Paths64{}, kSlack);
   require(!router.usable(), "there is nothing to route through in an empty region");
@@ -171,6 +265,8 @@ int main() {
     check_separated_rooms();
     check_route_stays_inside();
     check_noisy_boundary();
+    check_anchors_survive_the_erosion();
+    check_anchorless_region_is_just_eroded();
     check_empty_region();
     std::cout << "routing_tests: shortest paths around obstacles\n";
     return 0;

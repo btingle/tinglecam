@@ -75,9 +75,13 @@ class Crossings {
   // route that uses all of it still only reaches the edge of where the tool was
   // allowed. The straight-line test above is untouched by this: it demands the
   // whole segment inside the region as given, and needs no such margin.
-  Crossings(const Paths64& region, double slack)
-      : router_(slack > 0.0 ? InflatePaths(region, -2.0 * slack,
-                                           JoinType::Miter, EndType::Polygon)
+  //
+  // `anchors` are the points connectors run between -- the ends of the contours
+  // -- which lie on the region's own boundary and would otherwise be stranded
+  // outside it by that same pulling in. See `routable_region`.
+  Crossings(const Paths64& region, double slack,
+            const std::vector<Point64>& anchors)
+      : router_(slack > 0.0 ? routable_region(region, slack, anchors)
                             : Paths64{},
                 slack) {}
 
@@ -344,8 +348,19 @@ TraversalResult plan_traversal(const std::vector<TraversalTask>& tasks,
   if (usable.empty()) return result;
   std::size_t variant_count = 0;
   for (const TraversalTask& task : usable) variant_count += task.variants.size();
+  // Every point a connector can be asked to start or finish at. A route is only
+  // ever planned between these, so they are the whole of what the routing
+  // region has to keep reachable.
+  std::vector<Point64> anchors;
+  anchors.reserve(2 * variant_count + 1);
+  if (settings.initial_position) anchors.push_back(*settings.initial_position);
+  for (const TraversalTask& task : usable)
+    for (const TraversalVariant& variant : task.variants) {
+      anchors.push_back(variant.path.front());
+      anchors.push_back(variant.path.back());
+    }
   const Crossings crossings(settings.stay_down_region,
-                            settings.stay_down_slack);
+                            settings.stay_down_slack, anchors);
   result.order = usable.size() <= 10 && variant_count <= 64
                      ? exact_order(usable, settings, crossings)
                      : greedy_order(usable, settings, crossings);

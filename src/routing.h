@@ -76,4 +76,30 @@ class Router {
   std::vector<Point64> edge_to_;
 };
 
+// The region to hand a Router when a route must stay inside `region` even after
+// spending the slack the Router allows it.
+//
+// A Router turns at the corners of its region grown by the slack, so a route
+// wrapping an obstacle runs that far inside the obstacle. Where the obstacle is
+// the finished part, that is a cut into it, and the caller's answer is to erode
+// the region by the allowance first, so a route that spends all of it still
+// only reaches the edge of what was actually cleared.
+//
+// Eroding alone does not work, because it also moves the boundary away from the
+// points the route has to start and end at. Those lie on `region`'s own
+// boundary -- the end of a contour, the end of a cut -- and eroding is an
+// opening, which pulls the boundary in wherever the region is locally thin or
+// concave and strands them outside every region the Router tests against. A
+// Router cannot see out of a point it places outside itself: every corner fails
+// the visibility probe, the query returns nothing, and the caller lifts to the
+// rapid plane instead of travelling at depth. That is invisible while the
+// region is fat around those points and total when it is not.
+//
+// So the erosion is kept and `region` is restored around each anchor. The
+// erosion still governs everywhere a route may wander; only the ends it must
+// reach are exempt, and they are exempt to the region the caller already
+// vouched for rather than to anything past it.
+Paths64 routable_region(const Paths64& region, double slack,
+                        const std::vector<Point64>& anchors);
+
 }  // namespace wave

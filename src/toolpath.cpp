@@ -559,13 +559,29 @@ static void append_toolpath(Toolpath& toolpath, const WaveResult& wave,
           }
         }
 
+        // Walking the boundary two fronts share is a shortcut, not an
+        // invariant. It assumes that boundary runs through material the wave
+        // has opened, which holds while the propagation domain is the stock
+        // itself: the band the fronts came out of covers the wall between them.
+        // A stock-aware subdivision pass propagates through a domain grown out
+        // into the surrounding air, so one boundary component can span stretches
+        // of wall the wave never reached, and the walk along such a stretch is
+        // not a transition through cleared space at all -- it is a full-width
+        // cut along the part.
+        //
+        // This used to be a thrown topology error, which discarded the whole
+        // depth: on the sample jig at four subdivisions it cost fourteen of
+        // sixty-eight passes, and the material they would have removed was left
+        // standing. The ordinary logic below still has a free link, a routed
+        // detour and a lift to offer, and one of them is the right answer, so
+        // the shortcut is dropped rather than the pass.
+        if (preferred_boundary &&
+            !stays_clear(*preferred_boundary, travel_forbidden, tolerance))
+          preferred_boundary.reset();
+
         // Free travel first: a move that never leaves cleared material costs
         // nothing in engagement, so it is always preferable to an engaged step.
         if (preferred_boundary) {
-          if (!stays_clear(*preferred_boundary, travel_forbidden, tolerance))
-            throw std::runtime_error(
-                "Wavefront topology error: shared-boundary transition leaves "
-                "the legal propagation band");
           emit(*preferred_boundary,
                !stays_clear(*preferred_boundary, cleared_forbidden, tolerance));
         } else if (segment_avoids(position, entry, cleared_forbidden, tolerance)) {

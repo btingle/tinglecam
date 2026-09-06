@@ -74,7 +74,64 @@ double path_length(const Path64& path) {
   return total;
 }
 
+// A closed ring covering the disc of `radius` about `centre`. Coarse on
+// purpose: it is intersected with the caller's region before it is used for
+// anything, so its only job is to bound how far from the anchor that region is
+// restored. Eight sides through the radius rather than around it: the narrowest
+// direction still reaches 92% of it, which is well clear of the inset this has
+// to bridge, and every unit of overshoot is region restored for nothing.
+Path64 disc_around(const Point64& centre, double radius) {
+  constexpr std::size_t kSides = 8;
+  constexpr double kTwoPi = 6.283185307179586;
+  Path64 ring;
+  ring.reserve(kSides);
+  for (std::size_t i = 0; i < kSides; ++i) {
+    const double angle = kTwoPi * static_cast<double>(i) /
+                         static_cast<double>(kSides);
+    ring.push_back(Point64(
+        centre.x + std::llround(std::cos(angle) * radius),
+        centre.y + std::llround(std::sin(angle) * radius)));
+  }
+  return ring;
+}
+
 }  // namespace
+
+Paths64 routable_region(const Paths64& region, double slack,
+                        const std::vector<Point64>& anchors) {
+  if (region.empty() || !(slack > 0.0)) return region;
+  // What a route may spend before it is asked for one: the Router pads by the
+  // slack to build its graph and again to probe against, so this is how far
+  // outside the region a route it offers can sit.
+  const double inset = 2.0 * slack;
+  const Paths64 eroded =
+      InflatePaths(region, -inset, JoinType::Miter, EndType::Polygon);
+  if (anchors.empty()) return eroded;
+
+  // Half again the inset: far enough that an anchor on the region's own
+  // boundary reaches the eroded interior with room to spare rather than meeting
+  // it at a single point, and no farther, because inside this radius a route is
+  // held to `region` rather than to the eroded one, and holding it to the
+  // eroded one is the whole of what the erosion was buying. Widening it does
+  // not buy anything back: at twice the inset the circular test part gouges
+  // 0.576 mm2 against 0.567 here, and lifts the same 70-odd times either way.
+  const double reach = 1.5 * inset;
+  // Deduplicated first. A caller naming the two ends of every contour variant
+  // names most points twice over, and each repeat is another ring for the union
+  // below to reconcile against every other.
+  std::vector<Point64> unique(anchors);
+  std::sort(unique.begin(), unique.end(),
+            [](const Point64& a, const Point64& b) {
+              return a.x != b.x ? a.x < b.x : a.y < b.y;
+            });
+  unique.erase(std::unique(unique.begin(), unique.end()), unique.end());
+  Paths64 discs;
+  discs.reserve(unique.size());
+  for (const Point64& anchor : unique) discs.push_back(disc_around(anchor, reach));
+  const Paths64 restored =
+      Intersect(Union(discs, FillRule::NonZero), region, FillRule::NonZero);
+  return Union(eroded, restored, FillRule::NonZero);
+}
 
 Router::Router(const Paths64& region, double slack)
     : slack_(std::max(slack, 2.0)) {

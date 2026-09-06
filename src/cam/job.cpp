@@ -430,9 +430,12 @@ void stitch_passes(OperationPlan& plan, const OperationSetup& setup,
     // narrower than this stops offering a way through, and the transition falls
     // back to lifting -- but a corridor that narrow is one stepover wide at
     // most, and worth refusing.
-    const wave::Paths64 room = Clipper2Lib::InflatePaths(
-        earlier->toolpath.cleared, -2.0 * slack, Clipper2Lib::JoinType::Miter,
-        Clipper2Lib::EndType::Polygon);
+    //
+    // The two ends are exempt from it. They are where the passes actually
+    // finish and start, they lie on the boundary being pulled in, and a router
+    // asked to leave from a point outside itself answers nothing at all.
+    const wave::Paths64 room =
+        wave::routable_region(earlier->toolpath.cleared, slack, {from, to});
     if (room.empty()) continue;
     const wave::Router router(room, slack);
     const auto route = router.route(from, to);
