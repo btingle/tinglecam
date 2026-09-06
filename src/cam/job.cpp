@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <iterator>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -211,6 +212,11 @@ bool resolve_setup(const Operation& operation, const Tool& tool,
     error = "Path pitch must be at least 0.001 mm";
     return false;
   }
+  if (operation.finishing_subdivisions < 1 ||
+      operation.finishing_subdivisions > 64) {
+    error = "Finishing subdivisions must be between 1 and 64";
+    return false;
+  }
   if (!(operation.entry_front_match_tolerance > 0.0) ||
       !std::isfinite(operation.entry_front_match_tolerance)) {
     error = "Entry-front Z match tolerance must be positive";
@@ -310,6 +316,62 @@ void finish_job(JobPlan& plan) {
         plan.warnings.push_back(operation.operation_name + ": " +
                                 operation.error);
   }
+}
+
+wave::Paths64 stock_after_operation_at_z(
+    const wave::Paths64& nominal_stock, double z,
+    const OperationPlan& operation) {
+  if (nominal_stock.empty() || !operation.ok()) return nominal_stock;
+  wave::Paths64 removed;
+  for (const LevelPlan& level : operation.levels) {
+    if (level.nothing_to_cut || level.simulation.removed_material.empty())
+      continue;
+    const double slab_bottom = level.floor_z;
+    const double slab_top = level.floor_z + level.axial_depth;
+    constexpr double kZEpsilon = 1e-9;
+    if (z < slab_bottom - kZEpsilon || z > slab_top + kZEpsilon) continue;
+    removed.insert(removed.end(), level.simulation.removed_material.begin(),
+                   level.simulation.removed_material.end());
+  }
+  if (removed.empty()) return nominal_stock;
+  return Clipper2Lib::Difference(
+      nominal_stock,
+      Clipper2Lib::Union(removed, Clipper2Lib::FillRule::NonZero),
+      Clipper2Lib::FillRule::NonZero);
+}
+
+void append_inter_layer(wave::InterLayerTopology& into,
+                        wave::InterLayerTopology from,
+                        std::size_t layer_offset) {
+  const std::size_t node_offset = into.node_chains.size();
+  const std::size_t entry_offset = into.entry_front_chains.size();
+  for (wave::InterLayerChain& chain : from.node_chains) {
+    for (wave::LayerItemId& member : chain.members)
+      member.layer += layer_offset;
+    into.node_chains.push_back(std::move(chain));
+  }
+  for (wave::InterLayerChain& chain : from.entry_front_chains) {
+    for (wave::LayerItemId& member : chain.members)
+      member.layer += layer_offset;
+    into.entry_front_chains.push_back(std::move(chain));
+  }
+  for (auto& ids : from.node_chain_ids) {
+    for (std::size_t& id : ids)
+      if (id != wave::kNoTopologyId) id += node_offset;
+    into.node_chain_ids.push_back(std::move(ids));
+  }
+  for (auto& ids : from.entry_front_chain_ids) {
+    for (std::size_t& id : ids)
+      if (id != wave::kNoTopologyId) id += entry_offset;
+    into.entry_front_chain_ids.push_back(std::move(ids));
+  }
+  for (wave::LayerItemId item : from.node_schedule) {
+    item.layer += layer_offset;
+    into.node_schedule.push_back(item);
+  }
+  into.layers.insert(into.layers.end(),
+                     std::make_move_iterator(from.layers.begin()),
+                     std::make_move_iterator(from.layers.end()));
 }
 
 // The way from where one pass finishes to where the next one starts. Lifting to
@@ -526,7 +588,8 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
                               const ProgressCallback& progress,
                               double progress_from,
                               double progress_to,
-                              const std::vector<OperationPlan>* prior_operations) {
+                              const std::vector<OperationPlan>* prior_operations,
+                              const OperationPlan* prior_subdivisions) {
   OperationPlan plan;
   plan.operation_name = operation.name;
   plan.tool_id = operation.tool_id;
@@ -591,6 +654,9 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
               ? level.stock_slice
               : stock_after_operations_at_z(level.stock_slice, floor_z,
                                              *prior_operations);
+      if (prior_subdivisions != nullptr)
+        level.incoming_stock = stock_after_operation_at_z(
+            level.incoming_stock, floor_z, *prior_subdivisions);
       plan.metrics.slicing_milliseconds += elapsed_milliseconds(slice_start);
 
       if (level.stock_slice.empty() || level.incoming_stock.empty()) {
@@ -1175,14 +1241,15 @@ OperationPlan plan_operation(const JobGeometry& geometry,
                              double progress_from,
                              double progress_to,
                              double rapid_plane,
-                             const std::vector<OperationPlan>* prior_operations) {
+                             const std::vector<OperationPlan>* prior_operations,
+                             const OperationPlan* prior_subdivisions) {
   const auto planning_start = PlanningClock::now();
   // Wavefronts are the cheaper half; give the toolpaths the larger share of the
   // reported progress so the bar does not stall in the second stage.
   const double seam = progress_from + (progress_to - progress_from) * 0.4;
   OperationPlan plan = plan_wavefronts(geometry, operation, tool, machine,
                                        material, progress, progress_from, seam,
-                                       prior_operations);
+                                       prior_operations, prior_subdivisions);
   plan_toolpaths(plan, operation, tool, machine, material, progress, seam,
                  progress_to, rapid_plane);
   plan.metrics.total_milliseconds = elapsed_milliseconds(planning_start);
@@ -1194,28 +1261,111 @@ wave::Paths64 stock_after_operations_at_z(
     const std::vector<OperationPlan>& operations) {
   if (nominal_stock.empty()) return {};
 
-  wave::Paths64 removed;
+  wave::Paths64 remaining =
+      Clipper2Lib::Union(nominal_stock, Clipper2Lib::FillRule::NonZero);
   for (const OperationPlan& operation : operations) {
-    if (!operation.ok()) continue;
-    for (const LevelPlan& level : operation.levels) {
-      if (level.nothing_to_cut || level.simulation.removed_material.empty())
-        continue;
-      const double slab_bottom = level.floor_z;
-      const double slab_top = level.floor_z + level.axial_depth;
-      // Include shared slab boundaries. They have zero volume, and including
-      // both adjacent sweeps matches the physical cutter at that exact plane.
-      constexpr double kZEpsilon = 1e-9;
-      if (z < slab_bottom - kZEpsilon || z > slab_top + kZEpsilon) continue;
-      removed.insert(removed.end(), level.simulation.removed_material.begin(),
-                     level.simulation.removed_material.end());
-    }
+    remaining = stock_after_operation_at_z(remaining, z, operation);
+    if (remaining.empty()) break;
   }
-  if (removed.empty())
-    return Clipper2Lib::Union(nominal_stock, Clipper2Lib::FillRule::NonZero);
-  return Clipper2Lib::Difference(
-      nominal_stock,
-      Clipper2Lib::Union(removed, Clipper2Lib::FillRule::NonZero),
-      Clipper2Lib::FillRule::NonZero);
+  return remaining;
+}
+
+std::size_t subdivision_preview_source(const OperationPlan& operation,
+                                       std::size_t active_level,
+                                       std::size_t target_level) {
+  if (active_level >= operation.levels.size() ||
+      target_level >= operation.levels.size())
+    return target_level;
+  const LevelPlan& active = operation.levels[active_level];
+  const LevelPlan& target = operation.levels[target_level];
+  if (target.subdivision <= active.subdivision ||
+      active.subdivision >= operation.subdivisions.size())
+    return target_level;
+  const OperationSubdivision& source =
+      operation.subdivisions[active.subdivision];
+  if (source.level_count == 0) return target_level;
+  return source.first_level +
+         std::min(target.subdivision_level, source.level_count - 1);
+}
+
+OperationPlan plan_subdivided_operation(
+    const JobGeometry& geometry, const Operation& operation,
+    const Tool& tool, const Machine& machine, const Material& material,
+    const ProgressCallback& progress, double progress_from,
+    double progress_to, double rapid_plane,
+    const std::vector<OperationPlan>* prior_operations) {
+  OperationPlan result;
+  result.operation_name = operation.name;
+  result.tool_id = operation.tool_id;
+  result.machine_id = operation.machine_id;
+  result.material_id = operation.material_id;
+
+  OperationSetup setup;
+  if (!resolve_setup(operation, tool, machine, material, result.error, nullptr,
+                     setup))
+    return result;
+  const int count = operation.mode == OperationMode::Roughing
+                        ? operation.finishing_subdivisions
+                        : 1;
+  const double span = progress_to - progress_from;
+  for (int subdivision = 0; subdivision < count; ++subdivision) {
+    // The base floors are one full step below depth_from. Raising each
+    // following group by stepdown/N produces, for N=4, starts at 1.0, 0.75,
+    // 0.5 and 0.25 stepdowns while preserving the base layer count.
+    const double shift =
+        setup.stepdown * static_cast<double>(subdivision) / count;
+    Operation pass = operation;
+    pass.finishing_subdivisions = 1;
+    pass.depth_from -= shift;
+    pass.depth_to -= shift;
+    if (count > 1)
+      pass.name = operation.name + " subdivision " +
+                  std::to_string(subdivision + 1) + "/" +
+                  std::to_string(count);
+
+    const double pass_from =
+        progress_from + span * static_cast<double>(subdivision) / count;
+    const double pass_to =
+        progress_from + span * static_cast<double>(subdivision + 1) / count;
+    OperationPlan planned = plan_operation(
+        geometry, pass, tool, machine, material, progress, pass_from, pass_to,
+        rapid_plane, prior_operations,
+        result.levels.empty() ? nullptr : &result);
+    if (!planned.ok()) {
+      if (planned.error == "Cancelled") {
+        result.error = "Cancelled";
+        return result;
+      }
+      result.error = count == 1
+                         ? planned.error
+                         : "Subdivision " + std::to_string(subdivision + 1) +
+                               "/" + std::to_string(count) + ": " +
+                               planned.error;
+      return result;
+    }
+
+    const std::size_t first = result.levels.size();
+    result.subdivisions.push_back(
+        {first, planned.levels.size(), shift});
+    append_inter_layer(result.inter_layer, std::move(planned.inter_layer),
+                       first);
+    for (std::size_t local = 0; local < planned.levels.size(); ++local) {
+      planned.levels[local].subdivision =
+          static_cast<std::size_t>(subdivision);
+      planned.levels[local].subdivision_level = local;
+      result.levels.push_back(std::move(planned.levels[local]));
+    }
+    accumulate(result.stats, planned.stats);
+    accumulate(result.metrics, planned.metrics);
+    result.spindle_rpm = std::max(result.spindle_rpm, planned.spindle_rpm);
+    for (const std::string& warning : planned.warnings)
+      result.warnings.push_back(
+          count == 1
+              ? warning
+              : "Subdivision " + std::to_string(subdivision + 1) + "/" +
+                    std::to_string(count) + ": " + warning);
+  }
+  return result;
 }
 
 JobPlan plan_job(const JobGeometry& geometry,
@@ -1249,9 +1399,10 @@ JobPlan plan_job(const JobGeometry& geometry,
     else if (!material) result.error = "Unknown material: " + operation.material_id;
 
     if (result.ok()) {
-      result = plan_operation(geometry, operation, *tool, *machine, *material,
-                              progress, share * index, share * (index + 1),
-                              plan.rapid_plane, &plan.operations);
+      result = plan_subdivided_operation(
+          geometry, operation, *tool, *machine, *material, progress,
+          share * index, share * (index + 1), plan.rapid_plane,
+          &plan.operations);
       if (result.error == "Cancelled") {
         plan.error = "Cancelled";
         return plan;

@@ -436,9 +436,11 @@ void check_multi_operation_plan(const std::filesystem::path& data,
   rough.stepdown = rough.depth_to;
   rough.stepover_ratio = 0.7;
   rough.path_pitch = 0.5;
+  rough.finishing_subdivisions = 4;
 
   cam::Operation rest = rough;
   rest.name = "Rest rough second";
+  rest.finishing_subdivisions = 1;
 
   cam::Operation finish = rest;
   finish.name = "Finish third";
@@ -458,6 +460,58 @@ void check_multi_operation_plan(const std::filesystem::path& data,
               plan.operations[1].operation_name == rest.name &&
               plan.operations[2].operation_name == finish.name,
           "operation execution order matches the job list");
+
+  const cam::OperationPlan& subdivided = plan.operations[0];
+  require(subdivided.subdivisions.size() == 4,
+          "four finishing subdivisions remain one planned operation");
+  if (subdivided.subdivisions.size() == 4) {
+    const std::size_t base_count = subdivided.subdivisions.front().level_count;
+    require(subdivided.levels.size() == base_count * 4,
+            "each subdivision allocates the base number of preview layers");
+    for (std::size_t pass = 0; pass < 4; ++pass) {
+      const cam::OperationSubdivision& range = subdivided.subdivisions[pass];
+      require(range.level_count == base_count,
+              "every subdivision keeps its own complete layer record");
+      if (range.level_count == 0) continue;
+      const cam::LevelPlan& first = subdivided.levels[range.first_level];
+      require(first.subdivision == pass && first.subdivision_level == 0,
+              "flattened execution levels retain subdivision identity");
+      const double expected_depth =
+          rough.depth_from + rough.stepdown * (1.0 - pass / 4.0);
+      require_near(high - first.floor_z, expected_depth, 1e-8,
+                   "subdivision first floors are interleaved in execution order");
+    }
+    bool inherited_between_subdivisions = false;
+    for (std::size_t pass = 1; pass < 4; ++pass) {
+      const cam::OperationSubdivision& range = subdivided.subdivisions[pass];
+      for (std::size_t local = 0; local < range.level_count; ++local) {
+        const cam::LevelPlan& level =
+            subdivided.levels[range.first_level + local];
+        if (wave::material_area(level.incoming_stock) + 0.001 <
+            wave::material_area(level.stock_slice))
+          inherited_between_subdivisions = true;
+      }
+    }
+    require(inherited_between_subdivisions,
+            "later subdivisions inherit stock from earlier subdivisions");
+
+    if (base_count > 0) {
+      const std::size_t active =
+          subdivided.subdivisions[1].first_level;
+      const std::size_t future =
+          subdivided.subdivisions[3].first_level + base_count - 1;
+      const std::size_t expected =
+          subdivided.subdivisions[1].first_level + base_count - 1;
+      require(cam::subdivision_preview_source(subdivided, active, future) ==
+                  expected,
+              "future preview layers alias the active subdivision at the same depth");
+      const std::size_t completed =
+          subdivided.subdivisions[0].first_level + base_count - 1;
+      require(cam::subdivision_preview_source(subdivided, active, completed) ==
+                  completed,
+              "completed subdivision preview layers retain their own stock");
+    }
+  }
 
   bool roughing_inherited_less_stock = false;
   bool roughing_compared = false;
@@ -785,6 +839,8 @@ void check_serialisation() {
   std::cout << "serialisation\n";
   require_near(cam::Operation{}.path_pitch, 1.0, 1e-9,
                "new operations default to a 1 mm simulation pitch");
+  require(cam::Operation{}.finishing_subdivisions == 1,
+          "roughing defaults to one finishing subdivision");
   const cam::Tool tool = test_tool();
   const cam::Tool tool_back =
       cam::tool_from_json_text(cam::to_json_text(tool));
@@ -805,6 +861,7 @@ void check_serialisation() {
   cam::Job job;
   cam::Operation operation;
   operation.path_pitch = 0.15;
+  operation.finishing_subdivisions = 4;
   operation.mode = cam::OperationMode::ContourFinishing;
   operation.entry_front_match_tolerance = 0.12;
   operation.contour_direction = cam::ContourDirectionPolicy::Climb;
@@ -819,6 +876,8 @@ void check_serialisation() {
   if (!job_back.operations.empty()) {
     require_near(job_back.operations[0].path_pitch, 0.15, 1e-9,
                  "path pitch survives");
+    require(job_back.operations[0].finishing_subdivisions == 4,
+            "finishing subdivisions survive");
     require(job_back.operations[0].mode == cam::OperationMode::ContourFinishing,
             "operation mode survives");
     require_near(job_back.operations[0].entry_front_match_tolerance, 0.12, 1e-9,

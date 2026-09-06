@@ -109,6 +109,15 @@ playback for a finishing operation see the stock left by roughing instead of a
 fresh copy of the blank. Toolpath geometry is still derived from nominal slices;
 clipping finishing paths to the inherited stock is a separate future step.
 
+A roughing operation's **Finishing subdivisions** setting repeats its complete
+depth plan at evenly interleaved offsets, handing each repetition the stock left
+by the one before it. For example, a 1 mm stepdown with four subdivisions runs
+the base floors first, followed by groups beginning 0.75, 0.5, and 0.25 mm below
+the work top. Each group retains its own base-layer stock record. The stacked
+preview interleaves all of those records into physical Z order; layers belonging
+to a group that has not started yet temporarily mirror the active group's stock
+at the corresponding depth, so playback updates only one simulated layer.
+
 ## Stock
 
 With no stock model, the blank is the part's bounding box grown in X and Y by
@@ -451,6 +460,7 @@ data:
 --material ID
 --stepover RATIO
 --stepdown MM
+--finishing-subdivisions N
 --path-pitch MM
 --mode rough|finish
 --box-stock MM

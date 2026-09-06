@@ -432,7 +432,9 @@ const cam::LevelPlan* current_level(const App& app) {
   if (app.selected_plan_operation < 0 ||
       app.selected_plan_operation >= static_cast<int>(app.plan.operations.size()))
     return nullptr;
-  const auto& levels = app.plan.operations[app.selected_plan_operation].levels;
+  const auto& planned_operation =
+      app.plan.operations[app.selected_plan_operation];
+  const auto& levels = planned_operation.levels;
   if (app.selected_level < 0 || app.selected_level >= static_cast<int>(levels.size()))
     return nullptr;
   return &levels[app.selected_level];
@@ -1643,7 +1645,9 @@ void draw_result(App& app) {
     finish("Plan the job to see the result");
     return;
   }
-  const auto& levels = app.plan.operations[app.selected_plan_operation].levels;
+  const auto& planned_operation =
+      app.plan.operations[app.selected_plan_operation];
+  const auto& levels = planned_operation.levels;
   if (levels.empty()) {
     finish("This operation has no passes");
     return;
@@ -1652,8 +1656,7 @@ void draw_result(App& app) {
   const int active_level = std::clamp(
       app.selected_level, 0, static_cast<int>(levels.size()) - 1);
   const cam::LevelPlan& active = levels[active_level];
-  const cam::Tool* active_tool = app.tools.find(
-      app.plan.operations[app.selected_plan_operation].tool_id);
+  const cam::Tool* active_tool = app.tools.find(planned_operation.tool_id);
   std::optional<cam::MotionCursor> cutter_cursor;
   if (active_tool != nullptr && !active.toolpath.moves.empty()) {
     if (!active.feeds.motion.empty()) {
@@ -1694,7 +1697,14 @@ void draw_result(App& app) {
     }
   }
   const double material_lowest = lowest;
-  const double material_highest = highest;
+  double material_highest = highest;
+  if (!planned_operation.subdivisions.empty() &&
+      planned_operation.subdivisions.front().level_count > 0) {
+    const std::size_t first =
+        planned_operation.subdivisions.front().first_level;
+    if (first < levels.size())
+      material_highest = levels[first].floor_z + levels[first].axial_depth;
+  }
   // Everywhere the cutter is ever commanded to be, with room for its flute,
   // taken once from the plan rather than from where it happens to stand this
   // frame. A lead-in and a retract both reach outside the stock, so the stack
@@ -1759,24 +1769,46 @@ void draw_result(App& app) {
       std::max(1e-6f, std::sqrt(raw.x * raw.x + raw.y * raw.y + raw.z * raw.z));
   const Vec3 light{raw.x / raw_length, raw.y / raw_length, raw.z / raw_length};
 
-  // What each pass leaves behind, resolved once so a pass can be compared with
-  // the one above it to find the top surface it actually exposes.
-  std::vector<const Paths64*> leftover(levels.size(), nullptr);
-  for (std::size_t i = 0; i < levels.size(); ++i) {
-    const cam::LevelPlan& level = levels[i];
-    if (level.stock_slice.empty()) continue;
-    // Passes above the cutter are finished, the one it is in is part way
-    // through, and the ones below it have not been touched.
-    const Paths64* remaining = &level.simulation.remaining_stock;
-    if (level.nothing_to_cut) {
-      remaining = &level.incoming_stock;
-    } else if (app.stack_follows_playback) {
-      if (static_cast<int>(i) > app.selected_level)
-        remaining = &level.simulation.initial_stock;
-      else if (static_cast<int>(i) == app.selected_level && !app.material.empty())
-        remaining = &app.material;
+  // Posting and playback keep subdivision groups in execution order. The
+  // stack is a physical section, so interleave those groups by their actual Z
+  // floors before building its slabs.
+  std::vector<std::size_t> display_levels(levels.size());
+  for (std::size_t i = 0; i < levels.size(); ++i) display_levels[i] = i;
+  std::stable_sort(display_levels.begin(), display_levels.end(),
+                   [&](std::size_t a, std::size_t b) {
+                     return levels[a].floor_z > levels[b].floor_z;
+                   });
+
+  // Future subdivision layers deliberately alias the latest subdivision being
+  // evaluated. Once subdivision 2 begins, subdivision 3's virtual layers stop
+  // aliasing subdivision 1 and alias subdivision 2 instead. Only the selected
+  // source layer ever needs a live, partially simulated stock object.
+  const auto stock_for = [&](std::size_t target_index) -> const Paths64* {
+    const cam::LevelPlan& target = levels[target_index];
+    std::size_t source_index = target_index;
+    if (app.stack_follows_playback)
+      source_index = cam::subdivision_preview_source(
+          planned_operation, active_level, target_index);
+    const cam::LevelPlan& source = levels[source_index];
+    const Paths64* remaining = &source.simulation.remaining_stock;
+    if (source.nothing_to_cut) {
+      remaining = &source.incoming_stock;
+    } else if (app.stack_follows_playback &&
+               source.subdivision == active.subdivision) {
+      if (source.subdivision_level > active.subdivision_level) {
+        remaining = &source.simulation.initial_stock;
+      } else if (source.subdivision_level == active.subdivision_level) {
+        remaining = !app.material.empty() ? &app.material
+                                          : &source.simulation.initial_stock;
+      }
     }
-    if (!remaining->empty()) leftover[i] = remaining;
+    return remaining->empty() ? nullptr : remaining;
+  };
+
+  std::vector<const Paths64*> leftover(display_levels.size(), nullptr);
+  for (std::size_t display = 0; display < display_levels.size(); ++display) {
+    const std::size_t target = display_levels[display];
+    if (!levels[target].stock_slice.empty()) leftover[display] = stock_for(target);
   }
 
   // The walls only need enough vertices for the current display scale. Keep the
@@ -1784,16 +1816,17 @@ void draw_result(App& app) {
   // independently thinned versions of the same curved boundary can retain
   // different vertices, and subtracting them creates clouds of microscopic
   // slivers that are not real exposed material.
-  std::vector<Paths64> outline(levels.size());
-  for (std::size_t i = 0; i < levels.size(); ++i)
+  std::vector<Paths64> outline(display_levels.size());
+  for (std::size_t i = 0; i < display_levels.size(); ++i)
     if (leftover[i] != nullptr) outline[i] = drawable_region(*leftover[i], spacing);
 
   std::vector<Facet> facets;
   std::vector<ImVec2> pool;
   std::size_t untriangulated = 0;
-  for (std::size_t i = 0; i < levels.size(); ++i) {
+  for (std::size_t i = 0; i < display_levels.size(); ++i) {
     if (leftover[i] == nullptr) continue;
-    const cam::LevelPlan& level = levels[i];
+    const std::size_t level_index = display_levels[i];
+    const cam::LevelPlan& level = levels[level_index];
 
     const Paths64& walls = outline[i];
     if (walls.empty()) continue;
@@ -1817,20 +1850,24 @@ void draw_result(App& app) {
 
     // Tinted by depth so the steps read apart even where two of them meet on a
     // face turned away from the light, and the pass being watched is picked out.
-    const float t = levels.size() < 2
+    const float t = display_levels.size() < 2
                         ? 0.0f
-                        : static_cast<float>(i) / (levels.size() - 1);
+                        : static_cast<float>(i) / (display_levels.size() - 1);
     const bool active =
-        app.stack_follows_playback && static_cast<int>(i) == app.selected_level;
+        app.stack_follows_playback &&
+        static_cast<int>(level_index) == app.selected_level;
     const float face_colour[3] = {active ? 0.44f : 0.54f - 0.12f * t,
                                   active ? 0.62f : 0.61f - 0.12f * t,
                                   active ? 0.78f : 0.70f - 0.12f * t};
     const float wall_colour[3] = {0.44f, 0.50f, 0.58f};
     const ImU32 edge = active ? IM_COL32(170, 215, 250, 200)
                               : IM_COL32(196, 214, 236, 90);
-    append_slab(facets, pool, walls, lid_mesh, lid_rings, level.floor_z,
-                level.floor_z + level.axial_depth, projection, light, wall_colour,
-                face_colour, edge);
+    const double slab_top =
+        i == 0 ? material_highest
+               : levels[display_levels[i - 1]].floor_z;
+    if (slab_top > level.floor_z)
+      append_slab(facets, pool, walls, lid_mesh, lid_rings, level.floor_z,
+                  slab_top, projection, light, wall_colour, face_colour, edge);
   }
   if (cutter_cursor && active_tool != nullptr) {
     append_cutter(
@@ -1879,16 +1916,26 @@ void draw_result(App& app) {
   }
 
   char caption[200];
-  std::snprintf(caption, sizeof caption,
-                "%zu passes stacked, Z %.2f to %.2f mm   Drag: orbit   Right-drag: pan   "
-                "Wheel: zoom",
-                levels.size(), material_lowest, material_highest);
+  if (planned_operation.subdivisions.size() > 1) {
+    std::snprintf(
+        caption, sizeof caption,
+        "%zu layers from %zu subdivisions, Z %.2f to %.2f mm   Drag: orbit   "
+        "Right-drag: pan   Wheel: zoom",
+        levels.size(), planned_operation.subdivisions.size(), material_lowest,
+        material_highest);
+  } else {
+    std::snprintf(
+        caption, sizeof caption,
+        "%zu passes stacked, Z %.2f to %.2f mm   Drag: orbit   Right-drag: pan   "
+        "Wheel: zoom",
+        levels.size(), material_lowest, material_highest);
+  }
   list->AddText({top_left.x + 12.0f, top_left.y + 10.0f}, IM_COL32(130, 142, 158, 255),
                 caption);
   if (untriangulated > 0) {
     std::snprintf(caption, sizeof caption,
-                  "%zu pass%s could not be triangulated and is not drawn",
-                  untriangulated, untriangulated == 1 ? "" : "es");
+                  "%zu layer%s could not be triangulated and is not drawn",
+                  untriangulated, untriangulated == 1 ? "" : "s");
     list->AddText({top_left.x + 12.0f, top_left.y + 28.0f}, IM_COL32(232, 156, 92, 255),
                   caption);
   }
@@ -2503,12 +2550,33 @@ void operation_settings_panel(App& app) {
   ImGui::DragScalar("Stepover (of diameter)", ImGuiDataType_Double,
                     &operation.stepover_ratio, 0.005f);
   ImGui::DragScalar("Stepdown (mm)", ImGuiDataType_Double, &operation.stepdown, 0.1f);
-  if (tool)
+  const std::size_t base_layers =
+      cam::level_floors(operation, operation.stepdown,
+                        cam::highest_model_z(app.geometry))
+          .size();
+  if (operation.mode == cam::OperationMode::Roughing) {
+    if (ImGui::DragInt("Finishing subdivisions",
+                       &operation.finishing_subdivisions, 0.05f, 1, 64))
+      operation.finishing_subdivisions =
+          std::clamp(operation.finishing_subdivisions, 1, 64);
+    ImGui::SetItemTooltip(
+        "Runs this roughing operation repeatedly at evenly interleaved depth "
+        "offsets. Each pass receives the stock left by the preceding pass.");
+  }
+  if (tool) {
+    const std::string preview_layers =
+        operation.mode == cam::OperationMode::Roughing &&
+                operation.finishing_subdivisions > 1
+            ? ", " +
+                  std::to_string(base_layers *
+                                 operation.finishing_subdivisions) +
+                  " preview layers"
+            : "";
     ImGui::TextDisabled(
-        "= %.3f mm wide, %zu passes", operation.stepover_ratio * tool->diameter,
-        cam::level_floors(operation, operation.stepdown,
-                          cam::highest_model_z(app.geometry))
-            .size());
+        "= %.3f mm wide, %zu base layers%s",
+        operation.stepover_ratio * tool->diameter, base_layers,
+        preview_layers.c_str());
+  }
   ImGui::DragScalar("Radial stock to leave", ImGuiDataType_Double,
                     &operation.radial_stock_to_leave, 0.02f);
   ImGui::DragScalar("Axial stock to leave", ImGuiDataType_Double,
@@ -2754,6 +2822,16 @@ void view_panel(App& app) {
     ImGui::TextDisabled("Depth %.3f mm, cutting %.3f mm",
                         levels[app.selected_level].floor_z,
                         levels[app.selected_level].axial_depth);
+    const cam::LevelPlan& selected = levels[app.selected_level];
+    const auto& subdivisions =
+        app.plan.operations[app.selected_plan_operation].subdivisions;
+    if (subdivisions.size() > 1 &&
+        selected.subdivision < subdivisions.size()) {
+      ImGui::TextDisabled(
+          "Subdivision %zu/%zu, layer %zu/%zu", selected.subdivision + 1,
+          subdivisions.size(), selected.subdivision_level + 1,
+          subdivisions[selected.subdivision].level_count);
+    }
   }
   static const char* kColourings[]{"Feed rate", "Limiting reason", "Engagement",
                                    "Move type"};
@@ -3009,6 +3087,7 @@ int main(int argc, char** argv) {
   std::string view_name;
   double progress_fraction = -1.0;
   double stepdown = 0.0;
+  int finishing_subdivisions = 0;
   double stepover = 0.0;
   double path_pitch = 0.0;
   double entry_front_tolerance = 0.0;
@@ -3050,6 +3129,8 @@ int main(int argc, char** argv) {
       else if (argument == "--machine") machine_id = value();
       else if (argument == "--material") material_id = value();
       else if (argument == "--stepdown") stepdown = std::stod(value());
+      else if (argument == "--finishing-subdivisions")
+        finishing_subdivisions = std::stoi(value());
       else if (argument == "--stepover") stepover = std::stod(value());
       else if (argument == "--path-pitch") path_pitch = std::stod(value());
       else if (argument == "--entry-front-tolerance")
@@ -3072,6 +3153,8 @@ int main(int argc, char** argv) {
             "  --material ID      Workpiece material\n"
             "  --stepover RATIO   Radial engagement as a fraction of diameter\n"
             "  --stepdown MM      Axial depth per pass\n"
+            "  --finishing-subdivisions N\n"
+            "                     Interleaved stock-aware roughing passes (default 1)\n"
             "  --path-pitch MM    Simulation/feed sampling interval (default 1.0)\n"
             "  --mode rough|finish\n"
             "                     Roughing or offset-contour finishing\n"
@@ -3135,6 +3218,8 @@ int main(int argc, char** argv) {
     if (!machine_id.empty()) operation.machine_id = machine_id;
     if (!material_id.empty()) operation.material_id = material_id;
     if (stepdown > 0.0) operation.stepdown = stepdown;
+    if (finishing_subdivisions > 0)
+      operation.finishing_subdivisions = finishing_subdivisions;
     if (stepover > 0.0) operation.stepover_ratio = stepover;
     if (path_pitch > 0.0) operation.path_pitch = path_pitch;
     if (entry_front_tolerance > 0.0)

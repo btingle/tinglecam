@@ -38,6 +38,10 @@ struct Operation {
   // one is millimetres and is capped by the flute length.
   double stepover_ratio = 0.4;
   double stepdown = 1.0;
+  // Roughing may be repeated at evenly interleaved Z offsets. One is the
+  // ordinary pass; N adds N-1 stock-aware finishing passes while keeping this
+  // operation as a single editable/postable unit.
+  int finishing_subdivisions = 1;
 
   double radial_stock_to_leave = 0.2;
   double axial_stock_to_leave = 0.0;
@@ -107,6 +111,10 @@ struct Job {
 struct LevelPlan {
   double floor_z = 0.0;    // the depth this pass cuts down to
   double axial_depth = 0.0;  // a_p actually taken, which the last pass may trim
+  // Execution group and position inside it. Subdivision groups are flattened
+  // into OperationPlan::levels for posting and playback.
+  std::size_t subdivision = 0;
+  std::size_t subdivision_level = 0;
   wave::Paths64 part_slice;
   wave::Paths64 stock_slice;
   // Material present when this operation reaches the level. The nominal stock
@@ -133,6 +141,13 @@ struct LevelPlan {
   // all that separates them is one pass depth of descent.
   bool stays_down_after = false;
   wave::Path64 transition;
+};
+
+struct OperationSubdivision {
+  std::size_t first_level = 0;
+  std::size_t level_count = 0;
+  // How far this group's floors are raised from the base roughing floors.
+  double depth_shift = 0.0;
 };
 
 struct PlanStats {
@@ -197,6 +212,7 @@ struct OperationPlan {
   std::string material_id;
   double spindle_rpm = 0.0;
   std::vector<LevelPlan> levels;
+  std::vector<OperationSubdivision> subdivisions;
   wave::InterLayerTopology inter_layer;
   PlanStats stats;
   PlanningMetrics metrics;
@@ -300,7 +316,8 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
                               double progress_from = 0.0,
                               double progress_to = 1.0,
                               const std::vector<OperationPlan>* prior_operations =
-                                  nullptr);
+                                  nullptr,
+                              const OperationPlan* prior_subdivisions = nullptr);
 
 // The one plane every disconnected move traverses at, in job coordinates; the
 // post adds origin_z to it. A 2D slice cannot certify a lower traverse, so this
@@ -347,7 +364,8 @@ OperationPlan plan_operation(const JobGeometry& geometry,
                              double progress_to = 1.0,
                              double rapid_plane = 10.0,
                              const std::vector<OperationPlan>* prior_operations =
-                                 nullptr);
+                                 nullptr,
+                             const OperationPlan* prior_subdivisions = nullptr);
 
 // Resolves the material present at one Z plane after a sequence of operations.
 // A level removes material only through the axial slab it represents. This is
@@ -357,6 +375,14 @@ OperationPlan plan_operation(const JobGeometry& geometry,
 wave::Paths64 stock_after_operations_at_z(
     const wave::Paths64& nominal_stock, double z,
     const std::vector<OperationPlan>& operations);
+
+// Chooses the execution-record layer that supplies a physical stack layer
+// while subdivision playback is in progress. Completed subdivisions retain
+// their own stock; layers belonging to a future subdivision mirror the active
+// subdivision at the same local depth until that future group begins.
+std::size_t subdivision_preview_source(const OperationPlan& operation,
+                                       std::size_t active_level,
+                                       std::size_t target_level);
 
 JobPlan plan_job(const JobGeometry& geometry,
                  const Job& job,

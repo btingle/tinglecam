@@ -187,6 +187,7 @@ json to_json(const Operation& operation) {
               {"material", operation.material_id},
               {"stepover_ratio", operation.stepover_ratio},
               {"stepdown", operation.stepdown},
+              {"finishing_subdivisions", operation.finishing_subdivisions},
               {"radial_stock_to_leave", operation.radial_stock_to_leave},
               {"axial_stock_to_leave", operation.axial_stock_to_leave},
               {"depth_from", operation.depth_from},
@@ -218,6 +219,7 @@ Operation operation_from(const json& node) {
   read(node, "material", operation.material_id);
   read(node, "stepover_ratio", operation.stepover_ratio);
   read(node, "stepdown", operation.stepdown);
+  read(node, "finishing_subdivisions", operation.finishing_subdivisions);
   read(node, "radial_stock_to_leave", operation.radial_stock_to_leave);
   read(node, "axial_stock_to_leave", operation.axial_stock_to_leave);
   read(node, "depth_from", operation.depth_from);
