@@ -833,6 +833,16 @@ double job_rapid_plane(const Job& job, double highest) {
   return highest + job.rapid_clearance_height;
 }
 
+// Where an operation leaves the cutter standing when it finishes: the end of
+// the last pass in it that cut anything. Absent when none did.
+std::optional<wave::Point64> resting_position(const OperationPlan& plan) {
+  for (auto level = plan.levels.rbegin(); level != plan.levels.rend(); ++level) {
+    if (level->nothing_to_cut || level->feeds.motion.empty()) continue;
+    return level->feeds.motion.back().to;
+  }
+  return std::nullopt;
+}
+
 void plan_toolpaths(OperationPlan& plan,
                     const Operation& operation,
                     const Tool& tool,
@@ -842,7 +852,8 @@ void plan_toolpaths(OperationPlan& plan,
                     double progress_from,
                     double progress_to,
                     double rapid_plane,
-                    bool finishing_subdivision) {
+                    const OperationPlan* prior_subdivisions) {
+  const bool finishing_subdivision = prior_subdivisions != nullptr;
   if (!plan.ok()) return;
   if (!std::isfinite(rapid_plane)) {
     plan.error = "Rapid plane must be finite";
@@ -1176,6 +1187,15 @@ void plan_toolpaths(OperationPlan& plan,
   // intentionally restored in level order after all independent simulations.
   PassLink link;
   link.from_z = rapid_plane;
+  // A subdivision group is planned on its own but does not run on its own: it
+  // picks up where the group before it put the cutter down. Starting its first
+  // pass with nowhere to come from leaves that pass with no opening rapid at
+  // all, so the cutter arrives at it out of nothing -- which is what the
+  // preview draws, and what the travel totals leave out. The group before
+  // always finishes at the rapid plane, so only the position has to be
+  // carried; the height is the one already set above.
+  if (prior_subdivisions != nullptr)
+    link.from = resting_position(*prior_subdivisions);
   for (const std::size_t index : simulated_levels) {
     LevelPlan& level = plan.levels[index];
     if (level.nothing_to_cut) continue;
@@ -1285,7 +1305,7 @@ OperationPlan plan_operation(const JobGeometry& geometry,
                                        material, progress, progress_from, seam,
                                        prior_operations, prior_subdivisions);
   plan_toolpaths(plan, operation, tool, machine, material, progress, seam,
-                 progress_to, rapid_plane, prior_subdivisions != nullptr);
+                 progress_to, rapid_plane, prior_subdivisions);
   plan.metrics.total_milliseconds = elapsed_milliseconds(planning_start);
   return plan;
 }

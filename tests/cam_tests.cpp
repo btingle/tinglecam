@@ -495,6 +495,39 @@ void check_multi_operation_plan(const std::filesystem::path& data,
     require(inherited_between_subdivisions,
             "later subdivisions inherit stock from earlier subdivisions");
 
+    // A subdivision group is planned on its own but runs on from the one before
+    // it, so its first cutting pass has to open with a rapid in from wherever
+    // that group left the cutter. Planning each group with nowhere to come from
+    // left that rapid out: the post still emitted the motion, but the schedule
+    // did not carry it, so the preview drew the toolpath appearing at the new
+    // group out of nothing and the travel totals were short by it.
+    const cam::LevelPlan* previous_cut = nullptr;
+    std::size_t openings_checked = 0;
+    for (const cam::LevelPlan& level : subdivided.levels) {
+      if (level.nothing_to_cut || level.feeds.motion.empty()) continue;
+      if (previous_cut != nullptr &&
+          previous_cut->subdivision != level.subdivision) {
+        std::size_t arrivals = 0;
+        for (const cam::MotionPhase& phase : level.feeds.motion)
+          if (phase.arrival) ++arrivals;
+        require(arrivals == 1,
+                "a subdivision opens with one rapid in from the group before it");
+        require(level.feeds.motion.front().arrival,
+                "and making it is the first thing that pass does");
+        require(level.feeds.motion.front().from ==
+                    previous_cut->feeds.motion.back().to,
+                "starting where the group before it left the cutter standing");
+        ++openings_checked;
+      }
+      previous_cut = &level;
+    }
+    // Not every group necessarily cuts -- an earlier one can leave a depth with
+    // nothing on it -- so the count is not fixed at three. What matters is that
+    // a boundary was reached at all, or the checks above passed by never
+    // running.
+    require(openings_checked >= 1,
+            "at least one subdivision boundary was there to be checked");
+
     if (base_count > 0) {
       const std::size_t active =
           subdivided.subdivisions[1].first_level;
