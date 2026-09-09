@@ -401,6 +401,64 @@ void check_box_stock(const std::filesystem::path& part_mesh) {
           "and dropping it hands the job back to the box");
 }
 
+void check_engagement_limits(const std::filesystem::path& part_mesh) {
+  std::cout << "engagement limit diagnostics\n";
+  cam::Tool tool = test_tool();
+  tool.diameter = 3.175;
+  tool.flute_length = 25;
+  tool.cutting_data.front().max_ae_over_d = 0.3;
+  tool.cutting_data.front().max_ap_over_d = 0.5;
+  const cam::Machine machine = test_machine();
+  cam::JobGeometry geometry;
+  geometry.load_part(part_mesh);
+  geometry.set_box_stock(true, 1.0);
+  cam::Operation operation;
+  operation.tool_id = tool.id;
+  operation.machine_id = machine.id;
+  operation.material_id = "plastic";
+  operation.stepover_ratio = 0.4;
+  operation.stepdown = 2;
+  operation.depth_to = 3;
+  operation.finishing_subdivisions = 4;
+  cam::Job job;
+  job.operations = {operation};
+  cam::ToolLibrary tools;
+  tools.upsert(tool);
+  cam::MachineLibrary machines;
+  machines.upsert(machine);
+  cam::MaterialLibrary materials;
+  materials.materials.push_back({"plastic", "Plastic"});
+  const auto plan = cam::plan_job(geometry, job, tools, machines, materials, {});
+  require(plan.ok(), "limited engagement plans: " + plan.error);
+  int radial = 0;
+  int axial = 0;
+  for (const auto& warning : plan.warnings) {
+    if (warning.find("Stepover reduced") != std::string::npos) {
+      ++radial;
+      require(warning.find("1.270000") != std::string::npos &&
+                  warning.find("0.952500") != std::string::npos &&
+                  warning.find(tool.id) != std::string::npos &&
+                  warning.find("Plastic") != std::string::npos &&
+                  warning.find("max_ae_over_d") != std::string::npos,
+              "radial warning identifies requested/applied values and the profile");
+    }
+    if (warning.find("Stepdown reduced") != std::string::npos) {
+      ++axial;
+      require(warning.find("2.000000") != std::string::npos &&
+                  warning.find("1.587500") != std::string::npos &&
+                  warning.find("max_ap_over_d") != std::string::npos &&
+                  warning.find("25.000000") != std::string::npos,
+              "axial warning explains the material limit and flute length");
+    }
+  }
+  require(radial == 1 && axial == 1,
+          "engagement reductions are reported once across four subdivisions");
+  if (!plan.operations.empty())
+    for (const auto& level : plan.operations.front().levels)
+      require(level.axial_depth <= 1.5875 + 1e-9,
+              "the material axial limit still applies to every planned layer");
+}
+
 // A real roughing-to-roughing-to-finishing plan exercises both operation
 // ordering and the inherited-stock planning and simulation handoff.
 void check_multi_operation_plan(const std::filesystem::path& data,
@@ -1500,6 +1558,7 @@ int main(int argc, char** argv) {
     check_post_output();
     if (argc > 1) check_shipped_data(argv[1]);
     if (argc > 2) check_box_stock(argv[2]);
+    if (argc > 2) check_engagement_limits(argv[2]);
     if (argc > 2) check_multi_operation_plan(argv[1], argv[2]);
     if (argc > 3)
       check_lsjig_subdivision_cleanup(

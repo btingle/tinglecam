@@ -250,8 +250,13 @@ bool resolve_setup(const Operation& operation, const Tool& tool,
       stepover_ratio > setup.data->max_ae_over_d) {
     if (warnings)
       warnings->push_back(
-          "Stepover reduced to the tool's ceiling of " +
-          std::to_string(setup.data->max_ae_over_d) + " of diameter");
+          "Stepover reduced from " + std::to_string(stepover_ratio * tool.diameter) +
+          " mm (" + std::to_string(stepover_ratio) + " of diameter) to " +
+          std::to_string(setup.data->max_ae_over_d * tool.diameter) +
+          " mm: tool '" + tool.name + "' [" + tool.id + "] in " +
+          material.name + " has max_ae_over_d = " +
+          std::to_string(setup.data->max_ae_over_d) +
+          ". Edit this limit under Libraries > Edit > Material cutting data.");
     stepover_ratio = setup.data->max_ae_over_d;
   }
   setup.stepover = std::max(stepover_ratio * tool.diameter, 1e-4);
@@ -263,8 +268,15 @@ bool resolve_setup(const Operation& operation, const Tool& tool,
                                       : tool.flute_length);
   if (axial_ceiling > 0.0 && stepdown > axial_ceiling) {
     if (warnings)
-      warnings->push_back("Stepdown reduced to " + std::to_string(axial_ceiling) +
-                          " mm, the deepest this tool takes in one pass");
+      warnings->push_back(
+          "Stepdown reduced from " + std::to_string(stepdown) + " mm to " +
+          std::to_string(axial_ceiling) + " mm: tool '" + tool.name + "' [" +
+          tool.id + "] in " + material.name + " has max_ap_over_d = " +
+          std::to_string(setup.data->max_ap_over_d) + " (" +
+          std::to_string(setup.data->max_ap_over_d * tool.diameter) +
+          " mm), with " + std::to_string(tool.flute_length) +
+          " mm flute length. The smaller limit applies. Edit these limits "
+          "under Libraries > Edit.");
     stepdown = axial_ceiling;
   }
 
@@ -1355,9 +1367,11 @@ OperationPlan plan_subdivided_operation(
   result.material_id = operation.material_id;
 
   OperationSetup setup;
-  if (!resolve_setup(operation, tool, machine, material, result.error, nullptr,
+  std::vector<std::string> setup_warnings;
+  if (!resolve_setup(operation, tool, machine, material, result.error, &setup_warnings,
                      setup))
     return result;
+  result.warnings = setup_warnings;
   const int count = operation.mode == OperationMode::Roughing
                         ? operation.finishing_subdivisions
                         : 1;
@@ -1412,12 +1426,18 @@ OperationPlan plan_subdivided_operation(
     accumulate(result.stats, planned.stats);
     accumulate(result.metrics, planned.metrics);
     result.spindle_rpm = std::max(result.spindle_rpm, planned.spindle_rpm);
-    for (const std::string& warning : planned.warnings)
+    for (const std::string& warning : planned.warnings) {
+      // Engagement limits apply to the whole operation. Keep layer-specific
+      // diagnostics, but don't repeat identical setup notes for every group.
+      if (std::find(setup_warnings.begin(), setup_warnings.end(), warning) !=
+          setup_warnings.end())
+        continue;
       result.warnings.push_back(
           count == 1
               ? warning
               : "Subdivision " + std::to_string(subdivision + 1) + "/" +
                     std::to_string(count) + ": " + warning);
+    }
   }
   return result;
 }

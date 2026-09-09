@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <utility>
 
 namespace cam {
@@ -51,18 +52,22 @@ std::vector<std::string> validate(const Tool& tool) {
   };
   require(!tool.id.empty(), "The tool needs an identifier");
   require(!tool.name.empty(), "The tool needs a name");
-  require(tool.diameter > 0.0, "Diameter must be greater than zero");
-  require(tool.flute_length > 0.0, "Flute length must be greater than zero");
+  require(std::isfinite(tool.diameter) && tool.diameter > 0.0,
+          "Diameter must be finite and greater than zero");
+  require(std::isfinite(tool.flute_length) && tool.flute_length > 0.0,
+          "Flute length must be finite and greater than zero");
   std::vector<std::string> seen;
   for (const auto& data : tool.cutting_data) {
     const std::string where = " for " + data.material_id;
     require(!data.material_id.empty(), "Cutting data is missing its material");
-    require(data.spindle_rpm > 0.0, "Spindle speed must be positive" + where);
+    require(std::isfinite(data.spindle_rpm) && data.spindle_rpm > 0.0,
+            "Spindle speed must be finite and positive" + where);
     require(data.max_ae_over_d > 0.0 && data.max_ae_over_d <= 1.0,
             "Radial engagement ceiling must be within (0, 1]" + where);
-    require(data.max_ap_over_d > 0.0,
-            "Axial engagement ceiling must be positive" + where);
-    require(data.plunge_feed > 0.0, "Plunge feed must be positive" + where);
+    require(std::isfinite(data.max_ap_over_d) && data.max_ap_over_d > 0.0,
+            "Axial engagement ceiling must be finite and positive" + where);
+    require(std::isfinite(data.plunge_feed) && data.plunge_feed > 0.0,
+            "Plunge feed must be finite and positive" + where);
     if (std::find(seen.begin(), seen.end(), data.material_id) != seen.end())
       problems.push_back("Two cutting-data entries for " + data.material_id);
     seen.push_back(data.material_id);

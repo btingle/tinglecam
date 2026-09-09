@@ -390,6 +390,28 @@ Machines and materials are individual JSON files under `data/`. User tools
 are stored under the platform configuration directory and are initialized from
 `data/starter-tools.json` on first run. Unknown JSON keys are ignored.
 
+The **Libraries** tab shows the exact active `tools.json` path (on Linux,
+`~/.config/tinglecam/tools.json`, or `$XDG_CONFIG_HOME/tinglecam/tools.json`).
+Use **New tool**, enter dimensions and cutting data directly in the numeric
+fields, then **Save tool**. The identifier is generated automatically; **Edit**
+keeps it and **Copy** creates a new one. Changes invalidate the existing plan.
+
+For JSON edits, edit the active file and click **Reload from disk**, or restart
+TingleCAM. Editing `data/starter-tools.json` does not change an existing user
+library automatically: use **Import tools** in the Libraries tab to apply it.
+The import path defaults to that starter file and can point to another library
+JSON. Imports add new IDs and replace matching IDs while keeping other tools.
+Invalid imports leave the current library intact. Close the tool builder and
+wait for planning to finish before reloading or importing.
+
+Planning caps stepover at the tool/material entry's `max_ae_over_d` times
+diameter, and stepdown at the smaller of flute length and `max_ap_over_d` times
+diameter. Operation settings show these limits and the effective values before
+planning. Reduction warnings include requested/applied values and the tool and
+material responsible, once per operation rather than once per subdivision.
+Warnings wrap in the GUI, can be copied with **Copy warnings**, and are also
+printed to the launching terminal when planning or G-code generation completes.
+
 A machine profile contains only values used for feed lookup, spindle clamping,
 timing, and G-code emission:
 

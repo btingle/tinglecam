@@ -342,15 +342,45 @@ ToolLibrary load_tools(const std::filesystem::path& path) {
   std::error_code code;
   if (!std::filesystem::exists(path, code)) return library;
   const json node = parse(read_file(path), path);
-  const json& list = node.is_array() ? node : node.value("tools", json::array());
-  for (const auto& entry : list) library.tools.push_back(tool_from(entry));
+  try {
+    const json& list = node.is_array() ? node : node.at("tools");
+    if (!list.is_array()) throw std::runtime_error("Expected a tools array");
+    for (const auto& entry : list) {
+      Tool tool = tool_from(entry);
+      const auto problems = validate(tool);
+      if (!problems.empty())
+        throw std::runtime_error(tool.name + ": " + problems.front());
+      if (library.find(tool.id))
+        throw std::runtime_error("Duplicate tool ID: " + tool.id);
+      library.tools.push_back(std::move(tool));
+    }
+  } catch (const std::exception& error) {
+    throw std::runtime_error(path.string() + ": " + error.what());
+  }
   return library;
 }
 
 void save_tools(const std::filesystem::path& path, const ToolLibrary& library) {
   json list = json::array();
   for (const auto& tool : library.tools) list.push_back(to_json(tool));
-  write_file(path, json{{"tools", list}}.dump(2) + "\n");
+  // Stage beside the destination so replacing it cannot leave a truncated
+  // library if writing fails. Keep the original file until the close succeeds.
+  auto temporary = path;
+  temporary += ".tmp";
+  try {
+    if (path.has_parent_path())
+      std::filesystem::create_directories(path.parent_path());
+    std::ofstream stream(temporary, std::ios::binary | std::ios::trunc);
+    if (!stream) throw std::runtime_error("Cannot open " + temporary.string());
+    stream << json{{"tools", list}}.dump(2) << '\n';
+    stream.close();
+    if (!stream) throw std::runtime_error("Failed while writing " + temporary.string());
+    std::filesystem::rename(temporary, path);
+  } catch (...) {
+    std::error_code ignored;
+    std::filesystem::remove(temporary, ignored);
+    throw;
+  }
 }
 
 MachineLibrary load_machines(const std::filesystem::path& directory) {

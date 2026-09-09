@@ -177,6 +177,10 @@ add_test(NAME cam_tests COMMAND cam_tests ${CMAKE_CURRENT_SOURCE_DIR}/data
 
 add_test(NAME tinglecam_help COMMAND tinglecam --help)
 
+add_executable(tool_library_tests tests/tool_library_tests.cpp)
+target_link_libraries(tool_library_tests PRIVATE tinglecam_core imgui_sdl_opengl)
+add_test(NAME tool_library_tests COMMAND tool_library_tests)
+
 add_test(NAME demo_help COMMAND clipper2_wave_demo --help)
 add_test(NAME demo_analysis_dump
          COMMAND clipper2_wave_demo ${CMAKE_CURRENT_SOURCE_DIR}/wavetest.svg

@@ -146,10 +146,57 @@ constexpr std::int64_t probe_distance = 2;
 // fronts is 878, so this floor sits with wide margin between the two.
 constexpr double gap_noise_floor = 32.0;
 
-void extract_ring_fronts(const Path64& ring, std::size_t band,
+// Splits every edge of a ring so that none is longer than `max_segment`,
+// leaving the ring's own vertices in place.
+//
+// The leading test below takes one probe pair per edge, so an edge is only
+// ever wholly leading or wholly not. That resolution is inherited from the
+// offsetter, which emits a straight wall as one edge however long it is: a
+// hundred-millimetre wall fronting unreached material along most of its length
+// is thrown away entire whenever its midpoint happens to sit against the part.
+// The generation after it still advances through the stretches that were open,
+// and the fronts that come out of them are left with no parent, because the
+// parent they grew from was never extracted. A parentless front is ready from
+// the outset, so the toolpath takes it in proximity order with nothing having
+// cleared a way in, and has nothing to enter it with but a plunge.
+//
+// Densifying first gives the classification a resolution that does not depend
+// on how the offset happened to be vertexed. Probe points end up at most one
+// pitch apart, so no leading or blocked run longer than a pitch can fall
+// between them.
+Path64 densify_ring(const Path64& ring, double max_segment) {
+  if (ring.size() < 2 || !(max_segment > 0.0)) return ring;
+  Path64 result;
+  result.reserve(ring.size());
+  for (std::size_t i = 0; i < ring.size(); ++i) {
+    const Point64& a = ring[i];
+    const Point64& b = ring[(i + 1) % ring.size()];
+    result.push_back(a);
+    const double dx = static_cast<double>(b.x - a.x);
+    const double dy = static_cast<double>(b.y - a.y);
+    const double length = std::hypot(dx, dy);
+    if (!(length > max_segment)) continue;
+    const auto pieces =
+        static_cast<std::size_t>(std::ceil(length / max_segment));
+    for (std::size_t piece = 1; piece < pieces; ++piece) {
+      const double ratio = static_cast<double>(piece) / pieces;
+      const Point64 point(
+          static_cast<std::int64_t>(std::llround(a.x + dx * ratio)),
+          static_cast<std::int64_t>(std::llround(a.y + dy * ratio)));
+      // Rounding can put a piece boundary back on the point before it. Keeping
+      // the duplicate would only add a zero-length edge the classifier skips.
+      if (point != result.back()) result.push_back(point);
+    }
+  }
+  return result;
+}
+
+void extract_ring_fronts(const Path64& raw_ring, std::size_t band,
                          const Paths64& unreached,
                          const Paths64& static_boundaries,
+                         double probe_pitch,
                          std::vector<LeadingFront>& fronts) {
+  const Path64 ring = densify_ring(raw_ring, probe_pitch);
   const std::size_t count = ring.size();
   if (count < 2) return;
   std::vector<bool> leading(count, false);
@@ -211,13 +258,29 @@ void extract_ring_fronts(const Path64& ring, std::size_t band,
   }
 }
 
+// How finely the leading test samples a ring. A front is responsible for a
+// stepover of material, so a run shorter than a quarter of one bounds a child
+// band well under the half-stepover-squared area that `reject_tiny_splits`
+// already dismisses as noise: at this pitch nothing the lineage would keep can
+// be missed. Blockages shorter than the pitch may go unsplit, which costs
+// nothing -- the children on either side of one still lie within the single
+// parent's reach and are matched to it. The floor keeps a piece longer than
+// the quantization gaps `absorb_quantization_gaps` is there to close, so
+// densifying can never manufacture a gap short enough to be absorbed.
+double front_probe_pitch(double stepover) {
+  return std::max(static_cast<double>(to_integer(stepover)) * 0.25,
+                  gap_noise_floor);
+}
+
 std::vector<LeadingFront> extract_leading_fronts(const std::vector<Paths64>& bands,
                                                  const Paths64& unreached,
-                                                 const Paths64& static_boundaries) {
+                                                 const Paths64& static_boundaries,
+                                                 double probe_pitch) {
   std::vector<LeadingFront> fronts;
   for (std::size_t band = 0; band < bands.size(); ++band)
     for (const auto& ring : bands[band])
-      extract_ring_fronts(ring, band, unreached, static_boundaries, fronts);
+      extract_ring_fronts(ring, band, unreached, static_boundaries, probe_pitch,
+                          fronts);
   return fronts;
 }
 
@@ -841,7 +904,8 @@ FrontLineage build_front_lineage(const WaveResult& wave,
         fronts.push_back(std::move(front));
       }
     } else {
-      fronts = extract_leading_fronts(bands, unreached, static_boundaries);
+      fronts = extract_leading_fronts(bands, unreached, static_boundaries,
+                                      front_probe_pitch(wave.stepover));
     }
     classify_front_contacts(fronts, static_boundaries, contact_tolerance);
     result.generations.push_back({std::move(fronts), std::move(bands)});

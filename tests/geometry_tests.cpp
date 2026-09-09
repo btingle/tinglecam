@@ -47,6 +47,36 @@ wave::WaveResult two_band_sweep(bool notched) {
   return wave_result;
 }
 
+// One wave band sweeping left to right, its leading edge a single straight
+// edge twenty units tall that stands against the part over the middle eight of
+// them. Offsetting emits a wall like this as one edge however long it is, and
+// the leading test takes one probe pair per edge, so the whole edge used to be
+// judged by the one spot that is blocked and discarded entire. The generation
+// behind it still advances through the stretches that were open, above the
+// part and below it, and those fronts are then left with no parent -- which is
+// what put a plunge into uncleared material at the head of a pass, since a
+// parentless front is ready before anything has cleared a way in.
+wave::WaveResult blocked_midpoint_sweep() {
+  wave::WaveResult result;
+  result.stock = wave::Paths64{{{0, 0}, {60000, 0}, {60000, 20000}, {0, 20000}}};
+  result.stock_boundary = result.stock.front();
+  result.subject = wave::Paths64{
+      {{10000, 6000}, {20000, 6000}, {20000, 14000}, {10000, 14000}}};
+  result.stepover = 10.0;
+  result.softening = 0.0;
+  const wave::Path64 first{{0, 0}, {10000, 0}, {10000, 20000}, {0, 20000}};
+  const wave::Path64 lower{
+      {10000, 0}, {20000, 0}, {20000, 6000}, {10000, 6000}};
+  const wave::Path64 upper{
+      {10000, 14000}, {20000, 14000}, {20000, 20000}, {10000, 20000}};
+  result.generations = {wave::Paths64{first}, wave::Paths64{lower, upper}};
+  result.reached_generations = {
+      wave::Paths64{first},
+      Clipper2Lib::Union(wave::Paths64{first, lower, upper},
+                         Clipper2Lib::FillRule::NonZero)};
+  return result;
+}
+
 // Two sources sweep a rectangular channel from opposite ends. Their last
 // fronts consume the middle band together and leave no surviving front, which
 // is a merge into an empty terminal node rather than two independent deaths.
@@ -527,6 +557,29 @@ void check_exterior_stock_reach() {
           "stock");
 }
 
+// The classification of a leading edge must not depend on how the offsetter
+// happened to vertex it. Whatever the sampling misses, every front the wave
+// grows has to descend from the front it grew out of: the toolpath sequences
+// fronts by that descent, and one with no parent is scheduled with nothing
+// cleared ahead of it and entered with a plunge.
+void check_long_leading_edge_is_split() {
+  const auto lineage = wave::build_front_lineage(blocked_midpoint_sweep());
+  require(lineage.generations.size() == 2,
+          "the blocked sweep should keep both of its generations");
+  require(!lineage.generations.front().fronts.empty(),
+          "an edge fronting open material along most of its length must yield "
+          "a front even when its midpoint stands against the part");
+  require(lineage.generations.front().fronts.size() == 2,
+          "the part should divide that edge into the two open stretches");
+  for (const auto& front : lineage.generations[1].fronts)
+    require(!front.parents.empty(),
+            "a front the wave advanced into must descend from the one it grew "
+            "out of");
+  for (const auto& event : lineage.events)
+    require(event.kind != wave::LineageEventKind::Birth,
+            "a wave that only advances must report no front born from nothing");
+}
+
 // A plunge lands in material that is already gone, so it has to stand at least
 // one tool radius clear of everything that is not. Before the radius reached
 // the planner this was half a stepover regardless of the cutter, which put the
@@ -598,6 +651,7 @@ int main(int argc, char** argv) {
     check_lead_in();
     check_exterior_stock_reach();
     check_plunge_clearance();
+    check_long_leading_edge_is_split();
 
     const auto lineage = wave::build_front_lineage(result);
     require(lineage.generations.size() == result.generations.size(),

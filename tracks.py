@@ -197,6 +197,8 @@ def create_all_tracks(grid_size, elevation_gain, profile, resolution=256):
 
     @njit
     def compute_contours(result, template, resolution, profile):
+        min_z = min(profile[:,1]) - elevation_gain
+        max_z = max(profile[:,1]) + elevation_gain
         for j in range(profile.shape[0]):
             pt = profile[j]
             template.set_sample_pt(pt)
@@ -205,7 +207,7 @@ def create_all_tracks(grid_size, elevation_gain, profile, resolution=256):
                 sample = template.sample_path_t(t)
                 result[j,k,0] = sample[0]
                 result[j,k,1] = sample[1]
-                result[j,k,2] = sample[2]
+                result[j,k,2] = max(min(sample[2], max_z), min_z)
 
     for i in range(len(all_templates)):
         template = all_templates[i]

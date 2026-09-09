@@ -269,11 +269,32 @@ struct App {
   std::array<char, 512> save_path{};
 
   std::filesystem::path tools_file;
+  std::string tools_import_file;
 };
 
 void say(App& app, std::string text, bool error = false) {
   app.banner = std::move(text);
   app.banner_is_error = error;
+}
+
+void log_warnings(const char* source, const std::vector<std::string>& warnings) {
+  for (const auto& warning : warnings)
+    std::fprintf(stderr, "%s warning: %s\n", source, warning.c_str());
+}
+
+void show_warnings(const char* id, const std::vector<std::string>& warnings) {
+  if (warnings.empty()) return;
+  ImGui::PushID(id);
+  if (ImGui::SmallButton("Copy warnings")) {
+    std::string text;
+    for (const auto& warning : warnings) text += warning + '\n';
+    ImGui::SetClipboardText(text.c_str());
+  }
+  ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.72f, 0.35f, 1.0f));
+  for (const auto& warning : warnings)
+    ImGui::TextWrapped("! %s", warning.c_str());
+  ImGui::PopStyleColor();
+  ImGui::PopID();
 }
 
 // ---------------------------------------------------------------------------
@@ -1972,6 +1993,35 @@ void text_field(const char* label, std::string& value, std::size_t capacity = 12
   if (ImGui::InputText(label, buffer.data(), buffer.size())) value = buffer.data();
 }
 
+void invalidate_plan(App& app);
+
+// Publish a library change only once it has been written successfully.
+void commit_tools(App& app, cam::ToolLibrary library) {
+  cam::save_tools(app.tools_file, library);
+  app.tools = std::move(library);
+  invalidate_plan(app);
+}
+
+void reload_tools(App& app) {
+  if (!std::filesystem::exists(app.tools_file))
+    throw std::runtime_error("Cannot open " + app.tools_file.string());
+  auto library = cam::load_tools(app.tools_file);
+  app.tools = std::move(library);
+  invalidate_plan(app);
+  say(app, "Reloaded " + app.tools_file.string());
+}
+
+void import_tools(App& app) {
+  if (!std::filesystem::exists(app.tools_import_file))
+    throw std::runtime_error("Cannot open " + app.tools_import_file);
+  const auto imported = cam::load_tools(app.tools_import_file);
+  auto library = app.tools;
+  for (const auto& tool : imported.tools) library.upsert(tool);
+  commit_tools(app, std::move(library));
+  say(app, "Imported " + std::to_string(imported.tools.size()) + " tools into " +
+               app.tools_file.string());
+}
+
 void tool_builder(App& app) {
   if (!app.builder_open) return;
   ImGui::SetNextWindowSize(ImVec2(620, 560), ImGuiCond_FirstUseEver);
@@ -1981,9 +2031,8 @@ void tool_builder(App& app) {
   }
   cam::Tool& tool = app.builder_tool;
   text_field("Name", tool.name);
-  ImGui::DragScalar("Diameter (mm)", ImGuiDataType_Double, &tool.diameter, 0.05f);
-  ImGui::DragScalar("Flute length (mm)", ImGuiDataType_Double,
-                    &tool.flute_length, 0.5f);
+  ImGui::InputDouble("Diameter (mm)", &tool.diameter, 0, 0, "%.15g");
+  ImGui::InputDouble("Flute length (mm)", &tool.flute_length, 0, 0, "%.15g");
   ImGui::Checkbox("Centre cutting", &tool.center_cutting);
   ImGui::InputInt("Tool number", &tool.tool_number);
   ImGui::InputInt("Length offset", &tool.length_offset);
@@ -1999,14 +2048,13 @@ void tool_builder(App& app) {
         material ? material->name : data.material_id + " (unknown)";
     if (ImGui::CollapsingHeader(title.c_str(),
                                 ImGuiTreeNodeFlags_DefaultOpen)) {
-      ImGui::DragScalar("Spindle (rpm)", ImGuiDataType_Double,
-                        &data.spindle_rpm, 100.0f);
-      ImGui::DragScalar("Max radial (of diameter)", ImGuiDataType_Double,
-                        &data.max_ae_over_d, 0.01f);
-      ImGui::DragScalar("Max axial (of diameter)", ImGuiDataType_Double,
-                        &data.max_ap_over_d, 0.05f);
-      ImGui::DragScalar("Plunge feed (mm/min)", ImGuiDataType_Double,
-                        &data.plunge_feed, 5.0f);
+      ImGui::InputDouble("Spindle (rpm)", &data.spindle_rpm, 0, 0, "%.15g");
+      ImGui::InputDouble("Max radial (of diameter)", &data.max_ae_over_d,
+                         0, 0, "%.15g");
+      ImGui::InputDouble("Max axial (of diameter)", &data.max_ap_over_d,
+                         0, 0, "%.15g");
+      ImGui::InputDouble("Plunge feed (mm/min)", &data.plunge_feed,
+                         0, 0, "%.15g");
       static const cam::CoolantNeed kCoolants[]{
           cam::CoolantNeed::Required, cam::CoolantNeed::Recommended,
           cam::CoolantNeed::Dry, cam::CoolantNeed::AirBlast};
@@ -2043,17 +2091,20 @@ void tool_builder(App& app) {
   }
 
   ImGui::Separator();
-  const auto problems = cam::validate(tool);
+  cam::Tool candidate = tool;
+  if (app.builder_is_new || candidate.id.empty())
+    candidate.id = app.tools.unique_id_for(candidate.name);
+  ImGui::TextDisabled("ID: %s", candidate.id.c_str());
+  const auto problems = cam::validate(candidate);
   for (const auto& problem : problems)
     ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.4f, 1.0f),
                        "%s", problem.c_str());
-  ImGui::BeginDisabled(!problems.empty());
+  ImGui::BeginDisabled(!problems.empty() || app.planner.running());
   if (ImGui::Button("Save tool")) {
-    if (app.builder_is_new || tool.id.empty())
-      tool.id = app.tools.unique_id_for(tool.name);
-    app.tools.upsert(tool);
     try {
-      cam::save_tools(app.tools_file, app.tools);
+      auto library = app.tools;
+      library.upsert(candidate);
+      commit_tools(app, std::move(library));
       say(app, "Saved " + tool.name);
       app.builder_open = false;
     } catch (const std::exception& error) {
@@ -2550,8 +2601,27 @@ void operation_settings_panel(App& app) {
   ImGui::DragScalar("Stepover (of diameter)", ImGuiDataType_Double,
                     &operation.stepover_ratio, 0.005f);
   ImGui::DragScalar("Stepdown (mm)", ImGuiDataType_Double, &operation.stepdown, 0.1f);
+  double effective_stepover = operation.stepover_ratio;
+  double effective_stepdown = operation.stepdown;
+  if (tool) {
+    if (const auto* data = tool->data_for(operation.material_id)) {
+      const double axial_limit = std::min(tool->flute_length,
+                                         data->max_ap_over_d * tool->diameter);
+      effective_stepover = std::min(effective_stepover, data->max_ae_over_d);
+      effective_stepdown = std::min(effective_stepdown, axial_limit);
+      ImGui::TextWrapped(
+          "Tool/material limits: stepover %.6g mm (%.6g of diameter), "
+          "stepdown %.6g mm.",
+          data->max_ae_over_d * tool->diameter, data->max_ae_over_d, axial_limit);
+      if (effective_stepover != operation.stepover_ratio ||
+          effective_stepdown != operation.stepdown)
+        ImGui::TextWrapped("Planning will use %.6g mm stepover and %.6g mm "
+                           "stepdown. Edit limits in Libraries > Edit.",
+                           effective_stepover * tool->diameter, effective_stepdown);
+    }
+  }
   const std::size_t base_layers =
-      cam::level_floors(operation, operation.stepdown,
+      cam::level_floors(operation, effective_stepdown,
                         cam::highest_model_z(app.geometry))
           .size();
   if (operation.mode == cam::OperationMode::Roughing) {
@@ -2590,9 +2660,9 @@ void operation_settings_panel(App& app) {
                                  operation.finishing_subdivisions) +
                   " preview layers"
             : "";
-    ImGui::TextDisabled(
+    ImGui::TextWrapped(
         "= %.3f mm wide, %zu base layers%s",
-        operation.stepover_ratio * tool->diameter, base_layers,
+        effective_stepover * tool->diameter, base_layers,
         preview_layers.c_str());
   }
   ImGui::DragScalar("Radial stock to leave", ImGuiDataType_Double,
@@ -2621,7 +2691,7 @@ void operation_settings_panel(App& app) {
         "the first pass to touch the stock aims for a full stepover less this, "
         "which leaves that much headroom for an oversize blank.");
     if (tool) {
-      const double bite = operation.stepover_ratio * tool->diameter;
+      const double bite = effective_stepover * tool->diameter;
       const double first = std::max(
           bite - std::clamp(operation.stock_deviation, 0.0, bite * 0.9), 0.0);
       ImGui::TextDisabled("= target first bite %.3f mm, then %.3f mm", first,
@@ -2741,8 +2811,7 @@ void plan_panel(App& app) {
     ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.35f, 1.0f), "Fronts never reached %zu",
                        stats.unreachable_fronts);
 
-  for (const auto& warning : app.plan.warnings)
-    ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.35f, 1.0f), "! %s", warning.c_str());
+  show_warnings("plan-warnings", app.plan.warnings);
 
   const cam::LevelPlan* level = current_level(app);
   if (level)
@@ -2754,6 +2823,7 @@ void output_panel(App& app) {
   ImGui::SeparatorText("Output");
   if (ImGui::Button("Generate G-code", ImVec2(-1, 0))) {
     app.post = cam::post_job(app.plan, app.job, app.tools, app.machines);
+    log_warnings("G-code", app.post.warnings);
     app.gcode = app.post.text;
     if (!app.post.ok()) say(app, app.post.error, true);
     else say(app, "Generated " + std::to_string(app.post.line_count) + " lines");
@@ -2763,8 +2833,7 @@ void output_panel(App& app) {
   ImGui::Text("%zu lines, %zu cutting moves, %zu rapids", app.post.line_count,
               app.post.cutting_moves, app.post.rapid_moves);
   ImGui::Text("Estimated %.1f minutes", app.post.estimated_minutes);
-  for (const auto& warning : app.post.warnings)
-    ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.35f, 1.0f), "! %s", warning.c_str());
+  show_warnings("post-warnings", app.post.warnings);
 
   ImGui::InputText("File", app.save_path.data(), app.save_path.size());
   if (ImGui::Button("Save")) {
@@ -2786,6 +2855,31 @@ void output_panel(App& app) {
 
 void library_panel(App& app) {
   ImGui::SeparatorText("Tools");
+  ImGui::TextWrapped("Library file: %s", app.tools_file.string().c_str());
+  if (ImGui::SmallButton("Copy library path"))
+    ImGui::SetClipboardText(app.tools_file.string().c_str());
+  ImGui::SameLine();
+  ImGui::BeginDisabled(app.builder_open || app.planner.running());
+  if (ImGui::SmallButton("Reload from disk")) {
+    try {
+      reload_tools(app);
+    } catch (const std::exception& error) {
+      say(app, error.what(), true);
+    }
+  }
+  ImGui::TextWrapped("Starter tools are copied only on first run. To apply edits "
+                     "to another JSON file, import it below. Matching IDs are "
+                     "replaced; other tools are kept.");
+  text_field("Import JSON", app.tools_import_file, 1024);
+  if (ImGui::Button("Import tools")) {
+    try {
+      import_tools(app);
+    } catch (const std::exception& error) {
+      say(app, error.what(), true);
+    }
+  }
+  ImGui::EndDisabled();
+  ImGui::Separator();
   for (const auto& tool : app.tools.tools) {
     ImGui::PushID(tool.id.c_str());
     ImGui::Text("%d  %s", tool.tool_number, tool.name.c_str());
@@ -3069,6 +3163,7 @@ void bootstrap(App& app) {
   const std::filesystem::path data = cam::data_directory();
   const std::filesystem::path config = cam::config_directory();
   app.tools_file = config / "tools.json";
+  app.tools_import_file = (data / "starter-tools.json").string();
 
   try {
     app.machines = cam::load_machines(data / "machines");
@@ -3080,8 +3175,9 @@ void bootstrap(App& app) {
     say(app, "No machine profiles found under " + (data / "machines").string(), true);
 
   try {
-    app.tools = cam::load_tools(app.tools_file);
-    if (app.tools.tools.empty()) {
+    if (std::filesystem::exists(app.tools_file)) {
+      app.tools = cam::load_tools(app.tools_file);
+    } else {
       // First run: start from the shipped tools rather than an empty crib, and
       // write them into the user's own file so editing them is normal.
       app.tools = cam::load_tools(data / "starter-tools.json");
@@ -3429,6 +3525,7 @@ int main(int argc, char** argv) {
     }
 
     if (app.planner.take(app.plan)) {
+      log_warnings("Planning", app.plan.warnings);
       app.has_plan = app.plan.ok();
       select_operation(app, app.selected_operation);
       app.view.needs_fit = true;
@@ -3445,8 +3542,6 @@ int main(int argc, char** argv) {
       }
       if (!app.plan.ok()) {
         std::fprintf(stderr, "Planning failed:\n%s\n", app.plan.error.c_str());
-        for (const std::string& warning : app.plan.warnings)
-          std::fprintf(stderr, "  warning: %s\n", warning.c_str());
         say(app, app.plan.error, true);
       } else if (screenshot_pending) {
         // The view was chosen on the command line; leave it alone.

@@ -55,6 +55,19 @@
       "cutting_data": [
         { "material": "aluminium-6082", "spindle_rpm": 13200.0, "max_ae_over_d": 0.3, "max_ap_over_d": 0.5, "plunge_feed": 100.0, "coolant": "air-blast" }
       ]
+    },
+    {
+      "id": "3.175mm-square",
+      "name" : "3.175 square end mill",
+      "notes" : "3.175 square end mill",
+      "diameter" : 3.175,
+      "flute_length" : 25,
+      "center_cutting" : true,
+      "tool_number" : 5,
+      "length_offset" : 5,
+      "cutting_data": [
+        { "material": "aluminium-6082", "spindle_rpm": 12000.0, "max_ae_over_d": 0.5, "max_ap_over_d": 1, "plunge_feed": 100.0, "coolant": "air-blast" }
+      ]
     }
   ]
 }
