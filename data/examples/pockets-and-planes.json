@@ -1,0 +1,113 @@
+{
+  "name": "Pockets and plane clearing example",
+  "rapid_clearance_height": 10,
+  "operations": [
+    {
+      "tool": "3mm-2f-alu",
+      "machine": "grbl-router",
+      "material": "aluminium-6082",
+      "stepover_ratio": 0.4,
+      "stepdown": 1.0,
+      "spindle_rpm": 12000,
+      "plunge_feed": 100,
+      "manual_feed_range": true,
+      "full_engagement_feed": 400,
+      "no_engagement_feed": 1000,
+      "name": "Circle pocket",
+      "mode": "pocket",
+      "pocket": {
+        "shape": "circle",
+        "center_x": -30,
+        "center_y": 0,
+        "top_z": 0,
+        "width": 20,
+        "height": 16,
+        "depth": 2.5,
+        "radius": 5,
+        "helix_angle_degrees": 3
+      }
+    },
+    {
+      "tool": "3mm-2f-alu",
+      "machine": "grbl-router",
+      "material": "aluminium-6082",
+      "stepover_ratio": 0.4,
+      "stepdown": 1.0,
+      "spindle_rpm": 12000,
+      "plunge_feed": 100,
+      "manual_feed_range": true,
+      "full_engagement_feed": 400,
+      "no_engagement_feed": 1000,
+      "name": "Rectangle pocket",
+      "mode": "pocket",
+      "pocket": {
+        "shape": "rectangle",
+        "center_x": 0,
+        "center_y": 0,
+        "top_z": 0,
+        "width": 20,
+        "height": 16,
+        "depth": 2.5,
+        "radius": 5,
+        "helix_angle_degrees": 3
+      }
+    },
+    {
+      "tool": "3mm-2f-alu",
+      "machine": "grbl-router",
+      "material": "aluminium-6082",
+      "stepover_ratio": 0.4,
+      "stepdown": 1.0,
+      "spindle_rpm": 12000,
+      "plunge_feed": 100,
+      "manual_feed_range": true,
+      "full_engagement_feed": 400,
+      "no_engagement_feed": 1000,
+      "name": "Rounded Rectangle pocket",
+      "mode": "pocket",
+      "pocket": {
+        "shape": "rounded_rectangle",
+        "center_x": 30,
+        "center_y": 0,
+        "top_z": 0,
+        "width": 20,
+        "height": 16,
+        "depth": 2.5,
+        "radius": 5,
+        "helix_angle_degrees": 3
+      }
+    },
+    {
+      "tool": "3mm-2f-alu",
+      "machine": "grbl-router",
+      "material": "aluminium-6082",
+      "stepover_ratio": 0.4,
+      "stepdown": 1.0,
+      "spindle_rpm": 12000,
+      "plunge_feed": 100,
+      "manual_feed_range": true,
+      "full_engagement_feed": 400,
+      "no_engagement_feed": 1000,
+      "name": "Two clearing areas",
+      "mode": "plane_clearing",
+      "plane": {
+        "top_z": 0,
+        "depth": 1.5,
+        "areas": [
+          {
+            "center_x": -20,
+            "center_y": 30,
+            "width": 24,
+            "height": 18
+          },
+          {
+            "center_x": 20,
+            "center_y": 30,
+            "width": 24,
+            "height": 18
+          }
+        ]
+      }
+    }
+  ]
+}

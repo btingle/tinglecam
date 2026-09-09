@@ -1,7 +1,8 @@
 # TingleCAM
 
 TingleCAM is an experimental 2.5D CAM application built on Clipper2. It supports
-wavefront roughing and offset-contour finishing, simulates material removal,
+wavefront roughing, offset-contour finishing, parametric pockets and plane clearing,
+simulates material removal,
 assigns feeds from measured engagement, previews the result, and emits linear
 G-code.
 
@@ -382,7 +383,7 @@ feed = full_engagement + (no_engagement - full_engagement) * (1 - e)
 Thus full engagement uses the slower endpoint and zero engagement uses the
 faster endpoint. An operation can replace the library range with manually
 entered endpoints. Retracts use the machine rapid feed, while vertical entries
-use the tool's material-specific plunge feed.
+use the operation's plunge/ramp feed.
 
 ## Configuration
 
@@ -392,8 +393,8 @@ are stored under the platform configuration directory and are initialized from
 
 The **Libraries** tab shows the exact active `tools.json` path (on Linux,
 `~/.config/tinglecam/tools.json`, or `$XDG_CONFIG_HOME/tinglecam/tools.json`).
-Use **New tool**, enter dimensions and cutting data directly in the numeric
-fields, then **Save tool**. The identifier is generated automatically; **Edit**
+Use **New tool**, enter diameter, flute length, flute count and type, then
+**Save tool**. The identifier is generated automatically; **Edit**
 keeps it and **Copy** creates a new one. Changes invalidate the existing plan.
 
 For JSON edits, edit the active file and click **Reload from disk**, or restart
@@ -404,11 +405,15 @@ JSON. Imports add new IDs and replace matching IDs while keeping other tools.
 Invalid imports leave the current library intact. Close the tool builder and
 wait for planning to finish before reloading or importing.
 
-Planning caps stepover at the tool/material entry's `max_ae_over_d` times
-diameter, and stepdown at the smaller of flute length and `max_ap_over_d` times
-diameter. Operation settings show these limits and the effective values before
-planning. Reduction warnings include requested/applied values and the tool and
-material responsible, once per operation rather than once per subdivision.
+Tools contain geometry only. Stepover, stepdown, spindle RPM, plunge/ramp feed,
+and coolant belong to each operation. Tool/material engagement caps have been
+removed. Machine RPM limits still apply. Pocket and plane operations reject a
+requested total depth beyond flute length instead of silently changing it.
+Old tool JSON files still load: retired fields (including `cutting_data`) are
+ignored and disappear on the next save. Missing flute counts default to two;
+missing type defaults to flat (the old ball starter is recognized by its ID).
+Tool numbers and length offsets can be set per operation; zero uses the tool's
+1-based library position and matching H number.
 Warnings wrap in the GUI, can be copied with **Copy warnings**, and are also
 printed to the launching terminal when planning or G-code generation completes.
 
@@ -452,8 +457,7 @@ A material contains only the identity used by the library and UI:
 }
 ```
 
-A tool contains its used geometry, post identifiers, and per-material cutting
-data:
+A tool has a name/ID and four physical attributes:
 
 ```json
 {
@@ -461,25 +465,62 @@ data:
   "name": "6 mm aluminium end mill",
   "diameter": 6.0,
   "flute_length": 16.0,
-  "center_cutting": true,
-  "tool_number": 1,
-  "length_offset": 1,
-  "cutting_data": [
-    {
-      "material": "hdpe",
-      "spindle_rpm": 15000.0,
-      "max_ae_over_d": 0.5,
-      "max_ap_over_d": 2.0,
-      "plunge_feed": 250.0,
-      "coolant": "air-blast"
-    }
-  ]
+  "flutes": 3,
+  "type": "flat"
 }
+```
+
+Supported type values are `flat`, `ball`, `drill`, and `v-bit`. The new flat-floor
+pocket and plane planners require `flat`; the other types remain available in
+the library. Flute count is stored as physical metadata and does not impose a
+feed formula.
+
+## Pockets and plane clearing
+
+Use **Add pocket** or **Add plane clearing** in the operation list, or change an
+existing operation's **Mode**. Remove the initial roughing operation if the job
+contains only dimension-driven operations: these need no part or stock mesh.
+Both accept operation stepover (fraction of diameter), stepdown in mm, and the
+same spindle/feed controls as the mesh operations. All coordinates are in the
+job frame, with the job origin offset applied once when posting.
+
+A pocket can be circular, rectangular (equal width/height makes a square), or a
+rounded rectangle. Enter center X/Y, top Z, depth, and width/height or radius.
+For circles, radius defines the opening; for rounded rectangles it defines the
+corner radius. Z is the top surface, and the floor is `top_z - depth`.
+Each stepdown starts with a gradual helix, followed by a full turn at the floor
+and outward clearing rings. Helix angle defaults to 3 degrees and ramp speed
+comes from the operation. The post emits simultaneous XYZ linear segments for
+the helix, and playback follows that same 3D timeline. Pockets too small for a
+helix, or rounded corners smaller than the cutter radius, are rejected. Square
+internal corners retain the cutter radius.
+
+Plane clearing takes an editable list of rectangles (center X/Y, width, height)
+and shared top Z and depth. Add/remove as many areas as needed. At each stepdown
+it clears each rectangle using alternating straight rows and an edge cleanup,
+then retracts to the job clearance plane before crossing to another area. Entry
+uses the operation's plunge feed. The cutter stays inside each rectangle, so
+corners retain its radius; areas must accommodate the cutter. Overlapping areas
+share simulated stock. These explicit regions define what to cut, independently
+of a loaded part's protected surfaces; any loaded models still contribute to
+the global rapid clearance height.
+
+Simulation remains a 2D slab approximation: the floor stock during a helical
+entry is conservatively left intact until the full turn at the floor. The
+motion preview, posted Z coordinates, and time estimate use the actual helix.
+
+**Job / Origin → Save job / Load job** preserves the complete ordered operation
+list and all area dimensions. The same file can be used with `--job`:
+
+```sh
+./build/tinglecam --job data/examples/pockets-and-planes.json
+./build/tinglecam --job data/examples/pockets-and-planes.json --gcode /tmp/pockets.nc
 ```
 
 ## Command line
 
 ```text
+--job PATH
 --part PATH
 --stock PATH
 --tool ID
@@ -489,7 +530,7 @@ data:
 --stepdown MM
 --finishing-subdivisions N
 --path-pitch MM
---mode rough|finish
+--mode rough|finish|pocket|plane
 --box-stock MM
 --models stock|part|both
 --contour-direction either|climb|conventional

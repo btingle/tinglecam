@@ -225,12 +225,17 @@ PostResult post_job(const JobPlan& plan,
     const Tool* tool = tools.find(operation.tool_id);
     if (!tool || !source) continue;
 
+    const int tool_number = source->tool_number > 0 ? source->tool_number :
+        static_cast<int>(tool - tools.tools.data()) + 1;
+    const int length_offset = source->length_offset > 0 ? source->length_offset : tool_number;
+    const std::string tool_assignment = tool->id + ":" + std::to_string(tool_number) +
+                                        ":" + std::to_string(length_offset);
     writer.blank();
     writer.comment("Operation: " + operation.operation_name);
-    writer.comment("Tool " + std::to_string(tool->tool_number) + " - " + tool->name);
+    writer.comment("Tool " + std::to_string(tool_number) + " - " + tool->name);
     writer.comment("Cutter " + writer.coordinate(tool->diameter) + " mm");
 
-    if (active_tool != tool->id) {
+    if (active_tool != tool_assignment) {
       writer.line("G0 Z" + writer.coordinate(rapid_plane));
       if (spindle_running) {
         writer.line("M5");
@@ -238,22 +243,22 @@ PostResult post_job(const JobPlan& plan,
       }
       switch (machine->tool_change) {
         case ToolChange::Automatic:
-          writer.line("T" + std::to_string(tool->tool_number) + " M6");
+          writer.line("T" + std::to_string(tool_number) + " M6");
           break;
         case ToolChange::SemiAutomatic:
-          writer.line("T" + std::to_string(tool->tool_number));
+          writer.line("T" + std::to_string(tool_number));
           writer.line("M6");
           break;
         case ToolChange::Manual:
-          writer.comment("Fit tool " + std::to_string(tool->tool_number) + ": " +
+          writer.comment("Fit tool " + std::to_string(tool_number) + ": " +
                          tool->name);
           writer.line("M0");
           break;
       }
       if (machine->length_offset_mode == LengthOffsetMode::G43WithH)
-        writer.line("G43 H" + std::to_string(tool->length_offset));
+        writer.line("G43 H" + std::to_string(length_offset));
       writer.reset_modal();
-      active_tool = tool->id;
+      active_tool = tool_assignment;
     }
 
     writer.line(spindle_word(*machine, operation.spindle_rpm));
@@ -264,19 +269,15 @@ PostResult post_job(const JobPlan& plan,
       writer.line(buffer);
     }
 
-    const std::string& material_id = operation.material_id.empty()
-                                         ? source->material_id
-                                         : operation.material_id;
-    const CuttingData* data = tool->data_for(material_id);
-    const bool wants_coolant =
-        data && (data->coolant == CoolantNeed::Required ||
-                 data->coolant == CoolantNeed::Recommended);
-    if (wants_coolant && !coolant_running) {
+    if (!source->coolant && coolant_running) {
+      writer.line("M9");
+      coolant_running = false;
+    }
+    if (source->coolant && !coolant_running) {
       if (machine->coolant_flood) { writer.line("M8"); coolant_running = true; }
       else if (machine->coolant_mist) { writer.line("M7"); coolant_running = true; }
-      else if (data->coolant == CoolantNeed::Required)
-        result.warnings.push_back(operation.operation_name +
-                                  ": the tool asks for coolant this machine has not got");
+      else result.warnings.push_back(operation.operation_name +
+          ": coolant requested but unavailable on this machine");
     }
 
     // Carried across the passes rather than reset at each one, because a pass
@@ -287,9 +288,10 @@ PostResult post_job(const JobPlan& plan,
     bool at_depth = false;
     bool rapid_descent = false;
     double depth_z = 0.0;
-    const double plunge_rate = std::max(data ? data->plunge_feed : 100.0, 1.0);
+    const double plunge_rate = std::max(source->plunge_feed, 1.0);
     for (const LevelPlan& level : operation.levels) {
-      if (level.nothing_to_cut || level.feeds.segments.empty()) continue;
+      if (level.nothing_to_cut ||
+          (level.feeds.segments.empty() && level.feeds.motion.empty())) continue;
       const double cut_z = level.floor_z + job.origin_z;
       writer.blank();
       // The posted depth, not the model's. Every other number in this file is
@@ -297,6 +299,20 @@ PostResult post_job(const JobPlan& plan,
       // nothing the operator can read off the machine.
       writer.comment("Depth " + writer.coordinate(cut_z) + " mm, cutting " +
                      writer.coordinate(level.axial_depth) + " mm");
+
+      if (level.explicit_motion) {
+        // XYZ phases are authoritative for helices: flattening these back to
+        // FeedSegment would turn the entry into a vertical plunge.
+        for (const MotionPhase& phase : level.feeds.motion) {
+          const double x = wave::to_world(phase.to.x) + job.origin_x;
+          const double y = wave::to_world(phase.to.y) + job.origin_y;
+          const double z = phase.to_z + job.origin_z;
+          if (phase.rapid) writer.rapid(x, y, z);
+          else writer.feed(x, y, z, phase.rate);
+        }
+        at_depth = false;
+        continue;
+      }
 
       // The opening retract of a pass reached at depth is the one thing that
       // must not be written out: it exists to prove the descent after it lands

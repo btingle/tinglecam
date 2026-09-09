@@ -48,13 +48,6 @@ cam::Tool test_tool() {
   tool.name = "6 mm test tool";
   tool.diameter = 6.0;
   tool.flute_length = 16.0;
-  cam::CuttingData data;
-  data.material_id = "plastic";
-  data.spindle_rpm = 12000.0;
-  data.max_ae_over_d = 1.0;
-  data.max_ap_over_d = 2.0;
-  data.plunge_feed = 120.0;
-  tool.cutting_data.push_back(data);
   return tool;
 }
 
@@ -406,8 +399,6 @@ void check_engagement_limits(const std::filesystem::path& part_mesh) {
   cam::Tool tool = test_tool();
   tool.diameter = 3.175;
   tool.flute_length = 25;
-  tool.cutting_data.front().max_ae_over_d = 0.3;
-  tool.cutting_data.front().max_ap_over_d = 0.5;
   const cam::Machine machine = test_machine();
   cam::JobGeometry geometry;
   geometry.load_part(part_mesh);
@@ -430,33 +421,17 @@ void check_engagement_limits(const std::filesystem::path& part_mesh) {
   materials.materials.push_back({"plastic", "Plastic"});
   const auto plan = cam::plan_job(geometry, job, tools, machines, materials, {});
   require(plan.ok(), "limited engagement plans: " + plan.error);
-  int radial = 0;
-  int axial = 0;
-  for (const auto& warning : plan.warnings) {
-    if (warning.find("Stepover reduced") != std::string::npos) {
-      ++radial;
-      require(warning.find("1.270000") != std::string::npos &&
-                  warning.find("0.952500") != std::string::npos &&
-                  warning.find(tool.id) != std::string::npos &&
-                  warning.find("Plastic") != std::string::npos &&
-                  warning.find("max_ae_over_d") != std::string::npos,
-              "radial warning identifies requested/applied values and the profile");
-    }
-    if (warning.find("Stepdown reduced") != std::string::npos) {
-      ++axial;
-      require(warning.find("2.000000") != std::string::npos &&
-                  warning.find("1.587500") != std::string::npos &&
-                  warning.find("max_ap_over_d") != std::string::npos &&
-                  warning.find("25.000000") != std::string::npos,
-              "axial warning explains the material limit and flute length");
-    }
-  }
-  require(radial == 1 && axial == 1,
-          "engagement reductions are reported once across four subdivisions");
-  if (!plan.operations.empty())
+  for (const auto& warning : plan.warnings)
+    require(warning.find("Stepover reduced") == std::string::npos &&
+                warning.find("Stepdown reduced") == std::string::npos,
+            "tools no longer impose material strategy limits");
+  if (!plan.operations.empty()) {
+    require_near(plan.operations.front().levels.front().axial_depth, 2.0, 1e-9,
+                 "requested stepdown is used without a tool-material cap");
     for (const auto& level : plan.operations.front().levels)
-      require(level.axial_depth <= 1.5875 + 1e-9,
-              "the material axial limit still applies to every planned layer");
+      require(level.axial_depth <= 2.0 + 1e-9,
+              "requested stepdown bounds each planned layer");
+  }
 }
 
 // A real roughing-to-roughing-to-finishing plan exercises both operation
@@ -468,8 +443,8 @@ void check_multi_operation_plan(const std::filesystem::path& data,
   const auto machines = cam::load_machines(data / "machines");
   const auto tools = cam::load_tools(data / "starter-tools.json");
   const cam::Tool* tool = tools.tools.empty() ? nullptr : &tools.tools.front();
-  if (!tool || tool->cutting_data.empty()) return;
-  const std::string material_id = tool->cutting_data.front().material_id;
+  if (!tool) return;
+  const std::string material_id = "aluminium-6082";
   const cam::Machine* machine = nullptr;
   for (const auto& candidate : machines.machines)
     if (candidate.feeds_for(material_id)) machine = &candidate;
@@ -1066,10 +1041,8 @@ void check_serialisation() {
   const cam::Tool tool_back =
       cam::tool_from_json_text(cam::to_json_text(tool));
   require(tool_back.id == tool.id, "tool identity survives a round trip");
-  require(tool_back.cutting_data.size() == 1, "tool cutting data survives");
-  if (!tool_back.cutting_data.empty())
-    require_near(tool_back.cutting_data.front().spindle_rpm, 12000.0, 1e-9,
-                 "tool spindle speed survives");
+  require(tool_back.flutes == tool.flutes && tool_back.type == tool.type,
+          "flute count and tool type survive a round trip");
 
   const cam::Machine machine = test_machine();
   const cam::Machine machine_back =
@@ -1399,8 +1372,8 @@ void check_validation() {
   bad.diameter = 0.0;
   require(!cam::validate(bad).empty(), "zero tool diameter is rejected");
   bad = test_tool();
-  bad.cutting_data.push_back(bad.cutting_data.front());
-  require(!cam::validate(bad).empty(), "duplicate tool material data is rejected");
+  bad.flutes = 0;
+  require(!cam::validate(bad).empty(), "zero flute count is rejected");
   require(cam::validate(test_machine()).empty(), "the test machine validates");
 }
 
@@ -1445,9 +1418,6 @@ void check_shipped_data(const std::filesystem::path& data) {
   for (const auto& tool : tools.tools) {
     for (const auto& problem : cam::validate(tool))
       require(false, tool.id + ": " + problem);
-    for (const auto& entry : tool.cutting_data)
-      require(materials.find(entry.material_id) != nullptr,
-              tool.id + " names an unknown material");
   }
   const cam::Machine* makera = machines.find("makera-z1");
   require(makera != nullptr, "the Makera profile is present");
@@ -1467,7 +1437,6 @@ void check_post_output() {
   std::cout << "post output\n";
   cam::ToolLibrary tools;
   cam::Tool tool = test_tool();
-  tool.tool_number = 3;
   tools.upsert(tool);
   cam::MachineLibrary machines;
   cam::Machine machine = test_machine();
@@ -1475,6 +1444,8 @@ void check_post_output() {
   cam::Job job;
   cam::Operation operation;
   operation.name = "Rough";
+  operation.tool_number = 3;
+  operation.plunge_feed = 120.0;
   operation.tool_id = tool.id;
   operation.machine_id = machine.id;
   operation.material_id = "plastic";

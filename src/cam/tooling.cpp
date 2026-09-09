@@ -23,26 +23,16 @@ std::optional<Enum> value_of(const std::string& text,
   return std::nullopt;
 }
 
-constexpr std::pair<CoolantNeed, const char*> kCoolants[]{
-    {CoolantNeed::Required, "required"},
-    {CoolantNeed::Recommended, "recommended"},
-    {CoolantNeed::Dry, "dry"},
-    {CoolantNeed::AirBlast, "air-blast"},
+constexpr std::pair<ToolType, const char*> kTypes[]{
+    {ToolType::FlatEndMill, "flat"}, {ToolType::BallEndMill, "ball"},
+    {ToolType::Drill, "drill"}, {ToolType::VBit, "v-bit"},
 };
 
 }  // namespace
 
-const char* coolant_need_name(CoolantNeed value) {
-  return name_of(value, kCoolants);
-}
-std::optional<CoolantNeed> coolant_need_from_name(const std::string& text) {
-  return value_of(text, kCoolants);
-}
-
-const CuttingData* Tool::data_for(const std::string& material_id) const {
-  for (const auto& data : cutting_data)
-    if (data.material_id == material_id) return &data;
-  return nullptr;
+const char* tool_type_name(ToolType value) { return name_of(value, kTypes); }
+std::optional<ToolType> tool_type_from_name(const std::string& text) {
+  return value_of(text, kTypes);
 }
 
 std::vector<std::string> validate(const Tool& tool) {
@@ -56,22 +46,9 @@ std::vector<std::string> validate(const Tool& tool) {
           "Diameter must be finite and greater than zero");
   require(std::isfinite(tool.flute_length) && tool.flute_length > 0.0,
           "Flute length must be finite and greater than zero");
-  std::vector<std::string> seen;
-  for (const auto& data : tool.cutting_data) {
-    const std::string where = " for " + data.material_id;
-    require(!data.material_id.empty(), "Cutting data is missing its material");
-    require(std::isfinite(data.spindle_rpm) && data.spindle_rpm > 0.0,
-            "Spindle speed must be finite and positive" + where);
-    require(data.max_ae_over_d > 0.0 && data.max_ae_over_d <= 1.0,
-            "Radial engagement ceiling must be within (0, 1]" + where);
-    require(std::isfinite(data.max_ap_over_d) && data.max_ap_over_d > 0.0,
-            "Axial engagement ceiling must be finite and positive" + where);
-    require(std::isfinite(data.plunge_feed) && data.plunge_feed > 0.0,
-            "Plunge feed must be finite and positive" + where);
-    if (std::find(seen.begin(), seen.end(), data.material_id) != seen.end())
-      problems.push_back("Two cutting-data entries for " + data.material_id);
-    seen.push_back(data.material_id);
-  }
+  require(tool.flutes > 0, "Number of flutes must be positive");
+  require(tool_type_from_name(tool_type_name(tool.type)).has_value(),
+          "Unknown tool type");
   return problems;
 }
 

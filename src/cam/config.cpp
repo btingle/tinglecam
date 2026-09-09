@@ -16,6 +16,8 @@ using nlohmann::json;
 std::optional<OperationMode> operation_mode_from_name(const std::string& name) {
   if (name == "roughing") return OperationMode::Roughing;
   if (name == "contour_finishing") return OperationMode::ContourFinishing;
+  if (name == "pocket") return OperationMode::Pocket;
+  if (name == "plane_clearing") return OperationMode::PlaneClearing;
   return std::nullopt;
 }
 
@@ -41,53 +43,28 @@ void read_enum(const json& node, const char* key, Enum& target,
   if (parsed) target = *parsed;
 }
 
-json to_json(const CuttingData& data) {
-  return json{{"material", data.material_id},
-              {"spindle_rpm", data.spindle_rpm},
-              {"max_ae_over_d", data.max_ae_over_d},
-              {"max_ap_over_d", data.max_ap_over_d},
-              {"plunge_feed", data.plunge_feed},
-              {"coolant", coolant_need_name(data.coolant)}};
-}
-
-CuttingData cutting_data_from(const json& node) {
-  CuttingData data;
-  read(node, "material", data.material_id);
-  read(node, "spindle_rpm", data.spindle_rpm);
-  read(node, "max_ae_over_d", data.max_ae_over_d);
-  read(node, "max_ap_over_d", data.max_ap_over_d);
-  read(node, "plunge_feed", data.plunge_feed);
-  read_enum(node, "coolant", data.coolant, coolant_need_from_name);
-  return data;
-}
-
 json to_json(const Tool& tool) {
-  json cutting = json::array();
-  for (const auto& entry : tool.cutting_data) cutting.push_back(to_json(entry));
-  return json{{"id", tool.id},
-              {"name", tool.name},
-              {"notes", tool.notes},
-              {"diameter", tool.diameter},
-              {"flute_length", tool.flute_length},
-              {"center_cutting", tool.center_cutting},
-              {"tool_number", tool.tool_number},
-              {"length_offset", tool.length_offset},
-              {"cutting_data", cutting}};
+  return json{{"id", tool.id}, {"name", tool.name},
+              {"diameter", tool.diameter}, {"flute_length", tool.flute_length},
+              {"flutes", tool.flutes}, {"type", tool_type_name(tool.type)}};
 }
 
 Tool tool_from(const json& node) {
   Tool tool;
   read(node, "id", tool.id);
   read(node, "name", tool.name);
-  read(node, "notes", tool.notes);
   read(node, "diameter", tool.diameter);
   read(node, "flute_length", tool.flute_length);
-  read(node, "center_cutting", tool.center_cutting);
-  read(node, "tool_number", tool.tool_number);
-  read(node, "length_offset", tool.length_offset);
-  if (node.contains("cutting_data") && node.at("cutting_data").is_array())
-    for (const auto& entry : node.at("cutting_data"))
-      tool.cutting_data.push_back(cutting_data_from(entry));
+  read(node, "flutes", tool.flutes);
+  if (node.contains("type")) {
+    const auto type = tool_type_from_name(node.at("type").get<std::string>());
+    if (!type) throw std::runtime_error("Unknown tool type");
+    tool.type = *type;
+  } else if (tool.id.find("ball") != std::string::npos) {
+    // The previous stripped schema omitted type even for its ball starter.
+    tool.type = ToolType::BallEndMill;
+  }
+  // Legacy cutting_data and other retired fields are deliberately ignored.
   return tool;
 }
 
@@ -180,6 +157,11 @@ Material material_from(const json& node) {
 }
 
 json to_json(const Operation& operation) {
+  const auto& p = operation.pocket;
+  json areas = json::array();
+  for (const auto& area : operation.plane.areas)
+    areas.push_back({{"center_x", area.center_x}, {"center_y", area.center_y},
+                     {"width", area.width}, {"height", area.height}});
   return json{{"name", operation.name},
               {"mode", operation_mode_name(operation.mode)},
               {"tool", operation.tool_id},
@@ -187,6 +169,19 @@ json to_json(const Operation& operation) {
               {"material", operation.material_id},
               {"stepover_ratio", operation.stepover_ratio},
               {"stepdown", operation.stepdown},
+              {"spindle_rpm", operation.spindle_rpm},
+              {"plunge_feed", operation.plunge_feed},
+              {"coolant", operation.coolant},
+              {"tool_number", operation.tool_number},
+              {"length_offset", operation.length_offset},
+              {"pocket", {{"shape", pocket_shape_name(p.shape)},
+                          {"center_x", p.center_x}, {"center_y", p.center_y},
+                          {"top_z", p.top_z}, {"width", p.width},
+                          {"height", p.height}, {"depth", p.depth},
+                          {"radius", p.radius},
+                          {"helix_angle_degrees", p.helix_angle_degrees}}},
+              {"plane", {{"top_z", operation.plane.top_z},
+                         {"depth", operation.plane.depth}, {"areas", areas}}},
               {"finishing_subdivisions", operation.finishing_subdivisions},
               {"radial_stock_to_leave", operation.radial_stock_to_leave},
               {"axial_stock_to_leave", operation.axial_stock_to_leave},
@@ -220,6 +215,45 @@ Operation operation_from(const json& node) {
   read(node, "material", operation.material_id);
   read(node, "stepover_ratio", operation.stepover_ratio);
   read(node, "stepdown", operation.stepdown);
+  read(node, "spindle_rpm", operation.spindle_rpm);
+  read(node, "plunge_feed", operation.plunge_feed);
+  read(node, "coolant", operation.coolant);
+  read(node, "tool_number", operation.tool_number);
+  read(node, "length_offset", operation.length_offset);
+  if (node.contains("pocket")) {
+    const auto& pocket = node.at("pocket");
+    auto& p = operation.pocket;
+    if (pocket.contains("shape")) {
+      const auto shape = pocket_shape_from_name(pocket.at("shape").get<std::string>());
+      if (!shape) throw std::runtime_error("Unknown pocket shape");
+      p.shape = *shape;
+    }
+    read(pocket, "center_x", p.center_x);
+    read(pocket, "center_y", p.center_y);
+    read(pocket, "top_z", p.top_z);
+    read(pocket, "width", p.width);
+    read(pocket, "height", p.height);
+    read(pocket, "depth", p.depth);
+    read(pocket, "radius", p.radius);
+    read(pocket, "helix_angle_degrees", p.helix_angle_degrees);
+  }
+  if (node.contains("plane")) {
+    const auto& plane = node.at("plane");
+    read(plane, "top_z", operation.plane.top_z);
+    read(plane, "depth", operation.plane.depth);
+    if (plane.contains("areas")) {
+      if (!plane.at("areas").is_array()) throw std::runtime_error("Expected plane areas array");
+      operation.plane.areas.clear();
+      for (const auto& entry : plane.at("areas")) {
+        ClearingArea area;
+        read(entry, "center_x", area.center_x);
+        read(entry, "center_y", area.center_y);
+        read(entry, "width", area.width);
+        read(entry, "height", area.height);
+        operation.plane.areas.push_back(area);
+      }
+    }
+  }
   read(node, "finishing_subdivisions", operation.finishing_subdivisions);
   read(node, "radial_stock_to_leave", operation.radial_stock_to_leave);
   read(node, "axial_stock_to_leave", operation.axial_stock_to_leave);

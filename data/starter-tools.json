@@ -3,71 +3,42 @@
     {
       "id": "6mm-3f-alu",
       "name": "6 mm aluminium end mill",
-      "notes": "General-purpose cutter for aluminium, brass, plastic and wood.",
       "diameter": 6.0,
       "flute_length": 16.0,
-      "center_cutting": true,
-      "tool_number": 1,
-      "length_offset": 1,
-      "cutting_data": [
-        { "material": "aluminium-6082", "spindle_rpm": 13200.0, "max_ae_over_d": 0.5, "max_ap_over_d": 2.0, "plunge_feed": 180.0, "coolant": "air-blast" },
-        { "material": "brass-cz121", "spindle_rpm": 10600.0, "max_ae_over_d": 0.5, "max_ap_over_d": 1.5, "plunge_feed": 160.0, "coolant": "dry" },
-        { "material": "hdpe", "spindle_rpm": 15000.0, "max_ae_over_d": 0.5, "max_ap_over_d": 2.0, "plunge_feed": 250.0, "coolant": "air-blast" },
-        { "material": "mdf", "spindle_rpm": 15000.0, "max_ae_over_d": 0.6, "max_ap_over_d": 2.0, "plunge_feed": 250.0, "coolant": "dry" }
-      ]
+      "flutes": 3,
+      "type": "flat"
     },
     {
       "id": "6mm-4f-steel",
       "name": "6 mm steel end mill",
-      "notes": "General-purpose cutter for ferrous materials.",
       "diameter": 6.0,
       "flute_length": 15.0,
-      "center_cutting": true,
-      "tool_number": 2,
-      "length_offset": 2,
-      "cutting_data": [
-        { "material": "steel-1018", "spindle_rpm": 4800.0, "max_ae_over_d": 0.4, "max_ap_over_d": 1.0, "plunge_feed": 80.0, "coolant": "recommended" },
-        { "material": "stainless-304", "spindle_rpm": 3200.0, "max_ae_over_d": 0.3, "max_ap_over_d": 1.0, "plunge_feed": 60.0, "coolant": "required" }
-      ]
+      "flutes": 4,
+      "type": "flat"
     },
     {
       "id": "3mm-2f-alu",
       "name": "3 mm aluminium end mill",
-      "notes": "Detail cutter for aluminium.",
       "diameter": 3.0,
       "flute_length": 10.0,
-      "center_cutting": true,
-      "tool_number": 3,
-      "length_offset": 3,
-      "cutting_data": [
-        { "material": "aluminium-6082", "spindle_rpm": 21200.0, "max_ae_over_d": 0.5, "max_ap_over_d": 1.5, "plunge_feed": 100.0, "coolant": "air-blast" }
-      ]
+      "flutes": 2,
+      "type": "flat"
     },
     {
       "id": "6mm-ball-alu",
       "name": "6 mm ball end mill",
-      "notes": "Finishing cutter for aluminium.",
       "diameter": 6.0,
       "flute_length": 16.0,
-      "center_cutting": true,
-      "tool_number": 4,
-      "length_offset": 4,
-      "cutting_data": [
-        { "material": "aluminium-6082", "spindle_rpm": 13200.0, "max_ae_over_d": 0.3, "max_ap_over_d": 0.5, "plunge_feed": 100.0, "coolant": "air-blast" }
-      ]
+      "flutes": 2,
+      "type": "ball"
     },
     {
       "id": "3.175mm-square",
-      "name" : "3.175 square end mill",
-      "notes" : "3.175 square end mill",
-      "diameter" : 3.175,
-      "flute_length" : 25,
-      "center_cutting" : true,
-      "tool_number" : 5,
-      "length_offset" : 5,
-      "cutting_data": [
-        { "material": "aluminium-6082", "spindle_rpm": 12000.0, "max_ae_over_d": 0.5, "max_ap_over_d": 1, "plunge_feed": 100.0, "coolant": "air-blast" }
-      ]
+      "name": "3.175 square end mill",
+      "diameter": 3.175,
+      "flute_length": 25,
+      "flutes": 2,
+      "type": "flat"
     }
   ]
 }

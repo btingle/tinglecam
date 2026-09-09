@@ -262,7 +262,6 @@ struct App {
   bool builder_open = false;
   bool builder_is_new = false;
   cam::Tool builder_tool;
-  int builder_material = 0;
 
   std::string gcode;
   cam::PostResult post;
@@ -270,6 +269,7 @@ struct App {
 
   std::filesystem::path tools_file;
   std::string tools_import_file;
+  std::string job_file = "tinglecam-job.json";
 };
 
 void say(App& app, std::string text, bool error = false) {
@@ -1819,8 +1819,7 @@ void draw_result(App& app) {
       if (source.subdivision_level > active.subdivision_level) {
         remaining = &source.simulation.initial_stock;
       } else if (source.subdivision_level == active.subdivision_level) {
-        remaining = !app.material.empty() ? &app.material
-                                          : &source.simulation.initial_stock;
+        remaining = &app.material;
       }
     }
     return remaining->empty() ? nullptr : remaining;
@@ -1883,9 +1882,8 @@ void draw_result(App& app) {
     const float wall_colour[3] = {0.44f, 0.50f, 0.58f};
     const ImU32 edge = active ? IM_COL32(170, 215, 250, 200)
                               : IM_COL32(196, 214, 236, 90);
-    const double slab_top =
-        i == 0 ? material_highest
-               : levels[display_levels[i - 1]].floor_z;
+    const double slab_top = level.explicit_motion ? level.floor_z + level.axial_depth :
+        (i == 0 ? material_highest : levels[display_levels[i - 1]].floor_z);
     if (slab_top > level.floor_z)
       append_slab(facets, pool, walls, lid_mesh, lid_rings, level.floor_z,
                   slab_top, projection, light, wall_colour, face_colour, edge);
@@ -1916,6 +1914,29 @@ void draw_result(App& app) {
                                 static_cast<int>(app.job.operations.size()) - 1)]
                             .slice_grid);
     paint_facets(list, model_facets, model_pool);
+  }
+  if (active.explicit_motion) {
+    const auto project = [&](const Point64& xy, double z) {
+      return projection.point({static_cast<float>(wave::to_world(xy.x)),
+                               static_cast<float>(wave::to_world(xy.y)),
+                               static_cast<float>(z)});
+    };
+    // Dimension-driven jobs may have no mesh. Keep their requested boundaries
+    // visible even after the last material has been removed from an area.
+    for (const auto& level : levels) {
+      if (level.floor_z != active.floor_z) continue;
+      for (const auto& ring : level.stock_slice)
+        for (std::size_t i = 0; i < ring.size(); ++i)
+          list->AddLine(project(ring[i], level.floor_z),
+                        project(ring[(i+1)%ring.size()], level.floor_z),
+                        IM_COL32(200, 175, 90, 180), 1.2f);
+    }
+    if (app.show_toolpath)
+      for (const auto& phase : active.feeds.motion) {
+        if (phase.rapid && !app.show_rapids) continue;
+        list->AddLine(project(phase.from, phase.from_z), project(phase.to, phase.to_z),
+                      move_colour(phase.kind), phase.kind == wave::MoveKind::Entry ? 1.8f : 1.0f);
+      }
   }
   // This view builds its own projection and canvas rather than going through
   // begin_scene, so the gizmo and the corner control are handed one made up on
@@ -2033,62 +2054,10 @@ void tool_builder(App& app) {
   text_field("Name", tool.name);
   ImGui::InputDouble("Diameter (mm)", &tool.diameter, 0, 0, "%.15g");
   ImGui::InputDouble("Flute length (mm)", &tool.flute_length, 0, 0, "%.15g");
-  ImGui::Checkbox("Centre cutting", &tool.center_cutting);
-  ImGui::InputInt("Tool number", &tool.tool_number);
-  ImGui::InputInt("Length offset", &tool.length_offset);
-  text_field("Notes", tool.notes, 512);
-
-  ImGui::SeparatorText("Material cutting data");
-  int remove = -1;
-  for (std::size_t i = 0; i < tool.cutting_data.size(); ++i) {
-    cam::CuttingData& data = tool.cutting_data[i];
-    ImGui::PushID(static_cast<int>(i));
-    const cam::Material* material = app.materials.find(data.material_id);
-    const std::string title =
-        material ? material->name : data.material_id + " (unknown)";
-    if (ImGui::CollapsingHeader(title.c_str(),
-                                ImGuiTreeNodeFlags_DefaultOpen)) {
-      ImGui::InputDouble("Spindle (rpm)", &data.spindle_rpm, 0, 0, "%.15g");
-      ImGui::InputDouble("Max radial (of diameter)", &data.max_ae_over_d,
-                         0, 0, "%.15g");
-      ImGui::InputDouble("Max axial (of diameter)", &data.max_ap_over_d,
-                         0, 0, "%.15g");
-      ImGui::InputDouble("Plunge feed (mm/min)", &data.plunge_feed,
-                         0, 0, "%.15g");
-      static const cam::CoolantNeed kCoolants[]{
-          cam::CoolantNeed::Required, cam::CoolantNeed::Recommended,
-          cam::CoolantNeed::Dry, cam::CoolantNeed::AirBlast};
-      enum_combo("Coolant", data.coolant, cam::coolant_need_name,
-                 kCoolants, std::size(kCoolants));
-      if (ImGui::Button("Remove this material"))
-        remove = static_cast<int>(i);
-    }
-    ImGui::PopID();
-  }
-  if (remove >= 0)
-    tool.cutting_data.erase(tool.cutting_data.begin() + remove);
-
-  std::vector<const char*> names;
-  for (const auto& material : app.materials.materials)
-    names.push_back(material.name.c_str());
-  if (!names.empty()) {
-    app.builder_material =
-        std::clamp(app.builder_material, 0, static_cast<int>(names.size()) - 1);
-    ImGui::SetNextItemWidth(240.0f);
-    ImGui::Combo("##add-material", &app.builder_material, names.data(),
-                 static_cast<int>(names.size()));
-    ImGui::SameLine();
-    if (ImGui::Button("Add material")) {
-      const auto& material = app.materials.materials[app.builder_material];
-      if (tool.data_for(material.id)) {
-        say(app, material.name + " is already on this tool", true);
-      } else {
-        cam::CuttingData data;
-        data.material_id = material.id;
-        tool.cutting_data.push_back(data);
-      }
-    }
-  }
+  ImGui::InputInt("Number of flutes", &tool.flutes);
+  static constexpr cam::ToolType types[]{cam::ToolType::FlatEndMill,
+      cam::ToolType::BallEndMill, cam::ToolType::Drill, cam::ToolType::VBit};
+  enum_combo("Type", tool.type, cam::tool_type_name, types, std::size(types));
 
   ImGui::Separator();
   cam::Tool candidate = tool;
@@ -2164,6 +2133,28 @@ void load_meshes(App& app) {
   } catch (const std::exception& error) {
     say(app, error.what(), true);
   }
+}
+
+void load_job_into(App& app, const std::filesystem::path& file) {
+  cam::Job job = cam::load_job(file);
+  cam::JobGeometry geometry;
+  const auto resolve = [&](std::filesystem::path& path) {
+    if (!path.empty() && path.is_relative())
+      path = std::filesystem::absolute(file).parent_path() / path;
+  };
+  resolve(job.part_mesh);
+  resolve(job.stock_mesh);
+  if (!job.part_mesh.empty()) geometry.load_part(job.part_mesh);
+  if (!job.stock_mesh.empty()) geometry.load_stock(job.stock_mesh);
+  geometry.set_box_stock(job.box_stock, job.box_stock_margin);
+  app.geometry = std::move(geometry);
+  app.job = std::move(job);
+  app.job_file = file.string();
+  std::snprintf(app.part_path.data(), app.part_path.size(), "%s", app.job.part_mesh.string().c_str());
+  std::snprintf(app.stock_path.data(), app.stock_path.size(), "%s", app.job.stock_mesh.string().c_str());
+  app.selected_operation = 0;
+  invalidate_plan(app);
+  say(app, "Loaded " + file.string());
 }
 
 // The box the program origin is placed against: the blank, because the blank is
@@ -2333,6 +2324,23 @@ void origin_panel(App& app) {
 void job_panel(App& app) {
   ImGui::SeparatorText("Job");
   text_field("Name", app.job.name);
+  text_field("Job JSON", app.job_file, 1024);
+  ImGui::BeginDisabled(app.planner.running());
+  if (ImGui::Button("Save job")) {
+    try {
+      cam::Job saved = app.job;
+      if (!saved.part_mesh.empty()) saved.part_mesh = std::filesystem::absolute(saved.part_mesh);
+      if (!saved.stock_mesh.empty()) saved.stock_mesh = std::filesystem::absolute(saved.stock_mesh);
+      cam::save_job(app.job_file, saved);
+      say(app, "Saved " + app.job_file);
+    } catch (const std::exception& error) { say(app, error.what(), true); }
+  }
+  ImGui::SameLine();
+  if (ImGui::Button("Load job")) {
+    try { load_job_into(app, app.job_file); }
+    catch (const std::exception& error) { say(app, error.what(), true); }
+  }
+  ImGui::EndDisabled();
   ImGui::InputText("Part model", app.part_path.data(), app.part_path.size());
   ImGui::InputText("Stock model", app.stock_path.data(), app.stock_path.size());
   // A named model always wins, so the fallback is only offered without one.
@@ -2375,7 +2383,12 @@ void job_panel(App& app) {
 cam::Operation make_operation(App& app, cam::OperationMode mode) {
   cam::Operation operation;
   operation.mode = mode;
-  operation.name = mode == cam::OperationMode::Roughing ? "Rough" : "Contour finish";
+  switch (mode) {
+    case cam::OperationMode::Roughing: operation.name = "Rough"; break;
+    case cam::OperationMode::ContourFinishing: operation.name = "Contour finish"; break;
+    case cam::OperationMode::Pocket: operation.name = "Pocket"; break;
+    case cam::OperationMode::PlaneClearing: operation.name = "Plane clearing"; break;
+  }
   if (!app.job.operations.empty()) {
     const cam::Operation& selected = app.job.operations[std::clamp(
         app.selected_operation, 0,
@@ -2383,6 +2396,12 @@ cam::Operation make_operation(App& app, cam::OperationMode mode) {
     operation.tool_id = selected.tool_id;
     operation.machine_id = selected.machine_id;
     operation.material_id = selected.material_id;
+    operation.spindle_rpm = selected.spindle_rpm;
+    operation.plunge_feed = selected.plunge_feed;
+    operation.coolant = selected.coolant;
+    operation.manual_feed_range = selected.manual_feed_range;
+    operation.full_engagement_feed = selected.full_engagement_feed;
+    operation.no_engagement_feed = selected.no_engagement_feed;
     operation.depth_from = selected.depth_from;
     operation.depth_to = selected.depth_to;
   } else {
@@ -2489,6 +2508,17 @@ void operations_list_panel(App& app) {
         make_operation(app, cam::OperationMode::ContourFinishing));
     select_operation(app, static_cast<int>(app.job.operations.size()) - 1);
   }
+  if (ImGui::Button("Add pocket")) {
+    invalidate_plan(app);
+    app.job.operations.push_back(make_operation(app, cam::OperationMode::Pocket));
+    select_operation(app, static_cast<int>(app.job.operations.size()) - 1);
+  }
+  ImGui::SameLine();
+  if (ImGui::Button("Add plane clearing")) {
+    invalidate_plan(app);
+    app.job.operations.push_back(make_operation(app, cam::OperationMode::PlaneClearing));
+    select_operation(app, static_cast<int>(app.job.operations.size()) - 1);
+  }
   if (ImGui::Button("Duplicate")) {
     invalidate_plan(app);
     cam::Operation copy = app.job.operations[app.selected_operation];
@@ -2544,6 +2574,7 @@ void operation_settings_panel(App& app) {
   static constexpr cam::OperationMode kModes[]{
       cam::OperationMode::Roughing,
       cam::OperationMode::ContourFinishing,
+      cam::OperationMode::Pocket, cam::OperationMode::PlaneClearing,
   };
   enum_combo("Mode", operation.mode, cam::operation_mode_name, kModes,
              std::size(kModes));
@@ -2558,7 +2589,7 @@ void operation_settings_panel(App& app) {
                std::size(kDirections));
     ImGui::Checkbox("Clip contours to nominal stock",
                     &operation.clip_contours_to_stock);
-  } else {
+  } else if (operation.mode == cam::OperationMode::Roughing) {
     ImGui::Checkbox("Boundary cleanup contour",
                     &operation.rough_boundary_cleanup);
   }
@@ -2591,37 +2622,62 @@ void operation_settings_panel(App& app) {
 
   const cam::Tool* tool = app.tools.find(operation.tool_id);
   const cam::Machine* machine = app.machines.find(operation.machine_id);
-  if (tool && !tool->data_for(operation.material_id))
-    ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.4f, 1.0f),
-                       "This tool has no cutting data for that material");
   if (machine && machine->specifications_unverified)
     ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.35f, 1.0f),
                        "This machine profile carries unverified limits");
 
-  ImGui::DragScalar("Stepover (of diameter)", ImGuiDataType_Double,
-                    &operation.stepover_ratio, 0.005f);
-  ImGui::DragScalar("Stepdown (mm)", ImGuiDataType_Double, &operation.stepdown, 0.1f);
-  double effective_stepover = operation.stepover_ratio;
-  double effective_stepdown = operation.stepdown;
-  if (tool) {
-    if (const auto* data = tool->data_for(operation.material_id)) {
-      const double axial_limit = std::min(tool->flute_length,
-                                         data->max_ap_over_d * tool->diameter);
-      effective_stepover = std::min(effective_stepover, data->max_ae_over_d);
-      effective_stepdown = std::min(effective_stepdown, axial_limit);
-      ImGui::TextWrapped(
-          "Tool/material limits: stepover %.6g mm (%.6g of diameter), "
-          "stepdown %.6g mm.",
-          data->max_ae_over_d * tool->diameter, data->max_ae_over_d, axial_limit);
-      if (effective_stepover != operation.stepover_ratio ||
-          effective_stepdown != operation.stepdown)
-        ImGui::TextWrapped("Planning will use %.6g mm stepover and %.6g mm "
-                           "stepdown. Edit limits in Libraries > Edit.",
-                           effective_stepover * tool->diameter, effective_stepdown);
+  ImGui::InputDouble("Stepover (of diameter)", &operation.stepover_ratio, 0, 0, "%.6g");
+  ImGui::InputDouble("Stepdown (mm)", &operation.stepdown, 0, 0, "%.6g");
+  if (cam::is_parametric(operation.mode)) {
+    if (operation.mode == cam::OperationMode::Pocket) {
+      auto& p = operation.pocket;
+      static constexpr cam::PocketShape shapes[]{cam::PocketShape::Circle,
+          cam::PocketShape::Rectangle, cam::PocketShape::RoundedRectangle};
+      enum_combo("Pocket shape", p.shape, cam::pocket_shape_name, shapes, std::size(shapes));
+      ImGui::InputDouble("Center X (mm)", &p.center_x, 0, 0, "%.6g");
+      ImGui::InputDouble("Center Y (mm)", &p.center_y, 0, 0, "%.6g");
+      ImGui::InputDouble("Top Z (mm)", &p.top_z, 0, 0, "%.6g");
+      if (p.shape != cam::PocketShape::Circle) {
+        ImGui::InputDouble("Width X (mm)", &p.width, 0, 0, "%.6g");
+        ImGui::InputDouble("Height Y (mm)", &p.height, 0, 0, "%.6g");
+      }
+      if (p.shape != cam::PocketShape::Rectangle)
+        ImGui::InputDouble(p.shape == cam::PocketShape::Circle ? "Radius (mm)" :
+            "Corner radius (mm)", &p.radius, 0, 0, "%.6g");
+      ImGui::InputDouble("Pocket depth (mm)", &p.depth, 0, 0, "%.6g");
+      ImGui::InputDouble("Helix angle (degrees)", &p.helix_angle_degrees, 0, 0, "%.6g");
+      ImGui::TextWrapped("Floor Z: %.6g mm. Every level starts with a helical entry.", p.top_z-p.depth);
+      if (p.shape == cam::PocketShape::Rectangle)
+        ImGui::TextWrapped("Rectangle corners retain the tool radius.");
+    } else {
+      auto& p = operation.plane;
+      ImGui::InputDouble("Top Z (mm)", &p.top_z, 0, 0, "%.6g");
+      ImGui::InputDouble("Clearing depth (mm)", &p.depth, 0, 0, "%.6g");
+      ImGui::TextWrapped("Floor Z: %.6g mm. Rectangles share these depths. "
+                         "The cutter stays inside each area, leaving rounded corners.", p.top_z-p.depth);
+      int remove = -1;
+      for (std::size_t i = 0; i < p.areas.size(); ++i) {
+        ImGui::PushID(static_cast<int>(i));
+        ImGui::SeparatorText(("Area " + std::to_string(i+1)).c_str());
+        auto& area = p.areas[i];
+        ImGui::InputDouble("Center X (mm)", &area.center_x, 0, 0, "%.6g");
+        ImGui::InputDouble("Center Y (mm)", &area.center_y, 0, 0, "%.6g");
+        ImGui::InputDouble("Width X (mm)", &area.width, 0, 0, "%.6g");
+        ImGui::InputDouble("Height Y (mm)", &area.height, 0, 0, "%.6g");
+        if (ImGui::Button("Remove area")) remove = static_cast<int>(i);
+        ImGui::PopID();
+      }
+      if (remove >= 0) p.areas.erase(p.areas.begin()+remove);
+      if (ImGui::Button("Add area")) p.areas.push_back(cam::ClearingArea{});
     }
+    ImGui::TextWrapped("Coordinates are in the job frame; the program origin offset "
+                       "is applied when posting. No part mesh is required.");
+    ImGui::InputDouble("Simulation/feed pitch (mm)", &operation.path_pitch, 0, 0, "%.6g");
+    feeds_panel(app);
+    return;
   }
   const std::size_t base_layers =
-      cam::level_floors(operation, effective_stepdown,
+      cam::level_floors(operation, operation.stepdown,
                         cam::highest_model_z(app.geometry))
           .size();
   if (operation.mode == cam::OperationMode::Roughing) {
@@ -2662,7 +2718,7 @@ void operation_settings_panel(App& app) {
             : "";
     ImGui::TextWrapped(
         "= %.3f mm wide, %zu base layers%s",
-        effective_stepover * tool->diameter, base_layers,
+        operation.stepover_ratio * tool->diameter, base_layers,
         preview_layers.c_str());
   }
   ImGui::DragScalar("Radial stock to leave", ImGuiDataType_Double,
@@ -2691,7 +2747,7 @@ void operation_settings_panel(App& app) {
         "the first pass to touch the stock aims for a full stepover less this, "
         "which leaves that much headroom for an oversize blank.");
     if (tool) {
-      const double bite = effective_stepover * tool->diameter;
+      const double bite = operation.stepover_ratio * tool->diameter;
       const double first = std::max(
           bite - std::clamp(operation.stock_deviation, 0.0, bite * 0.9), 0.0);
       ImGui::TextDisabled("= target first bite %.3f mm, then %.3f mm", first,
@@ -2728,6 +2784,14 @@ void feeds_panel(App& app) {
   const cam::Machine* machine = app.machines.find(operation.machine_id);
   const cam::MaterialFeedRange* library =
       machine ? machine->feeds_for(operation.material_id) : nullptr;
+  ImGui::SeparatorText("Operation cutting settings");
+  ImGui::InputDouble("Spindle (rpm)", &operation.spindle_rpm, 0, 0, "%.6g");
+  ImGui::InputDouble("Plunge / ramp feed (mm/min)", &operation.plunge_feed, 0, 0, "%.6g");
+  ImGui::Checkbox("Coolant", &operation.coolant);
+  if (ImGui::CollapsingHeader("Machine tool assignment")) {
+    ImGui::InputInt("Tool number (0 = auto)", &operation.tool_number);
+    ImGui::InputInt("H offset (0 = tool)", &operation.length_offset);
+  }
   ImGui::SeparatorText("Engagement feeds");
   ImGui::TextWrapped(
       "Feed is interpolated directly between these endpoints using the "
@@ -2773,11 +2837,14 @@ void plan_panel(App& app) {
     return;
   }
 
-  const bool ready = app.geometry.has_part() && app.geometry.has_stock();
+  const bool ready = !app.job.operations.empty() && std::all_of(
+      app.job.operations.begin(), app.job.operations.end(), [&](const cam::Operation& op) {
+        return cam::is_parametric(op.mode) || (app.geometry.has_part() && app.geometry.has_stock());
+      });
   ImGui::BeginDisabled(!ready);
   if (ImGui::Button("Plan job", ImVec2(-1, 0))) start_plan(app);
   ImGui::EndDisabled();
-  if (!ready) ImGui::TextDisabled("Load a part and a stock model first");
+  if (!ready) ImGui::TextDisabled("Mesh operations require a part and stock; pocket/plane operations use their dimensions");
 
   if (!app.has_plan) return;
 
@@ -2882,7 +2949,7 @@ void library_panel(App& app) {
   ImGui::Separator();
   for (const auto& tool : app.tools.tools) {
     ImGui::PushID(tool.id.c_str());
-    ImGui::Text("%d  %s", tool.tool_number, tool.name.c_str());
+    ImGui::Text("%s", tool.name.c_str());
     ImGui::SameLine(ImGui::GetContentRegionAvail().x - 90.0f);
     if (ImGui::SmallButton("Edit")) {
       app.builder_tool = tool;
@@ -2901,8 +2968,6 @@ void library_panel(App& app) {
   if (ImGui::Button("New tool")) {
     app.builder_tool = cam::Tool{};
     app.builder_tool.name = "New tool";
-    app.builder_tool.tool_number = static_cast<int>(app.tools.tools.size()) + 1;
-    app.builder_tool.length_offset = app.builder_tool.tool_number;
     app.builder_is_new = true;
     app.builder_open = true;
   }
@@ -3093,7 +3158,7 @@ void ensure_initial_operation(App& app) {
 void left_panel(App& app) {
   ensure_initial_operation(app);
   const float available = ImGui::GetContentRegionAvail().y;
-  const float operations_height = std::clamp(available * 0.38f, 275.0f, 370.0f);
+  const float operations_height = std::clamp(available * 0.46f, 330.0f, 420.0f);
   const float program_height = std::max(available - operations_height - 6.0f,
                                         140.0f);
 
@@ -3112,9 +3177,11 @@ void left_panel(App& app) {
       if (ImGui::BeginChild("job-origin-scroll", ImVec2(0, 0),
                             ImGuiChildFlags_None,
                             ImGuiWindowFlags_AlwaysVerticalScrollbar)) {
+        ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x * 0.48f);
         job_panel(app);
         plan_panel(app);
         output_panel(app);
+        ImGui::PopItemWidth();
       }
       ImGui::EndChild();
       ImGui::EndTabItem();
@@ -3145,10 +3212,12 @@ void right_panel(App& app) {
   ImGui::BeginChild("operation-settings", ImVec2(0, settings_height),
                     ImGuiChildFlags_Borders,
                     ImGuiWindowFlags_AlwaysVerticalScrollbar);
+  ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x * 0.43f);
   const std::string settings_before = cam::to_json_text(app.job);
   operation_settings_panel(app);
   if (app.has_plan && settings_before != cam::to_json_text(app.job))
     invalidate_plan(app);
+  ImGui::PopItemWidth();
   ImGui::EndChild();
 
   ImGui::BeginChild("playback-display", ImVec2(0, 0), ImGuiChildFlags_Borders,
@@ -3198,6 +3267,7 @@ int main(int argc, char** argv) {
 
   std::filesystem::path screenshot;
   std::filesystem::path gcode_out;
+  std::filesystem::path job_in;
   std::string view_name;
   double progress_fraction = -1.0;
   double stepdown = 0.0;
@@ -3239,6 +3309,7 @@ int main(int argc, char** argv) {
         app.job.box_stock_margin = std::stod(value());
       }
       else if (argument == "--gcode") gcode_out = value();
+      else if (argument == "--job") job_in = value();
       else if (argument == "--tool") tool_id = value();
       else if (argument == "--machine") machine_id = value();
       else if (argument == "--material") material_id = value();
@@ -3262,6 +3333,7 @@ int main(int argc, char** argv) {
             "TingleCAM -- wavefront roughing and contour finishing\n\n"
             "  --part PATH        Part model (OBJ or STL)\n"
             "  --stock PATH       Stock model (OBJ or STL)\n"
+            "  --job PATH         Load a job JSON, including pocket/plane dimensions\n"
             "  --tool ID          Tool from the library\n"
             "  --machine ID       Machine profile\n"
             "  --material ID      Workpiece material\n"
@@ -3270,8 +3342,8 @@ int main(int argc, char** argv) {
             "  --finishing-subdivisions N\n"
             "                     Interleaved stock-aware roughing passes (default 1)\n"
             "  --path-pitch MM    Simulation/feed sampling interval (default 1.0)\n"
-            "  --mode rough|finish\n"
-            "                     Roughing or offset-contour finishing\n"
+            "  --mode rough|finish|pocket|plane\n"
+            "                     Operation mode (pocket/plane need no mesh)\n"
             "  --contour-direction either|climb|conventional\n"
             "                     Permitted contour traversal direction\n"
             "  --entry-front-tolerance MM\n"
@@ -3311,12 +3383,18 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "--view must be models, pass, or result\n");
     return EXIT_FAILURE;
   }
-  if (app.part_path[0] != '\0' || app.stock_path[0] != '\0') load_meshes(app);
+  if (!job_in.empty()) {
+    try { load_job_into(app, job_in); }
+    catch (const std::exception& error) {
+      std::fprintf(stderr, "%s\n", error.what());
+      return EXIT_FAILURE;
+    }
+  } else if (app.part_path[0] != '\0' || app.stock_path[0] != '\0') load_meshes(app);
   app.geometry.set_box_stock(app.job.box_stock, app.job.box_stock_margin);
 
   // Anything the command line set has to reach the operation the panels would
   // otherwise have created, so make it here and apply them to it.
-  if (!app.job.operations.empty() || app.geometry.has_part()) {
+  if (!app.job.operations.empty() || app.geometry.has_part() || !mode_name.empty()) {
     if (app.job.operations.empty()) {
       cam::Operation operation;
       if (!app.tools.tools.empty()) operation.tool_id = app.tools.tools.front().id;
@@ -3346,8 +3424,10 @@ int main(int argc, char** argv) {
       if (mode_name == "rough") operation.mode = cam::OperationMode::Roughing;
       else if (mode_name == "finish")
         operation.mode = cam::OperationMode::ContourFinishing;
+      else if (mode_name == "pocket") operation.mode = cam::OperationMode::Pocket;
+      else if (mode_name == "plane") operation.mode = cam::OperationMode::PlaneClearing;
       else {
-        std::fprintf(stderr, "--mode must be rough or finish\n");
+        std::fprintf(stderr, "--mode must be rough, finish, pocket or plane\n");
         return EXIT_FAILURE;
       }
     }
@@ -3374,8 +3454,8 @@ int main(int argc, char** argv) {
   // Planning and posting with no window at all, which is how this gets checked
   // without a display and how it fits into anything scripted.
   if (!gcode_out.empty()) {
-    if (!app.geometry.has_part() || !app.geometry.has_stock()) {
-      std::fprintf(stderr, "--gcode needs both --part and --stock\n");
+    if (app.job.operations.empty()) {
+      std::fprintf(stderr, "--gcode needs --job, --mode, or model inputs\n");
       return EXIT_FAILURE;
     }
     const cam::JobPlan plan = cam::plan_job(
@@ -3506,7 +3586,7 @@ int main(int argc, char** argv) {
   // Declared above SDL initialisation, which needs to know.
   int screenshot_delay = 0;
   auto previous_frame = std::chrono::steady_clock::now();
-  if (screenshot_pending && app.geometry.has_part() && app.geometry.has_stock())
+  if (screenshot_pending && !app.job.operations.empty())
     start_plan(app);
   if (!view_name.empty()) {
     if (view_name == "result") app.force_tab = 2;

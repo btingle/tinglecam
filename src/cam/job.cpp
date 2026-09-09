@@ -1,4 +1,5 @@
 #include "cam/job.h"
+#include "cam/parametric.h"
 
 #include "routing.h"
 
@@ -167,7 +168,6 @@ wave::Paths64 open_space(const wave::Paths64& stock_slice,
 }
 
 struct OperationSetup {
-  const CuttingData* data = nullptr;
   double full_engagement_feed = 0.0;
   double no_engagement_feed = 0.0;
   double radius = 0.0;
@@ -186,10 +186,13 @@ bool resolve_setup(const Operation& operation, const Tool& tool,
                    const Machine& machine, const Material& material,
                    std::string& error, std::vector<std::string>* warnings,
                    OperationSetup& setup) {
-  setup.data = tool.data_for(operation.material_id);
-  if (!setup.data) {
-    error = "Tool " + tool.name + " has no cutting data for " +
-            operation.material_id;
+  const auto problems = validate(tool);
+  if (!problems.empty()) { error = problems.front(); return false; }
+  if (!(operation.stepover_ratio > 0.0 && operation.stepover_ratio <= 1.0) ||
+      !(operation.stepdown > 0.0) || !std::isfinite(operation.stepdown) ||
+      !(operation.spindle_rpm > 0.0) || !std::isfinite(operation.spindle_rpm) ||
+      !(operation.plunge_feed > 0.0) || !std::isfinite(operation.plunge_feed)) {
+    error = "Stepover must be in (0, 1]; stepdown, spindle and plunge feed must be finite and positive";
     return false;
   }
   const MaterialFeedRange* library_feeds =
@@ -242,43 +245,8 @@ bool resolve_setup(const Operation& operation, const Tool& tool,
 
   setup.radius = tool.diameter * 0.5;
 
-  // Engagement, capped by what the tool says it will take. Exceeding the book
-  // figure silently is how a plan looks fine and cuts badly, so the ceiling is
-  // applied here and reported rather than left to the operator to remember.
-  double stepover_ratio = operation.stepover_ratio;
-  if (setup.data->max_ae_over_d > 0.0 &&
-      stepover_ratio > setup.data->max_ae_over_d) {
-    if (warnings)
-      warnings->push_back(
-          "Stepover reduced from " + std::to_string(stepover_ratio * tool.diameter) +
-          " mm (" + std::to_string(stepover_ratio) + " of diameter) to " +
-          std::to_string(setup.data->max_ae_over_d * tool.diameter) +
-          " mm: tool '" + tool.name + "' [" + tool.id + "] in " +
-          material.name + " has max_ae_over_d = " +
-          std::to_string(setup.data->max_ae_over_d) +
-          ". Edit this limit under Libraries > Edit > Material cutting data.");
-    stepover_ratio = setup.data->max_ae_over_d;
-  }
-  setup.stepover = std::max(stepover_ratio * tool.diameter, 1e-4);
-
-  double stepdown = operation.stepdown;
-  const double axial_ceiling =
-      std::min(tool.flute_length, setup.data->max_ap_over_d > 0.0
-                                      ? setup.data->max_ap_over_d * tool.diameter
-                                      : tool.flute_length);
-  if (axial_ceiling > 0.0 && stepdown > axial_ceiling) {
-    if (warnings)
-      warnings->push_back(
-          "Stepdown reduced from " + std::to_string(stepdown) + " mm to " +
-          std::to_string(axial_ceiling) + " mm: tool '" + tool.name + "' [" +
-          tool.id + "] in " + material.name + " has max_ap_over_d = " +
-          std::to_string(setup.data->max_ap_over_d) + " (" +
-          std::to_string(setup.data->max_ap_over_d * tool.diameter) +
-          " mm), with " + std::to_string(tool.flute_length) +
-          " mm flute length. The smaller limit applies. Edit these limits "
-          "under Libraries > Edit.");
-    stepdown = axial_ceiling;
-  }
+  setup.stepover = operation.stepover_ratio * tool.diameter;
+  const double stepdown = operation.stepdown;
 
   // Held below the stepover: at or past it the first engaging front misses the
   // stock altogether and the one behind it arrives at more than a full bite,
@@ -482,6 +450,8 @@ const char* operation_mode_name(OperationMode value) {
   switch (value) {
     case OperationMode::Roughing: return "roughing";
     case OperationMode::ContourFinishing: return "contour_finishing";
+    case OperationMode::Pocket: return "pocket";
+    case OperationMode::PlaneClearing: return "plane_clearing";
   }
   return "unknown";
 }
@@ -878,7 +848,6 @@ void plan_toolpaths(OperationPlan& plan,
   if (!resolve_setup(operation, tool, machine, material, plan.error, nullptr,
                      setup))
     return;
-  const CuttingData* data = setup.data;
   const double radius = setup.radius;
   const double cleanup_reach =
       subdivision_cleanup_reach(operation, radius, finishing_subdivision);
@@ -1216,7 +1185,7 @@ void plan_toolpaths(OperationPlan& plan,
       const auto feeds_start = PlanningClock::now();
       level.feeds = plan_feeds(level.toolpath, level.simulation, machine,
                                full_engagement_feed, no_engagement_feed,
-                               data->spindle_rpm, data->plunge_feed,
+                               operation.spindle_rpm, operation.plunge_feed,
                                level.floor_z, rapid_plane, link);
       plan.metrics.feeds_milliseconds += elapsed_milliseconds(feeds_start);
       if (level.toolpath.moves.empty()) level.nothing_to_cut = true;
@@ -1283,9 +1252,6 @@ void plan_toolpaths(OperationPlan& plan,
         std::to_string(plan.stats.unresolved_entries) +
         " entry move(s) descend straight into material that has not been "
         "cleared; the planner has no ramp to offer in their place");
-  if (!tool.center_cutting && plan.stats.unresolved_entries > 0)
-    plan.warnings.push_back("This tool is not centre cutting and the path needs "
-                            "to enter solid material");
   if (plan.stats.lifts_over_subject > 0)
     plan.warnings.push_back(
         std::to_string(plan.stats.lifts_over_subject) +
@@ -1334,6 +1300,11 @@ wave::Paths64 stock_after_operations_at_z(
     if (remaining.empty()) break;
   }
   return remaining;
+}
+
+wave::Paths64 stock_after_planned_operation_at_z(
+    const wave::Paths64& nominal_stock, double z, const OperationPlan& operation) {
+  return stock_after_operation_at_z(nominal_stock, z, operation);
 }
 
 std::size_t subdivision_preview_source(const OperationPlan& operation,
@@ -1454,7 +1425,18 @@ JobPlan plan_job(const JobGeometry& geometry,
     return plan;
   }
 
-  plan.rapid_plane = job_rapid_plane(job, highest_model_z(geometry));
+  double highest = highest_model_z(geometry);
+  for (const auto& operation : job.operations) {
+    if (operation.mode == OperationMode::Pocket)
+      highest = std::max(highest, operation.pocket.top_z);
+    if (operation.mode == OperationMode::PlaneClearing)
+      highest = std::max(highest, operation.plane.top_z);
+  }
+  if (!(job.rapid_clearance_height > 0) || !std::isfinite(job.rapid_clearance_height)) {
+    plan.error = "Rapid clearance must be finite and greater than zero";
+    return plan;
+  }
+  plan.rapid_plane = job_rapid_plane(job, highest);
   const double share = 1.0 / static_cast<double>(job.operations.size());
   std::string previous_tool;
   for (std::size_t index = 0; index < job.operations.size(); ++index) {
@@ -1473,10 +1455,15 @@ JobPlan plan_job(const JobGeometry& geometry,
     else if (!material) result.error = "Unknown material: " + operation.material_id;
 
     if (result.ok()) {
-      result = plan_subdivided_operation(
-          geometry, operation, *tool, *machine, *material, progress,
-          share * index, share * (index + 1), plan.rapid_plane,
-          &plan.operations);
+      if (is_parametric(operation.mode))
+        result = plan_parametric_operation(operation, *tool, *machine,
+            plan.rapid_plane, plan.operations, progress,
+            share * index, share * (index + 1));
+      else
+        result = plan_subdivided_operation(
+            geometry, operation, *tool, *machine, *material, progress,
+            share * index, share * (index + 1), plan.rapid_plane,
+            &plan.operations);
       if (result.error == "Cancelled") {
         plan.error = "Cancelled";
         return plan;

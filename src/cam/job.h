@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <functional>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -24,6 +25,39 @@ namespace cam {
 enum class OperationMode {
   Roughing,
   ContourFinishing,
+  Pocket,
+  PlaneClearing,
+};
+
+enum class PocketShape { Circle, Rectangle, RoundedRectangle };
+const char* pocket_shape_name(PocketShape shape);
+std::optional<PocketShape> pocket_shape_from_name(const std::string& name);
+bool is_parametric(OperationMode mode);
+
+struct ClearingArea {
+  double center_x = 0.0;
+  double center_y = 0.0;
+  double width = 30.0;
+  double height = 30.0;
+};
+
+struct PocketParameters {
+  PocketShape shape = PocketShape::Rectangle;
+  double center_x = 0.0;
+  double center_y = 0.0;
+  double top_z = 0.0;
+  double width = 30.0;
+  double height = 30.0;
+  double depth = 5.0;
+  // Circle radius, or corner radius for a rounded rectangle.
+  double radius = 5.0;
+  double helix_angle_degrees = 3.0;
+};
+
+struct PlaneParameters {
+  double top_z = 0.0;
+  double depth = 1.0;
+  std::vector<ClearingArea> areas{{}};
 };
 
 struct Operation {
@@ -33,11 +67,18 @@ struct Operation {
   std::string material_id;
   OperationMode mode = OperationMode::Roughing;
 
-  // Engagement. The radial figure is a fraction of the cutter diameter and is
-  // capped by whatever the tool says it will take in this material; the axial
-  // one is millimetres and is capped by the flute length.
+  // Strategies belong to operations, never to the tool library.
   double stepover_ratio = 0.4;
   double stepdown = 1.0;
+  double spindle_rpm = 12000.0;
+  double plunge_feed = 100.0;
+  bool coolant = false;
+  // Zero selects the tool's library position (1-based), or the tool number
+  // for H. Explicit machine assignments belong to this operation.
+  int tool_number = 0;
+  int length_offset = 0;
+  PocketParameters pocket;
+  PlaneParameters plane;
   // Roughing may be repeated at evenly interleaved Z offsets. One is the
   // ordinary pass; N adds N-1 stock-aware finishing passes while keeping this
   // operation as a single editable/postable unit.
@@ -113,6 +154,9 @@ struct Job {
 // One depth of cut: everything the engine produced for it, kept so the UI can
 // draw any level and the post can walk them in order.
 struct LevelPlan {
+  // Parametric operations carry their actual XYZ path in feeds.motion. The
+  // planar projection remains available for stock simulation and 2D views.
+  bool explicit_motion = false;
   double floor_z = 0.0;    // the depth this pass cuts down to
   double axial_depth = 0.0;  // a_p actually taken, which the last pass may trim
   // Execution group and position inside it. Subdivision groups are flattened
@@ -380,6 +424,8 @@ OperationPlan plan_operation(const JobGeometry& geometry,
 wave::Paths64 stock_after_operations_at_z(
     const wave::Paths64& nominal_stock, double z,
     const std::vector<OperationPlan>& operations);
+wave::Paths64 stock_after_planned_operation_at_z(
+    const wave::Paths64& nominal_stock, double z, const OperationPlan& operation);
 
 // Chooses the execution-record layer that supplies a physical stack layer
 // while subdivision playback is in progress. Completed subdivisions retain

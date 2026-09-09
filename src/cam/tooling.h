@@ -6,38 +6,19 @@
 
 namespace cam {
 
-enum class CoolantNeed {
-  Required,
-  Recommended,
-  Dry,
-  AirBlast,
-};
-
-struct CuttingData {
-  std::string material_id;
-  double spindle_rpm = 12000.0;
-  double max_ae_over_d = 0.5;
-  double max_ap_over_d = 1.0;
-  double plunge_feed = 100.0;
-  CoolantNeed coolant = CoolantNeed::Recommended;
-};
+enum class ToolType { FlatEndMill, BallEndMill, Drill, VBit };
 
 struct Tool {
   std::string id;
   std::string name;
-  std::string notes;
   double diameter = 6.0;
   double flute_length = 20.0;
-  bool center_cutting = true;
-  int tool_number = 1;
-  int length_offset = 1;
-  std::vector<CuttingData> cutting_data;
-
-  const CuttingData* data_for(const std::string& material_id) const;
+  int flutes = 2;
+  ToolType type = ToolType::FlatEndMill;
 };
 
-const char* coolant_need_name(CoolantNeed value);
-std::optional<CoolantNeed> coolant_need_from_name(const std::string& text);
+const char* tool_type_name(ToolType value);
+std::optional<ToolType> tool_type_from_name(const std::string& text);
 
 std::vector<std::string> validate(const Tool& tool);
 

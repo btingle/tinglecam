@@ -117,6 +117,7 @@ add_library(tinglecam_core
   src/cam/job.cpp
   src/cam/machine.cpp
   src/cam/material.cpp
+  src/cam/parametric.cpp
   src/cam/post.cpp
   src/cam/tooling.cpp
 )
@@ -180,6 +181,10 @@ add_test(NAME tinglecam_help COMMAND tinglecam --help)
 add_executable(tool_library_tests tests/tool_library_tests.cpp)
 target_link_libraries(tool_library_tests PRIVATE tinglecam_core imgui_sdl_opengl)
 add_test(NAME tool_library_tests COMMAND tool_library_tests)
+
+add_executable(parametric_tests tests/parametric_tests.cpp)
+target_link_libraries(parametric_tests PRIVATE tinglecam_core)
+add_test(NAME parametric_tests COMMAND parametric_tests)
 
 add_test(NAME demo_help COMMAND clipper2_wave_demo --help)
 add_test(NAME demo_analysis_dump
