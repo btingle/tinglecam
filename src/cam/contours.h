@@ -1,7 +1,7 @@
 #pragma once
 
-#include "geometry.h"
-#include "traversal.h"
+#include "planning/traversal.h"
+#include "wave/geometry.h"
 
 #include <cstddef>
 #include <vector>

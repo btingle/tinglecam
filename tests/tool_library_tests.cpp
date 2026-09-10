@@ -1,7 +1,7 @@
 // Exercise the actual tool-builder widgets without a display or GPU backend.
-#define main tinglecam_application_main
-#include "../src/tinglecam.cpp"
-#undef main
+#include "../src/gui/app_ui_api.h"
+
+using namespace tinglecam_gui;
 #include "imgui_internal.h"
 
 #include <iostream>

@@ -1,3 +1,6 @@
 /build/
 /imgui.ini
 /tinglecam.nc
+/objs/
+*.obj
+*.mtl

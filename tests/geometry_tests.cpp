@@ -1,8 +1,8 @@
-#include "analysis.h"
-#include "geometry.h"
-#include "mesh_slicer.h"
-#include "toolpath.h"
-#include "topology.h"
+#include "planning/toolpath.h"
+#include "wave/analysis.h"
+#include "wave/geometry.h"
+#include "wave/mesh_slicer.h"
+#include "wave/topology.h"
 
 #include <algorithm>
 #include <cmath>

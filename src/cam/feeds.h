@@ -1,8 +1,8 @@
 #pragma once
 
 #include "cam/machine.h"
-#include "simulation.h"
-#include "toolpath.h"
+#include "planning/toolpath.h"
+#include "simulation/simulation.h"
 
 #include <cstddef>
 #include <optional>

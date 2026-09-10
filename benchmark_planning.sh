@@ -59,10 +59,10 @@ ctest --test-dir "$build_dir" --output-on-failure
 # Representative roughing, simulation scaling, wave-count pressure, complex
 # boundaries, and contour finishing. Each case prints its deterministic G-code
 # hash alongside phase times and scale counters.
-run_case L_normal objs/final_obj/L.obj objs/stock_obj/L.obj --path-pitch 0.2
-run_case Rtwist_normal objs/Rtwist.obj objs/Rtwist_stock.obj --path-pitch 0.2
-run_case L_fine_pitch objs/final_obj/L.obj objs/stock_obj/L.obj --path-pitch 0.1
-run_case sSs_small_stepover objs/final_obj/sSs.obj objs/stock_obj/sSs.obj \
+run_case L_normal tests/fixtures/meshes/final/L.obj tests/fixtures/meshes/stock/L.obj --path-pitch 0.2
+run_case Rtwist_normal tests/fixtures/meshes/bench/Rtwist.obj tests/fixtures/meshes/bench/Rtwist_stock.obj --path-pitch 0.2
+run_case L_fine_pitch tests/fixtures/meshes/final/L.obj tests/fixtures/meshes/stock/L.obj --path-pitch 0.1
+run_case sSs_small_stepover tests/fixtures/meshes/final/sSs.obj tests/fixtures/meshes/stock/sSs.obj \
   --stepover 0.2 --path-pitch 0.2
-run_case L_finish objs/final_obj/L.obj objs/stock_obj/L.obj \
+run_case L_finish tests/fixtures/meshes/final/L.obj tests/fixtures/meshes/stock/L.obj \
   --mode finish --path-pitch 0.2

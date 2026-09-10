@@ -1,4 +1,4 @@
-#include "prism_renderer.h"
+#include "rendering/prism_renderer.h"
 #include <iostream>
 #include <stdexcept>
 using namespace wave::prism;

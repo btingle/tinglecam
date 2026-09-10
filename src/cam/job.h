@@ -5,12 +5,12 @@
 #include "cam/machine.h"
 #include "cam/material.h"
 #include "cam/tooling.h"
-#include "analysis.h"
-#include "geometry.h"
-#include "mesh_slicer.h"
-#include "simulation.h"
-#include "topology.h"
-#include "toolpath.h"
+#include "planning/toolpath.h"
+#include "simulation/simulation.h"
+#include "wave/analysis.h"
+#include "wave/geometry.h"
+#include "wave/mesh_slicer.h"
+#include "wave/topology.h"
 
 #include <cstdint>
 #include <filesystem>

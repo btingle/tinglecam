@@ -1,5 +1,5 @@
-#include "simulation.h"
-#include "topology.h"
+#include "simulation/simulation.h"
+#include "wave/topology.h"
 
 #include <cmath>
 #include <cstdlib>
