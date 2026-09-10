@@ -83,7 +83,7 @@ add_library(wave_geometry
   src/traversal.cpp
   src/toolpath.cpp
 )
-target_sources(wave_geometry PRIVATE src/mesh_slicer_cuda.cu)
+target_sources(wave_geometry PRIVATE src/mesh_slicer_cuda.cu src/prism_renderer.cu)
 target_link_libraries(wave_geometry PRIVATE cuBQL_cuda_float3_static)
 target_compile_definitions(wave_geometry PUBLIC WAVE_HAVE_CUDA=1)
 set_target_properties(wave_geometry PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
@@ -195,3 +195,7 @@ add_test(NAME demo_analysis_dump
 add_executable(stock_tests tests/stock_tests.cpp)
 target_link_libraries(stock_tests PRIVATE tinglecam_core)
 add_test(NAME stock_tests COMMAND stock_tests)
+
+add_executable(prism_renderer_tests tests/prism_renderer_tests.cpp)
+target_link_libraries(prism_renderer_tests PRIVATE wave_geometry)
+add_test(NAME prism_renderer_tests COMMAND prism_renderer_tests)

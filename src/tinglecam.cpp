@@ -7,6 +7,7 @@
 #include "cam/job.h"
 #include "cam/post.h"
 #include "cam/stock.h"
+#include "prism_renderer.h"
 
 #include "clipper2/clipper.triangulation.h"
 
@@ -15,6 +16,7 @@
 #include "imgui_impl_sdl2.h"
 
 #include <SDL.h>
+#define GL_GLEXT_PROTOTYPES
 #include <SDL_opengl.h>
 
 #include <algorithm>
@@ -30,6 +32,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <unordered_map>
 
 namespace {
 
@@ -912,6 +915,9 @@ struct Projection {
     return r.x * toward.x + r.y * toward.y + r.z * toward.z;
   }
 };
+
+#include "prism_view.h"
+PrismView prism_view;
 
 // A convex piece to paint, as a run of points in a shared pool. A frame builds
 // tens of thousands of these, so they carry an offset rather than a vector of
@@ -1848,62 +1854,19 @@ void draw_result(App& app) {
     if (!levels[target].stock_slice.empty()) leftover[display] = stock_for(target);
   }
 
-  // The walls only need enough vertices for the current display scale. Keep the
-  // exact remaining-stock regions as the source for comparisons, though: two
-  // independently thinned versions of the same curved boundary can retain
-  // different vertices, and subtracting them creates clouds of microscopic
-  // slivers that are not real exposed material.
-  std::vector<Paths64> outline(display_levels.size());
-  for (std::size_t i = 0; i < display_levels.size(); ++i)
-    if (leftover[i] != nullptr) outline[i] = drawable_region(*leftover[i], spacing);
-
   std::vector<Facet> facets;
   std::vector<ImVec2> pool;
   std::size_t untriangulated = 0;
-  if (!planned_operation.composed_stock) for (std::size_t i = 0; i < display_levels.size(); ++i) {
-    if (leftover[i] == nullptr) continue;
-    const std::size_t level_index = display_levels[i];
-    const cam::LevelPlan& level = levels[level_index];
-
-    const Paths64& walls = outline[i];
-    if (walls.empty()) continue;
-
-    // Only the ring of material this pass exposes gets a top: the rest of it is
-    // roofed by the pass above. A run of passes that all leave the same stock
-    // then reads as one wall rather than a stack of coincident lids.
-    Paths64 lid_rings;
-    if (i == 0 || leftover[i - 1] == nullptr || leftover[i - 1]->empty()) {
-      lid_rings = walls;
-    } else if (*leftover[i] != *leftover[i - 1]) {
-      // Compare the canonical simulation geometry first, then reduce only the
-      // actual exposed surface to display resolution. Decimating both operands
-      // before Difference makes coincident curves disagree by sub-pixel wedges.
-      lid_rings = drawable_surface(
-          Clipper2Lib::Difference(*leftover[i], *leftover[i - 1],
-                                  Clipper2Lib::FillRule::NonZero),
-          spacing);
+  std::vector<cam::StockSlab> shader_stock;
+  if (!planned_operation.composed_stock) {
+    for (std::size_t i=0;i<display_levels.size();++i) {
+      if (!leftover[i]) continue;
+      const auto& level=levels[display_levels[i]];
+      const double top=level.explicit_motion ? level.floor_z+level.axial_depth
+          : (i==0 ? material_highest : levels[display_levels[i-1]].floor_z);
+      if (top>level.floor_z) shader_stock.push_back({level.floor_z,top,
+          std::make_shared<const Paths64>(*leftover[i])});
     }
-    const Paths64 lid_mesh = fill_mesh(lid_rings, &untriangulated);
-
-    // Tinted by depth so the steps read apart even where two of them meet on a
-    // face turned away from the light, and the pass being watched is picked out.
-    const float t = display_levels.size() < 2
-                        ? 0.0f
-                        : static_cast<float>(i) / (display_levels.size() - 1);
-    const bool active =
-        app.stack_follows_playback &&
-        static_cast<int>(level_index) == app.selected_level;
-    const float face_colour[3] = {active ? 0.44f : 0.54f - 0.12f * t,
-                                  active ? 0.62f : 0.61f - 0.12f * t,
-                                  active ? 0.78f : 0.70f - 0.12f * t};
-    const float wall_colour[3] = {0.44f, 0.50f, 0.58f};
-    const ImU32 edge = active ? IM_COL32(170, 215, 250, 200)
-                              : IM_COL32(196, 214, 236, 90);
-    const double slab_top = level.explicit_motion ? level.floor_z + level.axial_depth :
-        (i == 0 ? material_highest : levels[display_levels[i - 1]].floor_z);
-    if (slab_top > level.floor_z)
-      append_slab(facets, pool, walls, lid_mesh, lid_rings, level.floor_z,
-                  slab_top, projection, light, wall_colour, face_colour, edge);
   }
   if (planned_operation.composed_stock) {
     const int before = app.stack_follows_playback ? active_level : static_cast<int>(levels.size());
@@ -1917,19 +1880,17 @@ void draw_result(App& app) {
       const auto removed = Clipper2Lib::Difference(active.incoming_stock, app.material, Clipper2Lib::FillRule::NonZero);
       stock = cam::stock_outside(stock, removed, active.floor_z, active.floor_z+active.axial_depth);
     }
-    for (const auto& slab : stock) {
-      Paths64 above;
-      for (const auto& other : stock)
-        if (std::abs(other.bottom-slab.top)<1e-8)
-          above.insert(above.end(),other.region->begin(),other.region->end());
-      const auto walls = drawable_region(*slab.region, spacing);
-      const auto lid = drawable_surface(Clipper2Lib::Difference(*slab.region,
-          Clipper2Lib::Union(above,Clipper2Lib::FillRule::NonZero),Clipper2Lib::FillRule::NonZero),spacing);
-      const auto mesh = fill_mesh(lid,&untriangulated);
-      const float wall_colour[3]={0.44f,0.50f,0.58f}, face_colour[3]={0.54f,0.61f,0.70f};
-      append_slab(facets,pool,walls,mesh,lid,slab.bottom,slab.top,projection,light,
-                  wall_colour,face_colour,IM_COL32(196,214,236,90));
-    }
+    shader_stock=std::move(stock);
+  }
+  try {
+    const GLuint texture=prism_view.render(shader_stock,projection,light,top_left,size,float(span*4));
+    list->AddImage(static_cast<ImTextureID>(texture),top_left,
+        ImVec2(top_left.x+size.x,top_left.y+size.y),ImVec2(0,1),ImVec2(1,0));
+    if (prism_view.failed_layers())
+      list->AddText(top_left,IM_COL32(255,150,80,255),"Some stock layers could not be triangulated; details in terminal.");
+  } catch (const std::exception& error) {
+    list->AddText(top_left,IM_COL32(255,90,90,255),error.what());
+    std::fprintf(stderr,"Prism renderer: %s\n",error.what());
   }
   if (cutter_cursor && active_tool != nullptr) {
     append_cutter(
@@ -3766,6 +3727,7 @@ int main(int argc, char** argv) {
   }
 
   app.planner.cancel();
+  prism_view.release();
   ImGui_ImplOpenGL3_Shutdown();
   ImGui_ImplSDL2_Shutdown();
   ImGui::DestroyContext();
