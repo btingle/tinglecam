@@ -6,6 +6,7 @@
 #include "cam/feeds.h"
 #include "cam/job.h"
 #include "cam/post.h"
+#include "cam/stock.h"
 
 #include "clipper2/clipper.triangulation.h"
 
@@ -257,6 +258,8 @@ struct App {
   double material_distance = -1.0;
   int material_level = -1;
   int material_operation = -1;
+  int stock_cache_operation = -1, stock_cache_level = -1;
+  std::vector<cam::StockSlab> stock_cache;
 
   // Tool Builder
   bool builder_open = false;
@@ -1717,6 +1720,20 @@ void draw_result(App& app) {
       highest = std::max(highest, level.floor_z + level.axial_depth);
     }
   }
+  if (planned_operation.composed_stock) {
+    const auto include = [&](const cam::StockSlab& slab) {
+      if (slab.region->empty()) return;
+      const auto b = Clipper2Lib::GetBounds(*slab.region);
+      if (!any) { extent_2d = b; lowest=slab.bottom; highest=slab.top; any=true; }
+      else {
+        extent_2d.left=std::min(extent_2d.left,b.left); extent_2d.right=std::max(extent_2d.right,b.right);
+        extent_2d.top=std::min(extent_2d.top,b.top); extent_2d.bottom=std::max(extent_2d.bottom,b.bottom);
+        lowest=std::min(lowest,slab.bottom); highest=std::max(highest,slab.top);
+      }
+    };
+    for (const auto& slab : planned_operation.preview_context) include(slab);
+    for (const auto& level : levels) for (const auto& slab : level.local_stock) include(slab);
+  }
   const double material_lowest = lowest;
   double material_highest = highest;
   if (!planned_operation.subdivisions.empty() &&
@@ -1843,7 +1860,7 @@ void draw_result(App& app) {
   std::vector<Facet> facets;
   std::vector<ImVec2> pool;
   std::size_t untriangulated = 0;
-  for (std::size_t i = 0; i < display_levels.size(); ++i) {
+  if (!planned_operation.composed_stock) for (std::size_t i = 0; i < display_levels.size(); ++i) {
     if (leftover[i] == nullptr) continue;
     const std::size_t level_index = display_levels[i];
     const cam::LevelPlan& level = levels[level_index];
@@ -1887,6 +1904,32 @@ void draw_result(App& app) {
     if (slab_top > level.floor_z)
       append_slab(facets, pool, walls, lid_mesh, lid_rings, level.floor_z,
                   slab_top, projection, light, wall_colour, face_colour, edge);
+  }
+  if (planned_operation.composed_stock) {
+    const int before = app.stack_follows_playback ? active_level : static_cast<int>(levels.size());
+    if (app.stock_cache_operation != app.selected_plan_operation || app.stock_cache_level != before) {
+      app.stock_cache = cam::preview_before_level(planned_operation, before);
+      app.stock_cache_operation = app.selected_plan_operation;
+      app.stock_cache_level = before;
+    }
+    auto stock = app.stock_cache;
+    if (app.stack_follows_playback && !active.nothing_to_cut) {
+      const auto removed = Clipper2Lib::Difference(active.incoming_stock, app.material, Clipper2Lib::FillRule::NonZero);
+      stock = cam::stock_outside(stock, removed, active.floor_z, active.floor_z+active.axial_depth);
+    }
+    for (const auto& slab : stock) {
+      Paths64 above;
+      for (const auto& other : stock)
+        if (std::abs(other.bottom-slab.top)<1e-8)
+          above.insert(above.end(),other.region->begin(),other.region->end());
+      const auto walls = drawable_region(*slab.region, spacing);
+      const auto lid = drawable_surface(Clipper2Lib::Difference(*slab.region,
+          Clipper2Lib::Union(above,Clipper2Lib::FillRule::NonZero),Clipper2Lib::FillRule::NonZero),spacing);
+      const auto mesh = fill_mesh(lid,&untriangulated);
+      const float wall_colour[3]={0.44f,0.50f,0.58f}, face_colour[3]={0.54f,0.61f,0.70f};
+      append_slab(facets,pool,walls,mesh,lid,slab.bottom,slab.top,projection,light,
+                  wall_colour,face_colour,IM_COL32(196,214,236,90));
+    }
   }
   if (cutter_cursor && active_tool != nullptr) {
     append_cutter(
@@ -2456,6 +2499,7 @@ void select_operation(App& app, int index) {
   app.material_distance = -1.0;
   app.material_level = -1;
   app.material_operation = -1;
+  app.stock_cache_operation = -1;
   app.view.needs_fit = true;
 }
 
@@ -2468,6 +2512,7 @@ void invalidate_plan(App& app) {
   app.material_distance = -1.0;
   app.material_level = -1;
   app.material_operation = -1;
+  app.stock_cache_operation = -1;
 }
 
 void feeds_panel(App& app);
@@ -3605,6 +3650,7 @@ int main(int argc, char** argv) {
     }
 
     if (app.planner.take(app.plan)) {
+      app.stock_cache_operation = -1;
       log_warnings("Planning", app.plan.warnings);
       app.has_plan = app.plan.ok();
       select_operation(app, app.selected_operation);

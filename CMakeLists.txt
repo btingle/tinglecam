@@ -117,6 +117,7 @@ add_library(tinglecam_core
   src/cam/job.cpp
   src/cam/machine.cpp
   src/cam/material.cpp
+  src/cam/stock.cpp
   src/cam/parametric.cpp
   src/cam/post.cpp
   src/cam/tooling.cpp
@@ -190,3 +191,7 @@ add_test(NAME demo_help COMMAND clipper2_wave_demo --help)
 add_test(NAME demo_analysis_dump
          COMMAND clipper2_wave_demo ${CMAKE_CURRENT_SOURCE_DIR}/wavetest.svg
                  --mitered-waves --dump-analysis)
+
+add_executable(stock_tests tests/stock_tests.cpp)
+target_link_libraries(stock_tests PRIVATE tinglecam_core)
+add_test(NAME stock_tests COMMAND stock_tests)

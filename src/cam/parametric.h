@@ -10,7 +10,7 @@ OperationPlan plan_parametric_operation(
     const Operation& operation, const Tool& tool, const Machine& machine,
     double rapid_plane, const std::vector<OperationPlan>& prior_operations,
     const ProgressCallback& progress = {}, double progress_from = 0.0,
-    double progress_to = 1.0);
+    double progress_to = 1.0, const JobGeometry* geometry = nullptr);
 
 wave::Paths64 pocket_boundary(const PocketParameters& pocket);
 

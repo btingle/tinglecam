@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <functional>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -153,7 +154,13 @@ struct Job {
 
 // One depth of cut: everything the engine produced for it, kept so the UI can
 // draw any level and the post can walk them in order.
+struct StockSlab {
+  double bottom = 0, top = 0;
+  std::shared_ptr<const wave::Paths64> region;
+};
+
 struct LevelPlan {
+  std::vector<StockSlab> local_stock;
   // Parametric operations carry their actual XYZ path in feeds.motion. The
   // planar projection remains available for stock simulation and 2D views.
   bool explicit_motion = false;
@@ -254,6 +261,9 @@ struct PlanningMetrics {
 };
 
 struct OperationPlan {
+  bool composed_stock = false;
+  // Prior stacks, clipped once during planning; playback changes local slabs only.
+  std::vector<StockSlab> preview_context;
   std::string operation_name;
   std::string tool_id;
   std::string machine_id;

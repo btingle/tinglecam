@@ -1458,7 +1458,7 @@ JobPlan plan_job(const JobGeometry& geometry,
       if (is_parametric(operation.mode))
         result = plan_parametric_operation(operation, *tool, *machine,
             plan.rapid_plane, plan.operations, progress,
-            share * index, share * (index + 1));
+            share * index, share * (index + 1), &geometry);
       else
         result = plan_subdivided_operation(
             geometry, operation, *tool, *machine, *material, progress,

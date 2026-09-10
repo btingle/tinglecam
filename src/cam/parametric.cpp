@@ -1,3 +1,4 @@
+#include "cam/stock.h"
 #include "cam/parametric.h"
 
 #include <clipper2/clipper.h>
@@ -200,7 +201,8 @@ wave::Paths64 pocket_boundary(const PocketParameters& p) {
 OperationPlan plan_parametric_operation(
     const Operation& operation, const Tool& tool, const Machine& machine,
     double rapid_plane, const std::vector<OperationPlan>& prior_operations,
-    const ProgressCallback& progress, double progress_from, double progress_to) {
+    const ProgressCallback& progress, double progress_from, double progress_to,
+    const JobGeometry* geometry) {
   const auto started = std::chrono::steady_clock::now();
   OperationPlan result;
   result.operation_name = operation.name; result.tool_id = tool.id;
@@ -275,6 +277,14 @@ OperationPlan plan_parametric_operation(
         point(area.center_x+area.width/2, area.center_y+area.height/2);
       }
     }
+    result.composed_stock = geometry && geometry->has_stock();
+    std::vector<double> boundaries;
+    for (int layer = 0; layer <= layers; ++layer)
+      boundaries.push_back(top-std::min(depth, layer*operation.stepdown));
+    auto incoming_stack = result.composed_stock
+        ? active_stock(*geometry, prior_operations, operation.slice_grid, boundaries)
+        : std::vector<StockSlab>{};
+    result.preview_context = incoming_stack;
     std::optional<Point64> previous;
     for (auto op = prior_operations.rbegin(); op != prior_operations.rend() && !previous; ++op)
       if (op->ok()) for (auto level = op->levels.rbegin(); level != op->levels.rend(); ++level)
@@ -297,10 +307,20 @@ OperationPlan plan_parametric_operation(
           boundary = {rounded_rectangle(area.center_x, area.center_y, area.width, area.height, 0)};
         }
         level.stock_slice = boundary;
-        const double sample_z = (upper+floor)/2;
-        level.incoming_stock = stock_after_operations_at_z(boundary, sample_z, prior_operations);
-        // Earlier areas can overlap this area at the same depth.
-        level.incoming_stock = stock_after_planned_operation_at_z(level.incoming_stock, sample_z, result);
+        if (result.composed_stock) {
+          level.local_stock = stock_inside(incoming_stack, boundary, floor, upper);
+          result.preview_context = stock_outside(result.preview_context, boundary, floor, upper);
+          // Overlapping areas transfer ownership to the later area. Its local
+          // stock includes earlier cuts, while earlier playback still owns the
+          // overlap until the later area starts (handled by the preview).
+          for (const auto& slab : level.local_stock)
+            level.incoming_stock.insert(level.incoming_stock.end(), slab.region->begin(), slab.region->end());
+          level.incoming_stock = Union(level.incoming_stock, FillRule::NonZero);
+        } else {
+          const double sample_z = (upper+floor)/2;
+          level.incoming_stock = stock_after_operations_at_z(boundary, sample_z, prior_operations);
+          level.incoming_stock = stock_after_planned_operation_at_z(level.incoming_stock, sample_z, result);
+        }
         if (level.incoming_stock.empty()) {
           level.nothing_to_cut = true;
           ++result.stats.levels;
@@ -371,7 +391,14 @@ OperationPlan plan_parametric_operation(
         result.stats.rapid_distance += stats.rapid_distance;
         result.stats.cutting_minutes += stats.cutting_minutes;
         result.stats.rapid_minutes += stats.rapid_minutes;
-        result.stats.removed_volume += level.simulation.stats.removed_area*level.axial_depth;
+        if (result.composed_stock) {
+          for (const auto& slab : level.local_stock) {
+            const auto removed = Intersect(*slab.region, level.simulation.removed_material, FillRule::NonZero);
+            result.stats.removed_volume += std::abs(Area(removed)) /
+                (double(wave::to_integer(1))*wave::to_integer(1)) * (slab.top-slab.bottom);
+          }
+          incoming_stack = stock_outside(incoming_stack, level.simulation.removed_material, floor, upper);
+        } else result.stats.removed_volume += level.simulation.stats.removed_area*level.axial_depth;
         result.stats.maximum_load = std::max(result.stats.maximum_load, level.simulation.stats.maximum_load);
         result.stats.excess_area += level.simulation.stats.excess_area;
         result.metrics.toolpath_moves += level.toolpath.moves.size();

@@ -501,9 +501,18 @@ it clears each rectangle using alternating straight rows and an edge cleanup,
 then retracts to the job clearance plane before crossing to another area. Entry
 uses the operation's plunge feed. The cutter stays inside each rectangle, so
 corners retain its radius; areas must accommodate the cutter. Overlapping areas
-share simulated stock. These explicit regions define what to cut, independently
-of a loaded part's protected surfaces; any loaded models still contribute to
-the global rapid clearance height.
+share simulated stock. With loaded or box stock, pocket and plane passes cut
+only the active stock remaining after earlier operations. An area outside that
+stock produces no cutting motion. Without stock, standalone dimension-only
+jobs continue to use their specified regions as the starting material. These
+operations do not protect loaded part surfaces automatically.
+
+The stacked pocket/plane preview is cumulative. Earlier stock remains visible
+outside the footprint and above/below the operation's depth range. Local slabs
+retain all crossed layer boundaries, even when one new stepdown spans several
+roughing layers. Boundary splits share the original polygon data. Prior-stock
+clipping is cached; playback removes material locally and leaves future layers
+intact. Overlapping areas apply their removals in execution order.
 
 Simulation remains a 2D slab approximation: the floor stock during a helical
 entry is conservatively left intact until the full turn at the floor. The
