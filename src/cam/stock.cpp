@@ -51,15 +51,15 @@ std::vector<StockSlab> preview_before_level(const OperationPlan& operation, std:
   return stock;
 }
 std::vector<StockSlab> active_stock(const JobGeometry& geometry,
-    const std::vector<OperationPlan>& previous, int grid,
+    const PriorOperations& previous, int grid,
     const std::vector<double>& extra_boundaries) {
   if (!geometry.has_stock()) return {};
   for (std::size_t i=previous.size(); i>0; --i) {
-    const auto& op = previous[i-1];
-    if (!op.ok() || !op.composed_stock) continue;
-    auto stock = preview_before_level(op,op.levels.size());
-    for (std::size_t j=i;j<previous.size();++j) if (previous[j].ok())
-      for (const auto& level : previous[j].levels)
+    const auto* op = previous[i-1];
+    if (!op || !op->ok() || !op->composed_stock) continue;
+    auto stock = preview_before_level(*op,op->levels.size());
+    for (std::size_t j=i;j<previous.size();++j) if (previous[j] && previous[j]->ok())
+      for (const auto& level : previous[j]->levels)
         stock = stock_outside(stock,level.simulation.removed_material,
                               level.floor_z,level.floor_z+level.axial_depth);
     return stock;
@@ -73,7 +73,7 @@ std::vector<StockSlab> active_stock(const JobGeometry& geometry,
   // not turn a slab model into an exact solid for sloping surfaces.
   for (double z : extra_boundaries)
     if (z > bottom && z < top) cuts.push_back(z);
-  for (const auto& op : previous) if (op.ok()) for (const auto& level : op.levels) {
+  for (const auto* op : previous) if (op && op->ok()) for (const auto& level : op->levels) {
     for (double z : {level.floor_z,level.floor_z+level.axial_depth})
       if (z > bottom && z < top) cuts.push_back(z);
   }

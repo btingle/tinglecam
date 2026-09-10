@@ -477,6 +477,9 @@ Material material_from_json_text(const std::string& text) {
   return material_from(parse(text, "<memory>"));
 }
 std::string to_json_text(const Job& job) { return to_json(job).dump(2); }
+std::string to_json_text(const Operation& operation) {
+  return to_json(operation).dump(2);
+}
 Job job_from_json_text(const std::string& text) {
   return job_from(parse(text, "<memory>"));
 }

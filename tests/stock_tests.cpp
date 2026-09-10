@@ -51,19 +51,19 @@ void integration() {
   op.pocket.center_x=10; op.pocket.center_y=10; op.pocket.width=12; op.pocket.height=12;
   op.pocket.top_z=9; op.pocket.depth=6; op.stepdown=6;
   OperationPlan rough; LevelPlan old; old.floor_z=6; old.axial_depth=4; old.simulation.removed_material=rect(0,0,10,20); rough.levels.push_back(old);
-  auto result=plan_parametric_operation(op,tool,machine,15,{rough},{},0,1,&geometry);
+  auto result=plan_parametric_operation(op,tool,machine,15,{&rough},{},0,1,&geometry);
   check(result.ok(),result.error.c_str()); check(result.composed_stock,"Loaded stock enables composition");
   check(result.levels.size()==1 && result.levels[0].local_stock.size()==2,"One new pass retains two previous Z sections");
   near(volume(preview_before_level(result,0)),3200);
   near(volume(preview_before_level(result,1)),3200-result.stats.removed_volume);
   check(result.stats.removed_volume>600 && result.stats.removed_volume<648.1,"Removal reflects prior roughing, not synthetic footprint");
-  const auto later=active_stock(geometry,{rough,result},32);
+  const auto later=active_stock(geometry,{&rough,&result},32);
   near(volume(later),3200-result.stats.removed_volume);
   Operation plane = op;
   plane.mode=OperationMode::PlaneClearing;
   plane.plane.top_z=8.5; plane.plane.depth=7; plane.stepdown=2.5;
   plane.plane.areas={{7,10,10,16},{12,10,12,16}};
-  const auto facing=plan_parametric_operation(plane,tool,machine,15,{rough,result},{},0,1,&geometry);
+  const auto facing=plan_parametric_operation(plane,tool,machine,15,{&rough,&result},{},0,1,&geometry);
   check(facing.ok(),facing.error.c_str());
   near(volume(preview_before_level(facing,0)),volume(later));
   near(volume(preview_before_level(facing,facing.levels.size())),
@@ -79,11 +79,100 @@ void integration() {
     check(previous_volume<=volume(before)+1e-6,"Overlapping passes monotonically remove stock");
   }
   op.pocket.center_x=100;
-  const auto air=plan_parametric_operation(op,tool,machine,15,{rough},{},0,1,&geometry);
+  const auto air=plan_parametric_operation(op,tool,machine,15,{&rough},{},0,1,&geometry);
   check(air.ok() && air.levels[0].nothing_to_cut,"Pocket outside active stock cuts nothing");
   near(volume(preview_before_level(air,1)),3200);
   op.pocket.center_x=10; op.pocket.top_z=15; op.pocket.depth=2; op.stepdown=1;
   const auto above=plan_parametric_operation(op,tool,machine,20,{},{},0,1,&geometry);
   check(above.ok() && above.stats.removed_volume==0,"Box stock is bounded in Z");
 }
-int main() { try { aliases(); integration(); } catch(const std::exception& e) { std::cerr<<e.what()<<'\n';return 1;} }
+// A partial re-plan has to produce exactly what planning the whole job
+// produces for the operations it covers. The point of it is that the ones it
+// does not cover are not recomputed, so what it reads their leftover stock out
+// of is the plan already in hand -- and if that handoff differed in any way
+// from the one a full run makes, the saving would be bought with a different
+// answer.
+void partial_replan() {
+  const auto file=std::filesystem::temp_directory_path()/"tinglecam-partial-test.obj";
+  { std::ofstream out(file); out << "v 0 0 0\nv 20 0 0\nv 20 20 0\nv 0 20 0\nv 0 0 10\nv 20 0 10\nv 20 20 10\nv 0 20 10\n"
+    "f 1 3 2\nf 1 4 3\nf 5 6 7\nf 5 7 8\nf 1 2 6\nf 1 6 5\nf 2 3 7\nf 2 7 6\nf 3 4 8\nf 3 8 7\nf 4 1 5\nf 4 5 8\n"; }
+  JobGeometry geometry; geometry.load_part(file); geometry.set_box_stock(true,0);
+  std::filesystem::remove(file);
+  Tool tool; tool.id="tool"; tool.name="Tool"; tool.diameter=2; tool.flute_length=20; tool.flutes=2;
+  Machine machine; machine.id="machine"; machine.name="Machine"; machine.rapid_feed=3000;
+  machine.rapid_feed_z=500; machine.min_rpm=1000; machine.max_rpm=24000;
+  machine.feed_ranges.push_back({"material",500,1500});
+  ToolLibrary tools{{tool}};
+  MachineLibrary machines{{machine}};
+  MaterialLibrary materials{{{"material","Test material"}}};
+
+  Job job;
+  Operation first; first.name="First"; first.mode=OperationMode::PlaneClearing;
+  first.tool_id="tool"; first.machine_id="machine"; first.material_id="material";
+  first.plane.top_z=10; first.plane.depth=3; first.stepdown=3;
+  first.plane.areas={{5,10,8,16}};
+  Operation second=first; second.name="Second"; second.mode=OperationMode::Pocket;
+  second.pocket.shape=PocketShape::Rectangle; second.pocket.center_x=10;
+  second.pocket.center_y=10; second.pocket.width=12; second.pocket.height=12;
+  second.pocket.top_z=9; second.pocket.depth=5; second.stepdown=5;
+  job.operations={first,second};
+
+  const JobPlan whole=plan_job(geometry,job,tools,machines,materials,{});
+  check(whole.ok(),whole.error.c_str());
+  check(whole.operations.size()==2,"A full plan covers every operation");
+  for (const auto& op : whole.operations)
+    check(op.planned && op.ok(),"A full plan marks every operation planned");
+
+  // The second operation alone, reading the first out of the plan just made.
+  const PriorOperations earlier{&whole.operations[0]};
+  const PartialPlan again=plan_operation_range(geometry,job,tools,machines,
+                                               materials,{},1,1,earlier);
+  check(again.error.empty(),again.error.c_str());
+  check(again.first==1 && again.operations.size()==1,"Only the asked-for range comes back");
+  check(again.operations[0].planned && again.operations[0].ok(),
+        again.operations[0].error.c_str());
+  near(again.operations[0].stats.removed_volume,
+       whole.operations[1].stats.removed_volume);
+  check(again.operations[0].levels.size()==whole.operations[1].levels.size(),
+        "A re-planned operation cuts the same passes as a full run");
+  near(again.rapid_plane,whole.rapid_plane);
+
+  // Planning the first on its own inherits nothing, so it must reproduce the
+  // first operation of a full run rather than the second's leftovers.
+  const PartialPlan head=plan_operation_range(geometry,job,tools,machines,
+                                              materials,{},0,0,{});
+  check(head.error.empty(),head.error.c_str());
+  near(head.operations[0].stats.removed_volume,
+       whole.operations[0].stats.removed_volume);
+
+  // A range whose predecessors are not accounted for is refused rather than
+  // planned against nothing, which would quietly cut air as though it were
+  // stock the operation above had already taken.
+  const PartialPlan gap=plan_operation_range(geometry,job,tools,machines,
+                                             materials,{},1,1,{});
+  check(!gap.error.empty(),"A range missing its predecessors must be refused");
+  const PartialPlan outside=plan_operation_range(geometry,job,tools,machines,
+                                                 materials,{},0,9,{});
+  check(!outside.error.empty(),"A range beyond the job must be refused");
+
+  // Splicing one operation's result into a plan and re-totalling it gives the
+  // totals of the plan as it now stands, not of the run that touched part of it.
+  JobPlan spliced=plan_job(geometry,job,tools,machines,materials,{});
+  spliced.operations[1]=again.operations[0];
+  summarise_job(spliced);
+  near(spliced.stats.removed_volume,whole.stats.removed_volume);
+  check(spliced.ok(),"A spliced plan is still a plan");
+
+  // An operation with no result is a gap, not a failure to report.
+  JobPlan partial=plan_job(geometry,job,tools,machines,materials,{});
+  partial.operations[1]=OperationPlan{};
+  partial.operations[1].operation_name="Second";
+  partial.operations[1].error="Not planned yet";
+  summarise_job(partial);
+  check(partial.ok(),"A half-planned job is still usable");
+  for (const auto& warning : partial.warnings)
+    check(warning.find("Not planned yet")==std::string::npos,
+          "An operation nothing has been asked of is not warned about");
+  near(partial.stats.removed_volume,whole.operations[0].stats.removed_volume);
+}
+int main() { try { aliases(); integration(); partial_replan(); } catch(const std::exception& e) { std::cerr<<e.what()<<'\n';return 1;} }

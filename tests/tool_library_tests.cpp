@@ -205,6 +205,153 @@ void check_warning_wrapping() {
   }
 }
 
+// The view cube, driven the way a hand drives it: a real press and release at a
+// real pixel, and the camera that comes out of it. Every piece of it is a place
+// where a sign or an axis can be transposed without looking wrong -- the cube
+// still draws, it just sends the camera somewhere else -- so what is checked is
+// the whole round trip: click the face that says Top, and end up looking down.
+void cube_frame(App& app, ImVec2 canvas) {
+  ImGui::NewFrame();
+  ImGui::SetNextWindowPos(ImVec2(0, 0));
+  ImGui::SetNextWindowSize(canvas);
+  ImGui::Begin("view cube", nullptr, ImGuiWindowFlags_NoDecoration);
+  view_cube(app, ImGui::GetWindowDrawList(), ImVec2(0, 0), canvas, true);
+  ImGui::End();
+  ImGui::Render();
+}
+
+void near(float a, float b, const char* message, float tolerance = 1e-4f) {
+  check(std::abs(a - b) <= tolerance, message);
+}
+
+void check_view_cube() {
+  const ImVec2 canvas(600, 600);
+  auto& io = ImGui::GetIO();
+
+  // Where a cell of a face lands on screen, worked out the way the cube draws
+  // it rather than by reaching into it.
+  const auto cell_at = [&](const App& app, int axis, int sign, int across,
+                           int down) {
+    const Basis basis = orbit_basis(app.orbit.yaw, app.orbit.pitch);
+    const CubeFace face = cube_face(axis, sign);
+    const float u = static_cast<float>(across) * 2.0f / 3.0f;
+    const float v = static_cast<float>(down) * 2.0f / 3.0f;
+    const Vec3 at{face.normal.x + face.across.x * u + face.down.x * v,
+                  face.normal.y + face.across.y * u + face.down.y * v,
+                  face.normal.z + face.across.z * u + face.down.z * v};
+    const ImVec2 middle = cube_centre(ImVec2(0, 0), canvas);
+    const float scale = kCubeBox * 0.5f / kCubeFit;
+    return ImVec2{
+        middle.x +
+            (at.x * basis.right.x + at.y * basis.right.y + at.z * basis.right.z) *
+                scale,
+        middle.y -
+            (at.x * basis.up.x + at.y * basis.up.y + at.z * basis.up.z) * scale};
+  };
+
+  const auto press = [&](App& app, ImVec2 position) {
+    io.AddMousePosEvent(position.x, position.y);
+    cube_frame(app, canvas);
+    io.AddMouseButtonEvent(0, true);
+    cube_frame(app, canvas);
+    io.AddMouseButtonEvent(0, false);
+    cube_frame(app, canvas);
+    // The turn is eased over about a quarter second; run it out.
+    advance_camera(app, 1.0);
+  };
+
+  const auto looks_from = [&](const App& app, float x, float y, float z,
+                              const char* message) {
+    const Basis basis = orbit_basis(app.orbit.yaw, app.orbit.pitch);
+    const float length = std::sqrt(x * x + y * y + z * z);
+    near(basis.toward.x, x / length, message, 2e-3f);
+    near(basis.toward.y, y / length, message, 2e-3f);
+    near(basis.toward.z, z / length, message, 2e-3f);
+  };
+
+  // Straight down. The clamp used to stop a little short of it, so this is
+  // also the check that the poles are reachable at all.
+  App app;
+  press(app, cell_at(app, 2, 1, 0, 0));
+  near(app.orbit.pitch, kQuarterTurn, "The top view is exactly a quarter turn");
+  looks_from(app, 0, 0, 1, "Clicking Top looks straight down");
+
+  // And that the basis has not gone degenerate there, which is the reason a
+  // clamp short of the pole is usually there in the first place.
+  const Basis pole = orbit_basis(app.orbit.yaw, app.orbit.pitch);
+  near(pole.right.x * pole.up.x + pole.right.y * pole.up.y +
+           pole.right.z * pole.up.z, 0.0f, "Right and up stay perpendicular");
+  near(std::sqrt(pole.up.x * pole.up.x + pole.up.y * pole.up.y +
+                 pole.up.z * pole.up.z), 1.0f, "Up stays a unit vector");
+  near(std::sqrt(pole.toward.x * pole.toward.x + pole.toward.y * pole.toward.y +
+                 pole.toward.z * pole.toward.z), 1.0f,
+       "Toward stays a unit vector");
+
+  // The named axis views, each clicked on the face carrying its name, against
+  // the axis directions the origin picker uses for the same words.
+  struct Named { int axis, sign; float x, y, z; const char* name; };
+  static const Named kNamed[] = {
+      {0, 1, 1, 0, 0, "Right"},  {0, -1, -1, 0, 0, "Left"},
+      {1, 1, 0, 1, 0, "Front"},  {1, -1, 0, -1, 0, "Back"},
+      {2, 1, 0, 0, 1, "Top"},    {2, -1, 0, 0, -1, "Bottom"},
+  };
+  for (const Named& named : kNamed) {
+    App named_app;
+    // Turn to the face first, or it is on the far side of the cube and there
+    // is nothing there to click.
+    aim_camera(named_app, {named.x, named.y, named.z});
+    advance_camera(named_app, 1.0);
+    press(named_app, cell_at(named_app, named.axis, named.sign, 0, 0));
+    check(std::string(cube_face_name(named.axis, named.sign)) == named.name,
+          "Each face carries the origin picker's name for its direction");
+    looks_from(named_app, named.x, named.y, named.z,
+               "Clicking a named face looks from that direction");
+  }
+
+  // A corner cell is the isometric between its three faces.
+  App corner;
+  press(corner, cell_at(corner, 2, 1, 1, 1));
+  looks_from(corner, 1, 1, 1, "A corner of the cube is the isometric view");
+
+  // An edge cell is the view halfway between its two faces.
+  App edge;
+  press(edge, cell_at(edge, 2, 1, 1, 0));
+  looks_from(edge, 1, 0, 1, "An edge of the cube splits its two faces");
+
+  // Azimuth roams, so the angles naming one direction can be many turns from
+  // the ones the camera happens to hold. The turn taken has to be the short
+  // way round rather than several revolutions back to where it already was.
+  App wound;
+  wound.orbit.yaw = 0.2f + 6.0f * kQuarterTurn * 2.0f;  // three turns on
+  aim_camera(wound, {0, 1, 0});
+  check(std::abs(wound.orbit.to_yaw - wound.orbit.from_yaw) <= kQuarterTurn * 2.0f,
+        "A snap turns by at most half a revolution");
+  advance_camera(wound, 1.0);
+  looks_from(wound, 0, 1, 0, "A wound-on azimuth still arrives at the view");
+
+  // A press that turns into a drag is an abandoned click, not a snap: the cube
+  // sits inside the canvas, and letting a stray drag across it throw the camera
+  // somewhere would make the corner of every view a hazard.
+  App dragged;
+  const float before_yaw = dragged.orbit.yaw;
+  const float before_pitch = dragged.orbit.pitch;
+  const ImVec2 from = cell_at(dragged, 2, 1, 0, 0);
+  io.AddMousePosEvent(from.x, from.y);
+  cube_frame(dragged, canvas);
+  io.AddMouseButtonEvent(0, true);
+  cube_frame(dragged, canvas);
+  io.AddMousePosEvent(from.x + 40.0f, from.y + 25.0f);
+  cube_frame(dragged, canvas);
+  io.AddMouseButtonEvent(0, false);
+  cube_frame(dragged, canvas);
+  check(!dragged.orbit.turning, "A drag off the cube does not snap the camera");
+  near(dragged.orbit.yaw, before_yaw, "A drag off the cube leaves the azimuth");
+  near(dragged.orbit.pitch, before_pitch,
+       "A drag off the cube leaves the elevation");
+  io.AddMousePosEvent(-1.0f, -1.0f);
+  cube_frame(dragged, canvas);
+}
+
 }  // namespace
 
 int main() {
@@ -223,7 +370,8 @@ int main() {
   try {
     run(directory);
     check_warning_wrapping();
-    std::cout << "Tool library GUI and persistence checks passed.\n";
+    check_view_cube();
+    std::cout << "Tool library, warning, and view cube GUI checks passed.\n";
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';
     result = EXIT_FAILURE;

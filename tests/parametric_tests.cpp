@@ -54,6 +54,13 @@ void check_timeline(const cam::JobPlan& result) {
   for (const auto& op : result.operations) {
     for (const auto& level : op.levels) {
       check(level.explicit_motion, "Parametric paths must carry actual XYZ motion");
+      // A level whose material an earlier area already took is kept as a pass
+      // with nothing in it rather than dropped, so playback and the operation
+      // list still account for every area at every depth.
+      if (level.nothing_to_cut) {
+        check(level.feeds.motion.empty(), "A pass with nothing to cut carries no motion");
+        continue;
+      }
       check(!level.feeds.motion.empty(), "A pass must have machine motion");
       double distance = 0;
       for (std::size_t i = 0; i < level.feeds.motion.size(); ++i) {
@@ -175,7 +182,8 @@ void planes() {
   for (std::size_t index = 0; index < levels.size(); ++index) {
     const auto& level = levels[index];
     const auto& area = op.plane.areas[index%2];
-    bool left = false, right = false;
+    const double radius = tool().diameter/2;
+    bool left = false, right = false, overran = false;
     for (const auto& phase : level.feeds.motion) {
       if (phase.rapid || phase.kind == wave::MoveKind::Entry) continue;
       near(phase.to_z, level.floor_z, "Raster is at the requested layer depth");
@@ -184,16 +192,31 @@ void planes() {
       left |= phase.to.x < phase.from.x;
       right |= phase.to.x > phase.from.x;
       for (const auto& point : {phase.from,phase.to}) {
-        check(std::abs(wave::to_world(point.x)-area.center_x)+tool().diameter/2 <= area.width/2+0.001,
-              "Cutter remains within the selected area's X bounds");
-        check(std::abs(wave::to_world(point.y)-area.center_y)+tool().diameter/2 <= area.height/2+0.001,
-              "Cutter remains within the selected area's Y bounds");
+        const double x = std::abs(wave::to_world(point.x)-area.center_x);
+        check(x <= area.width/2+radius+0.001,
+              "Facing rows overrun the area's X edges by exactly a radius");
+        overran |= x >= area.width/2+radius-0.001;
+        check(std::abs(wave::to_world(point.y)-area.center_y)+radius <= area.height/2+0.001,
+              "Rows stay within the area's Y bounds, which the overrun covers");
       }
     }
     check(left && right, "Plane clearing alternates row direction");
+    check(overran, "Every row runs clear off the edge it ends on");
+    // Descending inside the area would cut into the surface being faced with
+    // the whole of the cutter. The area is a statement about the surface, not
+    // about the air beside it, so the plunge belongs outside it.
+    bool descended = false;
+    for (const auto& phase : level.feeds.motion) {
+      if (phase.rapid || phase.to_z >= phase.from_z-1e-9) continue;
+      check(std::abs(wave::to_world(phase.to.x)-area.center_x) >=
+                area.width/2+radius-0.001,
+            "Facing descends clear of the area, not into it");
+      descended = true;
+    }
+    check(descended, "Every facing pass descends to its floor");
     check(level.subdivision_level == index, "Area playback retains execution order");
-    check(level.simulation.stats.removed_area > area.width*area.height*0.98,
-          "Raster clears the rectangle except its rounded corners");
+    check(level.simulation.stats.removed_area > area.width*area.height*0.999,
+          "Facing clears the complete surface, corners included");
   }
 }
 
@@ -217,8 +240,8 @@ void validation_and_storage() {
   const auto overlapping = plan(overlap);
   check_timeline(overlapping);
   const auto& overlap_levels = overlapping.operations.front().levels;
-  check(overlap_levels[1].simulation.stats.removed_area < 0.01,
-        "Overlapping areas inherit material removed earlier in the pass");
+  check(overlap_levels[1].nothing_to_cut,
+        "A coincident later area finds the surface already faced off");
 
   cam::Job job; job.operations = {op, operation(cam::OperationMode::PlaneClearing)};
   job.operations[0].tool_number = 8; job.operations[0].length_offset = 4;

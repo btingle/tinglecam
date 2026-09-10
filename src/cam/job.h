@@ -17,6 +17,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -86,6 +87,10 @@ struct Operation {
   int finishing_subdivisions = 1;
 
   double radial_stock_to_leave = 0.2;
+  // Stock left on the surfaces a pass comes down onto. The part is sliced this
+  // far below each floor, so a pass stops above anything within that distance.
+  // Floors stay on their own grid, so what is left is this to this plus a
+  // stepdown. Walls are the radial allowance's job.
   double axial_stock_to_leave = 0.0;
 
   // Depth range, measured downwards from the top of the work -- the taller of
@@ -261,6 +266,11 @@ struct PlanningMetrics {
 };
 
 struct OperationPlan {
+  // False for an operation the plan holds no result for at all: one added
+  // since the plan was made, or one a partial re-plan has not reached. Its
+  // error says so, so every reader that already skips a failed operation skips
+  // this one too; the flag is what tells a failure apart from a gap.
+  bool planned = false;
   bool composed_stock = false;
   // Prior stacks, clipped once during planning; playback changes local slabs only.
   std::vector<StockSlab> preview_context;
@@ -279,6 +289,14 @@ struct OperationPlan {
 
   bool ok() const { return error.empty(); }
 };
+
+// The operations already planned, in job order, as the source of the stock an
+// operation inherits. Pointers rather than the plans themselves, because a
+// partial re-plan reads its predecessors out of the plan already on screen and
+// appends the ones it has just computed, and those two do not sit next to each
+// other in memory. Copying an operation's plan to put them side by side would
+// cost a good part of the planning this exists to avoid.
+using PriorOperations = std::vector<const OperationPlan*>;
 
 struct JobPlan {
   std::vector<OperationPlan> operations;
@@ -299,10 +317,26 @@ struct JobPlan {
 using ProgressCallback = std::function<bool(double fraction, const std::string& stage)>;
 
 // Holds the sliced meshes so a replan does not rebuild the BVH, and the slices
-// themselves so repeated planning does not re-cut them. One instance per job;
-// slicing is not called from more than one thread at a time.
+// themselves so repeated planning does not re-cut them. One instance per job.
+//
+// Slicing may be called from more than one thread: a plan runs on a worker
+// while the window draws the same models, and both fill the same cache. What
+// is shared is the remembering, and that is locked. Replacing a mesh is not:
+// it empties the caches, and a slice already handed out by reference would go
+// with them, so a caller loading a model has to have stopped its planner
+// first.
 class JobGeometry {
  public:
+  JobGeometry() = default;
+  // Movable, because loading a job builds a fresh one and hands it over. The
+  // mutex below is not part of what moves: it guards this instance's caches,
+  // and the instance being moved into has its own to guard what arrives with.
+  JobGeometry(JobGeometry&& other) noexcept { take(std::move(other)); }
+  JobGeometry& operator=(JobGeometry&& other) noexcept {
+    if (this != &other) take(std::move(other));
+    return *this;
+  }
+
   void load_part(const std::filesystem::path& file);
   void load_stock(const std::filesystem::path& file);
   // Stand a rectangular blank in for a stock model: the part's bounding box
@@ -341,7 +375,22 @@ class JobGeometry {
   const wave::Paths64& outline(const wave::MeshSlicer& slicer,
                                std::map<SliceKey, wave::Paths64>& cache,
                                double z, int grid) const;
+  void take(JobGeometry&& other) noexcept {
+    std::scoped_lock lock(slices_, other.slices_);
+    part_ = std::move(other.part_);
+    stock_ = std::move(other.stock_);
+    box_stock_ = other.box_stock_;
+    box_margin_ = other.box_margin_;
+    part_slices_ = std::move(other.part_slices_);
+    stock_slices_ = std::move(other.stock_slices_);
+    box_ = std::move(other.box_);
+  }
 
+  // The slice caches are filled lazily, and a plan running on the worker
+  // thread fills them while the window draws the same models from the frame
+  // thread. Both are reads as far as the caller is concerned; only the
+  // remembering underneath is a write, and this is what makes it one.
+  mutable std::mutex slices_;
   wave::MeshSlicer part_;
   wave::MeshSlicer stock_;
   bool box_stock_ = false;
@@ -373,8 +422,7 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
                               const ProgressCallback& progress,
                               double progress_from = 0.0,
                               double progress_to = 1.0,
-                              const std::vector<OperationPlan>* prior_operations =
-                                  nullptr,
+                              const PriorOperations& prior_operations = {},
                               const OperationPlan* prior_subdivisions = nullptr);
 
 // The one plane every disconnected move traverses at, in job coordinates; the
@@ -391,6 +439,15 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
 // post writes the height every lift was costed against instead of working out
 // a second opinion.
 double job_rapid_plane(const Job& job, double highest);
+
+// The same plane, resolved from everything in the job that stands in the way:
+// the models, and the top surface of every dimension-driven operation, which
+// has no mesh to be read off. Every operation is costed against this one
+// figure, so a partial re-plan has to arrive at the same one the operations it
+// is not re-planning were costed against -- and when it does not, those
+// operations are out of date, which is exactly what recording it lets a caller
+// notice.
+double job_rapid_plane(const Job& job, const JobGeometry& geometry);
 
 // The top of the tallest loaded model, or negative infinity if none is loaded.
 // This is what an operation's depths are measured down from.
@@ -422,8 +479,7 @@ OperationPlan plan_operation(const JobGeometry& geometry,
                              double progress_from = 0.0,
                              double progress_to = 1.0,
                              double rapid_plane = 10.0,
-                             const std::vector<OperationPlan>* prior_operations =
-                                 nullptr,
+                             const PriorOperations& prior_operations = {},
                              const OperationPlan* prior_subdivisions = nullptr);
 
 // Resolves the material present at one Z plane after a sequence of operations.
@@ -433,7 +489,7 @@ OperationPlan plan_operation(const JobGeometry& geometry,
 // stock model later.
 wave::Paths64 stock_after_operations_at_z(
     const wave::Paths64& nominal_stock, double z,
-    const std::vector<OperationPlan>& operations);
+    const PriorOperations& operations);
 wave::Paths64 stock_after_planned_operation_at_z(
     const wave::Paths64& nominal_stock, double z, const OperationPlan& operation);
 
@@ -444,6 +500,44 @@ wave::Paths64 stock_after_planned_operation_at_z(
 std::size_t subdivision_preview_source(const OperationPlan& operation,
                                        std::size_t active_level,
                                        std::size_t target_level);
+
+// What one re-planning run produced. `operations` covers job operations
+// [first, first + operations.size()) and nothing else; the caller splices them
+// into the plan it already has.
+struct PartialPlan {
+  std::size_t first = 0;
+  std::vector<OperationPlan> operations;
+  double rapid_plane = 0.0;
+  // Non-empty when the run could not be made at all -- cancelled, or asked for
+  // a range the job does not have. Individual operations carry their own
+  // failures instead.
+  std::string error;
+};
+
+// Plans operations [first, last] of the job and nothing else, reading the
+// stock handed to the first of them out of `earlier`: the plans of the
+// operations above it, which are not recomputed. `earlier` holds one entry per
+// operation above `first`, in order.
+//
+// Planning an operation against a predecessor that was never planned is not
+// possible -- there is no stock to inherit -- and is the caller's to refuse
+// before asking. An entry that is present but failed is not a gap: the planner
+// already treats a failed operation as one that removed nothing, which is what
+// it did.
+PartialPlan plan_operation_range(const JobGeometry& geometry,
+                                 const Job& job,
+                                 const ToolLibrary& tools,
+                                 const MachineLibrary& machines,
+                                 const MaterialLibrary& materials,
+                                 const ProgressCallback& progress,
+                                 std::size_t first, std::size_t last,
+                                 const PriorOperations& earlier);
+
+// Rebuilds the job-wide statistics, metrics, warnings and error from whatever
+// the operations now say. Called after a partial re-plan has replaced some of
+// them, so the totals describe the plan as it now stands rather than the run
+// that last touched part of it.
+void summarise_job(JobPlan& plan);
 
 JobPlan plan_job(const JobGeometry& geometry,
                  const Job& job,

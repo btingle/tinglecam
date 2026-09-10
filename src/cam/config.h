@@ -48,5 +48,8 @@ std::string to_json_text(const Material& material);
 Material material_from_json_text(const std::string& text);
 std::string to_json_text(const Job& job);
 Job job_from_json_text(const std::string& text);
+// One operation on its own, so a caller comparing an operation against the one
+// a plan was built from does not have to serialise the whole job to do it.
+std::string to_json_text(const Operation& operation);
 
 }  // namespace cam

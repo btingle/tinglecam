@@ -237,6 +237,15 @@ bool resolve_setup(const Operation& operation, const Tool& tool,
     error = "Tiny split area factor must be nonnegative";
     return false;
   }
+  if (operation.radial_stock_to_leave < 0.0 ||
+      !std::isfinite(operation.radial_stock_to_leave) ||
+      operation.axial_stock_to_leave < 0.0 ||
+      !std::isfinite(operation.axial_stock_to_leave)) {
+    // Negative would slice the part above the floor and lose what the pass is
+    // about to come down on.
+    error = "Radial and axial stock to leave must be finite and nonnegative";
+    return false;
+  }
   if (operation.cleanup_tolerance < 0.0 ||
       !std::isfinite(operation.cleanup_tolerance)) {
     error = "Boundary cleanup tolerance must be finite and nonnegative";
@@ -282,13 +291,21 @@ bool resolve_floors(const Operation& operation, const OperationSetup& setup,
 // A job is usable when any one operation planned. The rest are reported as
 // warnings rather than hidden, and a job with none at all carries every reason.
 void finish_job(JobPlan& plan) {
-  const bool any = std::any_of(plan.operations.begin(), plan.operations.end(),
-                               [](const OperationPlan& op) { return op.ok(); });
-  if (!any) {
+  const bool tried = std::any_of(plan.operations.begin(), plan.operations.end(),
+                                 [](const OperationPlan& op) { return op.planned; });
+  const bool any = std::any_of(
+      plan.operations.begin(), plan.operations.end(),
+      [](const OperationPlan& op) { return op.planned && op.ok(); });
+  if (!tried) {
+    plan.error = "No operation has been planned";
+  } else if (!any) {
     std::ostringstream error;
     error << "No operation could be planned:";
     for (const OperationPlan& operation : plan.operations) {
-      if (operation.ok()) continue;
+      // An operation nothing has yet been asked of is not a failure to
+      // report. The list of operations says it has no plan; this is the
+      // account of the ones that were tried.
+      if (!operation.planned || operation.ok()) continue;
       error << "\n  " << operation.operation_name << ": ";
       std::string indent = operation.error;
       std::size_t newline = 0;
@@ -304,7 +321,7 @@ void finish_job(JobPlan& plan) {
     // failure visible without making the successfully planned operations
     // unpostable.
     for (const OperationPlan& operation : plan.operations)
-      if (!operation.ok())
+      if (operation.planned && !operation.ok())
         plan.warnings.push_back(operation.operation_name + ": " +
                                 operation.error);
   }
@@ -495,11 +512,18 @@ const wave::Paths64& JobGeometry::outline(const wave::MeshSlicer& slicer,
           std::llround(static_cast<double>(static_cast<float>(z)) *
                        wave::kIntegerScale)),
       grid};
-  const auto found = cache.find(key);
-  if (found != cache.end()) return found->second;
-  const auto slice = slicer.slice(static_cast<float>(z), grid);
-  return cache.emplace(key, Union(slice.polygons, FillRule::NonZero))
-      .first->second;
+  {
+    std::lock_guard<std::mutex> lock(slices_);
+    const auto found = cache.find(key);
+    if (found != cache.end()) return found->second;
+  }
+  // Sliced outside the lock: it is the expensive half, and a second thread
+  // arriving at the same depth may as well cut it twice as wait. The map is
+  // what needs protecting, not the work.
+  auto slice = slicer.slice(static_cast<float>(z), grid);
+  auto region = Union(slice.polygons, FillRule::NonZero);
+  std::lock_guard<std::mutex> lock(slices_);
+  return cache.emplace(key, std::move(region)).first->second;
 }
 
 const wave::Paths64& JobGeometry::part_outline(double z, int grid) const {
@@ -511,6 +535,7 @@ const wave::Paths64& JobGeometry::stock_outline(double z, int grid) const {
   // One rectangle, the same at every depth, so the depth is not part of the
   // question. An empty part leaves it empty and the level reports nothing to
   // cut, which is what a missing model should look like.
+  std::lock_guard<std::mutex> lock(slices_);
   if (box_.empty() && !part_.empty()) {
     const auto& bounds = part_.mesh().bounds;
     if (bounds.valid) {
@@ -560,8 +585,7 @@ std::vector<double> level_floors(const Operation& operation, double stepdown,
   std::vector<double> floors;
   if (!std::isfinite(work_top)) return floors;
   const double top = z_at_depth(work_top, operation.depth_from);
-  const double bottom =
-      z_at_depth(work_top, operation.depth_to) + operation.axial_stock_to_leave;
+  const double bottom = z_at_depth(work_top, operation.depth_to);
   if (!(top > bottom)) return floors;
   const double step = std::max(stepdown, 1e-6);
   double z = top;
@@ -585,7 +609,7 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
                               const ProgressCallback& progress,
                               double progress_from,
                               double progress_to,
-                              const std::vector<OperationPlan>* prior_operations,
+                              const PriorOperations& prior_operations,
                               const OperationPlan* prior_subdivisions) {
   OperationPlan plan;
   plan.operation_name = operation.name;
@@ -644,15 +668,19 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
     try {
       // The slicer returns the downward envelope: everything at or above this
       // depth, projected. That is exactly the material that has to survive the
-      // pass, so no separate rest model is needed for roughing.
+      // pass, so no separate rest model is needed for roughing. Taken the axial
+      // allowance below the floor, it also carries what the part has just under
+      // the cutter, so the pass stops above it. The blank is sliced at the
+      // floor: what is left is part, not stock.
       const auto slice_start = PlanningClock::now();
-      level.part_slice = geometry.part_outline(floor_z, operation.slice_grid);
+      level.part_slice = geometry.part_outline(
+          floor_z - operation.axial_stock_to_leave, operation.slice_grid);
       level.stock_slice = geometry.stock_outline(floor_z, operation.slice_grid);
       level.incoming_stock =
-          prior_operations == nullptr
+          prior_operations.empty()
               ? level.stock_slice
               : stock_after_operations_at_z(level.stock_slice, floor_z,
-                                             *prior_operations);
+                                            prior_operations);
       if (prior_subdivisions != nullptr)
         level.incoming_stock = stock_after_operation_at_z(
             level.incoming_stock, floor_z, *prior_subdivisions);
@@ -1273,7 +1301,7 @@ OperationPlan plan_operation(const JobGeometry& geometry,
                              double progress_from,
                              double progress_to,
                              double rapid_plane,
-                             const std::vector<OperationPlan>* prior_operations,
+                             const PriorOperations& prior_operations,
                              const OperationPlan* prior_subdivisions) {
   const auto planning_start = PlanningClock::now();
   // Wavefronts are the cheaper half; give the toolpaths the larger share of the
@@ -1290,13 +1318,14 @@ OperationPlan plan_operation(const JobGeometry& geometry,
 
 wave::Paths64 stock_after_operations_at_z(
     const wave::Paths64& nominal_stock, double z,
-    const std::vector<OperationPlan>& operations) {
+    const PriorOperations& operations) {
   if (nominal_stock.empty()) return {};
 
   wave::Paths64 remaining =
       Clipper2Lib::Union(nominal_stock, Clipper2Lib::FillRule::NonZero);
-  for (const OperationPlan& operation : operations) {
-    remaining = stock_after_operation_at_z(remaining, z, operation);
+  for (const OperationPlan* operation : operations) {
+    if (operation == nullptr) continue;
+    remaining = stock_after_operation_at_z(remaining, z, *operation);
     if (remaining.empty()) break;
   }
   return remaining;
@@ -1330,7 +1359,7 @@ OperationPlan plan_subdivided_operation(
     const Tool& tool, const Machine& machine, const Material& material,
     const ProgressCallback& progress, double progress_from,
     double progress_to, double rapid_plane,
-    const std::vector<OperationPlan>* prior_operations) {
+    const PriorOperations& prior_operations) {
   OperationPlan result;
   result.operation_name = operation.name;
   result.tool_id = operation.tool_id;
@@ -1424,7 +1453,28 @@ JobPlan plan_job(const JobGeometry& geometry,
     plan.error = "The job has no operations";
     return plan;
   }
+  if (!(job.rapid_clearance_height > 0) || !std::isfinite(job.rapid_clearance_height)) {
+    plan.error = "Rapid clearance must be finite and greater than zero";
+    return plan;
+  }
 
+  PartialPlan whole =
+      plan_operation_range(geometry, job, tools, machines, materials, progress,
+                           0, job.operations.size() - 1, {});
+  if (!whole.error.empty()) {
+    plan.error = std::move(whole.error);
+    return plan;
+  }
+  plan.rapid_plane = whole.rapid_plane;
+  plan.operations = std::move(whole.operations);
+
+  if (progress) progress(1.0, "Done");
+
+  summarise_job(plan);
+  return plan;
+}
+
+double job_rapid_plane(const Job& job, const JobGeometry& geometry) {
   double highest = highest_model_z(geometry);
   for (const auto& operation : job.operations) {
     if (operation.mode == OperationMode::Pocket)
@@ -1432,16 +1482,61 @@ JobPlan plan_job(const JobGeometry& geometry,
     if (operation.mode == OperationMode::PlaneClearing)
       highest = std::max(highest, operation.plane.top_z);
   }
-  if (!(job.rapid_clearance_height > 0) || !std::isfinite(job.rapid_clearance_height)) {
-    plan.error = "Rapid clearance must be finite and greater than zero";
-    return plan;
+  return job_rapid_plane(job, highest);
+}
+
+PartialPlan plan_operation_range(const JobGeometry& geometry,
+                                 const Job& job,
+                                 const ToolLibrary& tools,
+                                 const MachineLibrary& machines,
+                                 const MaterialLibrary& materials,
+                                 const ProgressCallback& progress,
+                                 std::size_t first, std::size_t last,
+                                 const PriorOperations& earlier) {
+  PartialPlan produced;
+  produced.first = first;
+  if (job.operations.empty() || first > last ||
+      last >= job.operations.size()) {
+    produced.error = "That range of operations is not in the job";
+    return produced;
   }
-  plan.rapid_plane = job_rapid_plane(job, highest);
-  const double share = 1.0 / static_cast<double>(job.operations.size());
+  if (earlier.size() != first) {
+    produced.error = "The operations above the range are not all accounted for";
+    return produced;
+  }
+  if (!(job.rapid_clearance_height > 0) ||
+      !std::isfinite(job.rapid_clearance_height)) {
+    produced.error = "Rapid clearance must be finite and greater than zero";
+    return produced;
+  }
+  produced.rapid_plane = job_rapid_plane(job, geometry);
+
+  // Reserved up front and never grown past it, because `prior` below holds
+  // pointers into it: an operation is planned against the ones before it, and
+  // for everything after the first of the range that means the ones this run
+  // has just produced.
+  const std::size_t count = last - first + 1;
+  produced.operations.reserve(count);
+  PriorOperations prior = earlier;
+  prior.reserve(last + 1);
+
+  // The tool the cutter is holding when the range begins. Taken from the last
+  // operation above it that actually produced a plan, exactly as running the
+  // job from the top would leave it: an operation that failed changed no tool.
   std::string previous_tool;
-  for (std::size_t index = 0; index < job.operations.size(); ++index) {
+  for (std::size_t index = first; index-- > 0;)
+    if (earlier[index] != nullptr && earlier[index]->ok()) {
+      previous_tool = earlier[index]->tool_id;
+      break;
+    }
+
+  const double share = 1.0 / static_cast<double>(count);
+  for (std::size_t index = first; index <= last; ++index) {
     const Operation& operation = job.operations[index];
+    const double from = share * static_cast<double>(index - first);
+    const double to = share * static_cast<double>(index - first + 1);
     OperationPlan result;
+    result.planned = true;
     result.operation_name = operation.name;
     result.tool_id = operation.tool_id;
     result.machine_id = operation.machine_id;
@@ -1457,16 +1552,16 @@ JobPlan plan_job(const JobGeometry& geometry,
     if (result.ok()) {
       if (is_parametric(operation.mode))
         result = plan_parametric_operation(operation, *tool, *machine,
-            plan.rapid_plane, plan.operations, progress,
-            share * index, share * (index + 1), &geometry);
+            produced.rapid_plane, prior, progress, from, to, &geometry);
       else
         result = plan_subdivided_operation(
             geometry, operation, *tool, *machine, *material, progress,
-            share * index, share * (index + 1), plan.rapid_plane,
-            &plan.operations);
+            from, to, produced.rapid_plane, prior);
+      result.planned = true;
       if (result.error == "Cancelled") {
-        plan.error = "Cancelled";
-        return plan;
+        produced.operations.clear();
+        produced.error = "Cancelled";
+        return produced;
       }
       if (result.ok()) {
         if (!previous_tool.empty() && previous_tool != operation.tool_id)
@@ -1476,17 +1571,25 @@ JobPlan plan_job(const JobGeometry& geometry,
       }
     }
 
-    accumulate(plan.stats, result.stats);
-    accumulate(plan.metrics, result.metrics);
-    for (const std::string& warning : result.warnings)
-      plan.warnings.push_back(operation.name + ": " + warning);
-    plan.operations.push_back(std::move(result));
+    produced.operations.push_back(std::move(result));
+    prior.push_back(&produced.operations.back());
   }
+  return produced;
+}
 
-  if (progress) progress(1.0, "Done");
-
+void summarise_job(JobPlan& plan) {
+  plan.stats = {};
+  plan.metrics = {};
+  plan.warnings.clear();
+  plan.error.clear();
+  for (const OperationPlan& operation : plan.operations) {
+    if (!operation.planned) continue;
+    accumulate(plan.stats, operation.stats);
+    accumulate(plan.metrics, operation.metrics);
+    for (const std::string& warning : operation.warnings)
+      plan.warnings.push_back(operation.operation_name + ": " + warning);
+  }
   finish_job(plan);
-  return plan;
 }
 
 }  // namespace cam

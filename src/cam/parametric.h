@@ -8,7 +8,7 @@ namespace cam {
 // job frame as mesh paths; the post applies the job origin exactly once.
 OperationPlan plan_parametric_operation(
     const Operation& operation, const Tool& tool, const Machine& machine,
-    double rapid_plane, const std::vector<OperationPlan>& prior_operations,
+    double rapid_plane, const PriorOperations& prior_operations,
     const ProgressCallback& progress = {}, double progress_from = 0.0,
     double progress_to = 1.0, const JobGeometry* geometry = nullptr);
 

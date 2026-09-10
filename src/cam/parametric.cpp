@@ -200,7 +200,7 @@ wave::Paths64 pocket_boundary(const PocketParameters& p) {
 
 OperationPlan plan_parametric_operation(
     const Operation& operation, const Tool& tool, const Machine& machine,
-    double rapid_plane, const std::vector<OperationPlan>& prior_operations,
+    double rapid_plane, const PriorOperations& prior_operations,
     const ProgressCallback& progress, double progress_from, double progress_to,
     const JobGeometry* geometry) {
   const auto started = std::chrono::steady_clock::now();
@@ -287,8 +287,9 @@ OperationPlan plan_parametric_operation(
     result.preview_context = incoming_stack;
     std::optional<Point64> previous;
     for (auto op = prior_operations.rbegin(); op != prior_operations.rend() && !previous; ++op)
-      if (op->ok()) for (auto level = op->levels.rbegin(); level != op->levels.rend(); ++level)
-        if (!level->feeds.motion.empty()) { previous = level->feeds.motion.back().to; break; }
+      if (*op && (*op)->ok())
+        for (auto level = (*op)->levels.rbegin(); level != (*op)->levels.rend(); ++level)
+          if (!level->feeds.motion.empty()) { previous = level->feeds.motion.back().to; break; }
     for (int layer = 0; layer < layers; ++layer) {
       const double upper = top-std::min(depth, layer*operation.stepdown);
       const double floor = top-std::min(depth, (layer+1)*operation.stepdown);
@@ -327,8 +328,11 @@ OperationPlan plan_parametric_operation(
           result.levels.push_back(std::move(level));
           continue;
         }
+        // Facing descends beside the area, not into it. The area is the
+        // operator's statement that the surface inside it is theirs to remove;
+        // it says nothing about the air beside it, and nothing here checks.
         const Point64 entry = pocket ? point(p.center_x+helix_radius,p.center_y) :
-            point(area.center_x-area.width/2+radius, area.center_y-area.height/2+radius);
+            point(area.center_x-area.width/2-radius, area.center_y-area.height/2+radius);
         PathBuilder path{level, operation, machine, previous.value_or(entry), rapid_plane};
         path.line(entry, rapid_plane, wave::MoveKind::Retract, true);
         path.line(entry, top, wave::MoveKind::Entry, true);
@@ -363,8 +367,15 @@ OperationPlan plan_parametric_operation(
           }
         } else {
           path.line(entry, floor, wave::MoveKind::Entry);
-          const double left = area.center_x-area.width/2+radius;
-          const double right = area.center_x+area.width/2-radius;
+          // Facing, not pocketing. Every row runs a full radius clear of both
+          // ends of the area, so the swept band reaches past each edge and the
+          // rows together take the whole of the top surface, corners included.
+          // Held inside the rectangle instead, the cutter centre could only
+          // reach a radius short of each corner and left the four of them
+          // standing -- which is what the perimeter ring here used to be
+          // chasing, and it could not reach them either.
+          const double left = area.center_x-area.width/2-radius;
+          const double right = area.center_x+area.width/2+radius;
           const double bottom = area.center_y-area.height/2+radius;
           const double span = std::max(0.0, area.height-tool.diameter);
           const double rows_needed = std::ceil(span/step);
@@ -375,12 +386,6 @@ OperationPlan plan_parametric_operation(
             path.line(point(row%2 ? right : left,y), floor, wave::MoveKind::Cut);
             path.line(point(row%2 ? left : right,y), floor, wave::MoveKind::Cut);
           }
-          // Close both side edges; alternating row connectors alone leave
-          // scallops on the opposite edge of every second row.
-          path.line(point(wave::to_world(path.position.x), bottom), floor, wave::MoveKind::Cut);
-          path.ring(rounded_rectangle(area.center_x, area.center_y,
-                                      area.width-tool.diameter,
-                                      area.height-tool.diameter, 0));
         }
         path.line(path.position, rapid_plane, wave::MoveKind::Retract, true);
         previous = path.position;

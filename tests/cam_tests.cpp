@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -196,12 +197,98 @@ void check_level_floors() {
     require_near(floors[0], -2.0, 1e-9, "first pass takes a full step");
     require_near(floors[2], -5.0, 1e-9, "last pass lands on the floor");
   }
+  // The axial allowance leaves the depth range alone; check_axial_allowance
+  // measures what it does instead.
   operation.axial_stock_to_leave = 0.5;
-  require_near(cam::level_floors(operation, operation.stepdown, 0.0).back(), -4.5,
-               1e-9, "axial stock allowance raises the final floor");
+  require_near(cam::level_floors(operation, operation.stepdown, 0.0).back(), -5.0,
+               1e-9, "an axial allowance does not move the depth range");
   // Depths are below the top of the work, so the same operation follows it.
   require_near(cam::level_floors(operation, operation.stepdown, 12.0).back(),
-               7.5, 1e-9, "and the range hangs off wherever the work tops out");
+               7.0, 1e-9, "and the range hangs off wherever the work tops out");
+}
+
+// A prism along Y with an L-shaped XZ section: the low half of the footprint
+// tops out at Z 6, the high half at Z 10. The face at Z 6 is the floor an
+// axial allowance has to protect.
+void write_stepped_part(const std::filesystem::path& file) {
+  std::ofstream out(file);
+  const double x[6] = {0, 40, 40, 20, 20, 0};
+  const double z[6] = {0, 0, 6, 6, 10, 10};
+  for (int y = 0; y < 2; ++y)
+    for (int i = 0; i < 6; ++i)
+      out << "v " << x[i] << ' ' << (y ? 40 : 0) << ' ' << z[i] << '\n';
+  for (int i = 1; i < 5; ++i) out << "f 1 " << (i + 1) << ' ' << (i + 2) << '\n';
+  for (int i = 1; i < 5; ++i) out << "f 7 " << (i + 8) << ' ' << (i + 7) << '\n';
+  for (int i = 0; i < 6; ++i) {
+    const int a = i + 1;
+    const int b = (i + 1) % 6 + 1;
+    out << "f " << a << ' ' << b << ' ' << (b + 6) << '\n';
+    out << "f " << a << ' ' << (b + 6) << ' ' << (a + 6) << '\n';
+  }
+}
+
+void check_axial_allowance() {
+  std::cout << "axial stock allowance\n";
+  const auto file = std::filesystem::temp_directory_path() /
+                    "tinglecam-axial-allowance.obj";
+  write_stepped_part(file);
+
+  cam::Tool tool = test_tool();
+  tool.diameter = 6.0;
+  tool.flute_length = 30.0;
+  const cam::Machine machine = test_machine();
+  cam::ToolLibrary tools;
+  tools.upsert(tool);
+  cam::MachineLibrary machines;
+  machines.upsert(machine);
+  cam::MaterialLibrary materials;
+  materials.materials.push_back({"plastic", "Plastic"});
+
+  // Floors land at 9.25, 8.25, ..., so one sits a quarter of a millimetre
+  // above the face -- the case the allowance exists to stop.
+  const auto lowest_pass_onto_the_face = [&](double allowance) {
+    cam::JobGeometry geometry;
+    geometry.load_part(file);
+    geometry.set_box_stock(true, 4.0);
+    cam::Operation operation;
+    operation.tool_id = tool.id;
+    operation.machine_id = machine.id;
+    operation.material_id = "plastic";
+    operation.stepover_ratio = 0.4;
+    operation.stepdown = 1.0;
+    operation.depth_from = 0.75;
+    operation.depth_to = 6.0;
+    operation.radial_stock_to_leave = 0.0;
+    operation.axial_stock_to_leave = allowance;
+    cam::Job job;
+    job.operations = {operation};
+    const auto plan =
+        cam::plan_job(geometry, job, tools, machines, materials, {});
+    require(plan.ok(), "stepped part plans: " + plan.error);
+    if (!plan.ok() || plan.operations.empty()) return 0.0;
+
+    // Well inside the low half, so a pass that reached the face is unmistakable.
+    const wave::Paths64 face{box(24.0, 8.0, 36.0, 32.0)};
+    double lowest = 0.0;
+    for (const auto& level : plan.operations.front().levels) {
+      if (level.nothing_to_cut) continue;
+      const auto onto = Clipper2Lib::Intersect(
+          level.simulation.removed_material, face, Clipper2Lib::FillRule::NonZero);
+      if (area(onto) < 1.0) continue;
+      if (lowest == 0.0 || level.floor_z < lowest) lowest = level.floor_z;
+    }
+    return lowest;
+  };
+
+  const double bare = lowest_pass_onto_the_face(0.0);
+  require(bare > 6.0 && bare < 6.5,
+          "with no allowance a pass comes down within a fraction of the face");
+  const double left = lowest_pass_onto_the_face(0.5);
+  require(left >= 6.5 - 1e-9,
+          "an axial allowance holds every pass at least that far above the face");
+  require(left > bare,
+          "and the allowance is what moved it, not the depth range");
+  std::filesystem::remove(file);
 }
 
 wave::FrontLineage single_front_lineage(const wave::Path64& front,
@@ -1116,7 +1203,7 @@ void check_operation_stock_handoff() {
       wave::Paths64{box(8.0, 0.0, 10.0, 10.0)};
   deep.levels.push_back(deep_level);
 
-  const std::vector<cam::OperationPlan> operations{shallow, deep};
+  const cam::PriorOperations operations{&shallow, &deep};
   const wave::Paths64 above =
       cam::stock_after_operations_at_z(nominal, -0.5, operations);
   require_near(area(above), 100.0, 0.001,
@@ -1146,7 +1233,7 @@ void check_operation_stock_handoff() {
   cam::OperationPlan failed = shallow;
   failed.error = "deliberate failure";
   const wave::Paths64 after_failure =
-      cam::stock_after_operations_at_z(nominal, -1.5, {failed});
+      cam::stock_after_operations_at_z(nominal, -1.5, {&failed});
   require_near(area(after_failure), 100.0, 0.001,
                "a failed operation cannot mutate downstream stock");
 }
@@ -1517,6 +1604,7 @@ int main(int argc, char** argv) {
     check_feed_compatible_merge();
     check_path_resampling();
     check_level_floors();
+    check_axial_allowance();
     check_boundary_rail_slack();
     check_entry_front_selection();
     check_inter_layer_topology();
