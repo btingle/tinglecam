@@ -417,4 +417,48 @@ PostResult post_job(const JobPlan& plan,
   return result;
 }
 
+PostResult post_operation(const JobPlan& plan,
+                          const Job& job,
+                          const ToolLibrary& tools,
+                          const MachineLibrary& machines,
+                          std::size_t operation_index) {
+  return post_operations(plan, job, tools, machines, {operation_index});
+}
+
+PostResult post_operations(const JobPlan& plan,
+                           const Job& job,
+                           const ToolLibrary& tools,
+                           const MachineLibrary& machines,
+                           const std::vector<std::size_t>& operation_indices) {
+  PostResult result;
+  if (operation_indices.empty()) {
+    result.error = "No operations were selected";
+    return result;
+  }
+
+  JobPlan selected_plan;
+  selected_plan.rapid_plane = plan.rapid_plane;
+  Job selected_job = job;
+  selected_job.operations.clear();
+  std::vector<std::size_t> sorted_indices = operation_indices;
+  std::sort(sorted_indices.begin(), sorted_indices.end());
+  sorted_indices.erase(std::unique(sorted_indices.begin(), sorted_indices.end()),
+                       sorted_indices.end());
+  for (const std::size_t index : sorted_indices) {
+    if (index >= plan.operations.size() || index >= job.operations.size()) {
+      result.error = "Operation index is out of range";
+      return result;
+    }
+    if (!plan.operations[index].planned || !plan.operations[index].ok()) {
+      result.error = "A selected operation has no valid plan";
+      return result;
+    }
+    selected_plan.operations.push_back(plan.operations[index]);
+    selected_job.operations.push_back(job.operations[index]);
+  }
+  summarise_job(selected_plan);
+  selected_plan.error.clear();
+  return post_job(selected_plan, selected_job, tools, machines);
+}
+
 }  // namespace cam

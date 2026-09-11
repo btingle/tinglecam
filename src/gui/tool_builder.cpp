@@ -53,7 +53,8 @@ void import_tools(App& app) {
 
 void tool_builder(App& app) {
   if (!app.builder_open) return;
-  ImGui::SetNextWindowSize(ImVec2(620, 560), ImGuiCond_FirstUseEver);
+  ImGui::SetNextWindowSize(ImVec2(ui_size(app, 620.0f), ui_size(app, 560.0f)),
+                           ImGuiCond_FirstUseEver);
   if (!ImGui::Begin("Tool builder", &app.builder_open)) {
     ImGui::End();
     return;

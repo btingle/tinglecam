@@ -5,6 +5,7 @@
 #include "cam/material.h"
 #include "cam/tooling.h"
 
+#include <array>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -13,6 +14,31 @@ namespace cam {
 
 // Where the user's own tools, preferences and jobs live.
 std::filesystem::path config_directory();
+
+struct PanelLayout {
+  // Dimensions are stored in unscaled application pixels. The UI scale is
+  // applied when they are used by the renderer.
+  double left_width = 440.0;
+  double right_width = 480.0;
+  double left_program_fraction = 0.54;
+  double right_settings_fraction = 0.58;
+};
+
+PanelLayout default_panel_layout();
+
+struct UserSettings {
+  double ui_scale = 1.0;
+  PanelLayout panel_layout{};
+  std::array<Operation, 4> operation_defaults{};
+};
+
+UserSettings default_user_settings();
+const Operation& operation_default(const UserSettings& settings,
+                                   OperationMode mode);
+Operation& operation_default(UserSettings& settings, OperationMode mode);
+UserSettings load_user_settings(const std::filesystem::path& path);
+void save_user_settings(const std::filesystem::path& path,
+                        const UserSettings& settings);
 
 // Where the shipped machine and material profiles live. Searched next to the
 // executable first, so an installed copy works, then at the path baked in at

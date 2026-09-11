@@ -347,6 +347,10 @@ void check_serialisation() {
   job.rapid_clearance_height = 12.0;
   const cam::Job job_back =
       cam::job_from_json_text(cam::to_json_text(job));
+  const std::string job_text = cam::to_json_text(job);
+  require(job_text.find("levels") == std::string::npos &&
+              job_text.find("triangles") == std::string::npos,
+          "job files contain reconstruction data, not models or plan results");
   require(job_back.operations.size() == 1, "job operations survive");
   if (!job_back.operations.empty()) {
     require_near(job_back.operations[0].path_pitch, 0.15, 1e-9,

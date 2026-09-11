@@ -170,32 +170,27 @@ bool is_parametric(OperationMode mode) {
 }
 const char* pocket_shape_name(PocketShape shape) {
   switch (shape) {
-    case PocketShape::Circle: return "circle";
-    case PocketShape::Rectangle: return "rectangle";
     case PocketShape::RoundedRectangle: return "rounded_rectangle";
   }
   return "unknown";
 }
 std::optional<PocketShape> pocket_shape_from_name(const std::string& name) {
-  if (name == "circle") return PocketShape::Circle;
-  if (name == "rectangle") return PocketShape::Rectangle;
-  if (name == "rounded_rectangle") return PocketShape::RoundedRectangle;
+  // The old names remain readable so existing job files still load. They are
+  // normalized to the one shape now exposed by the UI.
+  if (name == "circle" || name == "rectangle" ||
+      name == "rounded_rectangle")
+    return PocketShape::RoundedRectangle;
   return std::nullopt;
 }
 
 wave::Paths64 pocket_boundary(const PocketParameters& p) {
   require(pocket_shape_from_name(pocket_shape_name(p.shape)).has_value(), "Unknown pocket shape");
-  if (p.shape == PocketShape::Circle) {
-    require(positive(p.radius) && p.radius < 1e7, "Circle radius must be positive and finite");
-    return {Ellipse(point(p.center_x, p.center_y), wave::to_integer(p.radius),
-                    wave::to_integer(p.radius), circle_segments(p.radius))};
-  }
   require(positive(p.width) && positive(p.height) && p.width < 1e7 && p.height < 1e7,
           "Pocket width and height must be positive and finite");
-  const double radius = p.shape == PocketShape::Rectangle ? 0 : p.radius;
-  require(std::isfinite(radius) && radius >= 0 && radius <= std::min(p.width,p.height)/2,
+  require(std::isfinite(p.radius) && p.radius >= 0 &&
+              p.radius <= std::min(p.width,p.height)/2,
           "Corner radius must be between zero and half the smaller pocket dimension");
-  return {rounded_rectangle(p.center_x, p.center_y, p.width, p.height, radius)};
+  return {rounded_rectangle(p.center_x, p.center_y, p.width, p.height, p.radius)};
 }
 
 OperationPlan plan_parametric_operation(
@@ -229,187 +224,301 @@ OperationPlan plan_parametric_operation(
     require(positive(slow) && positive(fast) && fast >= slow,
             "Feed range must be positive, with maximum feed at least the full-engagement feed");
     const bool pocket = operation.mode == OperationMode::Pocket;
-    const auto& p = operation.pocket;
-    const double top = pocket ? p.top_z : operation.plane.top_z;
-    const double depth = pocket ? p.depth : operation.plane.depth;
-    require(std::isfinite(top) && positive(depth) && depth < 1e7,
-            "Top Z must be finite and depth must be positive and finite");
-    require(std::isfinite(rapid_plane) && rapid_plane > top,
-            "Rapid clearance must be above the operation's top surface");
-    require(depth <= tool.flute_length,
-            "Operation depth exceeds flute length; choose a tool with sufficient reach");
     const double radius = tool.diameter/2;
     const double step = operation.stepover_ratio * tool.diameter;
     require(step >= 0.001, "Stepover is below the 0.001 mm geometry resolution");
-    const double layer_count = std::ceil(depth/operation.stepdown);
-    require(layer_count <= 20000, "Too many depth levels; increase stepdown");
-    const int layers = static_cast<int>(layer_count);
-    const std::size_t areas = pocket ? 1 : operation.plane.areas.size();
-    require(areas > 0, "Add at least one plane clearing area");
-    require(areas * layer_count <= 20000, "Too many area/depth passes");
-    Paths64 boundary;
-    Paths64 centres;
-    double inradius = 0;
-    double helix_radius = 0;
+    struct Region {
+      const PocketParameters* pocket = nullptr;
+      const ClearingArea* area = nullptr;
+      Paths64 boundary;
+      Paths64 centres;
+      double top = 0.0;
+      double depth = 0.0;
+      double inradius = 0.0;
+      double helix_radius = 0.0;
+      int layers = 0;
+    };
+    std::vector<Region> regions;
     if (pocket) {
-      boundary = pocket_boundary(p);
-      require(positive(p.helix_angle_degrees) && p.helix_angle_degrees <= 10,
-              "Helix angle must be in (0, 10] degrees");
-      const double small = p.shape == PocketShape::Circle ? 2*p.radius : std::min(p.width,p.height);
-      inradius = small/2 - radius;
-      require(inradius >= 0.01, "Pocket is too small for this tool to enter helically");
-      require(p.shape != PocketShape::RoundedRectangle || p.radius >= radius,
-              "Pocket corner radius is smaller than the tool radius");
-      centres = InflatePaths(boundary, -wave::to_integer(radius), JoinType::Round, EndType::Polygon);
-      require(centres.size() == 1, "Pocket has no continuous cutter-centre region");
-      helix_radius = std::min(radius*0.5, inradius*0.75);
-      require(helix_radius >= 0.02,
-              "Pocket/tool combination is too small for a helix at 0.001 mm resolution");
-      if (p.shape == PocketShape::Rectangle)
-        result.warnings.push_back("Square pocket corners retain the tool radius; a round cutter cannot make sharp internal corners.");
+      require(!operation.pockets.empty(), "Add at least one pocket");
+      regions.reserve(operation.pockets.size());
+      for (const auto& p : operation.pockets) {
+        Region region;
+        region.pocket = &p;
+        region.top = p.top_z;
+        region.depth = p.depth;
+        region.boundary = pocket_boundary(p);
+        require(p.radius == 0.0 || p.radius >= radius,
+                "A rounded pocket corner must be at least the cutter radius");
+        require(positive(p.helix_angle_degrees) && p.helix_angle_degrees <= 10,
+                "Helix angle must be in (0, 10] degrees");
+        region.inradius = std::min(p.width, p.height) / 2 - radius;
+        require(region.inradius >= 0.01,
+                "Pocket is too small for this tool to enter helically");
+        region.centres = InflatePaths(region.boundary, -wave::to_integer(radius),
+                                      JoinType::Round, EndType::Polygon);
+        require(region.centres.size() == 1,
+                "Pocket has no continuous cutter-centre region");
+        region.helix_radius = std::min(radius * 0.5, region.inradius * 0.75);
+        require(region.helix_radius >= 0.02,
+                "Pocket/tool combination is too small for a helix at 0.001 mm resolution");
+        require(std::isfinite(region.top) && positive(region.depth) &&
+                    region.depth < 1e7,
+                "Top Z must be finite and depth must be positive and finite");
+        require(region.depth <= tool.flute_length,
+                "Operation depth exceeds flute length; choose a tool with sufficient reach");
+        regions.push_back(std::move(region));
+      }
     } else {
+      require(!operation.plane.areas.empty(), "Add at least one plane clearing area");
+      regions.reserve(operation.plane.areas.size());
       for (const auto& area : operation.plane.areas) {
+        Region region;
+        region.area = &area;
+        region.top = area.top_z;
+        region.depth = area.depth;
         require(positive(area.width) && positive(area.height) &&
                     area.width >= tool.diameter && area.height >= tool.diameter &&
                     std::max(area.width, area.height) > tool.diameter + 0.001,
                 "Each clearing area must be at least as wide and tall as the tool diameter");
         point(area.center_x-area.width/2, area.center_y-area.height/2);
         point(area.center_x+area.width/2, area.center_y+area.height/2);
+        require(std::isfinite(region.top) && positive(region.depth) &&
+                    region.depth < 1e7,
+                "Top Z must be finite and depth must be positive and finite");
+        require(region.depth <= tool.flute_length,
+                "Operation depth exceeds flute length; choose a tool with sufficient reach");
+        region.boundary = {rounded_rectangle(area.center_x, area.center_y,
+                                              area.width, area.height, 0)};
+        regions.push_back(std::move(region));
       }
     }
-    result.composed_stock = geometry && geometry->has_stock();
+    double highest_top = 0.0;
+    bool first_region = true;
+    std::size_t total_levels = 0;
     std::vector<double> boundaries;
-    for (int layer = 0; layer <= layers; ++layer)
-      boundaries.push_back(top-std::min(depth, layer*operation.stepdown));
+    for (Region& region : regions) {
+      require(std::isfinite(region.top) && region.top > -1e7,
+              "Top Z must be finite and within the geometry range");
+      if (first_region) {
+        highest_top = region.top;
+        first_region = false;
+      } else {
+        highest_top = std::max(highest_top, region.top);
+      }
+      region.layers = static_cast<int>(std::ceil(region.depth / operation.stepdown));
+      require(region.layers > 0 && total_levels + static_cast<std::size_t>(region.layers) <= 20000,
+              "Too many area/depth passes; increase stepdown");
+      total_levels += static_cast<std::size_t>(region.layers);
+      for (int layer = 0; layer <= region.layers; ++layer)
+        boundaries.push_back(region.top -
+                             std::min(region.depth, layer * operation.stepdown));
+    }
+    struct Task {
+      std::size_t region_index;
+      int layer;
+    };
+    std::vector<Task> tasks;
+    tasks.reserve(total_levels);
+    if (pocket) {
+      // Keep one pocket's layers together. This makes the safe stay-down
+      // connection between successive helical layers unambiguous.
+      for (std::size_t region_index = 0; region_index < regions.size();
+           ++region_index)
+        for (int layer = 0; layer < regions[region_index].layers; ++layer)
+          tasks.push_back({region_index, layer});
+    } else {
+      // Plane clearing has historically visited every area at a given depth
+      // before moving to the next depth. Preserve that playback order while
+      // allowing each area to have its own Z range.
+      int deepest_layer = 0;
+      for (const Region& region : regions)
+        deepest_layer = std::max(deepest_layer, region.layers);
+      for (int layer = 0; layer < deepest_layer; ++layer)
+        for (std::size_t region_index = 0; region_index < regions.size();
+             ++region_index)
+          if (layer < regions[region_index].layers)
+            tasks.push_back({region_index, layer});
+    }
+    require(tasks.size() == total_levels, "Internal parametric level count mismatch");
+    require(std::isfinite(rapid_plane) && rapid_plane > highest_top,
+            "Rapid clearance must be above every parametric top surface");
+    result.composed_stock = geometry && geometry->has_stock();
     auto incoming_stack = result.composed_stock
         ? active_stock(*geometry, prior_operations, operation.slice_grid, boundaries)
         : std::vector<StockSlab>{};
     result.preview_context = incoming_stack;
     std::optional<Point64> previous;
+    std::optional<double> previous_z;
+    std::optional<std::size_t> previous_region;
+    std::optional<int> previous_layer;
     for (auto op = prior_operations.rbegin(); op != prior_operations.rend() && !previous; ++op)
       if (*op && (*op)->ok())
         for (auto level = (*op)->levels.rbegin(); level != (*op)->levels.rend(); ++level)
-          if (!level->feeds.motion.empty()) { previous = level->feeds.motion.back().to; break; }
-    for (int layer = 0; layer < layers; ++layer) {
-      const double upper = top-std::min(depth, layer*operation.stepdown);
-      const double floor = top-std::min(depth, (layer+1)*operation.stepdown);
-      for (std::size_t area_index = 0; area_index < areas; ++area_index) {
-        if (progress && !progress(progress_from + (progress_to-progress_from)*
-                (layer*areas+area_index)/(layers*areas),
-                operation.name + ": depth " + std::to_string(layer+1) +
-                "/" + std::to_string(layers) + ", area " + std::to_string(area_index+1)))
-          throw std::runtime_error("Cancelled");
-        LevelPlan level;
-        level.explicit_motion = true; level.floor_z = floor; level.axial_depth = upper-floor;
-        level.subdivision_level = result.levels.size();
-        ClearingArea area;
-        if (!pocket) {
-          area = operation.plane.areas[area_index];
-          boundary = {rounded_rectangle(area.center_x, area.center_y, area.width, area.height, 0)};
-        }
-        level.stock_slice = boundary;
-        if (result.composed_stock) {
-          level.local_stock = stock_inside(incoming_stack, boundary, floor, upper);
-          result.preview_context = stock_outside(result.preview_context, boundary, floor, upper);
-          // Overlapping areas transfer ownership to the later area. Its local
-          // stock includes earlier cuts, while earlier playback still owns the
-          // overlap until the later area starts (handled by the preview).
-          for (const auto& slab : level.local_stock)
-            level.incoming_stock.insert(level.incoming_stock.end(), slab.region->begin(), slab.region->end());
-          level.incoming_stock = Union(level.incoming_stock, FillRule::NonZero);
-        } else {
-          const double sample_z = (upper+floor)/2;
-          level.incoming_stock = stock_after_operations_at_z(boundary, sample_z, prior_operations);
-          level.incoming_stock = stock_after_planned_operation_at_z(level.incoming_stock, sample_z, result);
-        }
-        if (level.incoming_stock.empty()) {
-          level.nothing_to_cut = true;
-          ++result.stats.levels;
-          result.levels.push_back(std::move(level));
-          continue;
-        }
-        // Facing descends beside the area, not into it. The area is the
-        // operator's statement that the surface inside it is theirs to remove;
-        // it says nothing about the air beside it, and nothing here checks.
-        const Point64 entry = pocket ? point(p.center_x+helix_radius,p.center_y) :
-            point(area.center_x-area.width/2-radius, area.center_y-area.height/2+radius);
-        PathBuilder path{level, operation, machine, previous.value_or(entry), rapid_plane};
-        path.line(entry, rapid_plane, wave::MoveKind::Retract, true);
-        path.line(entry, top, wave::MoveKind::Entry, true);
-        path.line(entry, upper, wave::MoveKind::Entry);
-        if (pocket) {
-          const double pitch = 2*pi*helix_radius*std::tan(p.helix_angle_degrees*pi/180);
-          const double turns = std::ceil((upper-floor)/pitch);
-          const int samples = circle_segments(helix_radius);
-          require(turns*samples <= max_phases, "Helix requires too many segments; increase its angle or pocket size");
-          const int segments = static_cast<int>(turns)*samples;
-          for (int i = 1; i <= segments; ++i) {
-            const double angle = 2*pi*i/samples;
-            path.line(point(p.center_x+helix_radius*std::cos(angle),
-                            p.center_y+helix_radius*std::sin(angle)),
-                      upper+(floor-upper)*i/segments, wave::MoveKind::Entry);
+          if (!level->feeds.motion.empty()) {
+            previous = level->feeds.motion.back().to;
+            previous_z = level->feeds.motion.back().to_z;
+            break;
           }
-          // One complete turn at the floor removes the sloped helix bottom.
-          for (int i = 1; i <= samples; ++i) {
-            const double angle = 2*pi*i/samples;
-            path.line(point(p.center_x+helix_radius*std::cos(angle),
-                            p.center_y+helix_radius*std::sin(angle)), floor, wave::MoveKind::Cut);
-          }
-          const double inner = std::max(0.0, inradius-0.005);
-          const double rings_needed = std::ceil(inner/step);
-          require(rings_needed <= 20000, "Too many pocket rings; increase stepover");
-          const int rings = static_cast<int>(rings_needed);
-          for (int ring = rings; ring >= 0; --ring) {
-            const double inset = rings ? inner*ring/rings : 0;
-            const Paths64 contours = ring == 0 ? centres : InflatePaths(
-                centres, -wave::to_integer(inset), JoinType::Round, EndType::Polygon);
-            for (const auto& contour : contours) path.ring(contour);
-          }
-        } else {
-          path.line(entry, floor, wave::MoveKind::Entry);
-          // Facing, not pocketing. Every row runs a full radius clear of both
-          // ends of the area, so the swept band reaches past each edge and the
-          // rows together take the whole of the top surface, corners included.
-          // Held inside the rectangle instead, the cutter centre could only
-          // reach a radius short of each corner and left the four of them
-          // standing -- which is what the perimeter ring here used to be
-          // chasing, and it could not reach them either.
-          const double left = area.center_x-area.width/2-radius;
-          const double right = area.center_x+area.width/2+radius;
-          const double bottom = area.center_y-area.height/2+radius;
-          const double span = std::max(0.0, area.height-tool.diameter);
-          const double rows_needed = std::ceil(span/step);
-          require(rows_needed <= 20000, "Too many clearing rows; increase stepover");
-          const int rows = static_cast<int>(rows_needed);
-          for (int row = 0; row <= rows; ++row) {
-            const double y = bottom + (rows ? span*row/rows : 0);
-            path.line(point(row%2 ? right : left,y), floor, wave::MoveKind::Cut);
-            path.line(point(row%2 ? left : right,y), floor, wave::MoveKind::Cut);
-          }
-        }
-        path.line(path.position, rapid_plane, wave::MoveKind::Retract, true);
-        previous = path.position;
-        finish_level(level, operation, tool, machine, slow, fast, rapid_plane);
-        const auto& stats = level.feeds.stats;
-        ++result.stats.levels; ++result.stats.cut_levels;
-        result.stats.cutting_distance += stats.cutting_distance;
-        result.stats.rapid_distance += stats.rapid_distance;
-        result.stats.cutting_minutes += stats.cutting_minutes;
-        result.stats.rapid_minutes += stats.rapid_minutes;
-        if (result.composed_stock) {
-          for (const auto& slab : level.local_stock) {
-            const auto removed = Intersect(*slab.region, level.simulation.removed_material, FillRule::NonZero);
-            result.stats.removed_volume += std::abs(Area(removed)) /
-                (double(wave::to_integer(1))*wave::to_integer(1)) * (slab.top-slab.bottom);
-          }
-          incoming_stack = stock_outside(incoming_stack, level.simulation.removed_material, floor, upper);
-        } else result.stats.removed_volume += level.simulation.stats.removed_area*level.axial_depth;
-        result.stats.maximum_load = std::max(result.stats.maximum_load, level.simulation.stats.maximum_load);
-        result.stats.excess_area += level.simulation.stats.excess_area;
-        result.metrics.toolpath_moves += level.toolpath.moves.size();
-        result.metrics.simulation_intervals += level.simulation.stats.cutting_steps;
-        result.levels.push_back(std::move(level));
+    std::size_t completed_levels = 0;
+    for (std::size_t task_index = 0; task_index < tasks.size(); ++task_index) {
+      const std::size_t region_index = tasks[task_index].region_index;
+      const int layer = tasks[task_index].layer;
+      Region& region = regions[region_index];
+      const double upper = region.top -
+                           std::min(region.depth, layer * operation.stepdown);
+      const double floor = region.top -
+                           std::min(region.depth, (layer + 1) * operation.stepdown);
+      if (progress && !progress(
+              progress_from + (progress_to - progress_from) *
+                  static_cast<double>(completed_levels) / total_levels,
+              operation.name + ": area " + std::to_string(region_index + 1) +
+                  ", depth " + std::to_string(layer + 1) + "/" +
+                  std::to_string(region.layers)))
+        throw std::runtime_error("Cancelled");
+      LevelPlan level;
+      level.explicit_motion = true;
+      level.floor_z = floor;
+      level.axial_depth = upper - floor;
+      level.subdivision_level = result.levels.size();
+      const bool next_is_same_pocket_layer =
+          region.pocket != nullptr && task_index + 1 < tasks.size() &&
+          tasks[task_index + 1].region_index == region_index &&
+          tasks[task_index + 1].layer == layer + 1;
+      level.stay_down_preferred = next_is_same_pocket_layer;
+      level.stock_slice = region.boundary;
+      if (result.composed_stock) {
+        level.local_stock = stock_inside(incoming_stack, region.boundary, floor, upper);
+        result.preview_context = stock_outside(result.preview_context, region.boundary, floor, upper);
+        // Overlapping areas transfer ownership to the later area. Its local
+        // stock includes earlier cuts, while earlier playback still owns the
+        // overlap until the later area starts (handled by the preview).
+        for (const auto& slab : level.local_stock)
+          level.incoming_stock.insert(level.incoming_stock.end(), slab.region->begin(), slab.region->end());
+        level.incoming_stock = Union(level.incoming_stock, FillRule::NonZero);
+      } else {
+        const double sample_z = (upper+floor)/2;
+        level.incoming_stock = stock_after_operations_at_z(region.boundary, sample_z, prior_operations);
+        level.incoming_stock = stock_after_planned_operation_at_z(level.incoming_stock, sample_z, result);
       }
+      if (level.incoming_stock.empty()) {
+        level.nothing_to_cut = true;
+        ++result.stats.levels;
+        result.levels.push_back(std::move(level));
+        ++completed_levels;
+        continue;
+      }
+      // Facing descends beside the area, not into it. The area is the
+      // operator's statement that the surface inside it is theirs to remove;
+      // it says nothing about the air beside it, and nothing here checks.
+      const Point64 entry = region.pocket
+          ? point(region.pocket->center_x + region.helix_radius,
+                  region.pocket->center_y)
+          : point(region.area->center_x - region.area->width / 2 - radius,
+                  region.area->center_y - region.area->height / 2 + radius);
+      const bool continuing_pocket =
+          previous && previous_z && previous_region && previous_layer &&
+          *previous_region == region_index && *previous_layer + 1 == layer &&
+          *previous_z != rapid_plane;
+      PathBuilder path{level, operation, machine, previous.value_or(entry),
+                       previous_z.value_or(rapid_plane)};
+      if (!continuing_pocket && path.z != rapid_plane) {
+        path.line(path.position, rapid_plane, wave::MoveKind::Retract, true);
+      }
+      if (!continuing_pocket) {
+        path.line(entry, rapid_plane, wave::MoveKind::Retract, true);
+        path.line(entry, region.top, wave::MoveKind::Entry, true);
+        path.line(entry, upper, wave::MoveKind::Entry);
+      } else {
+        // The preceding pocket layer ended at this same XY opening and floor.
+        // Move to the opening at depth, then descend helically again; no
+        // clearance-plane retract is needed between layers.
+        path.line(entry, upper, wave::MoveKind::Entry);
+      }
+      if (region.pocket) {
+        const PocketParameters& p = *region.pocket;
+        const double pitch = 2*pi*region.helix_radius*
+                             std::tan(p.helix_angle_degrees*pi/180);
+        const double turns = std::ceil((upper-floor)/pitch);
+        const int samples = circle_segments(region.helix_radius);
+        require(turns*samples <= max_phases, "Helix requires too many segments; increase its angle or pocket size");
+        const int segments = static_cast<int>(turns)*samples;
+        for (int i = 1; i <= segments; ++i) {
+          const double angle = 2*pi*i/samples;
+          path.line(point(p.center_x+region.helix_radius*std::cos(angle),
+                          p.center_y+region.helix_radius*std::sin(angle)),
+                    upper+(floor-upper)*i/segments, wave::MoveKind::Entry);
+        }
+        // One complete turn at the floor removes the sloped helix bottom.
+        for (int i = 1; i <= samples; ++i) {
+          const double angle = 2*pi*i/samples;
+          path.line(point(p.center_x+region.helix_radius*std::cos(angle),
+                          p.center_y+region.helix_radius*std::sin(angle)), floor,
+                    wave::MoveKind::Cut);
+        }
+        const double inner = std::max(0.0, region.inradius-0.005);
+        const double rings_needed = std::ceil(inner/step);
+        require(rings_needed <= 20000, "Too many pocket rings; increase stepover");
+        const int rings = static_cast<int>(rings_needed);
+        for (int ring = rings; ring >= 0; --ring) {
+          const double inset = rings ? inner*ring/rings : 0;
+          const Paths64 contours = ring == 0 ? region.centres : InflatePaths(
+              region.centres, -wave::to_integer(inset), JoinType::Round,
+              EndType::Polygon);
+          for (const auto& contour : contours) path.ring(contour);
+        }
+      } else {
+        const ClearingArea& area = *region.area;
+        path.line(entry, floor, wave::MoveKind::Entry);
+        // Facing, not pocketing. Every row runs a full radius clear of both
+        // ends of the area, so the swept band reaches past each edge and the
+        // rows together take the whole of the top surface, corners included.
+        // Held inside the rectangle instead, the cutter centre could only
+        // reach a radius short of each corner and left the four of them
+        // standing -- which is what the perimeter ring here used to be
+        // chasing, and it could not reach them either.
+        const double left = area.center_x-area.width/2-radius;
+        const double right = area.center_x+area.width/2+radius;
+        const double bottom = area.center_y-area.height/2+radius;
+        const double span = std::max(0.0, area.height-tool.diameter);
+        const double rows_needed = std::ceil(span/step);
+        require(rows_needed <= 20000, "Too many clearing rows; increase stepover");
+        const int rows = static_cast<int>(rows_needed);
+        for (int row = 0; row <= rows; ++row) {
+          const double y = bottom + (rows ? span*row/rows : 0);
+          path.line(point(row%2 ? right : left,y), floor, wave::MoveKind::Cut);
+          path.line(point(row%2 ? left : right,y), floor, wave::MoveKind::Cut);
+        }
+      }
+      if (!next_is_same_pocket_layer)
+        path.line(path.position, rapid_plane, wave::MoveKind::Retract, true);
+      level.stays_down_after = next_is_same_pocket_layer;
+      previous = path.position;
+      previous_z = level.stays_down_after ? floor : rapid_plane;
+      previous_region = region_index;
+      previous_layer = layer;
+      finish_level(level, operation, tool, machine, slow, fast, rapid_plane);
+      level.feeds.ends_at_depth = level.stays_down_after;
+      const auto& stats = level.feeds.stats;
+      ++result.stats.levels; ++result.stats.cut_levels;
+      result.stats.cutting_distance += stats.cutting_distance;
+      result.stats.rapid_distance += stats.rapid_distance;
+      result.stats.cutting_minutes += stats.cutting_minutes;
+      result.stats.rapid_minutes += stats.rapid_minutes;
+      if (result.composed_stock) {
+        for (const auto& slab : level.local_stock) {
+          const auto removed = Intersect(*slab.region, level.simulation.removed_material, FillRule::NonZero);
+          result.stats.removed_volume += std::abs(Area(removed)) /
+              (double(wave::to_integer(1))*wave::to_integer(1)) * (slab.top-slab.bottom);
+        }
+        incoming_stack = stock_outside(incoming_stack, level.simulation.removed_material, floor, upper);
+      } else result.stats.removed_volume += level.simulation.stats.removed_area*level.axial_depth;
+      result.stats.maximum_load = std::max(result.stats.maximum_load, level.simulation.stats.maximum_load);
+      result.stats.excess_area += level.simulation.stats.excess_area;
+      result.metrics.toolpath_moves += level.toolpath.moves.size();
+      result.metrics.simulation_intervals += level.simulation.stats.cutting_steps;
+      result.levels.push_back(std::move(level));
+      ++completed_levels;
     }
     result.spindle_rpm = commandable_rpm(machine, operation.spindle_rpm);
   } catch (const std::exception& error) {

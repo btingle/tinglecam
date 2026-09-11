@@ -11,15 +11,53 @@ void output_panel(App& app) {
                        "This posts the plan as it was last computed. Edited "
                        "operations are not in it; re-plan first to include "
                        "them.");
-  if (ImGui::Button("Generate G-code", ImVec2(-1, 0))) {
+  if (app.plan.operations.empty()) return;
+  if (ImGui::Button("Generate all G-code", ImVec2(-1, 0))) {
     app.post = cam::post_job(app.plan, app.job, app.tools, app.machines);
+    app.posted_operations.clear();
     log_warnings("G-code", app.post.warnings);
     app.gcode = app.post.text;
     if (!app.post.ok()) say(app, app.post.error, true);
     else say(app, "Generated " + std::to_string(app.post.line_count) + " lines");
   }
+  const std::vector<std::size_t> selected_operations =
+      selected_operation_indices(app);
+  const bool selected_planned =
+      !selected_operations.empty() &&
+      std::all_of(selected_operations.begin(), selected_operations.end(),
+                  [&](std::size_t index) {
+                    return index < app.plan.operations.size() &&
+                           app.plan.operations[index].planned &&
+                           app.plan.operations[index].ok();
+                  });
+  ImGui::BeginDisabled(!selected_planned);
+  if (ImGui::Button("Generate selected operations", ImVec2(-1, 0))) {
+    app.post = cam::post_operations(app.plan, app.job, app.tools, app.machines,
+                                    selected_operations);
+    app.posted_operations.clear();
+    if (app.post.ok())
+      for (const std::size_t index : selected_operations)
+        app.posted_operations.push_back(static_cast<int>(index));
+    log_warnings("G-code", app.post.warnings);
+    app.gcode = app.post.text;
+    if (!app.post.ok()) say(app, app.post.error, true);
+    else say(app, "Generated " + std::to_string(app.post.line_count) +
+                       " lines for " +
+                       std::to_string(selected_operations.size()) +
+                       " selected operation(s)");
+  }
+  ImGui::EndDisabled();
   if (app.gcode.empty()) return;
 
+  if (app.posted_operations.empty()) {
+    ImGui::Text("Output: complete job");
+  } else if (app.posted_operations.size() == 1) {
+    const int index = app.posted_operations.front();
+    ImGui::Text("Output: operation %d, %s", index + 1,
+                app.job.operations[index].name.c_str());
+  } else {
+    ImGui::Text("Output: %zu selected operations", app.posted_operations.size());
+  }
   ImGui::Text("%zu lines, %zu cutting moves, %zu rapids", app.post.line_count,
               app.post.cutting_moves, app.post.rapid_moves);
   ImGui::Text("Estimated %.1f minutes", app.post.estimated_minutes);
@@ -35,7 +73,8 @@ void output_panel(App& app) {
     }
   }
   if (ImGui::CollapsingHeader("Preview")) {
-    ImGui::BeginChild("gcode", ImVec2(0, 220), ImGuiChildFlags_Borders,
+    ImGui::BeginChild("gcode", ImVec2(0, ui_size(app, 220.0f)),
+                      ImGuiChildFlags_Borders,
                       ImGuiWindowFlags_HorizontalScrollbar);
     ImGui::TextUnformatted(app.gcode.c_str(),
                            app.gcode.c_str() + std::min<std::size_t>(app.gcode.size(), 60000));
@@ -283,13 +322,10 @@ void view_panel(App& app) {
     const double started = level->simulation.stats.initial_stock_area;
     ImGui::Text("Stock left %.1f mm2 of %.1f", area, started);
     if (started > 0.0)
-      ImGui::ProgressBar(static_cast<float>(1.0 - area / started), ImVec2(-1, 12),
+      ImGui::ProgressBar(static_cast<float>(1.0 - area / started),
+                         ImVec2(-1, ui_size(app, 12.0f)),
                          "removed");
   }
 }
 
-void ensure_initial_operation(App& app) {
-  if (app.job.operations.empty())
-    insert_operation(app, 0, make_operation(app, cam::OperationMode::Roughing));
-}
 }  // namespace tinglecam_gui

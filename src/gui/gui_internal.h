@@ -112,8 +112,8 @@ void plan_buttons(App& app);
 void plan_panel(App& app);
 void output_panel(App& app);
 void library_panel(App& app);
+void settings_panel(App& app);
 void view_panel(App& app);
-void ensure_initial_operation(App& app);
 
 template <typename Enum>
 bool enum_combo(const char* label, Enum& value, const char* (*name)(Enum),

@@ -1,5 +1,57 @@
 #include "cam_test_support.h"
 namespace cam_test {
+void check_user_settings() {
+  std::cout << "user settings\n";
+  const auto directory = std::filesystem::temp_directory_path() /
+      ("tinglecam-settings-" + std::to_string(
+          std::chrono::steady_clock::now().time_since_epoch().count()));
+  const auto file = directory / "settings.json";
+  cam::UserSettings settings = cam::default_user_settings();
+  settings.ui_scale = 1.35;
+  settings.panel_layout.left_width = 512.0;
+  settings.panel_layout.right_width = 604.0;
+  settings.panel_layout.left_program_fraction = 0.61;
+  settings.panel_layout.right_settings_fraction = 0.43;
+  cam::operation_default(settings, cam::OperationMode::Pocket)
+      .pockets.front().width = 47.0;
+  cam::operation_default(settings, cam::OperationMode::PlaneClearing)
+      .plane.areas.front().depth = 2.5;
+  cam::save_user_settings(file, settings);
+  const cam::UserSettings loaded = cam::load_user_settings(file);
+  require_near(loaded.ui_scale, 1.35, 1e-12,
+               "UI scale survives settings persistence");
+  require_near(loaded.panel_layout.left_width, 512.0, 1e-12,
+               "left panel width survives settings persistence");
+  require_near(loaded.panel_layout.right_width, 604.0, 1e-12,
+               "right panel width survives settings persistence");
+  require_near(loaded.panel_layout.left_program_fraction, 0.61, 1e-12,
+               "left panel split survives settings persistence");
+  require_near(loaded.panel_layout.right_settings_fraction, 0.43, 1e-12,
+               "right panel split survives settings persistence");
+  require_near(
+      cam::operation_default(loaded, cam::OperationMode::Pocket)
+          .pockets.front().width,
+      47.0, 1e-12, "pocket defaults survive settings persistence");
+  require_near(cam::operation_default(loaded,
+                                       cam::OperationMode::PlaneClearing)
+                    .plane.areas.front().depth,
+                2.5, 1e-12, "plane defaults survive settings persistence");
+  cam::write_file(file, R"({"ui_scale":1.2})");
+  const cam::UserSettings legacy = cam::load_user_settings(file);
+  require_near(legacy.ui_scale, 1.2, 1e-12,
+               "settings may omit optional operation defaults");
+  bool rejected = false;
+  try {
+    cam::write_file(file, R"({"ui_scale":4.0})");
+    (void)cam::load_user_settings(file);
+  } catch (const std::exception&) {
+    rejected = true;
+  }
+  require(rejected, "invalid UI scale is rejected");
+  std::error_code ignored;
+  std::filesystem::remove_all(directory, ignored);
+}
+
 void check_operation_stock_handoff() {
   std::cout << "operation stock handoff\n";
   const wave::Paths64 nominal{box(0.0, 0.0, 10.0, 10.0)};

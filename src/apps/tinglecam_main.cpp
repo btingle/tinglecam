@@ -133,17 +133,27 @@ int main(int argc, char** argv) {
   } else if (app.part_path[0] != '\0' || app.stock_path[0] != '\0') load_meshes(app);
   app.geometry.set_box_stock(app.job.box_stock, app.job.box_stock_margin);
 
-  // Anything the command line set has to reach the operation the panels would
-  // otherwise have created, so make it here and apply them to it.
-  if (!app.job.operations.empty() || app.geometry.has_part() || !mode_name.empty()) {
+  cam::OperationMode requested_mode = cam::OperationMode::Roughing;
+  if (!mode_name.empty()) {
+    if (mode_name == "rough") requested_mode = cam::OperationMode::Roughing;
+    else if (mode_name == "finish")
+      requested_mode = cam::OperationMode::ContourFinishing;
+    else if (mode_name == "pocket")
+      requested_mode = cam::OperationMode::Pocket;
+    else if (mode_name == "plane")
+      requested_mode = cam::OperationMode::PlaneClearing;
+    else {
+      std::fprintf(stderr, "--mode must be rough, finish, pocket or plane\n");
+      return EXIT_FAILURE;
+    }
+  }
+
+  // Command-line options apply to an existing job operation, or to a new
+  // operation only when --mode explicitly asks for one. Loading models alone
+  // should leave the same empty operation list as a fresh GUI job.
+  if (!app.job.operations.empty() || !mode_name.empty()) {
     if (app.job.operations.empty()) {
-      cam::Operation operation;
-      if (!app.tools.tools.empty()) operation.tool_id = app.tools.tools.front().id;
-      if (!app.machines.machines.empty())
-        operation.machine_id = app.machines.machines.front().id;
-      if (!app.materials.materials.empty())
-        operation.material_id = app.materials.materials.front().id;
-      depth_defaults(app, operation);
+      cam::Operation operation = make_operation(app, requested_mode);
       // Through the helper, so the plan's entry for it exists from the start
       // and the three lists never have to be repaired.
       insert_operation(app, 0, std::move(operation));
@@ -163,17 +173,7 @@ int main(int argc, char** argv) {
       operation.tiny_split_area_factor = *tiny_split_area_factor;
     if (rapid_clearance > 0.0)
       app.job.rapid_clearance_height = rapid_clearance;
-    if (!mode_name.empty()) {
-      if (mode_name == "rough") operation.mode = cam::OperationMode::Roughing;
-      else if (mode_name == "finish")
-        operation.mode = cam::OperationMode::ContourFinishing;
-      else if (mode_name == "pocket") operation.mode = cam::OperationMode::Pocket;
-      else if (mode_name == "plane") operation.mode = cam::OperationMode::PlaneClearing;
-      else {
-        std::fprintf(stderr, "--mode must be rough, finish, pocket or plane\n");
-        return EXIT_FAILURE;
-      }
-    }
+    if (!mode_name.empty()) operation.mode = requested_mode;
     if (!direction_name.empty()) {
       if (direction_name == "either")
         operation.contour_direction = cam::ContourDirectionPolicy::Either;
@@ -198,7 +198,7 @@ int main(int argc, char** argv) {
   // without a display and how it fits into anything scripted.
   if (!gcode_out.empty()) {
     if (app.job.operations.empty()) {
-      std::fprintf(stderr, "--gcode needs --job, --mode, or model inputs\n");
+      std::fprintf(stderr, "--gcode needs --job or --mode with model inputs\n");
       return EXIT_FAILURE;
     }
     const cam::JobPlan plan = cam::plan_job(
@@ -322,6 +322,7 @@ int main(int argc, char** argv) {
   ImGui::StyleColorsDark();
   ImGui::GetIO().IniFilename = nullptr;
   ImGui::GetStyle().FrameRounding = 3.0f;
+  apply_ui_scale(app);
   ImGui_ImplSDL2_InitForOpenGL(window, context);
   ImGui_ImplOpenGL3_Init("#version 150");
 
@@ -439,16 +440,44 @@ int main(int argc, char** argv) {
     ImGui::Begin("TingleCAM", nullptr,
                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
                      ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus);
-    ImGui::BeginChild("left-panel", ImVec2(kLeftPanelWidth, 0.0f));
-    ImGui::PushItemWidth(kLeftPanelWidth * 0.48f);
+    const float content_width = ImGui::GetContentRegionAvail().x;
+    const float content_height = ImGui::GetContentRegionAvail().y;
+    const float splitter_width = ui_size(app, 6.0f);
+    const float spacing = ImGui::GetStyle().ItemSpacing.x;
+    const float usable_width = std::max(
+        1.0f, content_width - 2.0f * splitter_width - 4.0f * spacing);
+    const float minimum_left = ui_size(app, 260.0f);
+    const float minimum_centre = ui_size(app, 200.0f);
+    const float minimum_right = ui_size(app, 280.0f);
+    const float maximum_left =
+        std::max(minimum_left, usable_width - minimum_centre - minimum_right);
+    float left_panel_width = std::clamp(
+        ui_size(app, static_cast<float>(app.settings.panel_layout.left_width)),
+        minimum_left, maximum_left);
+    const float maximum_right =
+        std::max(minimum_right, usable_width - minimum_centre - left_panel_width);
+    float right_panel_width = std::clamp(
+        ui_size(app, static_cast<float>(app.settings.panel_layout.right_width)),
+        minimum_right, maximum_right);
+    float centre_width = std::max(
+        1.0f, usable_width - left_panel_width - right_panel_width);
+
+    ImGui::BeginChild("left-panel", ImVec2(left_panel_width, content_height));
+    ImGui::PushItemWidth(left_panel_width * 0.48f);
     left_panel(app);
     ImGui::PopItemWidth();
     ImGui::EndChild();
     ImGui::SameLine();
-    const float centre_width = std::max(
-        200.0f, ImGui::GetContentRegionAvail().x - kRightPanelWidth -
-                    ImGui::GetStyle().ItemSpacing.x);
-    ImGui::BeginChild("views", ImVec2(centre_width, 0));
+    float delta = 0.0f;
+    layout_splitter(app, "left-column-splitter", true, content_height, delta);
+    if (delta != 0.0f) {
+      app.settings.panel_layout.left_width = std::clamp(
+          app.settings.panel_layout.left_width +
+              delta / static_cast<float>(app.settings.ui_scale),
+          260.0, 1200.0);
+    }
+    ImGui::SameLine();
+    ImGui::BeginChild("views", ImVec2(centre_width, content_height));
     if (ImGui::BeginTabBar("view-tabs")) {
       const auto flag = [&](int index) -> ImGuiTabItemFlags {
         return app.force_tab == index ? ImGuiTabItemFlags_SetSelected : 0;
@@ -473,12 +502,26 @@ int main(int argc, char** argv) {
     if (!screenshot_pending) app.force_tab = -1;
     ImGui::EndChild();
     ImGui::SameLine();
-    ImGui::BeginChild("right-panel", ImVec2(0, 0));
-    ImGui::PushItemWidth(kRightPanelWidth * 0.44f);
+    delta = 0.0f;
+    layout_splitter(app, "right-column-splitter", true, content_height, delta);
+    if (delta != 0.0f) {
+      app.settings.panel_layout.right_width = std::clamp(
+          app.settings.panel_layout.right_width -
+              delta / static_cast<float>(app.settings.ui_scale),
+          280.0, 1400.0);
+    }
+    ImGui::SameLine();
+    ImGui::BeginChild("right-panel", ImVec2(right_panel_width, content_height));
+    ImGui::PushItemWidth(right_panel_width * 0.44f);
     right_panel(app);
     ImGui::PopItemWidth();
     ImGui::EndChild();
     ImGui::End();
+    if (app.panel_layout_dragging &&
+        !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+      save_settings(app);
+      app.panel_layout_dragging = false;
+    }
     tool_builder(app);
 
     ImGui::Render();

@@ -402,7 +402,7 @@ void stitch_passes(OperationPlan& plan, const OperationSetup& setup,
                          std::abs(rapid_plane - level.floor_z)) / rapid_z +
                         distance_mm(from, to) / rapid;
     const double stay = crossing / travel + descent / rapid_z;
-    if (stay >= lift) continue;
+    if (stay >= lift && !earlier->stay_down_preferred) continue;
 
     // Kept aside rather than appended here. It joins the pass after the pass
     // has been resampled, because resampling runs consecutive engaged moves

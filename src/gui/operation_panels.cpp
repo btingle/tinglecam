@@ -63,35 +63,42 @@ void operation_settings_panel(App& app) {
   ImGui::InputDouble("Stepdown (mm)", &operation.stepdown, 0, 0, "%.6g");
   if (cam::is_parametric(operation.mode)) {
     if (operation.mode == cam::OperationMode::Pocket) {
-      auto& p = operation.pocket;
-      static constexpr cam::PocketShape shapes[]{cam::PocketShape::Circle,
-          cam::PocketShape::Rectangle, cam::PocketShape::RoundedRectangle};
-      enum_combo("Pocket shape", p.shape, cam::pocket_shape_name, shapes, std::size(shapes));
-      origin_field("Center X (mm)", p.center_x, app.job.origin_x);
-      origin_field("Center Y (mm)", p.center_y, app.job.origin_y);
-      origin_field("Top Z (mm)", p.top_z, app.job.origin_z);
-      if (p.shape != cam::PocketShape::Circle) {
+      if (operation.pockets.empty()) operation.pockets.push_back(cam::PocketParameters{});
+      ImGui::TextWrapped(
+          "Rounded rectangles cover square, rounded, and circular pockets. "
+          "Each pocket may have its own position and depth.");
+      int remove = -1;
+      for (std::size_t i = 0; i < operation.pockets.size(); ++i) {
+        ImGui::PushID(static_cast<int>(i));
+        ImGui::SeparatorText(("Pocket " + std::to_string(i + 1)).c_str());
+        auto& p = operation.pockets[i];
+        origin_field("Center X (mm)", p.center_x, app.job.origin_x);
+        origin_field("Center Y (mm)", p.center_y, app.job.origin_y);
+        origin_field("Top Z (mm)", p.top_z, app.job.origin_z);
         ImGui::InputDouble("Width X (mm)", &p.width, 0, 0, "%.6g");
         ImGui::InputDouble("Height Y (mm)", &p.height, 0, 0, "%.6g");
+        ImGui::InputDouble("Corner radius (mm)", &p.radius, 0, 0, "%.6g");
+        ImGui::InputDouble("Pocket depth (mm)", &p.depth, 0, 0, "%.6g");
+        ImGui::InputDouble("Helix angle (degrees)", &p.helix_angle_degrees,
+                           0, 0, "%.6g");
+        ImGui::TextWrapped("Floor Z: %.6g mm. Every level starts with a helical entry.",
+                           p.top_z - p.depth + app.job.origin_z);
+        if (ImGui::Button("Remove pocket")) remove = static_cast<int>(i);
+        ImGui::PopID();
       }
-      if (p.shape != cam::PocketShape::Rectangle)
-        ImGui::InputDouble(p.shape == cam::PocketShape::Circle ? "Radius (mm)" :
-            "Corner radius (mm)", &p.radius, 0, 0, "%.6g");
-      ImGui::InputDouble("Pocket depth (mm)", &p.depth, 0, 0, "%.6g");
-      ImGui::InputDouble("Helix angle (degrees)", &p.helix_angle_degrees, 0, 0, "%.6g");
-      ImGui::TextWrapped("Floor Z: %.6g mm. Every level starts with a helical entry.",
-                         p.top_z - p.depth + app.job.origin_z);
-      if (p.shape == cam::PocketShape::Rectangle)
-        ImGui::TextWrapped("Rectangle corners retain the tool radius.");
+      if (remove >= 0) operation.pockets.erase(operation.pockets.begin() + remove);
+      if (ImGui::Button("Add pocket")) {
+        cam::PocketParameters pocket;
+        pocket.center_x = -app.job.origin_x;
+        pocket.center_y = -app.job.origin_y;
+        pocket.top_z = -app.job.origin_z;
+        operation.pockets.push_back(pocket);
+      }
     } else {
       auto& p = operation.plane;
-      origin_field("Top Z (mm)", p.top_z, app.job.origin_z);
-      ImGui::InputDouble("Clearing depth (mm)", &p.depth, 0, 0, "%.6g");
       ImGui::TextWrapped(
-          "Floor Z: %.6g mm. Rectangles share these depths. Each area is faced: "
-          "the cutter descends beside it, runs clear off both ends of every "
-          "row, and takes the whole surface, corners included.",
-          p.top_z - p.depth + app.job.origin_z);
+          "Each area has its own top Z and depth. The cutter descends beside "
+          "the area and faces the whole surface, corners included.");
       int remove = -1;
       for (std::size_t i = 0; i < p.areas.size(); ++i) {
         ImGui::PushID(static_cast<int>(i));
@@ -101,6 +108,10 @@ void operation_settings_panel(App& app) {
         origin_field("Center Y (mm)", area.center_y, app.job.origin_y);
         ImGui::InputDouble("Width X (mm)", &area.width, 0, 0, "%.6g");
         ImGui::InputDouble("Height Y (mm)", &area.height, 0, 0, "%.6g");
+        origin_field("Top Z (mm)", area.top_z, app.job.origin_z);
+        ImGui::InputDouble("Clearing depth (mm)", &area.depth, 0, 0, "%.6g");
+        ImGui::TextWrapped("Floor Z: %.6g mm.",
+                           area.top_z - area.depth + app.job.origin_z);
         if (ImGui::Button("Remove area")) remove = static_cast<int>(i);
         ImGui::PopID();
       }
@@ -169,11 +180,8 @@ void operation_settings_panel(App& app) {
   ImGui::DragScalar("Axial stock to leave", ImGuiDataType_Double,
                     &operation.axial_stock_to_leave, 0.02f);
   ImGui::SetItemTooltip(
-      "Stock left on floors: the part is sliced this far below each pass, so "
-      "the pass stops above anything within that distance. Walls are the "
-      "radial allowance's job.\n\n"
-      "Floors stay on their own grid, so what is left is this to this plus a "
-      "stepdown. It does not change the depth range -- use Depth to.");
+      "When considering accessible cutting area, the part's Z is shifted up "
+      "by this amount.");
   ImGui::DragScalar("Depth from (mm)", ImGuiDataType_Double,
                     &operation.depth_from, 0.1f);
   ImGui::DragScalar("Depth to (mm)", ImGuiDataType_Double, &operation.depth_to,
@@ -316,9 +324,9 @@ bool plannable_range(const App& app, int first, int last) {
 }
 
 // Planning, at the operation list, because what gets planned is a question
-// about that list. Three buttons rather than one: a job whose roughing takes
-// minutes and whose pockets take seconds should not have to spend the minutes
-// again to change a pocket.
+// about that list. Checked rows form one ordered planning span; any operations
+// between the first and last checked row are included because later operations
+// inherit their stock from everything above them.
 void plan_buttons(App& app) {
   ImGui::SeparatorText("Plan");
   if (app.planner.running()) {
@@ -331,6 +339,9 @@ void plan_buttons(App& app) {
 
   const int selected = std::clamp(app.selected_operation, 0,
                                   static_cast<int>(app.job.operations.size()) - 1);
+  const std::vector<std::size_t> chosen = selected_operation_indices(app);
+  const int chosen_first = static_cast<int>(chosen.front());
+  const int chosen_last = static_cast<int>(chosen.back());
   const int last = static_cast<int>(app.job.operations.size()) - 1;
 
   // An operation is cut out of the stock the ones above it left, so planning
@@ -338,12 +349,13 @@ void plan_buttons(App& app) {
   // it. A result that failed is not a gap: a failed operation removed nothing,
   // which is exactly what the planner takes it to have done.
   int missing = -1;
-  for (int i = 0; i < selected; ++i)
+  for (int i = 0; i < chosen_first; ++i)
     if (!app.plan.operations[i].planned) { missing = i; break; }
 
   const int upto_from = first_out_of_date(app, selected);
   const int all_from = first_out_of_date(app, last);
-  const bool can_select = missing < 0 && plannable_range(app, selected, selected);
+  const bool can_select = missing < 0 &&
+                          plannable_range(app, chosen_first, chosen_last);
   const bool can_upto = upto_from >= 0 && plannable_range(app, upto_from, selected);
   const bool can_all = all_from >= 0 && plannable_range(app, all_from, last);
 
@@ -364,7 +376,7 @@ void plan_buttons(App& app) {
 
   ImGui::BeginDisabled(!can_select);
   if (ImGui::Button(kLabels[0], ImVec2(width[0], 0)))
-    start_plan(app, selected, selected);
+    start_plan(app, chosen_first, chosen_last);
   ImGui::EndDisabled();
   ImGui::SameLine();
   ImGui::BeginDisabled(!can_upto);
@@ -388,6 +400,11 @@ void plan_buttons(App& app) {
         "\"%s\" has no result yet, so the operations below it have no stock to "
         "be cut out of. Plan up to the selected operation instead.",
         app.job.operations[missing].name.c_str());
+  if (chosen.size() > 1)
+    ImGui::TextWrapped(
+        "%zu operations selected; planning includes every operation from %d "
+        "through %d so stock handoff remains valid.",
+        chosen.size(), chosen_first + 1, chosen_last + 1);
   const std::size_t stale = stale_operations(app);
   if (stale == 0)
     ImGui::TextWrapped("Every operation matches the plan.");

@@ -191,11 +191,13 @@ add_library(tinglecam_app_ui STATIC
   src/gui/bootstrap.cpp
   src/gui/drawing.cpp
   src/gui/job_panels.cpp
+  src/gui/layout.cpp
   src/gui/operation_panels.cpp
   src/gui/output_panels.cpp
   src/gui/result_view.cpp
   src/gui/setup_result.cpp
   src/gui/sidebar.cpp
+  src/gui/settings.cpp
   src/gui/tool_builder.cpp
 )
 target_link_libraries(tinglecam_app_ui PUBLIC tinglecam_core tinglecam_gui imgui_sdl_opengl)

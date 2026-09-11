@@ -1,11 +1,15 @@
 #include "gui_internal.h"
 namespace tinglecam_gui {
 void left_panel(App& app) {
-  ensure_initial_operation(app);
   const float available = ImGui::GetContentRegionAvail().y;
-  const float operations_height = std::clamp(available * 0.46f, 330.0f, 420.0f);
-  const float program_height = std::max(available - operations_height - 6.0f,
-                                        140.0f);
+  const float splitter_height = ui_size(app, 6.0f);
+  const float minimum_program = ui_size(app, 140.0f);
+  const float minimum_operations = ui_size(app, 220.0f);
+  const float maximum_program =
+      std::max(minimum_program, available - splitter_height - minimum_operations);
+  const float program_height = std::clamp(
+      available * static_cast<float>(app.settings.panel_layout.left_program_fraction),
+      minimum_program, maximum_program);
 
   ImGui::BeginChild("program-controls", ImVec2(0, program_height),
                     ImGuiChildFlags_Borders);
@@ -39,9 +43,25 @@ void left_panel(App& app) {
       ImGui::EndChild();
       ImGui::EndTabItem();
     }
+    if (ImGui::BeginTabItem("Settings")) {
+      if (ImGui::BeginChild("settings-scroll", ImVec2(0, 0),
+                            ImGuiChildFlags_None,
+                            ImGuiWindowFlags_AlwaysVerticalScrollbar))
+        settings_panel(app);
+      ImGui::EndChild();
+      ImGui::EndTabItem();
+    }
     ImGui::EndTabBar();
   }
   ImGui::EndChild();
+
+  float delta = 0.0f;
+  layout_splitter(app, "left-program-splitter", false,
+                  ImGui::GetContentRegionAvail().x, delta);
+  if (delta != 0.0f && available > 0.0f) {
+    app.settings.panel_layout.left_program_fraction = std::clamp(
+        (program_height + delta) / available, 0.2f, 0.8f);
+  }
 
   ImGui::BeginChild("operation-list", ImVec2(0, 0), ImGuiChildFlags_Borders,
                     ImGuiWindowFlags_AlwaysVerticalScrollbar);
@@ -50,9 +70,15 @@ void left_panel(App& app) {
 }
 
 void right_panel(App& app) {
-  ensure_initial_operation(app);
   const float available = ImGui::GetContentRegionAvail().y;
-  const float settings_height = std::max(available * 0.58f, 220.0f);
+  const float splitter_height = ui_size(app, 6.0f);
+  const float minimum_settings = ui_size(app, 220.0f);
+  const float minimum_playback = ui_size(app, 180.0f);
+  const float maximum_settings =
+      std::max(minimum_settings, available - splitter_height - minimum_playback);
+  const float settings_height = std::clamp(
+      available * static_cast<float>(app.settings.panel_layout.right_settings_fraction),
+      minimum_settings, maximum_settings);
 
   ImGui::BeginChild("operation-settings", ImVec2(0, settings_height),
                     ImGuiChildFlags_Borders,
@@ -64,6 +90,14 @@ void right_panel(App& app) {
   operation_settings_panel(app);
   ImGui::PopItemWidth();
   ImGui::EndChild();
+
+  float delta = 0.0f;
+  layout_splitter(app, "right-settings-splitter", false,
+                  ImGui::GetContentRegionAvail().x, delta);
+  if (delta != 0.0f && available > 0.0f) {
+    app.settings.panel_layout.right_settings_fraction = std::clamp(
+        (settings_height + delta) / available, 0.2f, 0.8f);
+  }
 
   ImGui::BeginChild("playback-display", ImVec2(0, 0), ImGuiChildFlags_Borders,
                     ImGuiWindowFlags_AlwaysVerticalScrollbar);

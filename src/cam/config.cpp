@@ -3,6 +3,8 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
@@ -28,6 +30,20 @@ std::optional<ContourDirectionPolicy> contour_direction_from_name(
   if (name == "conventional") return ContourDirectionPolicy::Conventional;
   return std::nullopt;
 }
+
+std::size_t operation_default_index(OperationMode mode) {
+  switch (mode) {
+    case OperationMode::Roughing: return 0;
+    case OperationMode::ContourFinishing: return 1;
+    case OperationMode::Pocket: return 2;
+    case OperationMode::PlaneClearing: return 3;
+  }
+  return 0;
+}
+
+constexpr std::array<OperationMode, 4> kOperationModes{
+    OperationMode::Roughing, OperationMode::ContourFinishing,
+    OperationMode::Pocket, OperationMode::PlaneClearing};
 
 template <typename T>
 void read(const json& node, const char* key, T& target) {
@@ -157,11 +173,28 @@ Material material_from(const json& node) {
 }
 
 json to_json(const Operation& operation) {
-  const auto& p = operation.pocket;
+  json pockets = json::array();
+  for (const auto& p : operation.pockets)
+    pockets.push_back({{"shape", pocket_shape_name(p.shape)},
+                       {"center_x", p.center_x},
+                       {"center_y", p.center_y},
+                       {"top_z", p.top_z},
+                       {"width", p.width},
+                       {"height", p.height},
+                       {"depth", p.depth},
+                       {"radius", p.radius},
+                       {"helix_angle_degrees", p.helix_angle_degrees}});
   json areas = json::array();
   for (const auto& area : operation.plane.areas)
     areas.push_back({{"center_x", area.center_x}, {"center_y", area.center_y},
-                     {"width", area.width}, {"height", area.height}});
+                     {"width", area.width}, {"height", area.height},
+                     {"top_z", area.top_z}, {"depth", area.depth}});
+  const double plane_top = operation.plane.areas.empty()
+                               ? operation.plane.top_z
+                               : operation.plane.areas.front().top_z;
+  const double plane_depth = operation.plane.areas.empty()
+                                 ? operation.plane.depth
+                                 : operation.plane.areas.front().depth;
   return json{{"name", operation.name},
               {"mode", operation_mode_name(operation.mode)},
               {"tool", operation.tool_id},
@@ -174,14 +207,9 @@ json to_json(const Operation& operation) {
               {"coolant", operation.coolant},
               {"tool_number", operation.tool_number},
               {"length_offset", operation.length_offset},
-              {"pocket", {{"shape", pocket_shape_name(p.shape)},
-                          {"center_x", p.center_x}, {"center_y", p.center_y},
-                          {"top_z", p.top_z}, {"width", p.width},
-                          {"height", p.height}, {"depth", p.depth},
-                          {"radius", p.radius},
-                          {"helix_angle_degrees", p.helix_angle_degrees}}},
-              {"plane", {{"top_z", operation.plane.top_z},
-                         {"depth", operation.plane.depth}, {"areas", areas}}},
+              {"pockets", std::move(pockets)},
+              {"plane", {{"top_z", plane_top},
+                         {"depth", plane_depth}, {"areas", areas}}},
               {"finishing_subdivisions", operation.finishing_subdivisions},
               {"radial_stock_to_leave", operation.radial_stock_to_leave},
               {"axial_stock_to_leave", operation.axial_stock_to_leave},
@@ -206,6 +234,22 @@ json to_json(const Operation& operation) {
                operation.simulation_stock_inflation}};
 }
 
+json to_json(const UserSettings& settings) {
+  json defaults = json::object();
+  for (const OperationMode mode : kOperationModes)
+    defaults[operation_mode_name(mode)] =
+        to_json(operation_default(settings, mode));
+  const PanelLayout& layout = settings.panel_layout;
+  return json{{"ui_scale", settings.ui_scale},
+              {"panel_layout", {{"left_width", layout.left_width},
+                                 {"right_width", layout.right_width},
+                                 {"left_program_fraction",
+                                  layout.left_program_fraction},
+                                 {"right_settings_fraction",
+                                  layout.right_settings_fraction}}},
+              {"operation_defaults", std::move(defaults)}};
+}
+
 Operation operation_from(const json& node) {
   Operation operation;
   read(node, "name", operation.name);
@@ -220,23 +264,6 @@ Operation operation_from(const json& node) {
   read(node, "coolant", operation.coolant);
   read(node, "tool_number", operation.tool_number);
   read(node, "length_offset", operation.length_offset);
-  if (node.contains("pocket")) {
-    const auto& pocket = node.at("pocket");
-    auto& p = operation.pocket;
-    if (pocket.contains("shape")) {
-      const auto shape = pocket_shape_from_name(pocket.at("shape").get<std::string>());
-      if (!shape) throw std::runtime_error("Unknown pocket shape");
-      p.shape = *shape;
-    }
-    read(pocket, "center_x", p.center_x);
-    read(pocket, "center_y", p.center_y);
-    read(pocket, "top_z", p.top_z);
-    read(pocket, "width", p.width);
-    read(pocket, "height", p.height);
-    read(pocket, "depth", p.depth);
-    read(pocket, "radius", p.radius);
-    read(pocket, "helix_angle_degrees", p.helix_angle_degrees);
-  }
   if (node.contains("plane")) {
     const auto& plane = node.at("plane");
     read(plane, "top_z", operation.plane.top_z);
@@ -246,13 +273,60 @@ Operation operation_from(const json& node) {
       operation.plane.areas.clear();
       for (const auto& entry : plane.at("areas")) {
         ClearingArea area;
+        area.top_z = operation.plane.top_z;
+        area.depth = operation.plane.depth;
         read(entry, "center_x", area.center_x);
         read(entry, "center_y", area.center_y);
         read(entry, "width", area.width);
         read(entry, "height", area.height);
+        read(entry, "top_z", area.top_z);
+        read(entry, "depth", area.depth);
         operation.plane.areas.push_back(area);
       }
+    } else {
+      // Very old files could carry only the operation-wide plane range.
+      // Materialise it on the default area so the planner still sees the same
+      // cutting envelope after the per-area representation is loaded.
+      operation.plane.areas.front().top_z = operation.plane.top_z;
+      operation.plane.areas.front().depth = operation.plane.depth;
     }
+  }
+  const auto read_pocket = [](const json& pocket) {
+    PocketParameters p;
+    bool circle = false;
+    bool rectangle = false;
+    if (pocket.contains("shape")) {
+      if (!pocket.at("shape").is_string())
+        throw std::runtime_error("Pocket shape must be a string");
+      const std::string shape = pocket.at("shape").get<std::string>();
+      const auto parsed = pocket_shape_from_name(shape);
+      if (!parsed) throw std::runtime_error("Unknown pocket shape");
+      p.shape = *parsed;
+      circle = shape == "circle";
+      rectangle = shape == "rectangle";
+    }
+    read(pocket, "center_x", p.center_x);
+    read(pocket, "center_y", p.center_y);
+    read(pocket, "top_z", p.top_z);
+    read(pocket, "width", p.width);
+    read(pocket, "height", p.height);
+    read(pocket, "depth", p.depth);
+    read(pocket, "radius", p.radius);
+    read(pocket, "helix_angle_degrees", p.helix_angle_degrees);
+    // Old files represented circles by a radius and squares by a separate
+    // shape. Both are now rounded rectangles.
+    if (circle) p.width = p.height = 2.0 * p.radius;
+    if (rectangle) p.radius = 0.0;
+    return p;
+  };
+  if (node.contains("pockets")) {
+    const auto& pockets = node.at("pockets");
+    if (!pockets.is_array()) throw std::runtime_error("Expected pockets array");
+    operation.pockets.clear();
+    for (const auto& pocket : pockets)
+      operation.pockets.push_back(read_pocket(pocket));
+  } else if (node.contains("pocket")) {
+    operation.pockets = {read_pocket(node.at("pocket"))};
   }
   read(node, "finishing_subdivisions", operation.finishing_subdivisions);
   read(node, "radial_stock_to_leave", operation.radial_stock_to_leave);
@@ -277,6 +351,49 @@ Operation operation_from(const json& node) {
   read(node, "simulation_stock_inflation",
        operation.simulation_stock_inflation);
   return operation;
+}
+
+UserSettings settings_from(const json& node) {
+  UserSettings settings = default_user_settings();
+  read(node, "ui_scale", settings.ui_scale);
+  if (!(settings.ui_scale >= 0.5 && settings.ui_scale <= 3.0) ||
+      !std::isfinite(settings.ui_scale))
+    throw std::runtime_error("UI scale must be finite and between 0.5 and 3.0");
+  if (node.contains("panel_layout")) {
+    const auto& layout = node.at("panel_layout");
+    if (!layout.is_object())
+      throw std::runtime_error("Expected panel_layout object");
+    read(layout, "left_width", settings.panel_layout.left_width);
+    read(layout, "right_width", settings.panel_layout.right_width);
+    read(layout, "left_program_fraction",
+         settings.panel_layout.left_program_fraction);
+    read(layout, "right_settings_fraction",
+         settings.panel_layout.right_settings_fraction);
+  }
+  const PanelLayout& layout = settings.panel_layout;
+  if (!std::isfinite(layout.left_width) || layout.left_width < 260.0 ||
+      layout.left_width > 1200.0 || !std::isfinite(layout.right_width) ||
+      layout.right_width < 280.0 || layout.right_width > 1400.0 ||
+      !std::isfinite(layout.left_program_fraction) ||
+      layout.left_program_fraction < 0.2 ||
+      layout.left_program_fraction > 0.8 ||
+      !std::isfinite(layout.right_settings_fraction) ||
+      layout.right_settings_fraction < 0.2 ||
+      layout.right_settings_fraction > 0.8)
+    throw std::runtime_error("Panel layout values are outside their allowed ranges");
+  if (node.contains("operation_defaults")) {
+    const auto& defaults = node.at("operation_defaults");
+    if (!defaults.is_object())
+      throw std::runtime_error("Expected operation_defaults object");
+    for (const OperationMode mode : kOperationModes) {
+      const std::string key = operation_mode_name(mode);
+      if (!defaults.contains(key)) continue;
+      settings.operation_defaults[operation_default_index(mode)] =
+          operation_from(defaults.at(key));
+      settings.operation_defaults[operation_default_index(mode)].mode = mode;
+    }
+  }
+  return settings;
 }
 
 json to_json(const Job& job) {
@@ -339,6 +456,60 @@ std::filesystem::path config_directory() {
     return std::filesystem::path(home) / ".config" / "tinglecam";
 #endif
   return std::filesystem::current_path() / ".tinglecam";
+}
+
+PanelLayout default_panel_layout() { return PanelLayout{}; }
+
+UserSettings default_user_settings() {
+  UserSettings settings;
+  settings.panel_layout = default_panel_layout();
+  for (const OperationMode mode : kOperationModes) {
+    Operation& operation = settings.operation_defaults[operation_default_index(mode)];
+    operation.mode = mode;
+    if (mode == OperationMode::ContourFinishing) {
+      operation.radial_stock_to_leave = 0.0;
+      operation.rough_boundary_cleanup = false;
+    }
+  }
+  return settings;
+}
+
+const Operation& operation_default(const UserSettings& settings,
+                                   OperationMode mode) {
+  return settings.operation_defaults[operation_default_index(mode)];
+}
+
+Operation& operation_default(UserSettings& settings, OperationMode mode) {
+  return settings.operation_defaults[operation_default_index(mode)];
+}
+
+UserSettings load_user_settings(const std::filesystem::path& path) {
+  std::error_code code;
+  if (!std::filesystem::exists(path, code)) return default_user_settings();
+  try {
+    return settings_from(parse(read_file(path), path));
+  } catch (const std::exception& error) {
+    throw std::runtime_error(path.string() + ": " + error.what());
+  }
+}
+
+void save_user_settings(const std::filesystem::path& path,
+                        const UserSettings& settings) {
+  if (!(settings.ui_scale >= 0.5 && settings.ui_scale <= 3.0) ||
+      !std::isfinite(settings.ui_scale))
+    throw std::runtime_error("UI scale must be finite and between 0.5 and 3.0");
+  const PanelLayout& layout = settings.panel_layout;
+  if (!std::isfinite(layout.left_width) || layout.left_width < 260.0 ||
+      layout.left_width > 1200.0 || !std::isfinite(layout.right_width) ||
+      layout.right_width < 280.0 || layout.right_width > 1400.0 ||
+      !std::isfinite(layout.left_program_fraction) ||
+      layout.left_program_fraction < 0.2 ||
+      layout.left_program_fraction > 0.8 ||
+      !std::isfinite(layout.right_settings_fraction) ||
+      layout.right_settings_fraction < 0.2 ||
+      layout.right_settings_fraction > 0.8)
+    throw std::runtime_error("Panel layout values are outside their allowed ranges");
+  write_file(path, to_json(settings).dump(2) + "\n");
 }
 
 std::filesystem::path data_directory() {

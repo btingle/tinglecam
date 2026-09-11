@@ -31,4 +31,21 @@ PostResult post_job(const JobPlan& plan,
                     const ToolLibrary& tools,
                     const MachineLibrary& machines);
 
+// Posts one already-planned operation as a complete, standalone program. The
+// operation keeps the job's origin, work offset, machine profile, and tool
+// conventions, but no other operation is emitted.
+PostResult post_operation(const JobPlan& plan,
+                          const Job& job,
+                          const ToolLibrary& tools,
+                          const MachineLibrary& machines,
+                          std::size_t operation_index);
+
+// Posts a chosen set of already-planned operations as one standalone program,
+// retaining their original job order and machine/tool conventions.
+PostResult post_operations(const JobPlan& plan,
+                           const Job& job,
+                           const ToolLibrary& tools,
+                           const MachineLibrary& machines,
+                           const std::vector<std::size_t>& operation_indices);
+
 }  // namespace cam

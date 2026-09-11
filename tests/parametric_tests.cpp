@@ -35,11 +35,12 @@ cam::Operation operation(cam::OperationMode mode) {
   value.mode = mode; value.tool_id = "cutter"; value.machine_id = "machine";
   value.material_id = "material"; value.stepover_ratio = 0.8; value.stepdown = 1;
   value.spindle_rpm = 17000; value.plunge_feed = 135;
-  value.pocket.center_x = 12; value.pocket.center_y = -8;
-  value.pocket.top_z = 10; value.pocket.depth = 2.5;
-  value.pocket.width = 24; value.pocket.height = 14; value.pocket.radius = 5;
-  value.plane.top_z = 10; value.plane.depth = 2.5;
-  value.plane.areas = {{-25, 4, 20, 14}, {25, -4, 18, 12}};
+  auto& pocket = value.pockets.front();
+  pocket.center_x = 12; pocket.center_y = -8;
+  pocket.top_z = 10; pocket.depth = 2.5;
+  pocket.width = 24; pocket.height = 14; pocket.radius = 5;
+  value.plane.areas = {{-25, 4, 20, 14, 10, 2.5},
+                       {25, -4, 18, 12, 9, 1.5}};
   return value;
 }
 cam::JobPlan plan(const cam::Operation& op) {
@@ -81,7 +82,12 @@ void check_timeline(const cam::JobPlan& result) {
         }
       }
       near(distance, wave::toolpath_length(level.toolpath), "Projection matches machine timeline");
-      near(level.feeds.motion.back().to_z, result.rapid_plane, "Every area ends retracted");
+      if (level.stays_down_after)
+        near(level.feeds.motion.back().to_z, level.floor_z,
+             "A stay-down pass ends at its floor");
+      else
+        near(level.feeds.motion.back().to_z, result.rapid_plane,
+             "Every independent pass ends retracted");
     }
   }
   near(seconds/60, result.stats.cutting_minutes + result.stats.rapid_minutes,
@@ -89,14 +95,21 @@ void check_timeline(const cam::JobPlan& result) {
 }
 
 void pockets() {
-  for (auto shape : {cam::PocketShape::Circle, cam::PocketShape::Rectangle,
-                     cam::PocketShape::RoundedRectangle}) {
+  for (const double radius : {0.0, 5.0, 7.0}) {
     auto op = operation(cam::OperationMode::Pocket);
-    op.pocket.shape = shape;
+    auto& pocket = op.pockets.front();
+    pocket.radius = radius;
     const auto result = plan(op);
     check_timeline(result);
     const auto& levels = result.operations.front().levels;
     check(levels.size() == 3, "Pocket depth is divided by requested stepdown");
+    check(levels[0].stays_down_after && levels[1].stays_down_after &&
+              !levels[2].stays_down_after,
+          "Pocket layers prefer staying down until the final layer");
+    near(levels[0].feeds.motion.back().to_z, levels[0].floor_z,
+         "First pocket layer stays at depth");
+    near(levels[1].feeds.motion.front().from_z, levels[0].floor_z,
+         "Next pocket layer starts where the previous one ended");
     near(levels.back().floor_z, 7.5, "Pocket finishes at top minus depth");
     for (const auto& level : levels) {
       const double upper = level.floor_z+level.axial_depth;
@@ -105,22 +118,17 @@ void pockets() {
       for (const auto& phase : level.feeds.motion) {
         if (phase.rapid) continue;
         for (const auto& at : {phase.from, phase.to}) {
-          const double x = std::abs(wave::to_world(at.x)-op.pocket.center_x);
-          const double y = std::abs(wave::to_world(at.y)-op.pocket.center_y);
+          const double x = std::abs(wave::to_world(at.x)-pocket.center_x);
+          const double y = std::abs(wave::to_world(at.y)-pocket.center_y);
           const double cutter_radius = tool().diameter/2;
-          if (shape == cam::PocketShape::Circle)
-            check(std::hypot(x,y)+cutter_radius <= op.pocket.radius+0.004,
-                  "Circular pocket motion keeps the cutter within the opening");
-          else {
-            check(x+cutter_radius <= op.pocket.width/2+0.004 &&
-                      y+cutter_radius <= op.pocket.height/2+0.004,
-                  "Rectangular pocket motion respects the finished dimensions");
-            if (shape == cam::PocketShape::RoundedRectangle)
-              check(std::hypot(std::max(0.0,x-(op.pocket.width/2-op.pocket.radius)),
-                               std::max(0.0,y-(op.pocket.height/2-op.pocket.radius))) <=
-                        op.pocket.radius-cutter_radius+0.004,
-                    "The cutter remains inside rounded pocket corners");
-          }
+          check(x+cutter_radius <= pocket.width/2+0.004 &&
+                    y+cutter_radius <= pocket.height/2+0.004,
+                "Rounded-rectangle motion respects the finished dimensions");
+          if (radius > 0)
+            check(std::hypot(std::max(0.0,x-(pocket.width/2-pocket.radius)),
+                             std::max(0.0,y-(pocket.height/2-pocket.radius))) <=
+                      pocket.radius-cutter_radius+0.004,
+                  "The cutter remains inside rounded pocket corners");
         }
         if (phase.to_z < upper-1e-8 && phase.to_z < phase.from_z-1e-8) {
           check(phase.kind == wave::MoveKind::Entry && phase.from != phase.to,
@@ -138,7 +146,7 @@ void pockets() {
       check(helix && angle_sum > 1, "Every depth level has a helical entry");
       check(level.simulation.stats.unresolved_entries == 0,
             "A real helix must not be reported as an unresolved plunge");
-      const double target = wave::material_area(cam::pocket_boundary(op.pocket));
+      const double target = wave::material_area(cam::pocket_boundary(pocket));
       check(level.simulation.stats.removed_area > target*0.985,
             "Pocket passes clear the interior, including the central core");
     }
@@ -173,15 +181,37 @@ void pockets() {
   }
 }
 
+void multiple_pockets() {
+  auto op = operation(cam::OperationMode::Pocket);
+  auto second = op.pockets.front();
+  second.center_x = -22;
+  second.center_y = 10;
+  second.top_z = 8;
+  second.depth = 1;
+  op.pockets.push_back(second);
+  const auto result = plan(op);
+  check_timeline(result);
+  check(result.operations.front().levels.size() == 4,
+        "One pocket operation can contain several pocket regions");
+  check(result.operations.front().levels[2].floor_z == 7.5,
+        "The first pocket finishes before the next pocket begins");
+  check(!result.operations.front().levels[2].stays_down_after,
+        "Different pockets remain separated by a retract");
+}
+
 void planes() {
   const auto op = operation(cam::OperationMode::PlaneClearing);
   const auto result = plan(op);
   check_timeline(result);
   const auto& levels = result.operations.front().levels;
-  check(levels.size() == 6, "Both clearing areas are visited at each depth");
+  check(levels.size() == 5, "Both clearing areas are visited at each depth");
   for (std::size_t index = 0; index < levels.size(); ++index) {
     const auto& level = levels[index];
     const auto& area = op.plane.areas[index%2];
+    const double expected_floor = index == 0 ? 9.0 : index == 1 ? 8.0 :
+        index == 2 ? 8.0 : 7.5;
+    near(level.floor_z, expected_floor,
+         "Each plane area uses its own top and depth");
     const double radius = tool().diameter/2;
     bool left = false, right = false, overran = false;
     for (const auto& phase : level.feeds.motion) {
@@ -223,10 +253,11 @@ void planes() {
 void validation_and_storage() {
   auto op = operation(cam::OperationMode::Pocket);
   auto expect_error = [&](const cam::Operation& invalid) { check(!plan(invalid).ok(), "Invalid input must fail planning"); };
-  auto bad = op; bad.pocket.depth = 26; expect_error(bad);
-  bad = op; bad.pocket.width = 2; expect_error(bad);
-  bad = op; bad.pocket.helix_angle_degrees = 0; expect_error(bad);
-  bad = op; bad.pocket.shape = cam::PocketShape::RoundedRectangle; bad.pocket.radius = 1; expect_error(bad);
+  auto bad = op; bad.pockets.front().depth = 26; expect_error(bad);
+  bad = op; bad.pockets.front().width = 2; expect_error(bad);
+  bad = op; bad.pockets.front().helix_angle_degrees = 0; expect_error(bad);
+  bad = op; bad.pockets.front().width = 4; bad.pockets.front().height = 4;
+  bad.pockets.front().radius = 1; expect_error(bad);
   bad = op; bad.stepover_ratio = 0; expect_error(bad);
   bad = op; bad.stepdown = std::numeric_limits<double>::infinity(); expect_error(bad);
   bad = operation(cam::OperationMode::PlaneClearing); bad.plane.areas.clear(); expect_error(bad);
@@ -236,7 +267,7 @@ void validation_and_storage() {
   check(cancelled.error == "Cancelled", "Cancellation must stop parametric planning");
 
   auto overlap = operation(cam::OperationMode::PlaneClearing);
-  overlap.plane.areas = {{0,0,20,20}, {0,0,20,20}};
+  overlap.plane.areas = {{0,0,20,20,10,2.5}, {0,0,20,20,10,2.5}};
   const auto overlapping = plan(overlap);
   check_timeline(overlapping);
   const auto& overlap_levels = overlapping.operations.front().levels;
@@ -263,7 +294,7 @@ void validation_and_storage() {
 }  // namespace
 
 int main() {
-  try { pockets(); planes(); validation_and_storage(); }
+  try { pockets(); multiple_pockets(); planes(); validation_and_storage(); }
   catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
   std::cout << "Parametric pocket, plane, motion and persistence checks passed.\n";
 }

@@ -37,10 +37,17 @@ extern PrismView prism_view;
 void release_prism_view();
 
 void bootstrap(App& app);
+void apply_ui_scale(App& app);
+bool save_settings(App& app);
+bool layout_splitter(App& app, const char* id, bool vertical, float extent,
+                     float& delta);
+void settings_panel(App& app);
 void load_meshes(App& app);
 void load_job_into(App& app, const std::filesystem::path& file);
 void depth_defaults(App& app, cam::Operation& operation);
 void insert_operation(App& app, int index, cam::Operation operation);
+std::vector<std::size_t> selected_operation_indices(const App& app,
+                                                     bool fallback_to_focus = true);
 void start_plan(App& app, int first, int last);
 void refresh_plan_states(App& app);
 void select_operation(App& app, int index);

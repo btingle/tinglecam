@@ -217,7 +217,7 @@ def create_all_tracks(grid_size, elevation_gain, profile, resolution=256):
 
     return all_template_names, all_results
 
-def main(grid_size, elevation_gain, profile_obj_path, save_dir, resolution):
+def main(grid_size, elevation_gain, profile_obj_path, save_dir, resolution, gcode):
     def load_profile_obj(profile_obj_path):
         profile = []
         with open(profile_obj_path, "r") as f:
@@ -251,12 +251,57 @@ def main(grid_size, elevation_gain, profile_obj_path, save_dir, resolution):
         obj_data += ''.join([yield_face_obj_data(i) for i in np.ndindex(I-1, J-1)])
         return obj_data
 
-    for i in range(results.shape[0]):
-        name = names[i]
-        print("saving", name)
-        data = save_obj(results[i])
-        with open(os.path.join(save_dir, name + ".obj"), "w") as f:
-            f.write(data)
+    def save_gcode(contours, datum=1, tool=1, spindle_speed=12000, feed=1000, retract=30):
+        def form_gcode(pt):
+            x, y, z = pt
+            return f"X{x:.3f} Y{y:.3f} Z{z:.3f}\n"
+        def form_obj(pt):
+            x, y, z = pt
+            return f"v {x:.3f} {y:.3f} {z:.3f}\n"
+        
+        first_pos = contours[0,0]
+        gcode = f"""
+        G21 G90 G94 G17 G{53+datum}
+        M6 T{tool}
+        G28
+        G0 X{first_pos[0]} Y{first_pos[1]}
+        Z{retract}
+        """
+        obj = ""
+        I, J = contours.shape[:2]
+        for i in range(0, I, 2):
+            for j in range(J):
+                gcode += form_gcode(contours[i,j])
+                obj += form_obj(contours[i,j])
+            i += 1
+            for j in reversed(range(J)):
+                gcode += form_gcode(contours[i,j])
+                obj += form_obj(contours[i,j])
+        # emit ze lines
+        for i in range(0, I*J, 100):
+            obj += f"f {" ".join([str(_i+1) for _i in range(i, min(I*J, i+100))])}"
+        return gcode, obj
+
+
+    if gcode:
+
+        for i in range(results.shape[0]):
+            name = names[i]
+            print("saving", name)
+            gcode_data, obj_data = save_gcode(results[i])
+            with open(os.path.join(save_dir, name + ".nc"), "w") as nc_f:
+                nc_f.write(gcode_data)
+            with open(os.path.join(save_dir, name + '.nc.obj'), "w") as nc_obj_f:
+                nc_obj_f.write(obj_data)
+
+    else:
+
+        for i in range(results.shape[0]):
+            name = names[i]
+            print("saving", name)
+            data = save_obj(results[i])
+            with open(os.path.join(save_dir, name + ".obj"), "w") as f:
+                f.write(data)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -265,9 +310,10 @@ if __name__ == "__main__":
     parser.add_argument("--profile-obj-path", type=str)
     parser.add_argument("--save-dir", type=str, default=".")
     parser.add_argument("--resolution", type=int, default=256)
+    parser.add_argument("--gcode", action="store_true")
 
     args = parser.parse_args()
-    main(args.grid_size, args.elevation_gain, args.profile_obj_path, args.save_dir, args.resolution)
+    main(args.grid_size, args.elevation_gain, args.profile_obj_path, args.save_dir, args.resolution, args.gcode)
 
 
 

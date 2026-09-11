@@ -47,9 +47,9 @@ void integration() {
   Tool tool; tool.id="tool"; tool.name="Tool"; tool.diameter=2; tool.flute_length=20; tool.flutes=2;
   Machine machine; machine.id="machine"; machine.name="Machine"; machine.rapid_feed=3000; machine.rapid_feed_z=500;
   machine.min_rpm=1000; machine.max_rpm=24000; machine.feed_ranges.push_back({"material",500,1500});
-  Operation op; op.mode=OperationMode::Pocket; op.material_id="material"; op.pocket.shape=PocketShape::Rectangle;
-  op.pocket.center_x=10; op.pocket.center_y=10; op.pocket.width=12; op.pocket.height=12;
-  op.pocket.top_z=9; op.pocket.depth=6; op.stepdown=6;
+  Operation op; op.mode=OperationMode::Pocket; op.material_id="material"; op.pockets.front().shape=PocketShape::RoundedRectangle; op.pockets.front().radius=0;
+  op.pockets.front().center_x=10; op.pockets.front().center_y=10; op.pockets.front().width=12; op.pockets.front().height=12;
+  op.pockets.front().top_z=9; op.pockets.front().depth=6; op.stepdown=6;
   OperationPlan rough; LevelPlan old; old.floor_z=6; old.axial_depth=4; old.simulation.removed_material=rect(0,0,10,20); rough.levels.push_back(old);
   auto result=plan_parametric_operation(op,tool,machine,15,{&rough},{},0,1,&geometry);
   check(result.ok(),result.error.c_str()); check(result.composed_stock,"Loaded stock enables composition");
@@ -61,8 +61,7 @@ void integration() {
   near(volume(later),3200-result.stats.removed_volume);
   Operation plane = op;
   plane.mode=OperationMode::PlaneClearing;
-  plane.plane.top_z=8.5; plane.plane.depth=7; plane.stepdown=2.5;
-  plane.plane.areas={{7,10,10,16},{12,10,12,16}};
+  plane.plane.areas={{7,10,10,16,8.5,7},{12,10,12,16,8.5,7}};
   const auto facing=plan_parametric_operation(plane,tool,machine,15,{&rough,&result},{},0,1,&geometry);
   check(facing.ok(),facing.error.c_str());
   near(volume(preview_before_level(facing,0)),volume(later));
@@ -78,11 +77,12 @@ void integration() {
     previous_volume=volume(preview_before_level(facing,i+1));
     check(previous_volume<=volume(before)+1e-6,"Overlapping passes monotonically remove stock");
   }
-  op.pocket.center_x=100;
+  op.pockets.front().center_x=100;
   const auto air=plan_parametric_operation(op,tool,machine,15,{&rough},{},0,1,&geometry);
   check(air.ok() && air.levels[0].nothing_to_cut,"Pocket outside active stock cuts nothing");
   near(volume(preview_before_level(air,1)),3200);
-  op.pocket.center_x=10; op.pocket.top_z=15; op.pocket.depth=2; op.stepdown=1;
+  op.pockets.front().center_x=10; op.pockets.front().top_z=15;
+  op.pockets.front().depth=2; op.stepdown=1;
   const auto above=plan_parametric_operation(op,tool,machine,20,{},{},0,1,&geometry);
   check(above.ok() && above.stats.removed_volume==0,"Box stock is bounded in Z");
 }
@@ -109,12 +109,11 @@ void partial_replan() {
   Job job;
   Operation first; first.name="First"; first.mode=OperationMode::PlaneClearing;
   first.tool_id="tool"; first.machine_id="machine"; first.material_id="material";
-  first.plane.top_z=10; first.plane.depth=3; first.stepdown=3;
-  first.plane.areas={{5,10,8,16}};
+  first.plane.areas={{5,10,8,16,10,3}}; first.stepdown=3;
   Operation second=first; second.name="Second"; second.mode=OperationMode::Pocket;
-  second.pocket.shape=PocketShape::Rectangle; second.pocket.center_x=10;
-  second.pocket.center_y=10; second.pocket.width=12; second.pocket.height=12;
-  second.pocket.top_z=9; second.pocket.depth=5; second.stepdown=5;
+  second.pockets.front().shape=PocketShape::RoundedRectangle; second.pockets.front().center_x=10;
+  second.pockets.front().center_y=10; second.pockets.front().width=12; second.pockets.front().height=12;
+  second.pockets.front().top_z=9; second.pockets.front().depth=5; second.stepdown=5;
   job.operations={first,second};
 
   const JobPlan whole=plan_job(geometry,job,tools,machines,materials,{});

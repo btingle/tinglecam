@@ -96,6 +96,7 @@ void check_post_output() {
       cut.toolpath, cut.simulation, machine, 500.0, 2000.0, 12000.0, 120.0);
   cam::OperationPlan planned_operation;
   planned_operation.operation_name = "Rough";
+  planned_operation.planned = true;
   planned_operation.tool_id = tool.id;
   planned_operation.spindle_rpm = 12000.0;
   planned_operation.levels.push_back(level);
@@ -112,6 +113,29 @@ void check_post_output() {
           "a cut without a cleared landing is posted at plunge feed");
   require(result.text.find("M30") != std::string::npos,
           "the program terminates");
+
+  cam::Operation second_operation = operation;
+  second_operation.name = "Second operation";
+  job.operations.push_back(second_operation);
+  cam::OperationPlan second_plan = planned_operation;
+  second_plan.operation_name = second_operation.name;
+  plan.operations.push_back(second_plan);
+  const cam::PostResult individual =
+      cam::post_operation(plan, job, tools, machines, 0);
+  require(individual.ok(), "an individual operation can be posted: " +
+                               individual.error);
+  require(individual.text.find("Operation: Rough") != std::string::npos &&
+              individual.text.find("Second operation") == std::string::npos,
+          "individual posting excludes the other operations");
+  const cam::PostResult selected =
+      cam::post_operations(plan, job, tools, machines, {1, 0, 1});
+  require(selected.ok(), "multiple selected operations can be posted: " +
+                             selected.error);
+  require(selected.text.find("Operation: Rough") != std::string::npos &&
+              selected.text.find("Second operation") != std::string::npos,
+          "multi-operation posting includes every selected operation once");
+  job.operations.pop_back();
+  plan.operations.pop_back();
 
   wave::Toolpath safe_path;
   wave::ToolpathMove landing;

@@ -31,7 +31,10 @@ enum class OperationMode {
   PlaneClearing,
 };
 
-enum class PocketShape { Circle, Rectangle, RoundedRectangle };
+// A rounded rectangle covers the former circle and square cases as well:
+// radius == half the smaller dimension is a circle, and radius == 0 is a
+// square-cornered pocket (the cutter still rounds its internal corners).
+enum class PocketShape { RoundedRectangle };
 const char* pocket_shape_name(PocketShape shape);
 std::optional<PocketShape> pocket_shape_from_name(const std::string& name);
 bool is_parametric(OperationMode mode);
@@ -41,10 +44,12 @@ struct ClearingArea {
   double center_y = 0.0;
   double width = 30.0;
   double height = 30.0;
+  double top_z = 0.0;
+  double depth = 1.0;
 };
 
 struct PocketParameters {
-  PocketShape shape = PocketShape::Rectangle;
+  PocketShape shape = PocketShape::RoundedRectangle;
   double center_x = 0.0;
   double center_y = 0.0;
   double top_z = 0.0;
@@ -57,6 +62,8 @@ struct PocketParameters {
 };
 
 struct PlaneParameters {
+  // Retained as a compatibility fallback for older job files. New files and
+  // the planner use each area's own Z range.
   double top_z = 0.0;
   double depth = 1.0;
   std::vector<ClearingArea> areas{{}};
@@ -79,7 +86,7 @@ struct Operation {
   // for H. Explicit machine assignments belong to this operation.
   int tool_number = 0;
   int length_offset = 0;
-  PocketParameters pocket;
+  std::vector<PocketParameters> pockets{{}};
   PlaneParameters plane;
   // Roughing may be repeated at evenly interleaved Z offsets. One is the
   // ordinary pass; N adds N-1 stock-aware finishing passes while keeping this
@@ -200,6 +207,9 @@ struct LevelPlan {
   // across at this pass's own floor, ending at the next pass's first point, so
   // all that separates them is one pass depth of descent.
   bool stays_down_after = false;
+  // Pocket layers share a known opening, so prefer that stay-down connection
+  // whenever the router can prove it is safe.
+  bool stay_down_preferred = false;
   wave::Path64 transition;
 };
 

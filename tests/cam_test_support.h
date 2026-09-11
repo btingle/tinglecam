@@ -6,6 +6,7 @@
 #include "cam/post.h"
 
 #include <cmath>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -54,6 +55,7 @@ void check_lsjig_subdivision_cleanup(const std::filesystem::path& data,
 void check_inter_layer_topology();
 void check_general_traversal_and_contours();
 void check_serialisation();
+void check_user_settings();
 void check_operation_stock_handoff();
 void check_schedule_timing();
 void check_validation();

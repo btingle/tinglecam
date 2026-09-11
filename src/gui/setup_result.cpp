@@ -33,17 +33,18 @@ std::vector<CutVolume> cut_volumes(const App& app) {
     // properly; a redraw has nothing useful to add and simply draws nothing.
     try {
       if (operation.mode == cam::OperationMode::Pocket) {
-        const cam::PocketParameters& pocket = operation.pocket;
-        if (!(pocket.depth > 0.0)) continue;
-        volumes.push_back({cam::pocket_boundary(pocket), pocket.top_z - pocket.depth,
-                           pocket.top_z, selected});
+        for (const cam::PocketParameters& pocket : operation.pockets) {
+          if (!(pocket.depth > 0.0)) continue;
+          volumes.push_back({cam::pocket_boundary(pocket),
+                             pocket.top_z - pocket.depth, pocket.top_z,
+                             selected});
+        }
       } else {
-        const cam::PlaneParameters& plane = operation.plane;
-        if (!(plane.depth > 0.0)) continue;
-        for (const cam::ClearingArea& area : plane.areas) {
+        for (const cam::ClearingArea& area : operation.plane.areas) {
+          if (!(area.depth > 0.0)) continue;
           if (!(area.width > 0.0) || !(area.height > 0.0)) continue;
-          volumes.push_back({area_outline(area), plane.top_z - plane.depth,
-                             plane.top_z, selected});
+          volumes.push_back({area_outline(area), area.top_z - area.depth,
+                             area.top_z, selected});
         }
       }
     } catch (const std::exception&) {

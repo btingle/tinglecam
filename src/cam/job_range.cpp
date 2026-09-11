@@ -4,10 +4,14 @@ using namespace detail;
 double job_rapid_plane(const Job& job, const JobGeometry& geometry) {
   double highest = highest_model_z(geometry);
   for (const auto& operation : job.operations) {
-    if (operation.mode == OperationMode::Pocket)
-      highest = std::max(highest, operation.pocket.top_z);
-    if (operation.mode == OperationMode::PlaneClearing)
-      highest = std::max(highest, operation.plane.top_z);
+    if (operation.mode == OperationMode::Pocket) {
+      for (const auto& pocket : operation.pockets)
+        highest = std::max(highest, pocket.top_z);
+    }
+    if (operation.mode == OperationMode::PlaneClearing) {
+      for (const auto& area : operation.plane.areas)
+        highest = std::max(highest, area.top_z);
+    }
   }
   return job_rapid_plane(job, highest);
 }

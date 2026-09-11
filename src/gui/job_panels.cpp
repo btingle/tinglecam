@@ -73,6 +73,7 @@ void load_job_into(App& app, const std::filesystem::path& file) {
   std::snprintf(app.part_path.data(), app.part_path.size(), "%s", app.job.part_mesh.string().c_str());
   std::snprintf(app.stock_path.data(), app.stock_path.size(), "%s", app.job.stock_mesh.string().c_str());
   app.selected_operation = 0;
+  app.operation_selection.assign(app.job.operations.size(), false);
   invalidate_plan(app);
   say(app, "Loaded " + file.string());
 }
@@ -249,8 +250,17 @@ void job_panel(App& app) {
   if (ImGui::Button("Save job")) {
     try {
       cam::Job saved = app.job;
-      if (!saved.part_mesh.empty()) saved.part_mesh = std::filesystem::absolute(saved.part_mesh);
-      if (!saved.stock_mesh.empty()) saved.stock_mesh = std::filesystem::absolute(saved.stock_mesh);
+      const std::filesystem::path destination =
+          std::filesystem::absolute(app.job_file);
+      const auto relative_to_job = [&](const std::filesystem::path& model) {
+        if (model.empty()) return std::filesystem::path{};
+        std::error_code error;
+        const auto relative = std::filesystem::relative(
+            std::filesystem::absolute(model), destination.parent_path(), error);
+        return error ? std::filesystem::absolute(model) : relative;
+      };
+      saved.part_mesh = relative_to_job(saved.part_mesh);
+      saved.stock_mesh = relative_to_job(saved.stock_mesh);
       cam::save_job(app.job_file, saved);
       say(app, "Saved " + app.job_file);
     } catch (const std::exception& error) { say(app, error.what(), true); }
@@ -305,7 +315,7 @@ void job_panel(App& app) {
 }
 
 cam::Operation make_operation(App& app, cam::OperationMode mode) {
-  cam::Operation operation;
+  cam::Operation operation = cam::operation_default(app.settings, mode);
   operation.mode = mode;
   switch (mode) {
     case cam::OperationMode::Roughing: operation.name = "Rough"; break;
@@ -313,28 +323,22 @@ cam::Operation make_operation(App& app, cam::OperationMode mode) {
     case cam::OperationMode::Pocket: operation.name = "Pocket"; break;
     case cam::OperationMode::PlaneClearing: operation.name = "Plane clearing"; break;
   }
-  if (!app.job.operations.empty()) {
-    const cam::Operation& selected = app.job.operations[std::clamp(
-        app.selected_operation, 0,
-        static_cast<int>(app.job.operations.size()) - 1)];
-    operation.tool_id = selected.tool_id;
-    operation.machine_id = selected.machine_id;
-    operation.material_id = selected.material_id;
-    operation.spindle_rpm = selected.spindle_rpm;
-    operation.plunge_feed = selected.plunge_feed;
-    operation.coolant = selected.coolant;
-    operation.manual_feed_range = selected.manual_feed_range;
-    operation.full_engagement_feed = selected.full_engagement_feed;
-    operation.no_engagement_feed = selected.no_engagement_feed;
-    operation.depth_from = selected.depth_from;
-    operation.depth_to = selected.depth_to;
-  } else {
-    if (!app.tools.tools.empty()) operation.tool_id = app.tools.tools.front().id;
-    if (!app.machines.machines.empty())
-      operation.machine_id = app.machines.machines.front().id;
-    if (!app.materials.materials.empty())
-      operation.material_id = app.materials.materials.front().id;
-    depth_defaults(app, operation);
+  if (operation.tool_id.empty() && !app.tools.tools.empty())
+    operation.tool_id = app.tools.tools.front().id;
+  if (operation.machine_id.empty() && !app.machines.machines.empty())
+    operation.machine_id = app.machines.machines.front().id;
+  if (operation.material_id.empty() && !app.materials.materials.empty())
+    operation.material_id = app.materials.materials.front().id;
+  depth_defaults(app, operation);
+  for (auto& pocket : operation.pockets) {
+    pocket.center_x = -app.job.origin_x;
+    pocket.center_y = -app.job.origin_y;
+    pocket.top_z = -app.job.origin_z;
+  }
+  for (auto& area : operation.plane.areas) {
+    area.center_x = -app.job.origin_x;
+    area.center_y = -app.job.origin_y;
+    area.top_z = -app.job.origin_z;
   }
   if (mode == cam::OperationMode::ContourFinishing) {
     operation.radial_stock_to_leave = 0.0;
@@ -356,7 +360,7 @@ cam::Operation make_operation(App& app, cam::OperationMode mode) {
 
 void select_operation(App& app, int index) {
   if (app.job.operations.empty()) {
-    app.selected_operation = 0;
+    app.selected_operation = -1;
     return;
   }
   index = std::clamp(index, 0,
@@ -425,6 +429,7 @@ void insert_operation(App& app, int index, cam::Operation operation) {
   app.plan.operations.insert(app.plan.operations.begin() + index,
                              unplanned(operation));
   app.planned.insert(app.planned.begin() + index, PlannedRecord{});
+  app.operation_selection.insert(app.operation_selection.begin() + index, false);
   app.job.operations.insert(app.job.operations.begin() + index,
                             std::move(operation));
 }
@@ -434,6 +439,8 @@ void erase_operation(App& app, int index) {
   app.job.operations.erase(app.job.operations.begin() + index);
   app.plan.operations.erase(app.plan.operations.begin() + index);
   app.planned.erase(app.planned.begin() + index);
+  if (index < static_cast<int>(app.operation_selection.size()))
+    app.operation_selection.erase(app.operation_selection.begin() + index);
 }
 
 void swap_operations(App& app, int a, int b) {
@@ -442,6 +449,9 @@ void swap_operations(App& app, int a, int b) {
   std::swap(app.job.operations[a], app.job.operations[b]);
   std::swap(app.plan.operations[a], app.plan.operations[b]);
   std::swap(app.planned[a], app.planned[b]);
+  if (a < static_cast<int>(app.operation_selection.size()) &&
+      b < static_cast<int>(app.operation_selection.size()))
+    std::swap(app.operation_selection[a], app.operation_selection[b]);
 }
 
 // A last line of defence. Everything that edits the list goes through the
@@ -450,11 +460,24 @@ void swap_operations(App& app, int a, int b) {
 // another operation's name.
 void align_plan(App& app) {
   const std::size_t count = app.job.operations.size();
+  app.operation_selection.resize(count, false);
   if (app.plan.operations.size() == count && app.planned.size() == count) return;
   app.plan.operations.clear();
   for (const cam::Operation& operation : app.job.operations)
     app.plan.operations.push_back(unplanned(operation));
   app.planned.assign(count, PlannedRecord{});
+}
+
+std::vector<std::size_t> selected_operation_indices(const App& app,
+                                                     bool fallback_to_focus) {
+  std::vector<std::size_t> selected;
+  for (std::size_t i = 0; i < app.job.operations.size(); ++i)
+    if (i < app.operation_selection.size() && app.operation_selection[i])
+      selected.push_back(i);
+  if (selected.empty() && fallback_to_focus && app.selected_operation >= 0 &&
+      app.selected_operation < static_cast<int>(app.job.operations.size()))
+    selected.push_back(static_cast<std::size_t>(app.selected_operation));
+  return selected;
 }
 
 // An operation is out of date when its own settings have moved on, when it has
@@ -527,6 +550,7 @@ void invalidate_plan(App& app) {
   app.playback.playing = false;
   app.gcode.clear();
   app.post = {};
+  app.posted_operations.clear();
   app.material.clear();
   app.material_distance = -1.0;
   app.material_level = -1;
@@ -539,13 +563,15 @@ void plan_buttons(App& app);
 
 void operations_list_panel(App& app) {
   ImGui::SeparatorText("Ordered operations");
+  app.operation_selection.resize(app.job.operations.size(), false);
   if (app.job.operations.empty())
-    insert_operation(app, 0, make_operation(app, cam::OperationMode::Roughing));
-
-  app.selected_operation =
-      std::clamp(app.selected_operation, 0,
-                 static_cast<int>(app.job.operations.size()) - 1);
-  if (ImGui::BeginListBox("##operation-order", ImVec2(-FLT_MIN, 190.0f))) {
+    app.selected_operation = -1;
+  else
+    app.selected_operation =
+        std::clamp(app.selected_operation, 0,
+                   static_cast<int>(app.job.operations.size()) - 1);
+  if (ImGui::BeginListBox("##operation-order",
+                          ImVec2(-FLT_MIN, ui_size(app, 190.0f)))) {
     for (std::size_t i = 0; i < app.job.operations.size(); ++i) {
       const cam::Operation& operation = app.job.operations[i];
       const PlanState state = plan_state(app, i);
@@ -575,13 +601,26 @@ void operations_list_panel(App& app) {
             state == PlanState::Edited ? ImVec4(1.0f, 0.72f, 0.35f, 1.0f)
             : state == PlanState::Failed ? ImVec4(1.0f, 0.45f, 0.4f, 1.0f)
                                          : ImVec4(0.62f, 0.68f, 0.78f, 1.0f));
+      ImGui::PushID(static_cast<int>(i));
+      bool selected_for_action = app.operation_selection[i];
+      if (ImGui::Checkbox("##action", &selected_for_action))
+        app.operation_selection[i] = selected_for_action;
+      ImGui::SameLine();
       if (ImGui::Selectable(label.c_str(),
                             static_cast<int>(i) == app.selected_operation))
         select_operation(app, static_cast<int>(i));
+      ImGui::PopID();
       if (coloured) ImGui::PopStyleColor();
     }
     ImGui::EndListBox();
   }
+
+  ImGui::TextDisabled("Checked operations are used by multi-operation actions.");
+  if (ImGui::SmallButton("Select all"))
+    std::fill(app.operation_selection.begin(), app.operation_selection.end(), true);
+  ImGui::SameLine();
+  if (ImGui::SmallButton("Clear selection"))
+    std::fill(app.operation_selection.begin(), app.operation_selection.end(), false);
 
   ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x -
                           ImGui::CalcTextSize("Add").x -
@@ -599,14 +638,16 @@ void operations_list_panel(App& app) {
                      make_operation(app, app.add_mode));
     select_operation(app, static_cast<int>(app.job.operations.size()) - 1);
   }
+  ImGui::BeginDisabled(app.job.operations.empty());
   if (ImGui::Button("Duplicate")) {
     cam::Operation copy = app.job.operations[app.selected_operation];
     copy.name += " copy";
     insert_operation(app, app.selected_operation + 1, std::move(copy));
     select_operation(app, app.selected_operation + 1);
   }
+  ImGui::EndDisabled();
   ImGui::SameLine();
-  ImGui::BeginDisabled(app.selected_operation == 0);
+  ImGui::BeginDisabled(app.selected_operation <= 0);
   if (ImGui::Button("Move up")) {
     swap_operations(app, app.selected_operation, app.selected_operation - 1);
     select_operation(app, app.selected_operation - 1);
@@ -614,6 +655,7 @@ void operations_list_panel(App& app) {
   ImGui::EndDisabled();
   ImGui::SameLine();
   ImGui::BeginDisabled(
+      app.selected_operation < 0 ||
       app.selected_operation + 1 >= static_cast<int>(app.job.operations.size()));
   if (ImGui::Button("Move down")) {
     swap_operations(app, app.selected_operation, app.selected_operation + 1);
@@ -621,7 +663,7 @@ void operations_list_panel(App& app) {
   }
   ImGui::EndDisabled();
 
-  ImGui::BeginDisabled(app.job.operations.size() < 2);
+  ImGui::BeginDisabled(app.job.operations.empty());
   if (ImGui::Button("Remove")) {
     erase_operation(app, app.selected_operation);
     const int next = std::min(app.selected_operation,

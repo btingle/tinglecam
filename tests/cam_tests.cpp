@@ -13,6 +13,7 @@ int main(int argc, char** argv) {
     check_inter_layer_topology();
     check_general_traversal_and_contours();
     check_serialisation();
+    check_user_settings();
     check_operation_stock_handoff();
     check_schedule_timing();
     check_validation();

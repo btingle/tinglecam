@@ -3,11 +3,6 @@
 using Clipper2Lib::Paths64;
 using Clipper2Lib::Point64;
 
-// The control column. Everything in it is laid out against this, so widening
-// the panel widens the widgets and their labels together.
-constexpr float kLeftPanelWidth = 440.0f;
-constexpr float kRightPanelWidth = 480.0f;
-
 // A quarter turn, which is as far as the camera's elevation goes either way.
 constexpr float kQuarterTurn = 1.57079632679489661923f;
 
@@ -248,6 +243,7 @@ struct App {
   cam::ToolLibrary tools;
   cam::MachineLibrary machines;
   cam::MaterialLibrary materials;
+  cam::UserSettings settings = cam::default_user_settings();
   cam::Job job;
   cam::JobGeometry geometry;
   // One entry per operation in the job, always: an operation with no result
@@ -276,10 +272,14 @@ struct App {
   std::array<char, 512> part_path{};
   std::array<char, 512> stock_path{};
   int selected_operation = 0;
+  // Separate from the focused row: these are the operations used by the
+  // multi-operation planning and G-code actions.
+  std::vector<char> operation_selection;
   // What the Add button will add. One picker and one button rather than a
   // button per mode: the modes are a list that grows, and a row of buttons is
   // not.
   cam::OperationMode add_mode = cam::OperationMode::Roughing;
+  cam::OperationMode settings_mode = cam::OperationMode::Roughing;
   int selected_level = 0;
   int selected_plan_operation = 0;
   Colouring colouring = Colouring::Feed;
@@ -339,12 +339,21 @@ struct App {
 
   std::string gcode;
   cam::PostResult post;
+  std::vector<int> posted_operations;
   std::array<char, 512> save_path{};
 
   std::filesystem::path tools_file;
+  std::filesystem::path settings_file;
   std::string tools_import_file;
   std::string job_file = "tinglecam-job.json";
+  bool panel_layout_dragging = false;
+  ImGuiStyle unscaled_style;
+  bool unscaled_style_captured = false;
 };
+
+inline float ui_size(const App& app, float value) {
+  return value * static_cast<float>(app.settings.ui_scale);
+}
 
 inline void say(App& app, std::string text, bool error = false) {
   app.banner = std::move(text);
