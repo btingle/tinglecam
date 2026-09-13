@@ -239,6 +239,18 @@ struct Playback {
   bool follow = true;   // keep the whole job's passes advancing, not just one
 };
 
+enum class LogSeverity {
+  Info,
+  Warning,
+  Error,
+};
+
+struct LogMessage {
+  LogSeverity severity = LogSeverity::Info;
+  std::string source;
+  std::string text;
+};
+
 struct App {
   cam::ToolLibrary tools;
   cam::MachineLibrary machines;
@@ -268,6 +280,8 @@ struct App {
   std::vector<std::string> planning_signatures;
   std::string banner;
   bool banner_is_error = false;
+  std::vector<LogMessage> messages;
+  int message_filter = 0;  // 0 all, 1 info, 2 warnings, 3 errors
 
   std::array<char, 512> part_path{};
   std::array<char, 512> stock_path{};
@@ -331,6 +345,8 @@ struct App {
   int material_operation = -1;
   int stock_cache_operation = -1, stock_cache_level = -1;
   std::vector<cam::StockSlab> stock_cache;
+  std::vector<cam::StockSlab> stock_display_cache;
+  double stock_display_distance = -1.0;
 
   // Tool Builder
   bool builder_open = false;
@@ -349,6 +365,10 @@ struct App {
   bool panel_layout_dragging = false;
   ImGuiStyle unscaled_style;
   bool unscaled_style_captured = false;
+  ImFont* theme_sans_font = nullptr;
+  ImFont* theme_mono_font = nullptr;
+  ImFont* theme_serif_font = nullptr;
+  bool theme_fonts_loaded = false;
 };
 
 inline float ui_size(const App& app, float value) {
@@ -358,11 +378,16 @@ inline float ui_size(const App& app, float value) {
 inline void say(App& app, std::string text, bool error = false) {
   app.banner = std::move(text);
   app.banner_is_error = error;
+  app.messages.push_back({error ? LogSeverity::Error : LogSeverity::Info,
+                          "Application", app.banner});
 }
 
-inline void log_warnings(const char* source, const std::vector<std::string>& warnings) {
+inline void log_warnings(App& app, const char* source,
+                         const std::vector<std::string>& warnings) {
   for (const auto& warning : warnings)
     std::fprintf(stderr, "%s warning: %s\n", source, warning.c_str());
+  for (const auto& warning : warnings)
+    app.messages.push_back({LogSeverity::Warning, source, warning});
 }
 
 inline void show_warnings(const char* id, const std::vector<std::string>& warnings) {

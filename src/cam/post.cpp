@@ -48,6 +48,44 @@ class Writer {
   // keeps a file readable and small.
   void rapid(double x, double y, double z) { motion("G0", x, y, z, 0.0); }
   void feed(double x, double y, double z, double rate) { motion("G1", x, y, z, rate); }
+  void arc(double x, double y, double z, double i, double j,
+           bool clockwise, double rate) {
+    const std::string code = clockwise ? "G2" : "G3";
+    std::string text;
+    if (code != last_motion_) {
+      text = code;
+      last_motion_ = code;
+    }
+    const auto append = [&](char axis, double value) {
+      if (!text.empty()) text += ' ';
+      text += axis;
+      text += coordinate(value);
+    };
+    if (!has_position_ || differs(x, position_x_)) append('X', x);
+    if (!has_position_ || differs(y, position_y_)) append('Y', y);
+    if (!has_position_ || differs(z, position_z_)) append('Z', z);
+    // I/J are offsets from the arc start and must be emitted even for a full
+    // circle whose XY endpoint is identical to its start.
+    append('I', i);
+    append('J', j);
+    if (rate > 0.0) {
+      const double rounded = std::round(rate);
+      if (last_feed_ < 0.0 || std::abs(rounded - last_feed_) >= 1.0) {
+        if (!text.empty()) text += ' ';
+        char buffer[32];
+        std::snprintf(buffer, sizeof buffer, "F%.0f",
+                      machine_.output_inches ? rounded / 25.4 : rounded);
+        text += buffer;
+        last_feed_ = rounded;
+      }
+    }
+    position_x_ = x;
+    position_y_ = y;
+    position_z_ = z;
+    has_position_ = true;
+    line(text);
+    ++result_.cutting_moves;
+  }
 
   void reset_modal() {
     has_position_ = false;
@@ -308,6 +346,11 @@ PostResult post_job(const JobPlan& plan,
           const double y = wave::to_world(phase.to.y) + job.origin_y;
           const double z = phase.to_z + job.origin_z;
           if (phase.rapid) writer.rapid(x, y, z);
+          else if (phase.arc)
+            writer.arc(x, y, z,
+                       wave::to_world(phase.arc_center.x - phase.from.x),
+                       wave::to_world(phase.arc_center.y - phase.from.y),
+                       phase.clockwise, phase.rate);
           else writer.feed(x, y, z, phase.rate);
         }
         at_depth = false;

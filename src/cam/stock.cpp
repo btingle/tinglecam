@@ -8,13 +8,27 @@ std::vector<StockSlab> clip(const std::vector<StockSlab>& stock,
     const wave::Paths64& footprint, double bottom, double top, bool inside) {
   if (footprint.empty() || top <= bottom) return inside ? std::vector<StockSlab>{} : stock;
   std::vector<StockSlab> out;
+  out.reserve(stock.size());
+  const auto bounds = Clipper2Lib::GetBounds(footprint);
   for (const auto& slab : stock) {
     const double lo = std::max(bottom, slab.bottom);
     const double hi = std::min(top, slab.top);
     if (hi <= lo) { if (!inside) out.push_back(slab); continue; }
-    if (!inside && slab.bottom < lo) out.push_back({slab.bottom, lo, slab.region});
+    const auto slab_bounds = Clipper2Lib::GetBounds(*slab.region);
+    if (bounds.right <= slab_bounds.left || slab_bounds.right <= bounds.left ||
+        bounds.bottom <= slab_bounds.top || slab_bounds.bottom <= bounds.top) {
+      if (!inside) out.push_back(slab);
+      continue;
+    }
     auto region = inside ? Clipper2Lib::Intersect(*slab.region, footprint, Clipper2Lib::FillRule::NonZero)
                          : Clipper2Lib::Difference(*slab.region, footprint, Clipper2Lib::FillRule::NonZero);
+    // A cut through another pocket must not split this slab in Z or replace
+    // its immutable polygons. Retaining identity also retains its render BVH.
+    if (!inside && region == *slab.region) {
+      out.push_back(slab);
+      continue;
+    }
+    if (!inside && slab.bottom < lo) out.push_back({slab.bottom, lo, slab.region});
     if (!region.empty()) {
       auto shared = region == *slab.region ? slab.region
           : std::make_shared<const wave::Paths64>(std::move(region));
@@ -31,18 +45,8 @@ std::vector<StockSlab> stock_outside(const std::vector<StockSlab>& s,
     const wave::Paths64& p, double b, double t) { return clip(s,p,b,t,false); }
 std::vector<StockSlab> preview_before_level(const OperationPlan& operation, std::size_t active) {
   auto stock = operation.preview_context;
-  for (std::size_t i=0;i<operation.levels.size();++i) {
-    const auto& level = operation.levels[i];
-    auto local = level.local_stock;
-    // Earliest area owns overlaps initially; subsequent removals are applied
-    // in execution order. Future areas must not reveal cuts prematurely.
-    for (std::size_t j=0;j<i;++j) {
-      const auto& earlier = operation.levels[j];
-      local = stock_outside(local, earlier.stock_slice, earlier.floor_z,
-                            earlier.floor_z+earlier.axial_depth);
-    }
-    stock.insert(stock.end(),local.begin(),local.end());
-  }
+  // Planning retains the complete incoming stack, including overlapping
+  // pocket areas. Playback only needs to apply the executed removals.
   for (std::size_t i=0;i<std::min(active,operation.levels.size());++i) {
     const auto& level = operation.levels[i];
     stock = stock_outside(stock,level.simulation.removed_material,
@@ -66,7 +70,8 @@ std::vector<StockSlab> active_stock(const JobGeometry& geometry,
   }
 
   const auto& mesh = geometry.box_stock() ? geometry.part().mesh() : geometry.stock().mesh();
-  const double bottom = mesh.bounds.lower.z, top = mesh.bounds.upper.z;
+  double bottom = mesh.bounds.lower.z, top = mesh.bounds.upper.z;
+  if (geometry.box_stock()) geometry.work_range(bottom, top);
   std::vector<double> cuts{bottom,top};
   // Use the slicer's existing slab approximation at machining boundaries.
   // Sampling every mesh vertex height can require millions of slices and does

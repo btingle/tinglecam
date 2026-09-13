@@ -11,7 +11,8 @@ namespace tinglecam_gui {
 // the figure in the box and leaves the pocket where it was cut.
 bool origin_field(const char* label, double& stored, double origin) {
   double shown = stored + origin;
-  if (!ImGui::InputDouble(label, &shown, 0, 0, "%.6g")) return false;
+  if (!ImGui::DragScalar(label, ImGuiDataType_Double, &shown, 0.1f))
+    return false;
   stored = shown - origin;
   return true;
 }

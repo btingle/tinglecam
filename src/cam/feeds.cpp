@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <stdexcept>
 
 namespace cam {
 namespace {
@@ -66,6 +67,21 @@ wave::Point64 interpolate(const wave::Point64& from,
   };
 }
 
+wave::Point64 interpolate_arc(const MotionPhase& phase, double t) {
+  if (!phase.arc) return interpolate(phase.from, phase.to, t);
+  if (t >= 1.0) return phase.to;
+  const double cx = wave::to_world(phase.arc_center.x);
+  const double cy = wave::to_world(phase.arc_center.y);
+  const double x = wave::to_world(phase.from.x);
+  const double y = wave::to_world(phase.from.y);
+  const double radius = std::hypot(x - cx, y - cy);
+  const double start = std::atan2(y - cy, x - cx);
+  const double angle = start + (phase.clockwise ? -1.0 : 1.0) *
+                                   2.0 * std::acos(-1.0) * t;
+  return {wave::to_integer(cx + radius * std::cos(angle)),
+          wave::to_integer(cy + radius * std::sin(angle))};
+}
+
 }  // namespace
 
 const char* feed_limit_name(FeedLimit value) {
@@ -88,7 +104,8 @@ FeedSchedule plan_feeds(const wave::Toolpath& toolpath,
                         double plunge_feed,
                         double floor_z,
                         double rapid_plane,
-                        PassLink link) {
+                        PassLink link,
+                        bool allow_plunge) {
   FeedSchedule schedule;
   if (toolpath.moves.empty()) return schedule;
 
@@ -114,6 +131,13 @@ FeedSchedule plan_feeds(const wave::Toolpath& toolpath,
           move.kind == wave::MoveKind::Retract &&
           index < simulation.moves.size() &&
           !(simulation.moves[index].plunge_collision_area > 0.0);
+      if (!allow_plunge && move.kind == wave::MoveKind::Entry)
+        throw std::runtime_error(
+            "roughing pass contained an entry move; the move was omitted");
+      if (!allow_plunge && move.kind == wave::MoveKind::Retract &&
+          !safe_retract)
+        throw std::runtime_error(
+            "roughing pass has an unsafe retract landing; the level was omitted");
       for (std::size_t i = 1; i < move.path.size(); ++i) {
         FeedSegment segment;
         segment.from = move.path[i - 1];
@@ -251,6 +275,9 @@ FeedSchedule plan_feeds(const wave::Toolpath& toolpath,
     const FeedSegment& first = unmerged_segments[first_segment];
     if (!at_depth) {
       const bool use_rapid = rapid_descent && move.kind != wave::MoveKind::Entry;
+      if (!allow_plunge && !use_rapid)
+        throw std::runtime_error(
+            "roughing pass requires a plunge descent; the level was omitted");
       const double from_z =
           first_descent && link.from ? link.from_z : rapid_plane;
       append_motion(first.from, first.from, from_z, floor_z,
@@ -421,7 +448,7 @@ MotionCursor feed_motion_at_seconds(const FeedSchedule& schedule,
                            ? std::clamp((seconds - elapsed) / duration, 0.0,
                                         1.0)
                            : 1.0;
-      cursor.position = interpolate(phase.from, phase.to, t);
+      cursor.position = interpolate_arc(phase, t);
       cursor.z = phase.from_z + (phase.to_z - phase.from_z) * t;
       cursor.path_distance =
           phase.path_distance_begin +

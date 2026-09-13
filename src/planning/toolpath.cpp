@@ -233,7 +233,8 @@ static void append_toolpath(Toolpath& toolpath, const WaveResult& wave,
                             double floor_z, double rapid_plane,
                             double rapid_feed, double traversal_feed,
                             double rapid_feed_z,
-                            const LayerTopology* existing_topology) {
+                            const LayerTopology* existing_topology,
+                            const Paths64& initial_cleared) {
   if (lineage.generations.empty()) return;
   if (lineage.generations.size() != wave.generations.size())
     throw std::invalid_argument("Lineage and wave generations do not match");
@@ -348,9 +349,12 @@ static void append_toolpath(Toolpath& toolpath, const WaveResult& wave,
   std::vector<bool> touches_stock(nodes.size(), false);
   std::vector<bool> emits_cut(nodes.size(), false);
   std::vector<std::vector<bool>> band_emits_cut(lineage.generations.size());
+  std::vector<std::vector<bool>> band_cut_skipped(lineage.generations.size());
   for (std::size_t generation = 0; generation < lineage.generations.size();
        ++generation) {
     band_emits_cut[generation].assign(
+        lineage.generations[generation].bands.size(), false);
+    band_cut_skipped[generation].assign(
         lineage.generations[generation].bands.size(), false);
     for (std::size_t index = 0;
          index < lineage.generations[generation].fronts.size(); ++index) {
@@ -381,9 +385,9 @@ static void append_toolpath(Toolpath& toolpath, const WaveResult& wave,
                    tolerance * 2.0, JoinType::Miter, EndType::Polygon),
       FillRule::NonZero);
 
-  Paths64 cleared = toolpath.cleared.empty()
-                        ? air
-                        : Union(toolpath.cleared, air, FillRule::NonZero);
+  Paths64 cleared = Union(air, initial_cleared, FillRule::NonZero);
+  if (!toolpath.cleared.empty())
+    cleared = Union(cleared, toolpath.cleared, FillRule::NonZero);
   // Rebuilt whenever `cleared` grows, which is once per front rather than once
   // per link.
   Paths64 cleared_forbidden = forbidden_region(cleared, world, tolerance);
@@ -397,7 +401,6 @@ static void append_toolpath(Toolpath& toolpath, const WaveResult& wave,
     break;
   }
   std::optional<FrontId> previous_front;
-
   struct LiftPlan { Path64 path; };
 
   // A disconnected move is deliberately simple: straight up to the single
@@ -486,22 +489,22 @@ static void append_toolpath(Toolpath& toolpath, const WaveResult& wave,
       }
 
       const Point64 entry = cut.front();
+      bool skipped_cut = false;
       if (!has_position) {
-        has_position = true;
-        // The air beside the stock is always somewhere the tool can come down,
-        // so the opening move is a plunge in free space followed by an ordinary
-        // feed in. Only a part that leaves no such landing forces a ramp.
+        // The air beside the stock is normally somewhere the tool can come down,
+        // followed by an ordinary feed in. If no safe landing exists, omit this
+        // front instead of inventing an entry into uncleared material.
         if (const auto plunge = find_plunge_point(cleared, entry, plunge_clearance)) {
+          has_position = true;
           position = *plunge;
           toolpath.moves.push_back({MoveKind::Retract, Path64{position, position}, {}, 0.0});
           ++toolpath.stats.retract_count;
         } else {
-          position = entry;
-          toolpath.moves.push_back({MoveKind::Entry, Path64{entry, entry}, {}, 0.0});
-          ++toolpath.stats.entry_count;
+          ++toolpath.stats.skipped_entry_count;
+          skipped_cut = true;
         }
       }
-      if (position != entry) {
+      if (!skipped_cut && position != entry) {
         const Paths64& band =
             front.band < lineage.generations[node.generation].bands.size()
                 ? lineage.generations[node.generation].bands[front.band]
@@ -650,23 +653,27 @@ static void append_toolpath(Toolpath& toolpath, const WaveResult& wave,
             emit(*detour, !stays_clear(*detour, cleared_forbidden, tolerance));
             ++toolpath.stats.detour_count;
           } else {
-            const LiftPlan rapid = plan_lift(position, entry);
-            const double length = path_length_world(rapid.path);
-            toolpath.moves.push_back({MoveKind::Entry, rapid.path, {}, length});
-            ++toolpath.stats.entry_count;
-            toolpath.stats.entry_length += length;
+            ++toolpath.stats.skipped_entry_count;
+            skipped_cut = true;
           }
         }
       }
 
-      const double cut_length = path_length_world(cut);
-      position = cut.back();
-      has_position = true;
-      toolpath.moves.push_back({MoveKind::Cut, std::move(cut),
-                                {node.generation, node.index}, cut_length});
-      ++toolpath.stats.cut_count;
-      toolpath.stats.cut_length += cut_length;
-      previous_front = FrontId{node.generation, node.index};
+      if (!skipped_cut) {
+        const double cut_length = path_length_world(cut);
+        position = cut.back();
+        has_position = true;
+        toolpath.moves.push_back({MoveKind::Cut, std::move(cut),
+                                  {node.generation, node.index}, cut_length});
+        ++toolpath.stats.cut_count;
+        toolpath.stats.cut_length += cut_length;
+        previous_front = FrontId{node.generation, node.index};
+      } else if (front.band < band_cut_skipped[node.generation].size()) {
+        // Do not credit this band as cleared merely because its front was
+        // sequenced. A later link must not travel through material belonging to
+        // a front we intentionally omitted.
+        band_cut_skipped[node.generation][front.band] = true;
+      }
     }
 
     auto& pending = band_pending[node.generation];
@@ -677,7 +684,8 @@ static void append_toolpath(Toolpath& toolpath, const WaveResult& wave,
       // credited as machined stock. Retain its truly exterior portion for
       // entry routing; the +1 child supplies the band that actually cuts in.
       const Paths64 cleared_band =
-          band_emits_cut[node.generation][front.band]
+          band_emits_cut[node.generation][front.band] &&
+                  !band_cut_skipped[node.generation][front.band]
               ? band
               : Difference(band, stock_area, FillRule::NonZero);
       cleared = Union(cleared, cleared_band, FillRule::NonZero);
@@ -703,23 +711,25 @@ Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage,
                         double tool_radius, double floor_z,
                         double rapid_plane, double rapid_feed,
                         double traversal_feed, double rapid_feed_z,
-                        const LayerTopology* existing_topology) {
+                        const LayerTopology* existing_topology,
+                        const Paths64& initial_cleared) {
   Toolpath toolpath;
   append_toolpath(toolpath, wave, lineage, tool_radius, floor_z, rapid_plane,
                   rapid_feed, traversal_feed, rapid_feed_z,
-                  existing_topology);
+                  existing_topology, initial_cleared);
   return toolpath;
 }
 
 Toolpath build_toolpath(const std::vector<WavefrontStage>& stages,
                         double tool_radius, double floor_z,
                         double rapid_plane, double rapid_feed,
-                        double traversal_feed, double rapid_feed_z) {
+                        double traversal_feed, double rapid_feed_z,
+                        const Paths64& initial_cleared) {
   Toolpath toolpath;
   for (const WavefrontStage& stage : stages)
     append_toolpath(toolpath, stage.wave, stage.lineage, tool_radius, floor_z,
                     rapid_plane, rapid_feed, traversal_feed, rapid_feed_z,
-                    &stage.topology);
+                    &stage.topology, initial_cleared);
   return toolpath;
 }
 
@@ -752,6 +762,7 @@ Toolpath resample_toolpath(const Toolpath& source, double pitch) {
   result.stats.detour_count = source.stats.detour_count;
   result.stats.lifts_over_subject = source.stats.lifts_over_subject;
   result.stats.unreachable_fronts = source.stats.unreachable_fronts;
+  result.stats.skipped_entry_count = source.stats.skipped_entry_count;
 
   std::size_t first = 0;
   while (first < source.moves.size()) {

@@ -13,11 +13,21 @@ int main(int argc, char** argv) {
   double progress_fraction = -1.0;
   double stepdown = 0.0;
   int finishing_subdivisions = 0;
+  std::vector<double> depth_breaks;
+  std::optional<double> cleanup_stepover_limit;
+  bool fixed_cleanup_stepover = false;
   double stepover = 0.0;
   double path_pitch = 0.0;
   double entry_front_tolerance = 0.0;
   std::optional<double> tiny_split_area_factor;
   double rapid_clearance = 0.0;
+  std::optional<double> box_stock_uniform;
+  std::optional<double> box_margin_minus_x;
+  std::optional<double> box_margin_plus_x;
+  std::optional<double> box_margin_minus_y;
+  std::optional<double> box_margin_plus_y;
+  std::optional<double> box_margin_minus_z;
+  std::optional<double> box_margin_plus_z;
   double full_feed = 0.0;
   double no_feed = 0.0;
   bool profile_planning = false;
@@ -46,9 +56,20 @@ int main(int argc, char** argv) {
                                        : ModelShow::Both;
       }
       else if (argument == "--box-stock") {
-        app.job.box_stock = true;
-        app.job.box_stock_margin = std::stod(value());
+        box_stock_uniform = std::stod(value());
       }
+      else if (argument == "--box-margin-minus-x")
+        box_margin_minus_x = std::stod(value());
+      else if (argument == "--box-margin-plus-x")
+        box_margin_plus_x = std::stod(value());
+      else if (argument == "--box-margin-minus-y")
+        box_margin_minus_y = std::stod(value());
+      else if (argument == "--box-margin-plus-y")
+        box_margin_plus_y = std::stod(value());
+      else if (argument == "--box-margin-minus-z")
+        box_margin_minus_z = std::stod(value());
+      else if (argument == "--box-margin-plus-z")
+        box_margin_plus_z = std::stod(value());
       else if (argument == "--gcode") gcode_out = value();
       else if (argument == "--job") job_in = value();
       else if (argument == "--tool") tool_id = value();
@@ -57,6 +78,10 @@ int main(int argc, char** argv) {
       else if (argument == "--stepdown") stepdown = std::stod(value());
       else if (argument == "--finishing-subdivisions")
         finishing_subdivisions = std::stoi(value());
+      else if (argument == "--depth-break") depth_breaks.push_back(std::stod(value()));
+      else if (argument == "--cleanup-stepover-limit")
+        cleanup_stepover_limit = std::stod(value());
+      else if (argument == "--fixed-cleanup-stepover") fixed_cleanup_stepover = true;
       else if (argument == "--stepover") stepover = std::stod(value());
       else if (argument == "--path-pitch") path_pitch = std::stod(value());
       else if (argument == "--entry-front-tolerance")
@@ -81,7 +106,11 @@ int main(int argc, char** argv) {
             "  --stepover RATIO   Radial engagement as a fraction of diameter\n"
             "  --stepdown MM      Axial depth per pass\n"
             "  --finishing-subdivisions N\n"
-            "                     Interleaved stock-aware roughing passes (default 1)\n"
+            "                     Coarse descent, then N-1 upward cuts per terrace\n"
+            "  --depth-break MM  Intermediate coarse floor; repeat for multiple depths\n"
+            "  --cleanup-stepover-limit RATIO\n"
+            "                     Adaptive cleanup width ceiling (default 0.5 diameter)\n"
+            "  --fixed-cleanup-stepover  Keep the base width on cleanup layers\n"
             "  --path-pitch MM    Simulation/feed sampling interval (default 1.0)\n"
             "  --mode rough|finish|pocket|plane\n"
             "                     Operation mode (pocket/plane need no mesh)\n"
@@ -100,7 +129,12 @@ int main(int argc, char** argv) {
             "  --gcode PATH       Plan and post without opening a window, then exit\n"
             "  --profile-planning Print planning phase timings and scale counters\n"
             "  --screenshot PATH  Render one frame to a binary PPM and exit\n"
-            "  --box-stock MM     Use the part's bounding box, grown by MM, as stock\n"
+            "  --box-stock MM     Use the part's bounding box, grown by MM in XY,\n"
+            "                     as stock (directional margins are configurable in the UI)\n"
+            "  --box-margin-minus-x MM / --box-margin-plus-x MM\n"
+            "  --box-margin-minus-y MM / --box-margin-plus-y MM\n"
+            "  --box-margin-minus-z MM / --box-margin-plus-z MM\n"
+            "                     Directional box-stock margins\n"
             "  --models stock|part|both   What the plan view shows\n"
             "  --view models|pass|result\n"
             "                     Which view a screenshot should capture\n"
@@ -131,7 +165,24 @@ int main(int argc, char** argv) {
       return EXIT_FAILURE;
     }
   } else if (app.part_path[0] != '\0' || app.stock_path[0] != '\0') load_meshes(app);
-  app.geometry.set_box_stock(app.job.box_stock, app.job.box_stock_margin);
+  if (box_stock_uniform) {
+    const double margin = *box_stock_uniform;
+    app.job.box_stock = true;
+    app.job.box_stock_margins = {margin, margin, margin, margin, 0.0, 0.0};
+  }
+  const auto apply_box_margin = [&](const std::optional<double>& value,
+                                    double& target) {
+    if (!value) return;
+    app.job.box_stock = true;
+    target = *value;
+  };
+  apply_box_margin(box_margin_minus_x, app.job.box_stock_margins.minus_x);
+  apply_box_margin(box_margin_plus_x, app.job.box_stock_margins.plus_x);
+  apply_box_margin(box_margin_minus_y, app.job.box_stock_margins.minus_y);
+  apply_box_margin(box_margin_plus_y, app.job.box_stock_margins.plus_y);
+  apply_box_margin(box_margin_minus_z, app.job.box_stock_margins.minus_z);
+  apply_box_margin(box_margin_plus_z, app.job.box_stock_margins.plus_z);
+  app.geometry.set_box_stock(app.job.box_stock, app.job.box_stock_margins);
 
   cam::OperationMode requested_mode = cam::OperationMode::Roughing;
   if (!mode_name.empty()) {
@@ -165,6 +216,9 @@ int main(int argc, char** argv) {
     if (stepdown > 0.0) operation.stepdown = stepdown;
     if (finishing_subdivisions > 0)
       operation.finishing_subdivisions = finishing_subdivisions;
+    if (!depth_breaks.empty()) operation.depth_breaks = depth_breaks;
+    if (cleanup_stepover_limit) operation.cleanup_stepover_limit = *cleanup_stepover_limit;
+    if (fixed_cleanup_stepover) operation.adaptive_cleanup_stepover = false;
     if (stepover > 0.0) operation.stepover_ratio = stepover;
     if (path_pitch > 0.0) operation.path_pitch = path_pitch;
     if (entry_front_tolerance > 0.0)
@@ -251,11 +305,13 @@ int main(int argc, char** argv) {
     // Everything the simulation flags, printed whether or not it fired, so a
     // clean run says so rather than being read off an absence of output.
     std::printf(
-        "Safety: %zu unsafe plunge(s), %zu entry(s) into solid, %zu rapid(s) over "
+        "Safety: %zu unsafe plunge(s), %zu entry(s) into solid, %zu roughing "
+        "entry point(s) skipped, %zu rapid(s) over "
         "the part, %zu front(s) never reached, %.3f mm2 gouged, %.0f mm2 left "
         "standing\n",
         plan.stats.unsafe_plunges, plan.stats.unresolved_entries,
-        plan.stats.lifts_over_subject, plan.stats.unreachable_fronts,
+        plan.stats.skipped_entries, plan.stats.lifts_over_subject,
+        plan.stats.unreachable_fronts,
         plan.stats.gouge_area, plan.stats.excess_area);
     std::printf(
         "%zu passes cut of %zu, %.0f mm of cutting in %.1f min, peak load %.2f\n"
@@ -319,10 +375,9 @@ int main(int argc, char** argv) {
 
   IMGUI_CHECKVERSION();
   ImGui::CreateContext();
-  ImGui::StyleColorsDark();
   ImGui::GetIO().IniFilename = nullptr;
-  ImGui::GetStyle().FrameRounding = 3.0f;
-  apply_ui_scale(app);
+  load_ui_fonts(app);
+  apply_ui_theme(app);
   ImGui_ImplSDL2_InitForOpenGL(window, context);
   ImGui_ImplOpenGL3_Init("#version 150");
 
@@ -379,7 +434,7 @@ int main(int argc, char** argv) {
         }
         app.plan.rapid_plane = produced.rapid_plane;
         cam::summarise_job(app.plan);
-        log_warnings("Planning", app.plan.warnings);
+        log_warnings(app, "Planning", app.plan.warnings);
         refresh_plan_states(app);
         select_operation(app, app.selected_operation);
         app.view.needs_fit = true;

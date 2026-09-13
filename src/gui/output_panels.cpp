@@ -15,7 +15,7 @@ void output_panel(App& app) {
   if (ImGui::Button("Generate all G-code", ImVec2(-1, 0))) {
     app.post = cam::post_job(app.plan, app.job, app.tools, app.machines);
     app.posted_operations.clear();
-    log_warnings("G-code", app.post.warnings);
+    log_warnings(app, "G-code", app.post.warnings);
     app.gcode = app.post.text;
     if (!app.post.ok()) say(app, app.post.error, true);
     else say(app, "Generated " + std::to_string(app.post.line_count) + " lines");
@@ -38,7 +38,7 @@ void output_panel(App& app) {
     if (app.post.ok())
       for (const std::size_t index : selected_operations)
         app.posted_operations.push_back(static_cast<int>(index));
-    log_warnings("G-code", app.post.warnings);
+    log_warnings(app, "G-code", app.post.warnings);
     app.gcode = app.post.text;
     if (!app.post.ok()) say(app, app.post.error, true);
     else say(app, "Generated " + std::to_string(app.post.line_count) +
@@ -175,9 +175,10 @@ void view_panel(App& app) {
     if (subdivisions.size() > 1 &&
         selected.subdivision < subdivisions.size()) {
       ImGui::TextDisabled(
-          "Subdivision %zu/%zu, layer %zu/%zu", selected.subdivision + 1,
-          subdivisions.size(), selected.subdivision_level + 1,
-          subdivisions[selected.subdivision].level_count);
+          "Terrace %zu, subdivision %d (%s)",
+          selected.coarse_level + 1, selected.finishing_index,
+          selected.finishing_index == 0 ? "down" : "up");
+      ImGui::TextDisabled("Stepover %.3f mm", selected.radial_width);
     }
   }
   static const char* kColourings[]{"Feed rate", "Limiting reason", "Engagement",

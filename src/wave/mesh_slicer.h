@@ -69,6 +69,11 @@ class MeshSlicer {
   // slicer is emptied once it has been given one.
   void clear();
   MeshSlice slice(float z, int grid_resolution = 32) const;
+  // GPU-accelerated downward ray query against the retained mesh. Misses are
+  // returned as NaN; callers decide whether the lower bound is the stock floor.
+  std::vector<float> vertical_raycast(const std::vector<Vec3f>& origins,
+                                      float lower_z,
+                                      double& milliseconds) const;
   const Mesh& mesh() const;
   const MeshBuildStats& stats() const;
   bool empty() const;

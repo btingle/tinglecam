@@ -195,6 +195,13 @@ json to_json(const Operation& operation) {
   const double plane_depth = operation.plane.areas.empty()
                                  ? operation.plane.depth
                                  : operation.plane.areas.front().depth;
+  json exclusions = json::array();
+  for (const auto& exclusion : operation.pocket_auto.exclusions)
+    exclusions.push_back({{"enabled", exclusion.enabled},
+                          {"center_x", exclusion.center_x},
+                          {"center_y", exclusion.center_y},
+                          {"width", exclusion.width},
+                          {"height", exclusion.height}});
   return json{{"name", operation.name},
               {"mode", operation_mode_name(operation.mode)},
               {"tool", operation.tool_id},
@@ -208,9 +215,19 @@ json to_json(const Operation& operation) {
               {"tool_number", operation.tool_number},
               {"length_offset", operation.length_offset},
               {"pockets", std::move(pockets)},
+              {"auto_identify_pockets", operation.auto_identify_pockets},
+              {"pocket_radial_margin", operation.pocket_radial_margin},
+              {"pocket_auto", {
+                  {"check_depth", operation.pocket_auto.check_depth},
+                  {"helix_angle_degrees",
+                   operation.pocket_auto.helix_angle_degrees},
+                  {"exclusions", std::move(exclusions)}}},
               {"plane", {{"top_z", plane_top},
                          {"depth", plane_depth}, {"areas", areas}}},
               {"finishing_subdivisions", operation.finishing_subdivisions},
+              {"adaptive_cleanup_stepover", operation.adaptive_cleanup_stepover},
+              {"cleanup_stepover_limit", operation.cleanup_stepover_limit},
+              {"depth_breaks", operation.depth_breaks},
               {"radial_stock_to_leave", operation.radial_stock_to_leave},
               {"axial_stock_to_leave", operation.axial_stock_to_leave},
               {"depth_from", operation.depth_from},
@@ -239,8 +256,16 @@ json to_json(const UserSettings& settings) {
   for (const OperationMode mode : kOperationModes)
     defaults[operation_mode_name(mode)] =
         to_json(operation_default(settings, mode));
+  json themes = json::array();
+  for (const auto& theme : settings.custom_themes)
+    themes.push_back({{"name", theme.name},
+                      {"font", ui_font_name(theme.font)},
+                      {"style", theme.style_blob}});
   const PanelLayout& layout = settings.panel_layout;
   return json{{"ui_scale", settings.ui_scale},
+              {"ui_theme", ui_theme_name(settings.ui_theme)},
+              {"custom_theme", settings.custom_theme},
+              {"custom_themes", std::move(themes)},
               {"panel_layout", {{"left_width", layout.left_width},
                                  {"right_width", layout.right_width},
                                  {"left_program_fraction",
@@ -264,6 +289,34 @@ Operation operation_from(const json& node) {
   read(node, "coolant", operation.coolant);
   read(node, "tool_number", operation.tool_number);
   read(node, "length_offset", operation.length_offset);
+  read(node, "auto_identify_pockets", operation.auto_identify_pockets);
+  if (node.contains("pocket_auto")) {
+    const auto& automatic = node.at("pocket_auto");
+    read(automatic, "check_depth", operation.pocket_auto.check_depth);
+    read(automatic, "helix_angle_degrees",
+         operation.pocket_auto.helix_angle_degrees);
+    const auto read_exclusion = [](const json& node) {
+      PocketExclusionArea exclusion;
+      read(node, "enabled", exclusion.enabled);
+      read(node, "center_x", exclusion.center_x);
+      read(node, "center_y", exclusion.center_y);
+      read(node, "width", exclusion.width);
+      read(node, "height", exclusion.height);
+      return exclusion;
+    };
+    if (automatic.contains("exclusions")) {
+      const auto& exclusions = automatic.at("exclusions");
+      if (!exclusions.is_array())
+        throw std::runtime_error("Expected pocket exclusions array");
+      operation.pocket_auto.exclusions.clear();
+      for (const auto& exclusion : exclusions)
+        operation.pocket_auto.exclusions.push_back(read_exclusion(exclusion));
+    } else if (automatic.contains("exclusion")) {
+      // Read the single-area form written by the first auto-pocket version.
+      operation.pocket_auto.exclusions = {
+          read_exclusion(automatic.at("exclusion"))};
+    }
+  }
   if (node.contains("plane")) {
     const auto& plane = node.at("plane");
     read(plane, "top_z", operation.plane.top_z);
@@ -328,7 +381,11 @@ Operation operation_from(const json& node) {
   } else if (node.contains("pocket")) {
     operation.pockets = {read_pocket(node.at("pocket"))};
   }
+  read(node, "pocket_radial_margin", operation.pocket_radial_margin);
   read(node, "finishing_subdivisions", operation.finishing_subdivisions);
+  read(node, "adaptive_cleanup_stepover", operation.adaptive_cleanup_stepover);
+  read(node, "cleanup_stepover_limit", operation.cleanup_stepover_limit);
+  read(node, "depth_breaks", operation.depth_breaks);
   read(node, "radial_stock_to_leave", operation.radial_stock_to_leave);
   read(node, "axial_stock_to_leave", operation.axial_stock_to_leave);
   read(node, "depth_from", operation.depth_from);
@@ -356,6 +413,23 @@ Operation operation_from(const json& node) {
 UserSettings settings_from(const json& node) {
   UserSettings settings = default_user_settings();
   read(node, "ui_scale", settings.ui_scale);
+  read_enum(node, "ui_theme", settings.ui_theme, ui_theme_from_name);
+  read(node, "custom_theme", settings.custom_theme);
+  if (node.contains("custom_themes")) {
+    const auto& themes = node.at("custom_themes");
+    if (!themes.is_array())
+      throw std::runtime_error("Expected custom_themes array");
+    for (const auto& item : themes) {
+      if (!item.is_object())
+        throw std::runtime_error("Expected custom theme object");
+      CustomUiTheme theme;
+      read(item, "name", theme.name);
+      read_enum(item, "font", theme.font, ui_font_from_name);
+      read(item, "style", theme.style_blob);
+      if (!theme.name.empty() && !theme.style_blob.empty())
+        settings.custom_themes.push_back(std::move(theme));
+    }
+  }
   if (!(settings.ui_scale >= 0.5 && settings.ui_scale <= 3.0) ||
       !std::isfinite(settings.ui_scale))
     throw std::runtime_error("UI scale must be finite and between 0.5 and 3.0");
@@ -400,9 +474,16 @@ json to_json(const Job& job) {
   json operations = json::array();
   for (const auto& operation : job.operations)
     operations.push_back(to_json(operation));
+  const BoxStockMargins& margins = job.box_stock_margins;
   return json{{"name", job.name},
               {"box_stock", job.box_stock},
-              {"box_stock_margin", job.box_stock_margin},
+              {"box_stock_margins", {
+                  {"minus_x", margins.minus_x},
+                  {"plus_x", margins.plus_x},
+                  {"minus_y", margins.minus_y},
+                  {"plus_y", margins.plus_y},
+                  {"minus_z", margins.minus_z},
+                  {"plus_z", margins.plus_z}}},
               {"part_mesh", job.part_mesh.string()},
               {"stock_mesh", job.stock_mesh.string()},
               {"origin_x", job.origin_x},
@@ -426,7 +507,24 @@ Job job_from(const json& node) {
   read(node, "origin_y", job.origin_y);
   read(node, "origin_z", job.origin_z);
   read(node, "box_stock", job.box_stock);
-  read(node, "box_stock_margin", job.box_stock_margin);
+  if (node.contains("box_stock_margins")) {
+    const auto& margins = node.at("box_stock_margins");
+    if (!margins.is_object())
+      throw std::runtime_error("Expected box_stock_margins object");
+    read(margins, "minus_x", job.box_stock_margins.minus_x);
+    read(margins, "plus_x", job.box_stock_margins.plus_x);
+    read(margins, "minus_y", job.box_stock_margins.minus_y);
+    read(margins, "plus_y", job.box_stock_margins.plus_y);
+    read(margins, "minus_z", job.box_stock_margins.minus_z);
+    read(margins, "plus_z", job.box_stock_margins.plus_z);
+  } else if (node.contains("box_stock_margin")) {
+    // Older jobs had one XY margin and no Z margin. Preserve that shape when
+    // loading them, then write the directional form on the next save.
+    read(node, "box_stock_margin", job.box_stock_margin);
+    job.box_stock_margins = {job.box_stock_margin, job.box_stock_margin,
+                             job.box_stock_margin, job.box_stock_margin, 0.0,
+                             0.0};
+  }
   read(node, "rapid_clearance_height", job.rapid_clearance_height);
   read(node, "work_offset", job.work_offset);
   if (node.contains("operations") && node.at("operations").is_array())
@@ -459,6 +557,47 @@ std::filesystem::path config_directory() {
 }
 
 PanelLayout default_panel_layout() { return PanelLayout{}; }
+
+const char* ui_theme_name(UiTheme theme) {
+  switch (theme) {
+    case UiTheme::Default: return "Default";
+    case UiTheme::Slate: return "Slate";
+    case UiTheme::Ember: return "Ember";
+    case UiTheme::Paper: return "Paper";
+  }
+  return "Default";
+}
+
+std::optional<UiTheme> ui_theme_from_name(const std::string& name) {
+  if (name == "Default") return UiTheme::Default;
+  if (name == "Slate") return UiTheme::Slate;
+  if (name == "Ember") return UiTheme::Ember;
+  if (name == "Paper") return UiTheme::Paper;
+  // Accept the lowercase spelling used by hand-authored settings files too.
+  if (name == "default") return UiTheme::Default;
+  if (name == "slate") return UiTheme::Slate;
+  if (name == "ember") return UiTheme::Ember;
+  if (name == "paper") return UiTheme::Paper;
+  return std::nullopt;
+}
+
+const char* ui_font_name(UiFont font) {
+  switch (font) {
+    case UiFont::Default: return "Default";
+    case UiFont::Sans: return "Sans";
+    case UiFont::Mono: return "Mono";
+    case UiFont::Serif: return "Serif";
+  }
+  return "Default";
+}
+
+std::optional<UiFont> ui_font_from_name(const std::string& name) {
+  if (name == "Default" || name == "default") return UiFont::Default;
+  if (name == "Sans" || name == "sans") return UiFont::Sans;
+  if (name == "Mono" || name == "mono") return UiFont::Mono;
+  if (name == "Serif" || name == "serif") return UiFont::Serif;
+  return std::nullopt;
+}
 
 UserSettings default_user_settings() {
   UserSettings settings;

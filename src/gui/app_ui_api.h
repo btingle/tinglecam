@@ -37,11 +37,16 @@ extern PrismView prism_view;
 void release_prism_view();
 
 void bootstrap(App& app);
+void load_ui_fonts(App& app);
+void apply_ui_theme(App& app);
 void apply_ui_scale(App& app);
+std::string ui_style_blob(const ImGuiStyle& style);
+bool ui_style_from_blob(const std::string& blob, ImGuiStyle& style);
 bool save_settings(App& app);
 bool layout_splitter(App& app, const char* id, bool vertical, float extent,
                      float& delta);
 void settings_panel(App& app);
+bool roughing_subdivision_settings(cam::Operation& operation);
 void load_meshes(App& app);
 void load_job_into(App& app, const std::filesystem::path& file);
 void depth_defaults(App& app, cam::Operation& operation);
@@ -58,6 +63,7 @@ void refresh_material(App& app);
 void advance_playback(App& app, double seconds);
 void left_panel(App& app);
 void right_panel(App& app);
+void messages_panel(App& app);
 void draw_setup(App& app);
 void draw_canvas(App& app);
 void draw_result(App& app);

@@ -62,6 +62,11 @@ struct MotionPhase {
   double rate = 0.0;
   wave::MoveKind kind = wave::MoveKind::Cut;
   bool rapid = false;
+  // A circular XY move. The endpoint and centre are in the same local frame
+  // as from/to; the post emits I/J relative to the move start.
+  bool arc = false;
+  bool clockwise = false;
+  wave::Point64 arc_center{};
   // The opening rapid that carries the cutter from where the previous pass
   // left it to where this one starts. It belongs to no pass's geometry, so it
   // is flagged rather than inferred from being horizontal and distance-free.
@@ -125,7 +130,8 @@ FeedSchedule plan_feeds(const wave::Toolpath& toolpath,
                         double plunge_feed,
                         double floor_z = 0.0,
                         double rapid_plane = 0.0,
-                        PassLink link = {});
+                        PassLink link = {},
+                        bool allow_plunge = true);
 
 double feed_schedule_seconds(const FeedSchedule& schedule);
 double feed_motion_length(const FeedSchedule& schedule);

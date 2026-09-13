@@ -262,6 +262,14 @@ MeshSlice MeshSlicer::slice(float z, int grid_resolution) const {
   return result;
 }
 
+std::vector<float> MeshSlicer::vertical_raycast(
+    const std::vector<Vec3f>& origins, float lower_z,
+    double& milliseconds) const {
+  if (empty()) throw std::runtime_error("No mesh has been loaded");
+  return cuda_slicer::vertical_raycast(impl_->gpu, origins, lower_z,
+                                       milliseconds);
+}
+
 const Mesh& MeshSlicer::mesh() const { return impl_->mesh; }
 const MeshBuildStats& MeshSlicer::stats() const { return impl_->stats; }
 void MeshSlicer::clear() {

@@ -1,5 +1,67 @@
 #include "gui_internal.h"
 namespace tinglecam_gui {
+bool roughing_subdivision_settings(cam::Operation& operation) {
+  bool changed = ImGui::DragInt("Finishing subdivisions",
+      &operation.finishing_subdivisions, 0.05f, 1, 64);
+  operation.finishing_subdivisions =
+      std::clamp(operation.finishing_subdivisions, 1, 64);
+  ImGui::SetItemTooltip(
+      "Complete all coarse depths first, then clean each terrace upward from "
+      "deepest to shallowest. N divides each coarse interval into N parts.");
+  ImGui::BeginDisabled(operation.finishing_subdivisions <= 1);
+  changed |= ImGui::Checkbox("Adapt cleanup stepover",
+                             &operation.adaptive_cleanup_stepover);
+  ImGui::SetItemTooltip(
+      "Increase radial width as the remaining terrace height decreases: "
+      "base width times coarse height / remaining height. Feed limits still apply.");
+  ImGui::BeginDisabled(!operation.adaptive_cleanup_stepover);
+  const double minimum = 0.01, maximum = 1.0;
+  changed |= ImGui::SliderScalar("Cleanup limit (D)",
+      ImGuiDataType_Double, &operation.cleanup_stepover_limit,
+      &minimum, &maximum, "%.2f");
+  ImGui::SetItemTooltip(
+      "Maximum cleanup stepover as a fraction of tool diameter; the base stepover "
+      "is always allowed. "
+      "Disable adaptation to keep the same width on every layer.");
+  ImGui::EndDisabled();
+  ImGui::EndDisabled();
+
+  ImGui::SeparatorText("Intermediate depth breaks");
+  ImGui::TextDisabled("Measured below work top");
+  ImGui::SetItemTooltip(
+      "Depths below work top. Each break lands a coarse floor exactly, then "
+      "restarts the stepdown grid. All downward cuts precede upward cleanup. "
+      "For a flat, enter its depth minus the axial stock to leave.");
+  int remove = -1;
+  for (std::size_t i = 0; i < operation.depth_breaks.size(); ++i) {
+    ImGui::PushID(static_cast<int>(i));
+    changed |= ImGui::DragScalar("Depth (mm)", ImGuiDataType_Double,
+                                 &operation.depth_breaks[i], 0.1f);
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Remove")) remove = static_cast<int>(i);
+    ImGui::PopID();
+  }
+  if (remove >= 0) {
+    operation.depth_breaks.erase(operation.depth_breaks.begin() + remove);
+    changed = true;
+  }
+  if (ImGui::Button("Add depth break")) {
+    // Split the widest band so repeated additions start with distinct values.
+    std::vector<double> depths{operation.depth_from, operation.depth_to};
+    for (double depth : operation.depth_breaks)
+      if (std::isfinite(depth) && depth > operation.depth_from &&
+          depth < operation.depth_to) depths.push_back(depth);
+    std::sort(depths.begin(), depths.end());
+    std::size_t widest = 1;
+    for (std::size_t i = 2; i < depths.size(); ++i)
+      if (depths[i] - depths[i-1] > depths[widest] - depths[widest-1]) widest = i;
+    operation.depth_breaks.push_back((depths[widest] + depths[widest-1]) * 0.5);
+    changed = true;
+  }
+  ImGui::Separator();
+  return changed;
+}
+
 void operation_settings_panel(App& app) {
   ImGui::SeparatorText("Selected operation");
   if (app.job.operations.empty()) {
@@ -59,40 +121,111 @@ void operation_settings_panel(App& app) {
     ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.35f, 1.0f),
                        "This machine profile carries unverified limits");
 
-  ImGui::InputDouble("Stepover (of diameter)", &operation.stepover_ratio, 0, 0, "%.6g");
-  ImGui::InputDouble("Stepdown (mm)", &operation.stepdown, 0, 0, "%.6g");
+  ImGui::DragScalar("Stepover (of diameter)", ImGuiDataType_Double,
+                    &operation.stepover_ratio, 0.01f);
+  ImGui::DragScalar("Stepdown (mm)", ImGuiDataType_Double,
+                    &operation.stepdown, 0.1f);
   if (cam::is_parametric(operation.mode)) {
     if (operation.mode == cam::OperationMode::Pocket) {
-      if (operation.pockets.empty()) operation.pockets.push_back(cam::PocketParameters{});
-      ImGui::TextWrapped(
-          "Rounded rectangles cover square, rounded, and circular pockets. "
-          "Each pocket may have its own position and depth.");
-      int remove = -1;
-      for (std::size_t i = 0; i < operation.pockets.size(); ++i) {
-        ImGui::PushID(static_cast<int>(i));
-        ImGui::SeparatorText(("Pocket " + std::to_string(i + 1)).c_str());
-        auto& p = operation.pockets[i];
-        origin_field("Center X (mm)", p.center_x, app.job.origin_x);
-        origin_field("Center Y (mm)", p.center_y, app.job.origin_y);
-        origin_field("Top Z (mm)", p.top_z, app.job.origin_z);
-        ImGui::InputDouble("Width X (mm)", &p.width, 0, 0, "%.6g");
-        ImGui::InputDouble("Height Y (mm)", &p.height, 0, 0, "%.6g");
-        ImGui::InputDouble("Corner radius (mm)", &p.radius, 0, 0, "%.6g");
-        ImGui::InputDouble("Pocket depth (mm)", &p.depth, 0, 0, "%.6g");
-        ImGui::InputDouble("Helix angle (degrees)", &p.helix_angle_degrees,
-                           0, 0, "%.6g");
-        ImGui::TextWrapped("Floor Z: %.6g mm. Every level starts with a helical entry.",
-                           p.top_z - p.depth + app.job.origin_z);
-        if (ImGui::Button("Remove pocket")) remove = static_cast<int>(i);
-        ImGui::PopID();
-      }
-      if (remove >= 0) operation.pockets.erase(operation.pockets.begin() + remove);
-      if (ImGui::Button("Add pocket")) {
-        cam::PocketParameters pocket;
-        pocket.center_x = -app.job.origin_x;
-        pocket.center_y = -app.job.origin_y;
-        pocket.top_z = -app.job.origin_z;
-        operation.pockets.push_back(pocket);
+      ImGui::DragScalar("Radial finishing margin (mm)", ImGuiDataType_Double,
+                        &operation.pocket_radial_margin, 0.02f);
+      ImGui::SetItemTooltip(
+          "Stock left on pocket walls: every wall, corners included, finishes "
+          "this far inside the size entered below, so a pocket comes out that "
+          "much undersize for a finishing pass. Negative cuts that far past "
+          "the wall instead, for a pocket that has to end up oversize.");
+      ImGui::Checkbox("Auto-identify pockets", &operation.auto_identify_pockets);
+      if (operation.auto_identify_pockets) {
+        ImGui::TextWrapped(
+            "Finds closed, convex holes in the part's downward-envelope slice, "
+            "checks that their footprint remains stable to the deepest ray hit, "
+            "and plans one pocket for each match.");
+        ImGui::DragScalar("Inspection depth below part top (mm)",
+                          ImGuiDataType_Double,
+                          &operation.pocket_auto.check_depth, 0.1f);
+        ImGui::DragScalar("Helix angle (degrees)", ImGuiDataType_Double,
+                          &operation.pocket_auto.helix_angle_degrees, 0.1f);
+        if (operation.pocket_auto.exclusions.empty())
+          operation.pocket_auto.exclusions.push_back(cam::PocketExclusionArea{});
+        int remove_exclusion = -1;
+        for (std::size_t i = 0; i < operation.pocket_auto.exclusions.size(); ++i) {
+          auto& exclusion = operation.pocket_auto.exclusions[i];
+          ImGui::PushID(static_cast<int>(i));
+          ImGui::SeparatorText(("Exclusion area " + std::to_string(i + 1)).c_str());
+          ImGui::Checkbox("Enabled", &exclusion.enabled);
+          ImGui::BeginDisabled(!exclusion.enabled);
+          origin_field("Center X (mm)", exclusion.center_x, app.job.origin_x);
+          origin_field("Center Y (mm)", exclusion.center_y, app.job.origin_y);
+          ImGui::DragScalar("Width X (mm)", ImGuiDataType_Double,
+                            &exclusion.width, 0.1f);
+          ImGui::DragScalar("Height Y (mm)", ImGuiDataType_Double,
+                            &exclusion.height, 0.1f);
+          ImGui::EndDisabled();
+          if (ImGui::Button("Remove exclusion")) remove_exclusion = static_cast<int>(i);
+          ImGui::PopID();
+        }
+        if (remove_exclusion >= 0)
+          operation.pocket_auto.exclusions.erase(
+              operation.pocket_auto.exclusions.begin() + remove_exclusion);
+        if (ImGui::Button("Add exclusion area"))
+          operation.pocket_auto.exclusions.push_back(cam::PocketExclusionArea{});
+        ImGui::TextDisabled("Candidates overlapping an enabled rectangle are omitted.");
+        if (app.selected_operation >= 0 &&
+            static_cast<std::size_t>(app.selected_operation) <
+                app.plan.operations.size()) {
+          const cam::OperationPlan& planned =
+              app.plan.operations[app.selected_operation];
+          if (planned.planned && planned.ok()) {
+            ImGui::SeparatorText("Identified pockets from last plan");
+            if (planned.identified_pockets.empty()) {
+              ImGui::TextDisabled("No pockets identified.");
+            } else {
+              for (std::size_t i = 0; i < planned.identified_pockets.size(); ++i) {
+                const auto& pocket = planned.identified_pockets[i];
+                ImGui::Text("%zu: center (%.3f, %.3f), size %.3f x %.3f mm",
+                            i + 1, pocket.center_x, pocket.center_y,
+                            pocket.width, pocket.height);
+                ImGui::TextDisabled("   Z %.3f to %.3f mm",
+                                    pocket.top_z + app.job.origin_z,
+                                    pocket.bottom_z + app.job.origin_z);
+              }
+            }
+          }
+        }
+      } else {
+        if (operation.pockets.empty()) operation.pockets.push_back(cam::PocketParameters{});
+        ImGui::TextWrapped(
+            "Rounded rectangles cover square, rounded, and circular pockets. "
+            "Each pocket may have its own position and depth.");
+        int remove = -1;
+        for (std::size_t i = 0; i < operation.pockets.size(); ++i) {
+          ImGui::PushID(static_cast<int>(i));
+          ImGui::SeparatorText(("Pocket " + std::to_string(i + 1)).c_str());
+          auto& p = operation.pockets[i];
+          origin_field("Center X (mm)", p.center_x, app.job.origin_x);
+          origin_field("Center Y (mm)", p.center_y, app.job.origin_y);
+          origin_field("Top Z (mm)", p.top_z, app.job.origin_z);
+          ImGui::DragScalar("Width X (mm)", ImGuiDataType_Double, &p.width, 0.1f);
+          ImGui::DragScalar("Height Y (mm)", ImGuiDataType_Double, &p.height, 0.1f);
+          ImGui::DragScalar("Corner radius (mm)", ImGuiDataType_Double,
+                            &p.radius, 0.1f);
+          ImGui::DragScalar("Pocket depth (mm)", ImGuiDataType_Double,
+                            &p.depth, 0.1f);
+          ImGui::DragScalar("Helix angle (degrees)", ImGuiDataType_Double,
+                            &p.helix_angle_degrees, 0.1f);
+          ImGui::TextWrapped("Floor Z: %.6g mm. Every level starts with a helical entry.",
+                             p.top_z - p.depth + app.job.origin_z);
+          if (ImGui::Button("Remove pocket")) remove = static_cast<int>(i);
+          ImGui::PopID();
+        }
+        if (remove >= 0) operation.pockets.erase(operation.pockets.begin() + remove);
+        if (ImGui::Button("Add pocket")) {
+          cam::PocketParameters pocket;
+          pocket.center_x = -app.job.origin_x;
+          pocket.center_y = -app.job.origin_y;
+          pocket.top_z = -app.job.origin_z;
+          operation.pockets.push_back(pocket);
+        }
       }
     } else {
       auto& p = operation.plane;
@@ -106,10 +239,11 @@ void operation_settings_panel(App& app) {
         auto& area = p.areas[i];
         origin_field("Center X (mm)", area.center_x, app.job.origin_x);
         origin_field("Center Y (mm)", area.center_y, app.job.origin_y);
-        ImGui::InputDouble("Width X (mm)", &area.width, 0, 0, "%.6g");
-        ImGui::InputDouble("Height Y (mm)", &area.height, 0, 0, "%.6g");
+        ImGui::DragScalar("Width X (mm)", ImGuiDataType_Double, &area.width, 0.1f);
+        ImGui::DragScalar("Height Y (mm)", ImGuiDataType_Double, &area.height, 0.1f);
         origin_field("Top Z (mm)", area.top_z, app.job.origin_z);
-        ImGui::InputDouble("Clearing depth (mm)", &area.depth, 0, 0, "%.6g");
+        ImGui::DragScalar("Clearing depth (mm)", ImGuiDataType_Double,
+                          &area.depth, 0.1f);
         ImGui::TextWrapped("Floor Z: %.6g mm.",
                            area.top_z - area.depth + app.job.origin_z);
         if (ImGui::Button("Remove area")) remove = static_cast<int>(i);
@@ -123,22 +257,13 @@ void operation_settings_panel(App& app) {
         "numbers the machine will be sent. Moving the origin restates them and "
         "leaves the operation where it is; sizes and depths are not measured "
         "from anywhere and do not change. No part mesh is required.");
-    ImGui::InputDouble("Simulation/feed pitch (mm)", &operation.path_pitch, 0, 0, "%.6g");
+    ImGui::DragScalar("Simulation/feed pitch (mm)", ImGuiDataType_Double,
+                      &operation.path_pitch, 0.01f);
     feeds_panel(app);
     return;
   }
-  const std::size_t base_layers =
-      cam::level_floors(operation, operation.stepdown,
-                        cam::highest_model_z(app.geometry))
-          .size();
   if (operation.mode == cam::OperationMode::Roughing) {
-    if (ImGui::DragInt("Finishing subdivisions",
-                       &operation.finishing_subdivisions, 0.05f, 1, 64))
-      operation.finishing_subdivisions =
-          std::clamp(operation.finishing_subdivisions, 1, 64);
-    ImGui::SetItemTooltip(
-        "Runs this roughing operation repeatedly at evenly interleaved depth "
-        "offsets. Each pass receives the stock left by the preceding pass.");
+    roughing_subdivision_settings(operation);
     const double minimum_cleanup_tolerance = 0.0;
     const double maximum_cleanup_tolerance =
         tool ? tool->diameter * 0.5 : 10.0;
@@ -158,6 +283,9 @@ void operation_settings_panel(App& app) {
         "rule.");
     ImGui::EndDisabled();
   }
+  const std::size_t base_layers =
+      cam::level_floors(operation, operation.stepdown,
+                        cam::highest_model_z(app.geometry)).size();
   if (tool) {
     const std::string preview_layers =
         operation.mode == cam::OperationMode::Roughing &&
@@ -242,12 +370,15 @@ void feeds_panel(App& app) {
   const cam::MaterialFeedRange* library =
       machine ? machine->feeds_for(operation.material_id) : nullptr;
   ImGui::SeparatorText("Operation cutting settings");
-  ImGui::InputDouble("Spindle (rpm)", &operation.spindle_rpm, 0, 0, "%.6g");
-  ImGui::InputDouble("Plunge / ramp feed (mm/min)", &operation.plunge_feed, 0, 0, "%.6g");
+  ImGui::DragScalar("Spindle (rpm)", ImGuiDataType_Double,
+                    &operation.spindle_rpm, 10.0f);
+  ImGui::DragScalar("Plunge / ramp feed (mm/min)", ImGuiDataType_Double,
+                    &operation.plunge_feed, 10.0f);
   ImGui::Checkbox("Coolant", &operation.coolant);
   if (ImGui::CollapsingHeader("Machine tool assignment")) {
-    ImGui::InputInt("Tool number (0 = auto)", &operation.tool_number);
-    ImGui::InputInt("H offset (0 = tool)", &operation.length_offset);
+    ImGui::DragInt("Tool number (0 = auto)", &operation.tool_number, 1.0f,
+                   0);
+    ImGui::DragInt("H offset (0 = tool)", &operation.length_offset, 1.0f, 0);
   }
   ImGui::SeparatorText("Engagement feeds");
   ImGui::TextWrapped(
@@ -283,6 +414,8 @@ void start_plan(App& app, int first, int last) {
 
   app.gcode.clear();
   app.post = {};
+  app.messages.clear();
+  app.messages.push_back({LogSeverity::Info, "Planning", "Build started"});
   app.planning_first = static_cast<std::size_t>(first);
   app.planning_signatures.clear();
   const std::string job_part = job_signature(app);
@@ -450,6 +583,9 @@ void plan_panel(App& app) {
   if (stats.unresolved_entries > 0)
     ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "Entries into solid %zu",
                        stats.unresolved_entries);
+  if (stats.skipped_entries > 0)
+    ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.35f, 1.0f),
+                       "Roughing entries skipped %zu", stats.skipped_entries);
   if (stats.lifts_over_subject > 0)
     ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.35f, 1.0f), "Rapids over the part %zu",
                        stats.lifts_over_subject);

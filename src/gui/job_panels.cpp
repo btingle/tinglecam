@@ -38,7 +38,7 @@ void load_meshes(App& app) {
       app.job.stock_mesh.clear();
       app.job.box_stock = true;
     }
-    app.geometry.set_box_stock(app.job.box_stock, app.job.box_stock_margin);
+    app.geometry.set_box_stock(app.job.box_stock, app.job.box_stock_margins);
     for (auto& operation : app.job.operations) depth_defaults(app, operation);
     // The blank has changed, so the picked corner of it is somewhere new.
     apply_origin_pick(app);
@@ -66,7 +66,7 @@ void load_job_into(App& app, const std::filesystem::path& file) {
   resolve(job.stock_mesh);
   if (!job.part_mesh.empty()) geometry.load_part(job.part_mesh);
   if (!job.stock_mesh.empty()) geometry.load_stock(job.stock_mesh);
-  geometry.set_box_stock(job.box_stock, job.box_stock_margin);
+  geometry.set_box_stock(job.box_stock, job.box_stock_margins);
   app.geometry = std::move(geometry);
   app.job = std::move(job);
   app.job_file = file.string();
@@ -279,15 +279,27 @@ void job_panel(App& app) {
   // A named model always wins, so the fallback is only offered without one.
   ImGui::BeginDisabled(app.stock_path[0] != '\0');
   if (ImGui::Checkbox("Box stock around the part", &app.job.box_stock))
-    app.geometry.set_box_stock(app.job.box_stock, app.job.box_stock_margin);
+    app.geometry.set_box_stock(app.job.box_stock, app.job.box_stock_margins);
   ImGui::SetItemTooltip(
       "Stand a rectangular blank in for a stock model: the part's bounding box "
-      "grown in X and Y. Z stays at the part's own range.");
+      "grown independently in each direction.");
   if (app.job.box_stock) {
-    if (ImGui::DragScalar("Box margin (mm)", ImGuiDataType_Double,
-                          &app.job.box_stock_margin, 0.1f))
-      app.geometry.set_box_stock(app.job.box_stock,
-                                 std::max(app.job.box_stock_margin, 0.0));
+    ImGui::SeparatorText("Box stock margins");
+    auto margin = [&](const char* label, double& value) {
+      if (!ImGui::DragScalar(label, ImGuiDataType_Double, &value, 0.1f))
+        return false;
+      value = std::max(value, 0.0);
+      return true;
+    };
+    bool changed = false;
+    changed |= margin("Margin -X (mm)", app.job.box_stock_margins.minus_x);
+    changed |= margin("Margin +X (mm)", app.job.box_stock_margins.plus_x);
+    changed |= margin("Margin -Y (mm)", app.job.box_stock_margins.minus_y);
+    changed |= margin("Margin +Y (mm)", app.job.box_stock_margins.plus_y);
+    changed |= margin("Margin -Z (mm)", app.job.box_stock_margins.minus_z);
+    changed |= margin("Margin +Z (mm)", app.job.box_stock_margins.plus_z);
+    if (changed)
+      app.geometry.set_box_stock(app.job.box_stock, app.job.box_stock_margins);
   }
   ImGui::EndDisabled();
   if (ImGui::Button("Load models")) load_meshes(app);
@@ -404,7 +416,12 @@ void select_operation(App& app, int index) {
 std::string job_signature(const App& app) {
   return app.job.part_mesh.string() + '\n' + app.job.stock_mesh.string() +
          (app.job.box_stock ? "\nbox " : "\nmodel ") +
-         std::to_string(app.job.box_stock_margin) + ' ' +
+         std::to_string(app.job.box_stock_margins.minus_x) + ' ' +
+         std::to_string(app.job.box_stock_margins.plus_x) + ' ' +
+         std::to_string(app.job.box_stock_margins.minus_y) + ' ' +
+         std::to_string(app.job.box_stock_margins.plus_y) + ' ' +
+         std::to_string(app.job.box_stock_margins.minus_z) + ' ' +
+         std::to_string(app.job.box_stock_margins.plus_z) + ' ' +
          std::to_string(cam::job_rapid_plane(app.job, app.geometry)) + '\n';
 }
 

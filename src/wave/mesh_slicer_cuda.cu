@@ -2,6 +2,7 @@
 
 #include <cuBQL/bvh.h>
 #include <cuBQL/traversal/fixedBoxQuery.h>
+#include <cuBQL/traversal/rayQueries.h>
 
 #include <cuda_runtime.h>
 
@@ -135,6 +136,36 @@ __global__ void query_tiles(std::uint32_t* flags, std::uint32_t* output,
     return CUBQL_CONTINUE_TRAVERSAL;
   };
   cuBQL::fixedBoxQuery::forEachPrim(candidate, bvh, query_box);
+}
+
+__device__ float downward_hit(const GpuTriangle& triangle, vec3f origin,
+                              float lower_z) {
+  if (!point_in_xy(triangle, origin)) return CUBQL_INF;
+  const float height = height_at(triangle, origin);
+  constexpr float epsilon = 1e-5f;
+  if (height >= origin.z - epsilon || height < lower_z - epsilon)
+    return CUBQL_INF;
+  return origin.z - height;
+}
+
+__global__ void vertical_rays(float* output, const vec3f* origins,
+                              std::uint32_t count, const GpuTriangle* triangles,
+                              bvh3f bvh, float lower_z) {
+  const std::uint32_t id = blockIdx.x * blockDim.x + threadIdx.x;
+  if (id >= count) return;
+  const vec3f origin = origins[id];
+  cuBQL::ray3f ray(origin, vec3f(0.0f, 0.0f, -1.0f), 1e-5f,
+                   origin.z - lower_z);
+  float nearest = ray.tMax;
+  auto candidate = [&](std::uint32_t primitive) -> float {
+    nearest = fminf(nearest,
+                    downward_hit(triangles[primitive], origin, lower_z));
+    return nearest;
+  };
+  cuBQL::shrinkingRayQuery::forEachPrim(candidate, bvh, ray);
+  output[id] = nearest < origin.z - lower_z - 1e-5f
+                   ? origin.z - nearest
+                   : CUBQL_INF;
 }
 
 float elapsed_ms(cudaEvent_t start, cudaEvent_t stop) {
@@ -280,6 +311,53 @@ std::vector<std::uint32_t> query(Handle* handle, float z, int grid_resolution,
                      cudaMemcpyDeviceToHost), "download slice candidates");
   std::sort(result.begin(), result.end());
   return result;
+}
+
+std::vector<float> vertical_raycast(Handle* handle,
+                                    const std::vector<Vec3f>& origins,
+                                    float lower_z, double& milliseconds) {
+  if (!handle) throw std::runtime_error("Mesh slicer is not initialized");
+  if (origins.empty()) {
+    milliseconds = 0.0;
+    return {};
+  }
+  const std::size_t origin_bytes = origins.size() * sizeof(vec3f);
+  const std::size_t result_bytes = origins.size() * sizeof(float);
+  vec3f* device_origins = nullptr;
+  float* device_results = nullptr;
+  check(cudaMalloc(&device_origins, origin_bytes), "allocate ray origins");
+  check(cudaMalloc(&device_results, result_bytes), "allocate ray results");
+  check(cudaMemcpy(device_origins, origins.data(), origin_bytes,
+                   cudaMemcpyHostToDevice), "upload ray origins");
+  cudaEvent_t start = nullptr;
+  cudaEvent_t stop = nullptr;
+  try {
+    check(cudaEventCreate(&start), "create CUDA timing event");
+    check(cudaEventCreate(&stop), "create CUDA timing event");
+    check(cudaEventRecord(start), "record CUDA timing event");
+    constexpr int block_size = 256;
+    const int blocks = static_cast<int>((origins.size() + block_size - 1) /
+                                        block_size);
+    vertical_rays<<<blocks, block_size>>>(
+        device_results, device_origins, static_cast<std::uint32_t>(origins.size()),
+        handle->triangles, handle->bvh, lower_z);
+    check(cudaGetLastError(), "launch vertical ray query");
+    milliseconds = elapsed_ms(start, stop);
+    std::vector<float> results(origins.size());
+    check(cudaMemcpy(results.data(), device_results, result_bytes,
+                     cudaMemcpyDeviceToHost), "download ray results");
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    cudaFree(device_origins);
+    cudaFree(device_results);
+    return results;
+  } catch (...) {
+    if (start) cudaEventDestroy(start);
+    if (stop) cudaEventDestroy(stop);
+    cudaFree(device_origins);
+    cudaFree(device_results);
+    throw;
+  }
 }
 
 }  // namespace wave::cuda_slicer

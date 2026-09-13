@@ -69,6 +69,22 @@ struct PlaneParameters {
   std::vector<ClearingArea> areas{{}};
 };
 
+struct PocketExclusionArea {
+  bool enabled = false;
+  double center_x = 0.0;
+  double center_y = 0.0;
+  double width = 30.0;
+  double height = 30.0;
+};
+
+struct PocketAutoParameters {
+  // Measured down from the top of the part. The downward-envelope slice at
+  // this depth supplies the candidate pocket contours.
+  double check_depth = 1.0;
+  double helix_angle_degrees = 3.0;
+  std::vector<PocketExclusionArea> exclusions{{}};
+};
+
 struct Operation {
   std::string name = "Rough";
   std::string tool_id;
@@ -87,11 +103,24 @@ struct Operation {
   int tool_number = 0;
   int length_offset = 0;
   std::vector<PocketParameters> pockets{{}};
+  bool auto_identify_pockets = false;
+  PocketAutoParameters pocket_auto;
+  // Pocket mode only, and applied to identified pockets as well as entered
+  // ones. Walls finish this far inside the requested outline, which leaves
+  // that much for a finishing pass; a negative margin cuts that far past them,
+  // for a pocket that has to end up oversize.
+  double pocket_radial_margin = 0.0;
   PlaneParameters plane;
-  // Roughing may be repeated at evenly interleaved Z offsets. One is the
-  // ordinary pass; N adds N-1 stock-aware finishing passes while keeping this
-  // operation as a single editable/postable unit.
+  // Descend through all coarse floors, then clean each terrace upward,
+  // deepest first. N divides each actual coarse interval into N equal parts.
   int finishing_subdivisions = 1;
+  bool adaptive_cleanup_stepover = true;
+  // Fraction of tool diameter. The effective ceiling is at least the base
+  // stepover, so enabling adaptation never narrows an existing roughing cut.
+  double cleanup_stepover_limit = 0.5;
+  // Intermediate depths below work top; each ends a coarse depth band and
+  // restarts its stepdown grid. Cleanup waits until every band has descended.
+  std::vector<double> depth_breaks;
 
   double radial_stock_to_leave = 0.2;
   // Stock left on the surfaces a pass comes down onto. The part is sliced this
@@ -142,6 +171,15 @@ struct Operation {
   double simulation_stock_inflation = 0.0;
 };
 
+struct BoxStockMargins {
+  double minus_x = 5.0;
+  double plus_x = 5.0;
+  double minus_y = 5.0;
+  double plus_y = 5.0;
+  double minus_z = 0.0;
+  double plus_z = 0.0;
+};
+
 struct Job {
   std::string name = "Untitled";
   std::filesystem::path part_mesh;
@@ -151,11 +189,12 @@ struct Job {
   double origin_x = 0.0;
   double origin_y = 0.0;
   double origin_z = 0.0;
-  // With no stock model, the blank is the part's bounding box grown by this
-  // much in X and Y. Z is left at the part's own range: a blank oversize in Z
-  // means facing the top off, which is a pass in its own right rather than
-  // something a fallback should decide to add.
+  // With no stock model, the blank is the part's bounding box grown by these
+  // directional margins.
   bool box_stock = false;
+  BoxStockMargins box_stock_margins;
+  // Kept as a source-compatibility field for callers built against the old
+  // uniform-margin API. New job files use box_stock_margins instead.
   double box_stock_margin = 5.0;
   // Every disconnected move retracts to Z0 plus this height. Keeping a single
   // safe plane avoids pretending a 2D slice can prove a lower traverse safe.
@@ -177,7 +216,11 @@ struct LevelPlan {
   // planar projection remains available for stock simulation and 2D views.
   bool explicit_motion = false;
   double floor_z = 0.0;    // the depth this pass cuts down to
-  double axial_depth = 0.0;  // a_p actually taken, which the last pass may trim
+  // Axial slab height; cleanup uses the remaining coarse terrace as its bound.
+  double axial_depth = 0.0;
+  double radial_width = 0.0; // planned stepover in mm
+  std::size_t coarse_level = 0;
+  int finishing_index = 0; // 0 = coarse descent; 1..N-1 = upward cleanup
   // Execution group and position inside it. Subdivision groups are flattened
   // into OperationPlan::levels for posting and playback.
   std::size_t subdivision = 0;
@@ -216,7 +259,7 @@ struct LevelPlan {
 struct OperationSubdivision {
   std::size_t first_level = 0;
   std::size_t level_count = 0;
-  // How far this group's floors are raised from the base roughing floors.
+  // Cleanup height above its coarse floor; zero for the initial descent.
   double depth_shift = 0.0;
 };
 
@@ -233,6 +276,7 @@ struct PlanStats {
   double gouge_area = 0.0;
   std::size_t unsafe_plunges = 0;
   std::size_t unresolved_entries = 0;
+  std::size_t skipped_entries = 0;
   // Rapids the planner had to route over the part because the free space
   // around it is disconnected. A slice says nothing about how far the part
   // rises above it, so each one is an assumption about the clearance plane.
@@ -282,12 +326,24 @@ struct OperationPlan {
   // this one too; the flag is what tells a failure apart from a gap.
   bool planned = false;
   bool composed_stock = false;
-  // Prior stacks, clipped once during planning; playback changes local slabs only.
+  // Complete incoming stock, including previous operations' cuts. Playback
+  // applies this operation's sweeps in order, without rebuilding area ownership.
   std::vector<StockSlab> preview_context;
   std::string operation_name;
   std::string tool_id;
   std::string machine_id;
   std::string material_id;
+  struct IdentifiedPocket {
+    wave::Paths64 boundary;
+    double center_x = 0.0;
+    double center_y = 0.0;
+    double width = 0.0;
+    double height = 0.0;
+    double top_z = 0.0;
+    double bottom_z = 0.0;
+  };
+  // Derived by an auto-pocket operation during planning; never serialized.
+  std::vector<IdentifiedPocket> identified_pockets;
   double spindle_rpm = 0.0;
   std::vector<LevelPlan> levels;
   std::vector<OperationSubdivision> subdivisions;
@@ -350,14 +406,17 @@ class JobGeometry {
   void load_part(const std::filesystem::path& file);
   void load_stock(const std::filesystem::path& file);
   // Stand a rectangular blank in for a stock model: the part's bounding box
-  // grown by `margin` in X and Y. A loaded stock model always wins.
+  // grown by directional margins. A loaded stock model always wins.
   // Drops a loaded stock model, so a blank named and then unnamed does not go
   // on winning over the box that replaced it.
   void clear_stock();
+  void set_box_stock(bool enabled, const BoxStockMargins& margins);
+  // Compatibility overload for callers using the former uniform XY margin.
   void set_box_stock(bool enabled, double margin);
   bool box_stock() const { return box_stock_ && stock_.empty(); }
   bool has_part() const { return !part_.empty(); }
   bool has_stock() const { return !stock_.empty() || (box_stock_ && !part_.empty()); }
+  double stock_bottom() const;
   const wave::MeshSlicer& part() const { return part_; }
   const wave::MeshSlicer& stock() const { return stock_; }
   // The Z range spanned by either mesh, which is what an operation may cover.
@@ -390,7 +449,7 @@ class JobGeometry {
     part_ = std::move(other.part_);
     stock_ = std::move(other.stock_);
     box_stock_ = other.box_stock_;
-    box_margin_ = other.box_margin_;
+    box_margins_ = other.box_margins_;
     part_slices_ = std::move(other.part_slices_);
     stock_slices_ = std::move(other.stock_slices_);
     box_ = std::move(other.box_);
@@ -404,7 +463,7 @@ class JobGeometry {
   wave::MeshSlicer part_;
   wave::MeshSlicer stock_;
   bool box_stock_ = false;
-  double box_margin_ = 5.0;
+  BoxStockMargins box_margins_;
   mutable std::map<SliceKey, wave::Paths64> part_slices_;
   mutable std::map<SliceKey, wave::Paths64> stock_slices_;
   // The stand-in blank, which is one rectangle at every depth.
@@ -416,7 +475,7 @@ class JobGeometry {
 // floor rather than overshooting it.
 // The floors of every pass, in job coordinates, deepest last. `work_top` is the
 // top of the work the operation's depths are measured down from; `stepdown` is
-// the figure after the tool's ceiling has been applied to it.
+// the maximum axial step. Roughing depth breaks restart the grid.
 std::vector<double> level_floors(const Operation& operation, double stepdown,
                                  double work_top);
 
@@ -477,7 +536,8 @@ void plan_toolpaths(OperationPlan& plan,
                     double progress_from = 0.0,
                     double progress_to = 1.0,
                     double rapid_plane = 10.0,
-                    bool finishing_subdivision = false);
+                    const PriorOperations& prior_operations = {},
+                    const OperationPlan* prior_subdivisions = nullptr);
 
 // Both stages back to back.
 OperationPlan plan_operation(const JobGeometry& geometry,
@@ -502,14 +562,6 @@ wave::Paths64 stock_after_operations_at_z(
     const PriorOperations& operations);
 wave::Paths64 stock_after_planned_operation_at_z(
     const wave::Paths64& nominal_stock, double z, const OperationPlan& operation);
-
-// Chooses the execution-record layer that supplies a physical stack layer
-// while subdivision playback is in progress. Completed subdivisions retain
-// their own stock; layers belonging to a future subdivision mirror the active
-// subdivision at the same local depth until that future group begins.
-std::size_t subdivision_preview_source(const OperationPlan& operation,
-                                       std::size_t active_level,
-                                       std::size_t target_level);
 
 // What one re-planning run produced. `operations` covers job operations
 // [first, first + operations.size()) and nothing else; the caller splices them

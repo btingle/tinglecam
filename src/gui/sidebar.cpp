@@ -51,6 +51,14 @@ void left_panel(App& app) {
       ImGui::EndChild();
       ImGui::EndTabItem();
     }
+    if (ImGui::BeginTabItem("Messages")) {
+      if (ImGui::BeginChild("messages-scroll", ImVec2(0, 0),
+                            ImGuiChildFlags_None,
+                            ImGuiWindowFlags_AlwaysVerticalScrollbar))
+        messages_panel(app);
+      ImGui::EndChild();
+      ImGui::EndTabItem();
+    }
     ImGui::EndTabBar();
   }
   ImGui::EndChild();

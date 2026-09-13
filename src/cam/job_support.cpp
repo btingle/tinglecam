@@ -51,6 +51,7 @@ void accumulate(PlanStats& into, const PlanStats& from) {
   into.gouge_area += from.gouge_area;
   into.unsafe_plunges += from.unsafe_plunges;
   into.unresolved_entries += from.unresolved_entries;
+  into.skipped_entries += from.skipped_entries;
   into.lifts_over_subject += from.lifts_over_subject;
   into.unreachable_fronts += from.unreachable_fronts;
   into.excess_area += from.excess_area;
@@ -180,6 +181,24 @@ bool resolve_setup(const Operation& operation, const Tool& tool,
     error = "Finishing subdivisions must be between 1 and 64";
     return false;
   }
+  if (!(operation.cleanup_stepover_limit > 0.0 &&
+        operation.cleanup_stepover_limit <= 1.0)) {
+    error = "Cleanup stepover limit must be in (0, 1]";
+    return false;
+  }
+  if (operation.mode == OperationMode::Roughing) {
+    if (operation.depth_breaks.size() > 1024) {
+      error = "At most 1024 depth breaks are supported";
+      return false;
+    }
+    for (double depth : operation.depth_breaks) {
+      if (!std::isfinite(depth) || !(depth > operation.depth_from &&
+                                   depth < operation.depth_to)) {
+        error = "Depth breaks must be finite and inside the operation depth range";
+        return false;
+      }
+    }
+  }
   if (!(operation.entry_front_match_tolerance > 0.0) ||
       !std::isfinite(operation.entry_front_match_tolerance)) {
     error = "Entry-front Z match tolerance must be positive";
@@ -191,12 +210,16 @@ bool resolve_setup(const Operation& operation, const Tool& tool,
     return false;
   }
   if (operation.radial_stock_to_leave < 0.0 ||
-      !std::isfinite(operation.radial_stock_to_leave) ||
-      operation.axial_stock_to_leave < 0.0 ||
-      !std::isfinite(operation.axial_stock_to_leave)) {
-    // Negative would slice the part above the floor and lose what the pass is
-    // about to come down on.
-    error = "Radial and axial stock to leave must be finite and nonnegative";
+      !std::isfinite(operation.radial_stock_to_leave)) {
+    error = "Radial stock to leave must be finite and nonnegative";
+    return false;
+  }
+  if (!std::isfinite(operation.pocket_radial_margin)) {
+    error = "Pocket radial finishing margin must be finite";
+    return false;
+  }
+  if (!std::isfinite(operation.axial_stock_to_leave)) {
+    error = "Axial stock to leave must be finite";
     return false;
   }
   if (operation.cleanup_tolerance < 0.0 ||

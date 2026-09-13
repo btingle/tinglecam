@@ -26,8 +26,27 @@ struct PanelLayout {
 
 PanelLayout default_panel_layout();
 
+enum class UiTheme { Default, Slate, Ember, Paper };
+const char* ui_theme_name(UiTheme theme);
+std::optional<UiTheme> ui_theme_from_name(const std::string& name);
+
+enum class UiFont { Default, Sans, Mono, Serif };
+const char* ui_font_name(UiFont font);
+std::optional<UiFont> ui_font_from_name(const std::string& name);
+
+struct CustomUiTheme {
+  std::string name;
+  UiFont font = UiFont::Default;
+  // Serialized ImGuiStyle snapshot. The GUI owns its representation so the
+  // CAM core does not depend on ImGui headers.
+  std::string style_blob;
+};
+
 struct UserSettings {
   double ui_scale = 1.0;
+  UiTheme ui_theme = UiTheme::Default;
+  std::string custom_theme;
+  std::vector<CustomUiTheme> custom_themes;
   PanelLayout panel_layout{};
   std::array<Operation, 4> operation_defaults{};
 };

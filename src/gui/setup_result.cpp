@@ -12,9 +12,18 @@ struct CutVolume {
   double bottom = 0.0;
   double top = 0.0;
   bool selected = false;
+  bool exclusion = false;
 };
 
 Paths64 area_outline(const cam::ClearingArea& area) {
+  const std::int64_t left = wave::to_integer(area.center_x - area.width * 0.5);
+  const std::int64_t right = wave::to_integer(area.center_x + area.width * 0.5);
+  const std::int64_t low = wave::to_integer(area.center_y - area.height * 0.5);
+  const std::int64_t high = wave::to_integer(area.center_y + area.height * 0.5);
+  return {{{left, low}, {right, low}, {right, high}, {left, high}}};
+}
+
+Paths64 exclusion_outline(const cam::PocketExclusionArea& area) {
   const std::int64_t left = wave::to_integer(area.center_x - area.width * 0.5);
   const std::int64_t right = wave::to_integer(area.center_x + area.width * 0.5);
   const std::int64_t low = wave::to_integer(area.center_y - area.height * 0.5);
@@ -33,11 +42,36 @@ std::vector<CutVolume> cut_volumes(const App& app) {
     // properly; a redraw has nothing useful to add and simply draws nothing.
     try {
       if (operation.mode == cam::OperationMode::Pocket) {
-        for (const cam::PocketParameters& pocket : operation.pockets) {
-          if (!(pocket.depth > 0.0)) continue;
-          volumes.push_back({cam::pocket_boundary(pocket),
-                             pocket.top_z - pocket.depth, pocket.top_z,
-                             selected});
+        if (operation.auto_identify_pockets) {
+          double low = 0.0;
+          double high = 0.0;
+          if (app.geometry.work_range(low, high)) {
+            for (const auto& exclusion : operation.pocket_auto.exclusions) {
+              if (!exclusion.enabled || !(exclusion.width > 0.0) ||
+                  !(exclusion.height > 0.0))
+                continue;
+              volumes.push_back({exclusion_outline(exclusion), low, high,
+                                 selected, true});
+            }
+          }
+        }
+        if (operation.auto_identify_pockets &&
+            i < app.plan.operations.size() &&
+            app.plan.operations[i].planned && app.plan.operations[i].ok()) {
+          for (const auto& pocket : app.plan.operations[i].identified_pockets) {
+            volumes.push_back({cam::pocket_margin_boundary(
+                                   pocket.boundary,
+                                   operation.pocket_radial_margin),
+                               pocket.bottom_z, pocket.top_z, selected});
+          }
+        } else if (!operation.auto_identify_pockets) {
+          for (const cam::PocketParameters& pocket : operation.pockets) {
+            if (!(pocket.depth > 0.0)) continue;
+            volumes.push_back({cam::pocket_boundary(
+                                   pocket, operation.pocket_radial_margin),
+                               pocket.top_z - pocket.depth, pocket.top_z,
+                               selected});
+          }
         }
       } else {
         for (const cam::ClearingArea& area : operation.plane.areas) {
@@ -64,12 +98,19 @@ void append_cut_volumes(const std::vector<CutVolume>& volumes,
     if (volume.top <= volume.bottom) continue;
     const Paths64 rings = drawable_region(volume.rings, spacing);
     if (rings.empty()) continue;
-    const float wall[3]{0.86f, 0.26f, 0.24f};
-    const float face[3]{0.95f, 0.42f, 0.36f};
+    const float wall[3] = {volume.exclusion ? 0.95f : 0.86f,
+                           volume.exclusion ? 0.62f : 0.26f,
+                           volume.exclusion ? 0.12f : 0.24f};
+    const float face[3] = {volume.exclusion ? 1.0f : 0.95f,
+                           volume.exclusion ? 0.78f : 0.42f,
+                           volume.exclusion ? 0.22f : 0.36f};
     const int alpha = volume.selected ? 110 : 60;
+    const ImU32 edge = volume.exclusion
+        ? IM_COL32(255, 205, 80, volume.selected ? 230 : 130)
+        : IM_COL32(255, 140, 130, volume.selected ? 220 : 120);
     append_slab(facets, pool, rings, fill_mesh(rings, nullptr), rings,
                 volume.bottom, volume.top, projection, light, wall, face,
-                IM_COL32(255, 140, 130, volume.selected ? 220 : 120), alpha,
+                edge, alpha,
                 wireframe);
   }
 }
@@ -394,7 +435,7 @@ void draw_result(App& app) {
   }
   const double material_lowest = lowest;
   double material_highest = highest;
-  if (!planned_operation.subdivisions.empty() &&
+  if (!planned_operation.composed_stock && !planned_operation.subdivisions.empty() &&
       planned_operation.subdivisions.front().level_count > 0) {
     const std::size_t first =
         planned_operation.subdivisions.front().first_level;
@@ -472,25 +513,17 @@ void draw_result(App& app) {
                      return levels[a].floor_z > levels[b].floor_z;
                    });
 
-  // Future subdivision layers deliberately alias the latest subdivision being
-  // evaluated. Once subdivision 2 begins, subdivision 3's virtual layers stop
-  // aliasing subdivision 1 and alias subdivision 2 instead. Only the selected
-  // source layer ever needs a live, partially simulated stock object.
+  // Legacy single-stack operations use their execution layer directly.
+  // Roughing with upward cleanup uses composed slabs below instead.
   const auto stock_for = [&](std::size_t target_index) -> const Paths64* {
-    const cam::LevelPlan& target = levels[target_index];
-    std::size_t source_index = target_index;
-    if (app.stack_follows_playback)
-      source_index = cam::subdivision_preview_source(
-          planned_operation, active_level, target_index);
-    const cam::LevelPlan& source = levels[source_index];
+    const cam::LevelPlan& source = levels[target_index];
     const Paths64* remaining = &source.simulation.remaining_stock;
     if (source.nothing_to_cut) {
       remaining = &source.incoming_stock;
-    } else if (app.stack_follows_playback &&
-               source.subdivision == active.subdivision) {
-      if (source.subdivision_level > active.subdivision_level) {
+    } else if (app.stack_follows_playback) {
+      if (target_index > static_cast<std::size_t>(active_level)) {
         remaining = &source.simulation.initial_stock;
-      } else if (source.subdivision_level == active.subdivision_level) {
+      } else if (target_index == static_cast<std::size_t>(active_level)) {
         remaining = &app.material;
       }
     }
@@ -519,17 +552,36 @@ void draw_result(App& app) {
   }
   if (planned_operation.composed_stock) {
     const int before = app.stack_follows_playback ? active_level : static_cast<int>(levels.size());
+    bool stock_changed = false;
     if (app.stock_cache_operation != app.selected_plan_operation || app.stock_cache_level != before) {
-      app.stock_cache = cam::preview_before_level(planned_operation, before);
+      if (app.stock_cache_operation != app.selected_plan_operation ||
+          before < app.stock_cache_level) {
+        app.stock_cache = planned_operation.preview_context;
+        app.stock_cache_level = 0;
+      }
+      // Advancing to the next pocket applies just the newly completed cuts.
+      // A backward seek starts from the immutable initial stock snapshot.
+      for (int i = app.stock_cache_level; i < before; ++i) {
+        const auto& level = levels[i];
+        app.stock_cache = cam::stock_outside(app.stock_cache,
+            level.simulation.removed_material, level.floor_z,
+            level.floor_z + level.axial_depth);
+      }
       app.stock_cache_operation = app.selected_plan_operation;
       app.stock_cache_level = before;
+      stock_changed = true;
     }
-    auto stock = app.stock_cache;
-    if (app.stack_follows_playback && !active.nothing_to_cut) {
-      const auto removed = Clipper2Lib::Difference(active.incoming_stock, app.material, Clipper2Lib::FillRule::NonZero);
-      stock = cam::stock_outside(stock, removed, active.floor_z, active.floor_z+active.axial_depth);
+    const double distance = app.stack_follows_playback ? app.material_distance : -1.0;
+    if (stock_changed || app.stock_display_distance != distance) {
+      app.stock_display_cache = app.stock_cache;
+      if (app.stack_follows_playback && !active.nothing_to_cut) {
+        const auto removed = Clipper2Lib::Difference(active.incoming_stock, app.material, Clipper2Lib::FillRule::NonZero);
+        app.stock_display_cache = cam::stock_outside(app.stock_cache, removed,
+            active.floor_z, active.floor_z + active.axial_depth);
+      }
+      app.stock_display_distance = distance;
     }
-    shader_stock=std::move(stock);
+    shader_stock = app.stock_display_cache;
   }
   try {
     const GLuint texture=prism_view.render(shader_stock,projection,light,top_left,size,float(span*4));
@@ -621,9 +673,9 @@ void draw_result(App& app) {
   if (planned_operation.subdivisions.size() > 1) {
     std::snprintf(
         caption, sizeof caption,
-        "%zu layers from %zu subdivisions, Z %.2f to %.2f mm   Drag: orbit   "
+        "%zu layers (%zu coarse + upward cleanup), Z %.2f to %.2f mm   Drag: orbit   "
         "Right-drag: pan   Wheel: zoom",
-        levels.size(), planned_operation.subdivisions.size(), material_lowest,
+        levels.size(), planned_operation.subdivisions.front().level_count, material_lowest,
         material_highest);
   } else {
     std::snprintf(

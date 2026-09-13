@@ -51,6 +51,9 @@ struct ToolpathStats {
   std::size_t link_count = 0;
   std::size_t retract_count = 0;
   std::size_t entry_count = 0;
+  // Roughing fronts deliberately omitted because neither an at-depth route nor
+  // a cleared landing was available. These are not moves.
+  std::size_t skipped_entry_count = 0;
   // Retracts routed around an obstruction at depth instead of lifting.
   std::size_t detour_count = 0;
   // Lifts whose rapid had to pass over the subject because the free space
@@ -64,11 +67,12 @@ struct Toolpath {
   std::vector<ToolpathMove> moves;
   ToolpathStats stats;
   // Everywhere the cutter's centre may still be at this depth once the pass is
-  // over: the air around the stock plus everything the pass took out. It is
-  // what the pass has to say about travelling at its own floor, and the caller
-  // that has to get from here to the next pass is the one place that question
-  // is asked -- so it is answered here rather than rebuilt from the outside
-  // out of pieces that would have to be kept in step with this.
+  // over: the air around the stock, material removed by earlier operations,
+  // and everything this pass took out. It is what the pass has to say about
+  // travelling at its own floor, and the caller that has to get from here to
+  // the next pass is the one place that question is asked -- so it is answered
+  // here rather than rebuilt from the outside out of pieces that would have to
+  // be kept in step with this.
   Paths64 cleared;
 };
 
@@ -104,7 +108,11 @@ Toolpath build_toolpath(const WaveResult& wave, const FrontLineage& lineage,
                         double rapid_feed_z = 0.0,
                         // Reuse topology already built for inter-layer
                         // association when the caller has it.
-                        const LayerTopology* existing_topology = nullptr);
+                        const LayerTopology* existing_topology = nullptr,
+                        // Material removed by earlier operations at this
+                        // depth, which is available as initial stay-down
+                        // space for the current pass.
+                        const Paths64& initial_cleared = {});
 
 // Sequences the committed layers of an optimized wave analysis in recursive
 // order. Cutter position and cleared material are shared across stage
@@ -115,7 +123,8 @@ Toolpath build_toolpath(const std::vector<WavefrontStage>& stages,
                         double rapid_plane = 10.0,
                         double rapid_feed = 2000.0,
                         double traversal_feed = 1000.0,
-                        double rapid_feed_z = 0.0);
+                        double rapid_feed_z = 0.0,
+                        const Paths64& initial_cleared = {});
 
 // Resamples every uninterrupted at-depth cutting path at a uniform travelled
 // distance. Original micro-vertices are not retained; motion-type changes are

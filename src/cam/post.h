@@ -19,9 +19,9 @@ struct PostResult {
   bool ok() const { return error.empty(); }
 };
 
-// Turns a planned job into G-code for the machine each operation names. Motion
-// is linear throughout: arc output changes the size of the file rather than
-// what it cuts, and is worth adding only once the rest is trusted.
+// Turns a planned job into G-code for the machine each operation names. Planned
+// helical entries retain their circular interpolation and are emitted as G2/G3
+// moves; the remaining toolpath is emitted linearly.
 //
 // Travel that the simulation found removes nothing is emitted at the machine's
 // cutting-feed ceiling rather than as a rapid, because it still happens at
