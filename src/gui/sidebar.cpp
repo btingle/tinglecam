@@ -71,6 +71,8 @@ void left_panel(App& app) {
         (program_height + delta) / available, 0.2f, 0.8f);
   }
 
+  // Keep live progress and cancellation visible above the scrolling list.
+  if (app.planner.running()) plan_buttons(app);
   ImGui::BeginChild("operation-list", ImVec2(0, 0), ImGuiChildFlags_Borders,
                     ImGuiWindowFlags_AlwaysVerticalScrollbar);
   operations_list_panel(app);

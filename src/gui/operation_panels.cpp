@@ -346,6 +346,14 @@ void operation_settings_panel(App& app) {
   ImGui::SetItemTooltip(
       "The complete at-depth path is resampled at this travelled-distance "
       "interval before simulation and feed assignment.");
+  int simulation_method = static_cast<int>(operation.simulation_method);
+  const char* simulation_methods[]{"Area / local stock", "Contact boundary (experimental)",
+                                    "Compare both (area feeds)", "Area / original reference"};
+  if (ImGui::Combo("Engagement method", &simulation_method, simulation_methods, 4))
+    operation.simulation_method = static_cast<wave::SimulationMethod>(simulation_method);
+  ImGui::SetItemTooltip("Compare both retains both engagement estimates for instant preview comparison; "
+                       "feeds use area. Contact boundary uses an experimental estimate for feeds. "
+                       "All modes check complete swept intervals for gouging.");
   if (operation.mode == cam::OperationMode::Roughing) {
     ImGui::DragScalar("Entry-front Z match (mm)", ImGuiDataType_Double,
                       &operation.entry_front_match_tolerance, 0.01f);
@@ -463,7 +471,37 @@ bool plannable_range(const App& app, int first, int last) {
 void plan_buttons(App& app) {
   ImGui::SeparatorText("Plan");
   if (app.planner.running()) {
-    ImGui::ProgressBar(static_cast<float>(app.planner.fraction()), ImVec2(-1, 0));
+    const auto progress = app.planner.progress();
+    const ImVec2 start = ImGui::GetCursorScreenPos();
+    const ImVec2 size(std::max(1.0f, ImGui::GetContentRegionAvail().x),
+                      ImGui::GetFrameHeight());
+    const ImVec2 end(start.x + size.x, start.y + size.y);
+    ImGui::InvisibleButton("##planning_progress", size);
+    auto* draw = ImGui::GetWindowDrawList();
+    draw->AddRectFilled(start, end, ImGui::GetColorU32(ImGuiCol_FrameBg),
+                        ImGui::GetStyle().FrameRounding);
+    const float completed = static_cast<float>(std::clamp(progress.fraction, 0.0, 1.0));
+    const float active = static_cast<float>(std::clamp(progress.active_until,
+                                                      progress.fraction, 1.0));
+    draw->AddRectFilled(start, ImVec2(start.x + size.x * completed, end.y),
+                        IM_COL32(45, 128, 185, 255));
+    if (active > completed)
+      draw->AddRectFilled(ImVec2(start.x + size.x * completed, start.y),
+                          ImVec2(start.x + size.x * active, end.y),
+                          IM_COL32(167, 110, 28, 255));
+    char label[32];
+    std::snprintf(label, sizeof(label), "%.1f%%", 100.0 * completed);
+    const ImVec2 text_size = ImGui::CalcTextSize(label);
+    draw->AddText(ImVec2(start.x + (size.x - text_size.x) * 0.5f,
+                         start.y + (size.y - text_size.y) * 0.5f),
+                  ImGui::GetColorU32(ImGuiCol_Text), label);
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Blue: completed work. Amber: work currently running.\n"
+                        "Progress measures work, not remaining time.");
+    if (progress.total_levels > 0)
+      ImGui::TextWrapped("%zu / %zu layers done | %zu active",
+                         progress.completed_levels, progress.total_levels,
+                         progress.active_workers);
     ImGui::TextWrapped("%s", app.planner.stage().c_str());
     if (ImGui::Button("Cancel")) app.planner.cancel();
     return;

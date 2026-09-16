@@ -642,11 +642,21 @@ void draw_result(App& app) {
     // roughing pass also has. Read off the planar path the retracts and the
     // traversals at the safe plane are invisible, which is most of what there
     // is to see in three dimensions.
+    const bool engagement_view = app.colouring == Colouring::Load && !active.explicit_motion;
     for (const cam::MotionPhase& phase : active.feeds.motion) {
       if (phase.rapid ? !app.show_rapid_travel : !app.show_cutting_paths)
         continue;
+      if (engagement_view && !phase.rapid && !phase.inter_layer &&
+          phase.kind != wave::MoveKind::Entry) continue;
       list->AddLine(project(phase.from, phase.from_z), project(phase.to, phase.to_z),
                     move_colour(phase.kind), phase.kind == wave::MoveKind::Entry ? 1.8f : 1.0f);
+    }
+    if (engagement_view && app.show_cutting_paths) {
+      const bool comparison = active.simulation.method == wave::SimulationMethod::Compare ||
+                              active.simulation.method == wave::SimulationMethod::Contact;
+      for (const auto& move : active.simulation.moves) for (const auto& step : move.steps)
+        list->AddLine(project(step.from,active.floor_z),project(step.to,active.floor_z),
+            engagement_colour(step,comparison ? app.engagement_display : 0),1.5f);
     }
   }
   // This view builds its own projection and canvas rather than going through

@@ -325,6 +325,7 @@ PostResult post_job(const JobPlan& plan,
     // false at the top of every pass -- and the tool crosses at the plane.
     bool at_depth = false;
     bool rapid_descent = false;
+    bool motion_positioned = false;
     double depth_z = 0.0;
     const double plunge_rate = std::max(source->plunge_feed, 1.0);
     for (const LevelPlan& level : operation.levels) {
@@ -338,7 +339,16 @@ PostResult post_job(const JobPlan& plan,
       writer.comment("Depth " + writer.coordinate(cut_z) + " mm, cutting " +
                      writer.coordinate(level.axial_depth) + " mm");
 
-      if (level.explicit_motion) {
+      if (level.explicit_motion || level.feeds.authoritative_motion) {
+        if (level.feeds.authoritative_motion && !motion_positioned &&
+            !level.feeds.motion.empty()) {
+          // The first schedule starts above its entry point. Establish that
+          // XY at clearance before executing its vertical descent.
+          const auto& first = level.feeds.motion.front();
+          writer.rapid(wave::to_world(first.from.x) + job.origin_x,
+                       wave::to_world(first.from.y) + job.origin_y, rapid_plane);
+          motion_positioned = true;
+        }
         // XYZ phases are authoritative for helices: flattening these back to
         // FeedSegment would turn the entry into a vertical plunge.
         for (const MotionPhase& phase : level.feeds.motion) {

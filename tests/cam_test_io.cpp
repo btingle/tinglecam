@@ -8,6 +8,9 @@ void check_user_settings() {
   const auto file = directory / "settings.json";
   cam::UserSettings settings = cam::default_user_settings();
   settings.ui_scale = 1.35;
+  settings.ui_theme = cam::UiTheme::Ember;
+  settings.custom_theme = "Workshop";
+  settings.custom_themes = {{"Workshop", cam::UiFont::Mono, "style-bytes"}};
   settings.panel_layout.left_width = 512.0;
   settings.panel_layout.right_width = 604.0;
   settings.panel_layout.left_program_fraction = 0.61;
@@ -16,10 +19,29 @@ void check_user_settings() {
       .pockets.front().width = 47.0;
   cam::operation_default(settings, cam::OperationMode::PlaneClearing)
       .plane.areas.front().depth = 2.5;
+  auto& rough_defaults = cam::operation_default(settings, cam::OperationMode::Roughing);
+  rough_defaults.depth_breaks = {1.5, 3.0};
+  rough_defaults.finishing_subdivisions = 3;
+  rough_defaults.cleanup_stepover_limit = 0.6;
+  rough_defaults.adaptive_cleanup_stepover = false;
   cam::save_user_settings(file, settings);
   const cam::UserSettings loaded = cam::load_user_settings(file);
+  const auto& loaded_rough = cam::operation_default(loaded, cam::OperationMode::Roughing);
+  require(loaded_rough.depth_breaks == rough_defaults.depth_breaks &&
+              loaded_rough.finishing_subdivisions == 3 &&
+              !loaded_rough.adaptive_cleanup_stepover,
+          "adaptive roughing defaults survive settings persistence");
+  require_near(loaded_rough.cleanup_stepover_limit, 0.6, 1e-12,
+               "default cleanup ceiling survives settings persistence");
   require_near(loaded.ui_scale, 1.35, 1e-12,
                "UI scale survives settings persistence");
+  require(loaded.ui_theme == cam::UiTheme::Ember,
+          "UI theme survives settings persistence");
+  require(loaded.custom_theme == "Workshop" &&
+              loaded.custom_themes.size() == 1 &&
+              loaded.custom_themes.front().font == cam::UiFont::Mono &&
+              loaded.custom_themes.front().style_blob == "style-bytes",
+          "custom theme library survives settings persistence");
   require_near(loaded.panel_layout.left_width, 512.0, 1e-12,
                "left panel width survives settings persistence");
   require_near(loaded.panel_layout.right_width, 604.0, 1e-12,

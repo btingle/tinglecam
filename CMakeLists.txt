@@ -1,6 +1,16 @@
 cmake_minimum_required(VERSION 3.20)
 project(clipper2_wave_demo VERSION 0.1.0 LANGUAGES CXX)
 
+# Geometry planning is expensive without compiler optimization. Plain
+# single-configuration builds should be usable interactively; developers can
+# still explicitly choose Debug, and multi-configuration generators select
+# their configuration when building.
+if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build configuration" FORCE)
+  set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS Debug Release RelWithDebInfo MinSizeRel)
+  message(STATUS "Defaulting to Release for interactive planning performance")
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -126,6 +136,7 @@ set_target_properties(wave_rendering PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_R
 add_library(imgui_sdl_opengl STATIC
   ${imgui_SOURCE_DIR}/imgui.cpp
   ${imgui_SOURCE_DIR}/imgui_draw.cpp
+  ${imgui_SOURCE_DIR}/imgui_demo.cpp
   ${imgui_SOURCE_DIR}/imgui_tables.cpp
   ${imgui_SOURCE_DIR}/imgui_widgets.cpp
   ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl2.cpp
@@ -142,6 +153,7 @@ target_link_libraries(imgui_sdl_opengl PUBLIC SDL2::SDL2 OpenGL::GL)
 add_library(tinglecam_core
   src/cam/contours.cpp
   src/cam/config.cpp
+  src/cam/auto_pockets.cpp
   src/cam/feeds.cpp
   src/cam/job_geometry.cpp
   src/cam/job_planning.cpp
@@ -192,12 +204,14 @@ add_library(tinglecam_app_ui STATIC
   src/gui/drawing.cpp
   src/gui/job_panels.cpp
   src/gui/layout.cpp
+  src/gui/messages.cpp
   src/gui/operation_panels.cpp
   src/gui/output_panels.cpp
   src/gui/result_view.cpp
   src/gui/setup_result.cpp
   src/gui/sidebar.cpp
   src/gui/settings.cpp
+  src/gui/theme.cpp
   src/gui/tool_builder.cpp
 )
 target_link_libraries(tinglecam_app_ui PUBLIC tinglecam_core tinglecam_gui imgui_sdl_opengl)

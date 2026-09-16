@@ -429,6 +429,15 @@ void settings_panel(App& app) {
   changed |= ImGui::DragScalar("Simulation/feed pitch (mm)",
                                ImGuiDataType_Double, &operation.path_pitch,
                                0.01f);
+  if (!cam::is_parametric(operation.mode)) {
+    int method = static_cast<int>(operation.simulation_method);
+    const char* methods[]{"Area / local stock", "Contact boundary (experimental)",
+                          "Compare both (area feeds)", "Area / original reference"};
+    if (ImGui::Combo("Engagement method", &method, methods, 4)) {
+      operation.simulation_method = static_cast<wave::SimulationMethod>(method);
+      changed = true;
+    }
+  }
   changed |= ImGui::Checkbox("Enter manual feed range",
                              &operation.manual_feed_range);
   if (operation.manual_feed_range) {

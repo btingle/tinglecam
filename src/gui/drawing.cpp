@@ -106,6 +106,16 @@ ImU32 blend(ImU32 low, ImU32 high, float t) {
       ImVec4(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t, 1.0f));
 }
 
+ImU32 engagement_colour(const wave::MaterialStep& step, int display) {
+  double value = step.load;
+  if (display == 1) value = step.area_load;
+  if (display == 2) value = step.contact_load;
+  if (display == 3)
+    value = 10*std::abs(std::clamp(step.contact_load,0.0,1.0)-
+                       std::clamp(step.area_load,0.0,1.0));
+  return blend(IM_COL32(70,150,255,255),IM_COL32(255,80,70,255),static_cast<float>(value));
+}
+
 ImU32 limit_colour(cam::FeedLimit limit) {
   switch (limit) {
     case cam::FeedLimit::Engagement: return IM_COL32(90, 200, 140, 255);
@@ -490,6 +500,8 @@ void draw_canvas(App& app) {
       walked += segment.length;
       if (segment.rapid ? !app.show_rapid_travel : !app.show_cutting_paths)
         continue;
+      if (app.colouring == Colouring::Load && !level->explicit_motion &&
+          !segment.rapid && segment.kind != wave::MoveKind::Entry) continue;
       // Anything still ahead of the cutter is drawn faintly, so the part of the
       // pass that has happened reads apart from the part that has not.
       const bool done = segment_start < travelled;
@@ -522,6 +534,23 @@ void draw_canvas(App& app) {
         colour = ImGui::ColorConvertFloat4ToU32(faded);
       }
       list->AddLine(to_screen(segment.from), to_screen(segment.to), colour, width);
+    }
+
+    if (app.colouring == Colouring::Load && !level->explicit_motion && app.show_cutting_paths) {
+      const bool comparison = level->simulation.method == wave::SimulationMethod::Compare ||
+                              level->simulation.method == wave::SimulationMethod::Contact;
+      double move_start = 0;
+      for (std::size_t i=0; i<level->simulation.moves.size(); ++i) {
+        for (const auto& step : level->simulation.moves[i].steps) {
+          ImU32 colour = engagement_colour(step, comparison ? app.engagement_display : 0);
+          if (move_start+step.move_distance_begin >= travelled) {
+            auto faded = ImGui::ColorConvertU32ToFloat4(colour); faded.w = 0.22f;
+            colour = ImGui::ColorConvertFloat4ToU32(faded);
+          }
+          list->AddLine(to_screen(step.from),to_screen(step.to),colour,1.7f);
+        }
+        move_start += level->toolpath.moves[i].length;
+      }
     }
 
     // The cutter itself, at its true diameter, so an engagement that looks

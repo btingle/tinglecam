@@ -52,6 +52,7 @@ void draw_paths(ImDrawList* list, const Paths64& paths, const Transform& to_scre
                 ImU32 colour, float width);
 void fill_paths(ImDrawList* list, const Paths64& paths, const Transform& to_screen,
                 ImU32 solid, std::size_t* failures = nullptr);
+ImU32 engagement_colour(const wave::MaterialStep& step, int display);
 ImU32 blend(ImU32 low, ImU32 high, float t);
 ImU32 limit_colour(cam::FeedLimit limit);
 ImU32 move_colour(wave::MoveKind kind);

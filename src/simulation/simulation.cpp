@@ -54,7 +54,91 @@ double segment_length(const Point64& from, const Point64& to) {
   return std::hypot(to_world(to.x - from.x), to_world(to.y - from.y));
 }
 
+// Point classification stays in floating point: rounding a contact point onto
+// the already-cut boundary would create false engagement on a repeated pass.
+bool contains(double x, double y, const Paths64& region) {
+  int winding = 0;
+  for (const auto& ring : region) {
+    if (ring.empty()) continue;
+    auto a = ring.back();
+    for (const auto& b : ring) {
+      const double side = (double(b.x) - a.x) * (y - a.y) -
+                          (x - a.x) * (double(b.y) - a.y);
+      if (a.y <= y && b.y > y && side > 0) ++winding;
+      if (a.y > y && b.y <= y && side < 0) --winding;
+      a = b;
+    }
+  }
+  return winding != 0;
+}
+
+// Integrate the projection of stock-contacting leading arcs onto the feed
+// direction. Arc length/angle alone is not the removed width. Dividing the
+// projected width by the diameter gives the instantaneous area-based load.
+double contact_at(double x, double y, double ux, double uy, double radius,
+                  const Paths64& stock) {
+  constexpr double half_pi = 1.57079632679489661923;
+  std::vector<double> angles{-half_pi, half_pi};
+  for (const auto& ring : stock) {
+    if (ring.empty()) continue;
+    auto a = ring.back();
+    for (const auto& b : ring) {
+      if (std::max(a.x,b.x) >= x-radius && std::min(a.x,b.x) <= x+radius &&
+          std::max(a.y,b.y) >= y-radius && std::min(a.y,b.y) <= y+radius) {
+        const double dx = double(b.x)-a.x, dy = double(b.y)-a.y;
+        const double ax = a.x-x, ay = a.y-y;
+        const double aa = dx*dx+dy*dy;
+        const double ab = ax*dx+ay*dy;
+        const double discriminant = ab*ab-aa*(ax*ax+ay*ay-radius*radius);
+        if (aa > 0 && discriminant >= 0) {
+          const double root = std::sqrt(discriminant);
+          for (double t : {(-ab-root)/aa, (-ab+root)/aa}) {
+            if (t < 0 || t > 1) continue;
+            const double px = ax+t*dx, py = ay+t*dy;
+            const double angle = std::atan2(ux*py-uy*px, ux*px+uy*py);
+            if (angle > -half_pi && angle < half_pi) angles.push_back(angle);
+          }
+        }
+      }
+      a = b;
+    }
+  }
+  std::sort(angles.begin(), angles.end());
+  double load = 0;
+  for (std::size_t i=1; i<angles.size(); ++i) {
+    const double mid = (angles[i-1]+angles[i])*0.5;
+    const double forward = radius*std::cos(mid), side = radius*std::sin(mid);
+    if (contains(x+ux*forward-uy*side, y+uy*forward+ux*side, stock))
+      load += 0.5*(std::sin(angles[i])-std::sin(angles[i-1]));
+  }
+  return std::clamp(load, 0.0, 1.0);
+}
+
+double contact_load(const Point64& from, const Point64& to, double radius,
+                    const Paths64& stock) {
+  const double dx = double(to.x)-from.x, dy = double(to.y)-from.y;
+  const double length = std::hypot(dx,dy);
+  // Fixed quadrature within the existing interval, not adaptive path sampling.
+  constexpr double nodes[]{0.1127016653792583, 0.5, 0.8872983346207417};
+  constexpr double weights[]{5.0/18, 8.0/18, 5.0/18};
+  double load = 0;
+  for (int i=0; i<3; ++i)
+    load += weights[i]*contact_at(from.x+nodes[i]*dx, from.y+nodes[i]*dy,
+                                  dx/length,dy/length,radius,stock);
+  return load;
+}
+
 }  // namespace
+
+const char* simulation_method_name(SimulationMethod method) {
+  switch (method) {
+    case SimulationMethod::LocalArea: return "local_area";
+    case SimulationMethod::Contact: return "contact";
+    case SimulationMethod::Compare: return "compare";
+    case SimulationMethod::ReferenceArea: return "reference_area";
+  }
+  return "unknown";
+}
 
 double material_area(const Paths64& paths) {
   if (paths.empty()) return 0.0;
@@ -66,7 +150,9 @@ SimulationResult simulate_material(const Paths64& raw_stock,
                                    const Paths64& raw_final_subject,
                                    const Toolpath& toolpath,
                                    double tool_radius,
-                                   double simulation_stock_inflation) {
+                                   double simulation_stock_inflation,
+                                   SimulationMethod method,
+                                   const std::function<bool(double)>& progress) {
   if (raw_stock.empty()) throw std::invalid_argument("Simulation stock is empty");
   if (raw_final_subject.empty())
     throw std::invalid_argument("Final subject is empty");
@@ -76,6 +162,7 @@ SimulationResult simulate_material(const Paths64& raw_stock,
     throw std::invalid_argument("Simulation stock inflation must be finite");
 
   SimulationResult result;
+  result.method = method;
   result.tool_radius = tool_radius;
   result.stock_inflation = simulation_stock_inflation;
   result.initial_stock = normalized(raw_stock);
@@ -97,9 +184,37 @@ SimulationResult simulate_material(const Paths64& raw_stock,
 
   Paths64 remaining = result.initial_stock;
   Paths64 gouges;
+  const bool local_mode = method != SimulationMethod::ReferenceArea;
+  const bool use_contact = method == SimulationMethod::Contact ||
+                           method == SimulationMethod::Compare;
+  Paths64 local, pending_sweeps;
+  std::size_t batch_end = 0;
+  const auto flush = [&] {
+    if (!pending_sweeps.empty()) {
+      // All capsule sweeps have positive winding. Clipper can subtract their
+      // union directly, committing one global update for the whole batch.
+      remaining = Difference(remaining, pending_sweeps, FillRule::NonZero);
+      pending_sweeps.clear();
+    }
+  };
+  Point64 last_cut_to;
+  bool continuing_cut = false;
+  double sampled_distance = 0;
   const Rect64 final_subject_bounds = GetBounds(result.final_subject);
   result.moves.resize(toolpath.moves.size());
   result.checkpoints.reserve(toolpath.moves.size() / kCheckpointMoveStride);
+
+  std::size_t total_intervals = toolpath.moves.size();
+  for (const auto& move : toolpath.moves)
+    if (engaged(move.kind) && !move.path.empty())
+      total_intervals += move.path.size() - 1;
+  std::size_t completed_intervals = 0;
+  const auto report_progress = [&] {
+    if (progress && !progress(total_intervals == 0 ? 1.0 :
+          static_cast<double>(completed_intervals) / total_intervals))
+      throw std::runtime_error("Cancelled");
+  };
+  report_progress();
 
   for (std::size_t move_index = 0; move_index < toolpath.moves.size(); ++move_index) {
     const ToolpathMove& move = toolpath.moves[move_index];
@@ -107,56 +222,110 @@ SimulationResult simulate_material(const Paths64& raw_stock,
 
     if (engaged(move.kind)) {
       double move_distance = 0.0;
+      batch_end = 0;
       for (std::size_t segment = 1; segment < move.path.size(); ++segment) {
-        const Point64& segment_from = move.path[segment - 1];
-        const Point64& segment_to = move.path[segment];
-        const double length = segment_length(segment_from, segment_to);
-        if (!(length > 0.0)) continue;
-
-        // The caller normalizes cutting paths to the configured simulation
-        // pitch. Evaluate those intervals exactly rather than imposing a
-        // second, unrelated subdivision here.
-        const std::size_t pieces = 1;
-        for (std::size_t piece = 0; piece < pieces; ++piece) {
-          const double begin_ratio = static_cast<double>(piece) / pieces;
-          const double end_ratio = static_cast<double>(piece + 1) / pieces;
-          MaterialStep step;
-          step.from = interpolate(segment_from, segment_to, begin_ratio);
-          step.to = interpolate(segment_from, segment_to, end_ratio);
-          const double step_length = segment_length(step.from, step.to);
-          if (!(step_length > 0.0)) continue;
-          step.move_distance_begin = move_distance + length * begin_ratio;
-          step.move_distance_end = move_distance + length * end_ratio;
-          const Paths64 sweep = tool_sweep(step.from, step.to, radius_integer);
-
-          const Paths64 removed =
-              Intersect(remaining, sweep, FillRule::NonZero);
-          Paths64 gouge;
-          if (removed.empty()) {
-            ++result.stats.empty_cutting_steps;
-          } else if (bounds_overlap(GetBounds(removed), final_subject_bounds)) {
-            gouge = Intersect(removed, result.final_subject,
-                              FillRule::NonZero);
-          } else {
-            ++result.stats.gouge_bounds_rejections;
-          }
-          step.removed_area = boolean_result_area(removed);
-          step.gouge_area = boolean_result_area(gouge);
-          step.load = step.removed_area /
-                      (2.0 * tool_radius * step_length);
-          result.stats.maximum_load =
-              std::max(result.stats.maximum_load, step.load);
-          if (step.gouge_area > 0.0) {
-            ++result.stats.gouging_steps;
-            gouges.insert(gouges.end(), gouge.begin(), gouge.end());
-          }
-          ++result.stats.cutting_steps;
-          if (!removed.empty())
-            remaining = Difference(remaining, sweep, FillRule::NonZero);
-          simulated.steps.push_back(std::move(step));
+        if ((++completed_intervals % 64) == 0) report_progress();
+        const Point64& from = move.path[segment-1];
+        const Point64& to = move.path[segment];
+        const double length = segment_length(from,to);
+        if (!(length > 0)) continue;
+        if (local_mode && segment >= batch_end) {
+          flush();
+          Rect64 bounds(from.x,from.y,from.x,from.y);
+          double distance = 0;
+          batch_end = segment;
+          // Bound both the geometry working set and the length of a batch.
+          // Preserve every input interval, including corners and reversals.
+          do {
+            const auto& p = move.path[batch_end];
+            bounds.left = std::min(bounds.left,p.x);
+            bounds.right = std::max(bounds.right,p.x);
+            bounds.top = std::min(bounds.top,p.y);
+            bounds.bottom = std::max(bounds.bottom,p.y);
+            distance += segment_length(move.path[batch_end-1],p);
+            ++batch_end;
+          } while (batch_end < move.path.size() && batch_end-segment < 64 &&
+                   distance < 4*tool_radius);
+          const auto margin = to_integer(tool_radius+1.0);
+          bounds.left -= margin; bounds.right += margin;
+          bounds.top -= margin; bounds.bottom += margin;
+          local = Clipper2Lib::RectClip(bounds,remaining);
+          ++result.stats.stock_batches;
         }
+        auto& stock = local_mode ? local : remaining;
+        MaterialStep step;
+        step.from = from; step.to = to;
+        step.move_distance_begin = move_distance;
+        step.move_distance_end = move_distance+length;
+        const Paths64 sweep = tool_sweep(from,to,radius_integer);
+        Clipper64 cut;
+        cut.AddSubject(stock);
+        cut.AddClip(sweep);
+        Paths64 removed, after, gouge;
+        if (method == SimulationMethod::Contact) {
+          cut.Execute(ClipType::Difference,FillRule::NonZero,after);
+          step.removed_area = std::max(0.0,boolean_result_area(stock)-boolean_result_area(after));
+          // Gouge detection always uses the swept interval, independently of
+          // the contact estimate and its three quadrature locations.
+          if (bounds_overlap(GetBounds(sweep),final_subject_bounds)) {
+            cut.Execute(ClipType::Intersection,FillRule::NonZero,removed);
+            gouge = Intersect(removed,result.final_subject,FillRule::NonZero);
+          } else if (step.removed_area > 0) ++result.stats.gouge_bounds_rejections;
+        } else {
+          cut.Execute(ClipType::Intersection,FillRule::NonZero,removed);
+          step.removed_area = boolean_result_area(removed);
+          if (!removed.empty()) {
+            cut.Execute(ClipType::Difference,FillRule::NonZero,after);
+            if (bounds_overlap(GetBounds(removed),final_subject_bounds))
+              gouge = Intersect(removed,result.final_subject,FillRule::NonZero);
+            else ++result.stats.gouge_bounds_rejections;
+          }
+        }
+        const bool cutting = step.removed_area > 0;
+        step.area_load = step.removed_area/(2*tool_radius*length);
+        step.contact_load = step.area_load;
+        if (use_contact && cutting) {
+          // A discontinuous entry may remove the starting disk as well as the
+          // forward sweep. A circumference query cannot measure that disk.
+          if (continuing_cut && last_cut_to == from && step.area_load <= 1) {
+            // Sweeps use the radius rounded to the integer grid, while feeds
+            // normalize by the configured diameter (also for area loads).
+            step.contact_load = contact_load(from,to,radius_integer,stock) *
+                                radius_integer/(kIntegerScale*tool_radius);
+            // Preserve positive removal if a thin feature falls between the
+            // quadrature locations. This does not make the estimate exact.
+            if (step.contact_load <= 1e-12) {
+              step.contact_load = step.area_load;
+              ++result.stats.contact_fallbacks;
+            }
+          } else ++result.stats.contact_fallbacks;
+        }
+        step.load = method == SimulationMethod::Contact ? step.contact_load : step.area_load;
+        const double disagreement = std::abs(std::clamp(step.contact_load,0.0,1.0) -
+                                            std::clamp(step.area_load,0.0,1.0));
+        result.stats.contact_mean_abs_difference += disagreement*length;
+        result.stats.contact_max_abs_difference =
+            std::max(result.stats.contact_max_abs_difference,disagreement);
+        sampled_distance += length;
+        step.gouge_area = boolean_result_area(gouge);
+        result.stats.maximum_load = std::max(result.stats.maximum_load,step.load);
+        if (step.gouge_area > 0) {
+          ++result.stats.gouging_steps;
+          gouges.insert(gouges.end(),gouge.begin(),gouge.end());
+        }
+        ++result.stats.cutting_steps;
+        if (!cutting) ++result.stats.empty_cutting_steps;
+        if (cutting) {
+          stock = std::move(after);
+        }
+        // Commit the geometric sweep regardless of either load estimate, so
+        // both methods leave identical stock for subsequent batches/layers.
+        if (local_mode) pending_sweeps.insert(pending_sweeps.end(),sweep.begin(),sweep.end());
+        simulated.steps.push_back(step);
         move_distance += length;
+        continuing_cut = true; last_cut_to = to;
       }
+      flush();
     } else if (move.kind == MoveKind::Retract && !move.path.empty()) {
       const Point64& destination = move.path.back();
       const Paths64 footprint{
@@ -171,14 +340,20 @@ SimulationResult simulate_material(const Paths64& raw_stock,
       ++result.stats.unresolved_entries;
     }
 
+    ++completed_intervals;
+    report_progress();
+    if (!engaged(move.kind)) continuing_cut = false;
     if ((move_index + 1) % kCheckpointMoveStride == 0)
       result.checkpoints.push_back({move_index + 1, remaining});
   }
 
   result.remaining_stock = remaining;
+  if (sampled_distance > 0) result.stats.contact_mean_abs_difference /= sampled_distance;
   result.removed_material = Difference(result.initial_stock, remaining,
                                        FillRule::NonZero);
-  result.gouged_subject = normalized(gouges);
+  result.gouged_subject = local_mode
+      ? Intersect(result.removed_material,result.final_subject,FillRule::NonZero)
+      : normalized(gouges);
   result.excess_material = Difference(remaining, result.final_subject,
                                       FillRule::NonZero);
   result.stats.initial_stock_area = boolean_result_area(result.initial_stock);
@@ -197,6 +372,7 @@ Paths64 simulation_stock_at(const SimulationResult& simulation,
   if (simulation.moves.size() != toolpath.moves.size())
     throw std::invalid_argument("Simulation and toolpath moves do not match");
 
+  if (distance >= toolpath_length(toolpath)) return simulation.remaining_stock;
   const ToolpathCursor cursor = toolpath_at(toolpath, distance);
   const double radius_integer = static_cast<double>(to_integer(simulation.tool_radius));
   Paths64 remaining = simulation.initial_stock;

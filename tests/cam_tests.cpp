@@ -3,11 +3,14 @@
 int main(int argc, char** argv) {
   using namespace cam_test;
   try {
+    check_parallel_progress();
     check_engagement_feeds();
     check_feed_compatible_merge();
     check_path_resampling();
     check_level_floors();
     check_axial_allowance();
+    check_adaptive_roughing();
+    check_roughing_links();
     check_boundary_rail_slack();
     check_entry_front_selection();
     check_inter_layer_topology();

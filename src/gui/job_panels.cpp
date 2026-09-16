@@ -691,7 +691,7 @@ void operations_list_panel(App& app) {
   ImGui::EndDisabled();
   ImGui::EndDisabled();
 
-  plan_buttons(app);
+  if (!app.planner.running()) plan_buttons(app);
 
   ImGui::TextWrapped(
       "Operations run from top to bottom. Simulation stock is handed to each "

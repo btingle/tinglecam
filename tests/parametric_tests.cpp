@@ -1,9 +1,11 @@
 #include "cam/config.h"
+#include "cam/auto_pockets.h"
 #include "cam/parametric.h"
 #include "cam/post.h"
 
 #include <algorithm>
 #include <cmath>
+#include <filesystem>
 #include <iostream>
 #include <limits>
 #include <sstream>
@@ -131,10 +133,9 @@ void pockets() {
                   "The cutter remains inside rounded pocket corners");
         }
         if (phase.to_z < upper-1e-8 && phase.to_z < phase.from_z-1e-8) {
-          check(phase.kind == wave::MoveKind::Entry && phase.from != phase.to,
-                "Every descent into a new pocket layer must be helical, not vertical");
-          const double xy = std::hypot(wave::to_world(phase.to.x-phase.from.x),
-                                       wave::to_world(phase.to.y-phase.from.y));
+          check(phase.kind == wave::MoveKind::Entry && phase.arc,
+                "Every descent into a new pocket layer must be a helical arc");
+          const double xy = phase.path_distance_end - phase.path_distance_begin;
           check((phase.from_z-phase.to_z)/xy < 0.055,
                 "Helical plunge must remain gradual (approximately three degrees)");
           near(phase.rate, op.plunge_feed, "Helix uses operation ramp feed");
@@ -157,28 +158,66 @@ void pockets() {
     check(post.text.find("F135") != std::string::npos, "Ramp feed reaches G-code");
     std::istringstream lines(post.text);
     std::string line;
-    int mode = -1, simultaneous = 0;
+    int arcs = 0;
     double x = 0, y = 0, z = 0;
-    bool have_position = false;
     while (std::getline(lines,line)) {
       if (line.empty() || line.front() == '(') continue;
       std::istringstream words(line); std::string word;
       double nx = x, ny = y, nz = z;
       bool coordinate = false;
       while (words >> word) {
-        if (word == "G0") mode = 0;
-        if (word == "G1") mode = 1;
+        if (word == "G2" || word == "G3") ++arcs;
         if (word.size() < 2) continue;
         if (word[0] == 'X') { nx = std::stod(word.substr(1)); coordinate = true; }
         if (word[0] == 'Y') { ny = std::stod(word.substr(1)); coordinate = true; }
         if (word[0] == 'Z') { nz = std::stod(word.substr(1)); coordinate = true; }
       }
-      if (coordinate && mode == 1 && have_position && nz < z && (nx != x || ny != y)) ++simultaneous;
-      if (coordinate) { x = nx; y = ny; z = nz; have_position = true; }
+      if (coordinate) { x = nx; y = ny; z = nz; }
     }
-    check(simultaneous > 60, "G-code retains simultaneous XY/Z helix motion");
+    check(arcs > 0, "G-code emits helical entries as circular moves");
+    check(post.text.find("G3") != std::string::npos &&
+              post.text.find(" I") != std::string::npos &&
+              post.text.find(" J") != std::string::npos,
+          "Helical circular moves include the controller arc centre offsets");
     check(post.text.find("Z14.5") != std::string::npos, "Post applies the origin to final pocket depth");
   }
+}
+
+// The radial margin moves every wall of the pocket by it, inwards or, when it
+// is negative, outwards. What gets cut must follow the margined outline rather
+// than the entered one.
+void pocket_margin() {
+  const double cutter_radius = tool().diameter/2;
+  for (const double margin : {0.4, -0.4}) {
+    auto op = operation(cam::OperationMode::Pocket);
+    op.pocket_radial_margin = margin;
+    const auto& pocket = op.pockets.front();
+    const auto result = plan(op);
+    check_timeline(result);
+    double reach_x = 0, reach_y = 0;
+    for (const auto& level : result.operations.front().levels) {
+      const double target =
+          wave::material_area(cam::pocket_boundary(pocket, margin));
+      check(level.simulation.stats.removed_area > target*0.985,
+            "A margined pocket is still cleared to its own wall");
+      for (const auto& phase : level.feeds.motion) {
+        if (phase.rapid) continue;
+        for (const auto& at : {phase.from, phase.to}) {
+          reach_x = std::max(reach_x, std::abs(wave::to_world(at.x)-pocket.center_x)+cutter_radius);
+          reach_y = std::max(reach_y, std::abs(wave::to_world(at.y)-pocket.center_y)+cutter_radius);
+        }
+      }
+    }
+    check(reach_x <= pocket.width/2-margin+0.004 &&
+              reach_y <= pocket.height/2-margin+0.004,
+          "The cut stops at the wall the margin asks for");
+    check(reach_x > pocket.width/2-margin-0.05 &&
+              reach_y > pocket.height/2-margin-0.05,
+          "The cut reaches the wall the margin asks for");
+  }
+  auto bad = operation(cam::OperationMode::Pocket);
+  bad.pocket_radial_margin = 7;
+  check(!plan(bad).ok(), "A margin that closes the pocket must fail planning");
 }
 
 void multiple_pockets() {
@@ -250,6 +289,70 @@ void planes() {
   }
 }
 
+void automatic_pockets() {
+  const std::filesystem::path fixture =
+      std::filesystem::path(__FILE__).parent_path() /
+      "fixtures/meshes/auto_pocket.obj";
+  cam::JobGeometry geometry;
+  geometry.load_part(fixture);
+  geometry.set_box_stock(true, 2.0);
+  auto op = operation(cam::OperationMode::Pocket);
+  op.auto_identify_pockets = true;
+  op.pocket_auto.check_depth = 1.0;
+  op.pocket_auto.helix_angle_degrees = 6.0;
+  op.pockets.clear();
+  const auto identified = cam::identify_pockets(geometry, op);
+  check(identified.size() == 1,
+        "Automatic pocket detection finds the blind hole: " +
+            std::to_string(identified.size()));
+  near(identified.front().center_x, 10.0, "Identified pocket center X");
+  near(identified.front().center_y, 10.0, "Identified pocket center Y");
+  near(identified.front().width, 4.0, "Identified pocket width");
+  near(identified.front().height, 4.0, "Identified pocket height");
+  near(identified.front().bottom_z, 3.0, "GPU ray finds pocket floor", 0.002);
+  const auto planned = cam::plan_parametric_operation(
+      op, tool(), machine(), 20.0, {}, {}, 0.0, 1.0, &geometry);
+  check(planned.ok(), planned.error);
+  check(planned.identified_pockets.size() == 1,
+        "Automatic pocket geometry is retained in the completed plan");
+  check(!planned.levels.empty(), "Automatic pocket produces cutting levels");
+  bool auto_arc = false;
+  for (const auto& level : planned.levels)
+    for (const auto& phase : level.feeds.motion)
+      if (phase.arc) {
+        auto_arc = true;
+        check((phase.from_z - phase.to_z) /
+                  (phase.path_distance_end - phase.path_distance_begin) > 0.08,
+              "Automatic pockets use the configured helix angle");
+      }
+  check(auto_arc, "Automatic pockets retain circular helical entries");
+
+  cam::JobGeometry through_geometry;
+  through_geometry.load_part(std::filesystem::path(__FILE__).parent_path() /
+                             "fixtures/meshes/auto_through_pocket.obj");
+  through_geometry.set_box_stock(true, 2.0);
+  const auto through = cam::identify_pockets(through_geometry, op);
+  check(through.size() == 1, "Automatic detection keeps through holes");
+  near(through.front().bottom_z, 0.0, "A missed ray uses the stock bottom", 0.002);
+
+  op.pocket_auto.exclusions.front().enabled = true;
+  op.pocket_auto.exclusions.front().center_x = 10.0;
+  op.pocket_auto.exclusions.front().center_y = 10.0;
+  op.pocket_auto.exclusions.front().width = 5.0;
+  op.pocket_auto.exclusions.front().height = 5.0;
+  op.pocket_auto.exclusions.push_back({true, -10.0, -10.0, 2.0, 2.0});
+  check(cam::identify_pockets(geometry, op).empty(),
+        "The exclusion area removes overlapping detected pockets");
+  const auto automatic_round_trip = cam::job_from_json_text(
+      cam::to_json_text(cam::Job{.operations = {op}}));
+  check(automatic_round_trip.operations.front().auto_identify_pockets &&
+            automatic_round_trip.operations.front().pocket_auto.exclusions.size() == 2 &&
+            automatic_round_trip.operations.front().pocket_auto.exclusions.front().enabled &&
+            automatic_round_trip.operations.front().pocket_auto.helix_angle_degrees == 6.0,
+        "Automatic pocket settings round-trip without saving derived geometry");
+
+}
+
 void validation_and_storage() {
   auto op = operation(cam::OperationMode::Pocket);
   auto expect_error = [&](const cam::Operation& invalid) { check(!plan(invalid).ok(), "Invalid input must fail planning"); };
@@ -275,6 +378,7 @@ void validation_and_storage() {
         "A coincident later area finds the surface already faced off");
 
   cam::Job job; job.operations = {op, operation(cam::OperationMode::PlaneClearing)};
+  job.operations[0].pocket_radial_margin = -0.25;
   job.operations[0].tool_number = 8; job.operations[0].length_offset = 4;
   job.operations[0].coolant = true;
   const auto text = cam::to_json_text(job);
@@ -294,7 +398,8 @@ void validation_and_storage() {
 }  // namespace
 
 int main() {
-  try { pockets(); multiple_pockets(); planes(); validation_and_storage(); }
+  try { pockets(); pocket_margin(); multiple_pockets(); planes(); automatic_pockets();
+        validation_and_storage(); }
   catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
   std::cout << "Parametric pocket, plane, motion and persistence checks passed.\n";
 }

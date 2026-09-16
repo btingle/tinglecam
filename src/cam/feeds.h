@@ -71,6 +71,8 @@ struct MotionPhase {
   // left it to where this one starts. It belongs to no pass's geometry, so it
   // is flagged rather than inferred from being horizontal and distance-free.
   bool arrival = false;
+  // A stock-validated positioning move between roughing layers.
+  bool inter_layer = false;
 };
 
 struct MotionCursor {
@@ -91,12 +93,13 @@ struct FeedSchedule {
   std::vector<FeedSegment> segments;
   std::vector<MotionPhase> motion;
   FeedStats stats;
+  // Inter-layer XYZ links cannot be reconstructed from planar feed segments.
+  bool authoritative_motion = false;
   // This pass finishes with the cutter still at its own floor. The pass after
   // it comes down from there rather than across the rapid plane.
   bool ends_at_depth = false;
-  // And the mirror of it: this pass was reached without lifting, so it opens
-  // standing over its own first point at the depth above, with only the descent
-  // left to make.
+  // This pass was reached without visiting clearance. Authoritative motion
+  // may begin with a validated XY/Z link from the preceding pass's endpoint.
   bool begins_at_depth = false;
 };
 

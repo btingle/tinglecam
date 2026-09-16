@@ -15,6 +15,13 @@ namespace {
 
 using nlohmann::json;
 
+std::optional<wave::SimulationMethod> simulation_method_from_name(const std::string& name) {
+  for (auto method : {wave::SimulationMethod::LocalArea, wave::SimulationMethod::Contact,
+                      wave::SimulationMethod::Compare, wave::SimulationMethod::ReferenceArea})
+    if (name == wave::simulation_method_name(method)) return method;
+  return std::nullopt;
+}
+
 std::optional<OperationMode> operation_mode_from_name(const std::string& name) {
   if (name == "roughing") return OperationMode::Roughing;
   if (name == "contour_finishing") return OperationMode::ContourFinishing;
@@ -235,6 +242,7 @@ json to_json(const Operation& operation) {
               {"lead_in", operation.lead_in},
               {"stock_deviation", operation.stock_deviation},
               {"path_pitch", operation.path_pitch},
+              {"simulation_method", wave::simulation_method_name(operation.simulation_method)},
               {"entry_front_match_tolerance",
                operation.entry_front_match_tolerance},
               {"tiny_split_area_factor", operation.tiny_split_area_factor},
@@ -393,6 +401,7 @@ Operation operation_from(const json& node) {
   read(node, "lead_in", operation.lead_in);
   read(node, "stock_deviation", operation.stock_deviation);
   read(node, "path_pitch", operation.path_pitch);
+  read_enum(node, "simulation_method", operation.simulation_method, simulation_method_from_name);
   read(node, "entry_front_match_tolerance",
        operation.entry_front_match_tolerance);
   read(node, "tiny_split_area_factor", operation.tiny_split_area_factor);

@@ -186,6 +186,26 @@ void view_panel(App& app) {
   int colouring = static_cast<int>(app.colouring);
   if (ImGui::Combo("Colour by", &colouring, kColourings, 4))
     app.colouring = static_cast<Colouring>(colouring);
+  if (app.colouring == Colouring::Load && !levels.empty()) {
+    const auto& simulation = levels[app.selected_level].simulation;
+    const bool comparison = simulation.method == wave::SimulationMethod::Compare ||
+                            simulation.method == wave::SimulationMethod::Contact;
+    if (comparison) {
+      const char* estimates[]{"Planned engagement", "Area", "Contact boundary", "Absolute difference"};
+      ImGui::Combo("Engagement display", &app.engagement_display, estimates, 4);
+      ImGui::TextWrapped("Difference: mean %.2f, max %.2f percentage points",
+          100*simulation.stats.contact_mean_abs_difference,
+          100*simulation.stats.contact_max_abs_difference);
+      ImGui::TextDisabled("%zu entry / thin-feature fallbacks",simulation.stats.contact_fallbacks);
+      if (app.engagement_display == 3)
+        ImGui::TextWrapped("Blue = equal; red = 10 percentage points or more apart.");
+      else ImGui::TextDisabled("Blue = 0%%; red = 100%% engagement.");
+      ImGui::TextWrapped("Display only. Compare both plans feeds from area; select Contact boundary "
+                         "in operation settings and re-plan to try contact-based feeds.");
+    } else if (!levels[app.selected_level].explicit_motion) {
+      ImGui::TextWrapped("Choose Compare both under Engagement method and re-plan to compare estimates here.");
+    }
+  }
   ImGui::Checkbox("Stock", &app.show_stock);
   ImGui::SameLine();
   ImGui::Checkbox("Part", &app.show_part);

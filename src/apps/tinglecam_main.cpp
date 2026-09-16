@@ -12,6 +12,7 @@ int main(int argc, char** argv) {
   std::string view_name;
   double progress_fraction = -1.0;
   double stepdown = 0.0;
+  std::string simulation_method;
   int finishing_subdivisions = 0;
   std::vector<double> depth_breaks;
   std::optional<double> cleanup_stepover_limit;
@@ -47,6 +48,14 @@ int main(int argc, char** argv) {
       else if (argument == "--stock") std::snprintf(app.stock_path.data(), app.stock_path.size(), "%s", value().c_str());
       else if (argument == "--screenshot") screenshot = value();
       else if (argument == "--view") view_name = value();
+      else if (argument == "--engagement-display") {
+        const auto name = value();
+        const std::array<std::string,4> names{"planned","area","contact","difference"};
+        const auto found = std::find(names.begin(),names.end(),name);
+        if (found == names.end()) throw std::invalid_argument("Unknown engagement display");
+        app.engagement_display = static_cast<int>(found-names.begin());
+        app.colouring = Colouring::Load;
+      }
       else if (argument == "--at") progress_fraction = std::stod(value());
       else if (argument == "--follow") app.stack_follows_playback = true;
       else if (argument == "--models") {
@@ -83,6 +92,7 @@ int main(int argc, char** argv) {
         cleanup_stepover_limit = std::stod(value());
       else if (argument == "--fixed-cleanup-stepover") fixed_cleanup_stepover = true;
       else if (argument == "--stepover") stepover = std::stod(value());
+      else if (argument == "--simulation-method") simulation_method = value();
       else if (argument == "--path-pitch") path_pitch = std::stod(value());
       else if (argument == "--entry-front-tolerance")
         entry_front_tolerance = std::stod(value());
@@ -104,6 +114,7 @@ int main(int argc, char** argv) {
             "  --machine ID       Machine profile\n"
             "  --material ID      Workpiece material\n"
             "  --stepover RATIO   Radial engagement as a fraction of diameter\n"
+            "  --simulation-method NAME  local_area, contact, compare, reference_area\n"
             "  --stepdown MM      Axial depth per pass\n"
             "  --finishing-subdivisions N\n"
             "                     Coarse descent, then N-1 upward cuts per terrace\n"
@@ -138,6 +149,8 @@ int main(int argc, char** argv) {
             "  --models stock|part|both   What the plan view shows\n"
             "  --view models|pass|result\n"
             "                     Which view a screenshot should capture\n"
+            "  --engagement-display planned|area|contact|difference\n"
+            "                     Engagement colours for preview/screenshots\n"
             "  --at FRACTION      How far through the pass to place the cutter, 0 to 1\n"
             "  -h, --help         Show this help and exit\n\n"
             "Tools live in %s\n"
@@ -221,6 +234,18 @@ int main(int argc, char** argv) {
     if (fixed_cleanup_stepover) operation.adaptive_cleanup_stepover = false;
     if (stepover > 0.0) operation.stepover_ratio = stepover;
     if (path_pitch > 0.0) operation.path_pitch = path_pitch;
+    if (!simulation_method.empty()) {
+      bool found = false;
+      for (auto method : {wave::SimulationMethod::LocalArea, wave::SimulationMethod::Contact,
+                          wave::SimulationMethod::Compare, wave::SimulationMethod::ReferenceArea})
+        if (simulation_method == wave::simulation_method_name(method)) {
+          operation.simulation_method = method; found = true;
+        }
+      if (!found) {
+        std::fprintf(stderr, "--simulation-method: use local_area, contact, compare, or reference_area\n");
+        return EXIT_FAILURE;
+      }
+    }
     if (entry_front_tolerance > 0.0)
       operation.entry_front_match_tolerance = entry_front_tolerance;
     if (tiny_split_area_factor)
@@ -276,13 +301,14 @@ int main(int argc, char** argv) {
           "planning_profile_ms total=%.3f slicing=%.3f preparation=%.3f "
           "wavefront=%.3f lineage=%.3f inter_layer=%.3f toolpath=%.3f "
           "cleanup=%.3f stitching=%.3f resampling=%.3f simulation=%.3f "
-          "feeds=%.3f\n",
+          "feeds=%.3f parallel_cleanup=%.3f cleanup_work=%.3f\n",
           m.total_milliseconds, m.slicing_milliseconds,
           m.preparation_milliseconds, m.wavefront_milliseconds,
           m.lineage_milliseconds, m.inter_layer_milliseconds,
           m.toolpath_milliseconds, m.cleanup_milliseconds,
           m.stitching_milliseconds, m.resampling_milliseconds,
-          m.simulation_milliseconds, m.feeds_milliseconds);
+          m.simulation_milliseconds, m.feeds_milliseconds,
+          m.parallel_cleanup_milliseconds, m.cleanup_work_milliseconds);
       std::fprintf(
           stderr,
           "planning_profile_counts wave_generations=%zu fronts=%zu "
@@ -293,6 +319,27 @@ int main(int argc, char** argv) {
           m.accepted_analysis_trials, m.toolpath_moves,
           m.simulation_intervals, m.empty_simulation_intervals,
           m.gouge_bounds_rejections);
+    }
+    if (profile_planning) {
+      for (std::size_t index=0; index<plan.operations.size(); ++index) {
+        std::size_t batches=0,fallbacks=0;
+        double distance=0,mean=0,maximum=0;
+        for (const auto& level : plan.operations[index].levels) {
+          batches += level.simulation.stats.stock_batches;
+          fallbacks += level.simulation.stats.contact_fallbacks;
+          for (const auto& move : level.simulation.moves) for (const auto& step : move.steps) {
+            const double length = step.move_distance_end-step.move_distance_begin;
+            const double difference = std::abs(std::clamp(step.area_load,0.0,1.0)-
+                                               std::clamp(step.contact_load,0.0,1.0));
+            distance += length; mean += length*difference;
+            maximum = std::max(maximum,difference);
+          }
+        }
+        std::fprintf(stderr,"simulation_profile operation=%zu method=%s batches=%zu contact_fallbacks=%zu "
+                            "mean_difference_pp=%.5f max_difference_pp=%.5f\n",index,
+            wave::simulation_method_name(app.job.operations[index].simulation_method),batches,fallbacks,
+            distance>0 ? 100*mean/distance : 0,100*maximum);
+      }
     }
     const cam::PostResult post = cam::post_job(plan, app.job, app.tools, app.machines);
     for (const auto& warning : post.warnings)

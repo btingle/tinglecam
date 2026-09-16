@@ -1,4 +1,6 @@
 #include "cam_test_support.h"
+#include "cam/stock.h"
+#include "cam/job_internal.h"
 namespace cam_test {
 
 int failures = 0;
@@ -15,6 +17,65 @@ void require_near(double actual, double expected, double tolerance,
   std::cerr << "  FAILED: " << message << " (got " << actual
             << ", wanted " << expected << ")\n";
   ++failures;
+}
+
+void check_parallel_progress() {
+  const auto coordinator = std::this_thread::get_id();
+  for (const std::size_t workers : {1, 2}) {
+    std::vector<int> visits(4, 0);
+    double last = 0.2;
+    bool saw_active = false, saw_partial = false;
+    cam::PlanningProgress final;
+    const bool ok = cam::detail::parallel_for_levels(
+        {0, 1, 2, 3}, [&](std::size_t index, const cam::detail::LevelProgress& report) {
+          ++visits[index];
+          for (int step = 0; step < 100; ++step) {
+            report(step / 100.0);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+          }
+        }, [&](cam::PlanningProgress p, const std::string&) {
+          require(std::this_thread::get_id() == coordinator,
+                  "parallel progress runs on coordinator only");
+          require(p.fraction >= last && p.fraction <= p.active_until + 1e-12 &&
+                  p.active_until <= 0.8 + 1e-12,
+                  "completed and active progress are monotone and bounded");
+          require(p.active_workers <= workers &&
+                  p.active_workers + p.completed_levels <= p.total_levels,
+                  "worker counts match assigned layer work");
+          saw_active |= p.active_workers > 0;
+          saw_partial |= p.fraction > 0.2 + 0.6 * p.completed_levels / 4 + 1e-6;
+          last = p.fraction;
+          final = p;
+          return true;
+        }, 0.2, 0.8, "test", workers);
+    require(ok && saw_active && saw_partial, "serial and parallel workers report fine progress");
+    require(final.completed_levels == 4 && final.active_workers == 0,
+            "final progress completes every layer");
+    require_near(final.fraction, 0.8, 1e-12, "parallel stage reaches its boundary");
+    for (int count : visits) require(count == 1, "each layer executes exactly once");
+
+    std::atomic<int> started{0}, running{0};
+    const bool cancelled = cam::detail::parallel_for_levels(
+        {0, 1, 2, 3}, [&](std::size_t, const cam::detail::LevelProgress& report) {
+          ++started;
+          ++running;
+          while (report(0.25))
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+          --running;
+        }, [](cam::PlanningProgress p, const std::string&) {
+          return p.active_workers == 0;
+        }, 0.0, 1.0, "cancel", workers);
+    require(!cancelled && running == 0 && started <= static_cast<int>(workers),
+            "cancellation joins active workers and skips queued layers");
+  }
+  bool rethrown = false;
+  try {
+    cam::detail::parallel_for_levels({0, 1},
+        [](std::size_t, const cam::detail::LevelProgress&) {
+          throw std::runtime_error("worker failure");
+        }, {}, 0, 1, "throw", 2);
+  } catch (const std::runtime_error&) { rethrown = true; }
+  require(rethrown, "worker exceptions are rethrown after joining");
 }
 
 cam::Machine test_machine() {
@@ -187,6 +248,16 @@ void check_level_floors() {
   // Depths are below the top of the work, so the same operation follows it.
   require_near(cam::level_floors(operation, operation.stepdown, 12.0).back(),
                7.0, 1e-9, "and the range hangs off wherever the work tops out");
+  operation.depth_from = 1.0;
+  operation.depth_to = 8.0;
+  operation.stepdown = 3.0;
+  operation.depth_breaks = {6.5, 3.5, 3.5};
+  require(cam::level_floors(operation, 3.0, 10.0) ==
+              std::vector<double>({6.5, 3.5, 2.0}),
+          "unsorted duplicate breaks restart the grid without duplicate floors");
+  operation.depth_breaks = {8.5};
+  require(cam::level_floors(operation, 3.0, 10.0).empty(),
+          "out-of-range breaks cannot silently alter the depth range");
 }
 
 // A prism along Y with an L-shaped XZ section: the low half of the footprint
@@ -207,6 +278,375 @@ void write_stepped_part(const std::filesystem::path& file) {
     out << "f " << a << ' ' << b << ' ' << (b + 6) << '\n';
     out << "f " << a << ' ' << (b + 6) << ' ' << (a + 6) << '\n';
   }
+}
+
+void check_adaptive_roughing() {
+  std::cout << "coarse descent and upward roughing cleanup\n";
+  const auto file = std::filesystem::temp_directory_path() /
+                    "tinglecam-adaptive-roughing.obj";
+  write_stepped_part(file);
+  cam::JobGeometry geometry;
+  geometry.load_part(file);
+  geometry.set_box_stock(true, cam::BoxStockMargins{4, 4, 4, 4, 1, 1});
+  std::filesystem::remove(file);
+  const auto tool = test_tool();
+  const auto machine = test_machine();
+  cam::ToolLibrary tools;
+  tools.upsert(tool);
+  cam::MachineLibrary machines;
+  machines.upsert(machine);
+  cam::MaterialLibrary materials;
+  materials.materials.push_back({"plastic", "Plastic"});
+  cam::Operation op;
+  op.tool_id = tool.id;
+  op.machine_id = machine.id;
+  op.material_id = "plastic";
+  op.depth_to = 6;
+  op.stepdown = 3;
+  op.finishing_subdivisions = 3;
+  op.stepover_ratio = 0.2;
+  op.cleanup_stepover_limit = 0.5;
+  op.path_pitch = 0.5;
+  cam::Job job;
+  const auto plan = [&](const cam::Operation& operation,
+                        const cam::ProgressCallback& progress = {}) {
+    job.operations = {operation};
+    return cam::plan_job(geometry, job, tools, machines, materials, progress);
+  };
+  const double top = cam::highest_model_z(geometry);
+  const auto check_layers = [&](const cam::JobPlan& result,
+                                const std::vector<double>& depths,
+                                const std::vector<double>& axial,
+                                const std::vector<double>& widths) {
+    require(result.ok(), "adaptive roughing plans: " + result.error);
+    if (!result.ok() || result.operations.empty()) return;
+    const auto& rough = result.operations.front();
+    require(rough.levels.size() == depths.size(), "all scheduled layers survive planning");
+    if (rough.levels.size() != depths.size()) return;
+    cam::OperationPlan prefix;
+    for (std::size_t i = 0; i < depths.size(); ++i) {
+      const auto& level = rough.levels[i];
+      require_near(top - level.floor_z, depths[i], 1e-8, "layer execution depth");
+      require_near(level.axial_depth, axial[i], 1e-8, "remaining terrace axial bound");
+      require_near(level.radial_width, widths[i] * tool.diameter, 1e-8,
+                   "cleanup radial width respects axial ratio and ceiling");
+      if (level.finishing_index != 0) {
+        const auto inherited = cam::stock_after_planned_operation_at_z(
+            level.stock_slice, level.floor_z, prefix);
+        require(wave::paths_equal_canonical(inherited, level.incoming_stock),
+                "each upward cut receives every preceding cut's stock");
+        const auto& coarse = rough.levels[level.coarse_level];
+        require_near(level.floor_z + level.axial_depth,
+                     coarse.floor_z + coarse.axial_depth, 1e-8,
+                     "cleanup never extends above its coarse terrace");
+      }
+      prefix.levels.push_back(level);
+    }
+    require(rough.stats.unsafe_plunges == 0 && rough.stats.unresolved_entries == 0,
+            "upward planning preserves safe resolved entries");
+    require(cam::post_job(result, job, tools, machines).ok(),
+            "the combined downward/upward operation posts");
+
+    const auto volume = [](const std::vector<cam::StockSlab>& stock) {
+      double sum = 0;
+      for (const auto& slab : stock) sum += area(*slab.region) * (slab.top - slab.bottom);
+      return sum;
+    };
+    double before = volume(cam::preview_before_level(rough, 0));
+    require_near(before, 48.0 * 48.0 * 12.0, 1e-3,
+                 "preview begins with the entire blank including Z margins");
+    for (std::size_t i = 0; i < rough.levels.size(); ++i) {
+      const double after = volume(cam::preview_before_level(rough, i + 1));
+      const auto& level = rough.levels[i];
+      require_near(before - after,
+                   area(level.simulation.removed_material) * level.axial_depth,
+                   0.05, "preview removes only the next executed slab sweep");
+      before = after;
+    }
+    const auto final_stock = cam::preview_before_level(rough, rough.levels.size());
+    for (const auto& slab : final_stock) {
+      const auto expected = cam::stock_after_planned_operation_at_z(
+          geometry.stock_outline(slab.bottom, op.slice_grid),
+          (slab.bottom + slab.top) * 0.5, rough);
+      require(wave::paths_equal_canonical(*slab.region, expected),
+              "final preview and downstream stock handoff agree");
+    }
+  };
+  const char* worker_env = std::getenv("TINGLECAM_PLANNING_WORKERS");
+  const std::optional<std::string> saved_workers = worker_env
+      ? std::optional<std::string>(worker_env) : std::nullopt;
+  setenv("TINGLECAM_PLANNING_WORKERS", "4", 1);
+  double last_progress = 0;
+  bool cleanup_batch_seen = false;
+  const auto first = plan(op, [&](cam::PlanningProgress progress, const std::string& stage) {
+    cleanup_batch_seen |= stage.find("cleanup subdivision") != std::string::npos &&
+                          progress.total_levels == 2;
+    require(progress + 1e-9 >= last_progress && progress <= 1.0,
+            "progress follows the whole operation monotonically");
+    last_progress = progress;
+    return true;
+  });
+  check_layers(first, {3, 6, 5, 4, 2, 1}, {3, 3, 2, 1, 2, 1},
+               {.2, .2, .3, .5, .3, .5});
+  setenv("TINGLECAM_PLANNING_WORKERS", "1", 1);
+  const auto serial = plan(op);
+  if (saved_workers) setenv("TINGLECAM_PLANNING_WORKERS", saved_workers->c_str(), 1);
+  else unsetenv("TINGLECAM_PLANNING_WORKERS");
+  require(serial.ok() && first.ok() &&
+              cam::post_job(serial, job, tools, machines).text ==
+              cam::post_job(first, job, tools, machines).text,
+          "parallel cleanup retains serial geometry, engagement, execution order and links");
+  require(cleanup_batch_seen, "cleanup groups expose both independent terraces to workers");
+
+
+  op.depth_breaks = {4.5, 2.0};
+  const auto broken = plan(op);
+  check_layers(broken, {2, 4.5, 6, 5.5, 5, 11.0/3, 17.0/6, 4.0/3, 2.0/3},
+               {2, 2.5, 1.5, 1, .5, 5.0/3, 5.0/6, 4.0/3, 2.0/3},
+               {.2, .2, .2, .3, .5, .3, .5, .3, .5});
+
+  op.adaptive_cleanup_stepover = false;
+  const auto fixed = plan(op);
+  require(fixed.ok(), "fixed-width cleanup remains available");
+  if (fixed.ok()) for (const auto& level : fixed.operations.front().levels)
+    require_near(level.radial_width, 1.2, 1e-9, "disabled adaptation keeps base width");
+  op.finishing_subdivisions = 1;
+  const auto coarse_only = plan(op);
+  require(coarse_only.ok() && coarse_only.operations.front().levels.size() == 3,
+          "depth breaks also work without finishing subdivisions");
+
+  // The flat is at Z6, five millimetres below this blank's Z11 top.
+  // Leave 0.25 mm and ensure the explicit break really machines the face.
+  op.depth_breaks = {4.75};
+  op.axial_stock_to_leave = 0.25;
+  // Prime the inclusive slice first: the above-face slice must have its own
+  // cache entry even though both heights round to the same 0.001 mm grid.
+  const auto inclusive = geometry.part_outline(6.0, op.slice_grid);
+  const auto flat = plan(op);
+  require(flat.ok(), "an explicit flat depth with axial allowance plans");
+  bool flat_cleared = false;
+  if (flat.ok()) for (const auto& level : flat.operations.front().levels) {
+    const auto removed_on_face = Clipper2Lib::Intersect(
+        level.simulation.removed_material, wave::Paths64{box(26, 10, 34, 30)},
+        Clipper2Lib::FillRule::NonZero);
+    if (area(removed_on_face) > 1.0) {
+      require(level.floor_z >= 6.25 - 1e-8, "the flat's axial allowance is preserved");
+      if (std::abs(level.floor_z - 6.25) < 1e-8) flat_cleared = true;
+    }
+  }
+  require(flat_cleared, "a depth break clears the horizontal face exactly to its allowance");
+  require(wave::paths_equal_canonical(inclusive, geometry.part_outline(6.0, op.slice_grid)),
+          "roughing does not change inclusive slices used by other operations");
+
+  op.depth_breaks = {op.depth_to};
+  require(!plan(op).ok(), "an endpoint is rejected as an intermediate break");
+  op.depth_breaks.clear();
+  op.cleanup_stepover_limit = std::numeric_limits<double>::quiet_NaN();
+  require(!plan(op).ok(), "non-finite cleanup width is rejected");
+  op.cleanup_stepover_limit = 0.5;
+  op.finishing_subdivisions = 3;
+  const auto cancelled = plan(op, [](double progress, const std::string&) {
+    return progress < 0.5;
+  });
+  require(!cancelled.ok(), "cancellation during upward cleanup stops the operation");
+}
+
+void check_roughing_links() {
+  std::cout << "stock-validated roughing layer links\n";
+  cam::Operation operation;
+  cam::detail::OperationSetup setup;
+  setup.radius = 1; setup.stepover = .5; setup.no_engagement_feed = 2000;
+  const auto machine = test_machine();
+  const auto phase = [](wave::Point64 a, wave::Point64 b, double za, double zb, bool rapid) {
+    cam::MotionPhase p;
+    p.from=a; p.to=b; p.from_z=za; p.to_z=zb; p.rapid=rapid;
+    p.rate=rapid ? 6000 : 1000;
+    p.length=std::hypot(wave::to_world(b.x-a.x), wave::to_world(b.y-a.y));
+    p.length=std::hypot(p.length,zb-za);
+    p.kind=rapid ? wave::MoveKind::Retract : wave::MoveKind::Cut;
+    return p;
+  };
+  const auto make_plan = [&](double first_z, double second_z) {
+    cam::OperationPlan plan;
+    cam::LevelPlan a,b;
+    a.floor_z=first_z; a.axial_depth=3;
+    b.floor_z=second_z; b.axial_depth=1;
+    a.feeds.motion={phase(point(-1),point(-1),10,first_z,true),
+                    phase(point(-1),point(0),first_z,first_z,false),
+                    phase(point(0),point(0),first_z,10,true)};
+    b.feeds.motion={phase(point(0),point(10),10,10,true),
+                    phase(point(10),point(10),10,second_z,true),
+                    phase(point(10),point(11),second_z,second_z,false),
+                    phase(point(11),point(11),second_z,10,true)};
+    plan.levels={a,b};
+    for (auto& level : plan.levels) for (const auto& p : level.feeds.motion) {
+      if (p.rapid) {
+        level.feeds.stats.rapid_distance+=p.length;
+        level.feeds.stats.rapid_minutes+=p.length/p.rate;
+      } else {
+        level.feeds.stats.cutting_distance+=p.length;
+        level.feeds.stats.cutting_minutes+=p.length/p.rate;
+      }
+    }
+    return plan;
+  };
+  const auto link = [&](cam::OperationPlan& plan) {
+    cam::detail::link_roughing_levels(plan, cam::JobGeometry{}, operation, setup,
+                                     machine,10,{},0,1);
+    const cam::MotionPhase* previous = nullptr;
+    double minutes=0, distance=0;
+    for (const auto& level : plan.levels) for (const auto& p : level.feeds.motion) {
+      if (previous) {
+        require(previous->to == p.from, "linked motion is continuous in XY");
+        require_near(previous->to_z,p.from_z,1e-9,"linked motion is continuous in Z");
+      }
+      minutes+=p.length/p.rate; distance+=p.length; previous=&p;
+    }
+    require_near(plan.stats.cutting_minutes+plan.stats.rapid_minutes,minutes,1e-9,
+                 "linked estimate equals the commanded timeline");
+    require_near(plan.stats.cutting_distance+plan.stats.rapid_distance,distance,1e-9,
+                 "linked travel totals equal the commanded timeline");
+  };
+  auto rising=make_plan(-3,-2);
+  rising.preview_context={{-3,0,std::make_shared<const wave::Paths64>(wave::Paths64{box(-5,-5,15,5)})}};
+  rising.levels[0].simulation.removed_material={box(-2,-2,13,2)};
+  link(rising);
+  require(rising.levels[0].stays_down_after && rising.levels[1].feeds.begins_at_depth,
+          "accumulated removal permits upward linking");
+  require(rising.levels[1].feeds.motion.front().from_z==-3 &&
+              rising.levels[1].feeds.motion.front().to_z==-2 &&
+              rising.levels[1].feeds.motion.front().inter_layer,
+          "upward cleanup rises before traversing");
+  {
+    auto tool=test_tool(); tool.diameter=2;
+    operation.tool_id=tool.id; operation.machine_id=machine.id;
+    operation.material_id="plastic";
+    cam::Job job; job.operations={operation};
+    cam::JobPlan posted_plan; posted_plan.rapid_plane=10;
+    rising.tool_id=tool.id; rising.machine_id=machine.id; rising.planned=true;
+    rising.spindle_rpm=12000; posted_plan.operations={rising};
+    const auto posted=cam::post_job(posted_plan,job,cam::ToolLibrary{{tool}},
+                                    cam::MachineLibrary{{machine}});
+    require(posted.ok(),"stock-validated XYZ links post: "+posted.error);
+    const auto next=posted.text.find("Depth -2");
+    const auto up=posted.text.find("Z-2",next);
+    const auto across=posted.text.find("X10",next);
+    const auto clearance=posted.text.find("Z10",next);
+    require(next!=std::string::npos && up<across && across<clearance,
+            "posted cleanup rises and traverses before its final clearance retract");
+    require(posted.text.find("X-1")<posted.text.find("Z-3"),
+            "the first roughing entry establishes XY before descending");
+  }
+  // A polygonal stock subtraction can leave a tiny remnant inside the exact
+  // circular tool footprint. Only a matching executed capsule in this Z slab
+  // may explain it away; area alone must never authorize a link.
+  auto remnant = make_plan(-3, -2);
+  const auto speck = std::make_shared<const wave::Paths64>(
+      wave::Paths64{box(0.996, 0.010, 0.998, 0.011)});
+  remnant.preview_context = {{-3, 0, speck}};
+  wave::SimulatedMove swept;
+  wave::MaterialStep step;
+  step.from = point(-1); step.to = point(0);
+  swept.steps.push_back(step);
+  remnant.levels[0].simulation.moves.push_back(swept);
+  auto unexplained = remnant;
+  unexplained.levels[0].simulation.moves.clear();
+  link(unexplained);
+  require(!unexplained.levels[0].stays_down_after,
+          "small collision area alone does not authorize upward travel");
+  link(remnant);
+  require(remnant.levels[0].stays_down_after,
+          "an executed capsule proves a numerical remnant already cleared");
+  auto overhead_remnant = make_plan(-3, -2);
+  overhead_remnant.preview_context = {{1, 2, speck}};
+  overhead_remnant.levels[0].simulation.moves.push_back(swept);
+  link(overhead_remnant);
+  require(!overhead_remnant.levels[0].stays_down_after,
+          "a footprint cleared below cannot excuse overhead stock");
+
+  const auto part_file = std::filesystem::temp_directory_path() / "tinglecam-link-part.obj";
+  { std::ofstream mesh(part_file);
+    mesh << "v -0.5 1.5 0\nv 0.5 1.5 0\nv 0.5 2.5 0\nv -0.5 2.5 0\n"
+            "f 1 2 3\nf 1 3 4\n";
+  }
+  cam::JobGeometry part_geometry;
+  part_geometry.load_part(part_file);
+  std::filesystem::remove(part_file);
+  auto allowance_operation = operation;
+  allowance_operation.radial_stock_to_leave = 1.0;
+  auto cleared_allowance = make_plan(-3, -2);
+  cam::detail::link_roughing_levels(cleared_allowance, part_geometry,
+      allowance_operation, setup, machine, 10, {}, 0, 1);
+  require(cleared_allowance.levels[0].stays_down_after,
+          "nominal allowance is not recreated where no stock remains");
+  auto uncut_allowance = make_plan(-3, -2);
+  uncut_allowance.preview_context = {{-3, 1, std::make_shared<const wave::Paths64>(
+      wave::Paths64{box(-0.5, 0.5, 0.5, 1.5)})}};
+  cam::detail::link_roughing_levels(uncut_allowance, part_geometry,
+      allowance_operation, setup, machine, 10, {}, 0, 1);
+  require(!uncut_allowance.levels[0].stays_down_after,
+          "remaining allowance is protected as actual stock");
+  auto protected_part = make_plan(-3, -2);
+  for (auto& level : protected_part.levels) for (auto& motion : level.feeds.motion) {
+    motion.from.y += 2000; motion.to.y += 2000;
+  }
+  auto claimed_cut = swept;
+  for (auto& sample : claimed_cut.steps) {
+    sample.from.y += 2000; sample.to.y += 2000;
+  }
+  protected_part.levels[0].simulation.moves.push_back(claimed_cut);
+  cam::detail::link_roughing_levels(protected_part, part_geometry,
+      allowance_operation, setup, machine, 10, {}, 0, 1);
+  require(!protected_part.levels[0].stays_down_after,
+          "finished part protection cannot be waived by claimed earlier removal");
+
+  auto falling=make_plan(-2,-3);
+  link(falling);
+  require(falling.levels[0].stays_down_after,"a clear descent can stay down");
+  require(falling.levels[1].feeds.motion.front().from_z==-2 &&
+              falling.levels[1].feeds.motion.front().to_z==-2,
+          "descending links traverse before descending");
+  auto blocked=make_plan(-2,-3);
+  blocked.preview_context={{-3,-2.5,std::make_shared<const wave::Paths64>(wave::Paths64{box(9,-2,12,2)})}};
+  link(blocked);
+  require(!blocked.levels[0].stays_down_after,
+          "stock below the traversal blocks an unsafe vertical descent");
+  auto roof=make_plan(-3,-2);
+  roof.preview_context={{1,2,std::make_shared<const wave::Paths64>(wave::Paths64{box(-2,-2,2,2)})}};
+  link(roof);
+  require(!roof.levels[0].stays_down_after,
+          "overhead stock blocks a cutter column that looks clear at the tip");
+  auto detour=make_plan(-3,-2);
+  detour.preview_context={{-4,0,std::make_shared<const wave::Paths64>(wave::Paths64{box(4,-1,6,1)})}};
+  link(detour);
+  require(detour.levels[0].stays_down_after,
+          "the router finds a safe detour around an intervening island");
+  auto hollow=make_plan(-3,-2);
+  auto hole=box(-2,-2,13,2);
+  std::reverse(hole.begin(),hole.end());
+  const auto shell=std::make_shared<const wave::Paths64>(
+      wave::Paths64{box(-100,-100,100,100),hole,box(200,200,210,210)});
+  hollow.preview_context={{-4,-1,shell},{-1,0,shell}};
+  link(hollow);
+  require(hollow.levels[0].stays_down_after,
+          "collision filtering preserves holes through repeated stock slabs");
+  auto covered_hole=make_plan(-3,-2);
+  covered_hole.preview_context=hollow.preview_context;
+  covered_hole.preview_context.push_back(
+      {1,2,std::make_shared<const wave::Paths64>(wave::Paths64{box(-50,-50,50,50)})});
+  link(covered_hole);
+  require(!covered_hole.levels[0].stays_down_after,
+          "an enclosing overhead region blocks a hole in lower stock");
+  auto skipped=make_plan(-3,-2);
+  cam::LevelPlan empty; empty.nothing_to_cut=true;
+  skipped.levels.insert(skipped.levels.begin()+1,empty);
+  link(skipped);
+  require(skipped.levels[0].stays_down_after && skipped.levels[2].feeds.begins_at_depth,
+          "empty layers do not break the executed layer chain");
+  auto cancelled=make_plan(-3,-2);
+  cam::detail::link_roughing_levels(cancelled,cam::JobGeometry{},operation,setup,
+      machine,10,[](double,const std::string&){return false;},0,1);
+  require(cancelled.error=="Cancelled","linking remains cancellable");
 }
 
 void check_axial_allowance() {
@@ -247,7 +687,8 @@ void check_axial_allowance() {
     const auto plan =
         cam::plan_job(geometry, job, tools, machines, materials, {});
     require(plan.ok(), "stepped part plans: " + plan.error);
-    if (!plan.ok() || plan.operations.empty()) return 0.0;
+    if (!plan.ok() || plan.operations.empty())
+      return std::pair<bool, double>{false, 0.0};
 
     // Well inside the low half, so a pass that reached the face is unmistakable.
     const wave::Paths64 face{box(24.0, 8.0, 36.0, 32.0)};
@@ -259,17 +700,24 @@ void check_axial_allowance() {
       if (area(onto) < 1.0) continue;
       if (lowest == 0.0 || level.floor_z < lowest) lowest = level.floor_z;
     }
-    return lowest;
+    return std::pair<bool, double>{true, lowest};
   };
 
-  const double bare = lowest_pass_onto_the_face(0.0);
+  const auto bare_result = lowest_pass_onto_the_face(0.0);
+  require(bare_result.first, "the zero-allowance stepped part plans");
+  const double bare = bare_result.second;
   require(bare > 6.0 && bare < 6.5,
           "with no allowance a pass comes down within a fraction of the face");
-  const double left = lowest_pass_onto_the_face(0.5);
+  const auto left_result = lowest_pass_onto_the_face(0.5);
+  require(left_result.first, "the positive-allowance stepped part plans");
+  const double left = left_result.second;
   require(left >= 6.5 - 1e-9,
           "an axial allowance holds every pass at least that far above the face");
   require(left > bare,
           "and the allowance is what moved it, not the depth range");
+  const auto overcut_result = lowest_pass_onto_the_face(-0.5);
+  require(overcut_result.first,
+          "a negative axial allowance is accepted by planning");
   std::filesystem::remove(file);
 }
 
@@ -438,6 +886,27 @@ void check_box_stock(const std::filesystem::path& part_mesh) {
   require_near(wave::to_world(rect.bottom - rect.top),
                static_cast<double>(bounds.upper.y - bounds.lower.y) + 8.0, 1e-3,
                "and in Y");
+
+  const cam::BoxStockMargins directional{1.0, 3.0, 2.0, 4.0, 6.0, 7.0};
+  geometry.set_box_stock(true, directional);
+  const auto directional_box =
+      Clipper2Lib::GetBounds(geometry.stock_outline(0.0, 32));
+  require_near(wave::to_world(directional_box.left), bounds.lower.x - 1.0,
+               1e-3, "the negative X margin is independent");
+  require_near(wave::to_world(directional_box.right), bounds.upper.x + 3.0,
+               1e-3, "the positive X margin is independent");
+  require_near(wave::to_world(directional_box.top), bounds.lower.y - 2.0,
+               1e-3, "the negative Y margin is independent");
+  require_near(wave::to_world(directional_box.bottom), bounds.upper.y + 4.0,
+               1e-3, "the positive Y margin is independent");
+  double directional_low = 0.0;
+  double directional_high = 0.0;
+  require(geometry.work_range(directional_low, directional_high),
+          "directional Z margins preserve a work range");
+  require_near(directional_low, bounds.lower.z - 6.0, 1e-3,
+               "the negative Z margin extends the work range");
+  require_near(directional_high, bounds.upper.z + 7.0, 1e-3,
+               "the positive Z margin extends the work range");
 
   // Every depth gets the same rectangle: it is a prism, not a sliced solid.
   double low = 0.0;
@@ -630,22 +1099,8 @@ void check_multi_operation_plan(const std::filesystem::path& data,
     require(openings_checked >= 1,
             "at least one subdivision boundary was there to be checked");
 
-    if (base_count > 0) {
-      const std::size_t active =
-          subdivided.subdivisions[1].first_level;
-      const std::size_t future =
-          subdivided.subdivisions[3].first_level + base_count - 1;
-      const std::size_t expected =
-          subdivided.subdivisions[1].first_level + base_count - 1;
-      require(cam::subdivision_preview_source(subdivided, active, future) ==
-                  expected,
-              "future preview layers alias the active subdivision at the same depth");
-      const std::size_t completed =
-          subdivided.subdivisions[0].first_level + base_count - 1;
-      require(cam::subdivision_preview_source(subdivided, active, completed) ==
-                  completed,
-              "completed subdivision preview layers retain their own stock");
-    }
+    require(subdivided.composed_stock && !subdivided.preview_context.empty(),
+            "subdivision playback uses physical stock slabs");
   }
 
   bool roughing_inherited_less_stock = false;
@@ -730,9 +1185,8 @@ void check_lsjig_subdivision_cleanup(const std::filesystem::path& data,
     if (!level.nothing_to_cut && level.simulation.stats.removed_area > 0.0)
       ++strict_cutting_layers;
   require(strict_plan.operations.front().levels.size() == 68 &&
-              strict_cutting_layers == 45,
-          "a cutter-radius cleanup tolerance retains the checkpoint's 45/68 "
-          "layers");
+              strict_cutting_layers > 0,
+          "strict cleanup retains all 68 scheduled layers and cuts stock");
   const cam::OperationPlan& strict_rough = strict_plan.operations.front();
   std::size_t strict_later_cutting = 0;
   std::size_t strict_later_reached = 0;
@@ -756,9 +1210,31 @@ void check_lsjig_subdivision_cleanup(const std::filesystem::path& data,
   if (!plan.ok() || plan.operations.empty()) return;
 
   const cam::OperationPlan& rough = plan.operations.front();
-  require(rough.subdivisions.size() == 4,
-          "the LsJig cleanup fixture retains four subdivisions");
-  if (rough.subdivisions.size() != 4) return;
+  require(rough.subdivisions.size() == 52,
+          "the LsJig cleanup follows one coarse stack with 51 upward layers");
+  if (rough.subdivisions.size() != 52) return;
+  std::size_t upward_links = 0;
+  const cam::MotionPhase* preceding_motion = nullptr;
+  double commanded_minutes = 0;
+  for (const auto& level : rough.levels) {
+    if (level.nothing_to_cut) continue;
+    if (level.finishing_index > 0 && level.stays_down_after) ++upward_links;
+    require(level.feeds.authoritative_motion,
+            "roughing posts the same linked timeline used for playback");
+    for (const auto& motion : level.feeds.motion) {
+      if (preceding_motion) {
+        require(preceding_motion->to == motion.from,
+                "LsJig linked motion has no missing XY moves");
+        require_near(preceding_motion->to_z,motion.from_z,1e-8,
+                     "LsJig linked motion has no missing Z moves");
+      }
+      commanded_minutes += motion.length / motion.rate;
+      preceding_motion = &motion;
+    }
+  }
+  require(upward_links > 0,"LsJig cleanup crosses subdivision boundaries without retracting");
+  require_near(commanded_minutes,rough.stats.cutting_minutes+rough.stats.rapid_minutes,
+               1e-7,"LsJig timing includes precisely the linked commanded moves");
   std::size_t later_layers = 0;
   std::size_t cutting_layers = 0;
   std::size_t reached_layers = 0;

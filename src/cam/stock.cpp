@@ -1,6 +1,7 @@
 #include "cam/stock.h"
 #include <algorithm>
 #include <cmath>
+#include <unordered_map>
 
 namespace cam {
 namespace {
@@ -10,6 +11,9 @@ std::vector<StockSlab> clip(const std::vector<StockSlab>& stock,
   std::vector<StockSlab> out;
   out.reserve(stock.size());
   const auto bounds = Clipper2Lib::GetBounds(footprint);
+  // Height subdivisions often share an identical XY region. Clip that region
+  // once per cut, retaining the shared result across all affected heights.
+  std::unordered_map<const wave::Paths64*, std::shared_ptr<const wave::Paths64>> clipped;
   for (const auto& slab : stock) {
     const double lo = std::max(bottom, slab.bottom);
     const double hi = std::min(top, slab.top);
@@ -20,20 +24,22 @@ std::vector<StockSlab> clip(const std::vector<StockSlab>& stock,
       if (!inside) out.push_back(slab);
       continue;
     }
-    auto region = inside ? Clipper2Lib::Intersect(*slab.region, footprint, Clipper2Lib::FillRule::NonZero)
-                         : Clipper2Lib::Difference(*slab.region, footprint, Clipper2Lib::FillRule::NonZero);
+    auto [entry, inserted] = clipped.try_emplace(slab.region.get());
+    if (inserted) {
+      auto region = inside ? Clipper2Lib::Intersect(*slab.region, footprint, Clipper2Lib::FillRule::NonZero)
+                           : Clipper2Lib::Difference(*slab.region, footprint, Clipper2Lib::FillRule::NonZero);
+      entry->second = region == *slab.region ? slab.region
+          : std::make_shared<const wave::Paths64>(std::move(region));
+    }
+    const auto& region = entry->second;
     // A cut through another pocket must not split this slab in Z or replace
     // its immutable polygons. Retaining identity also retains its render BVH.
-    if (!inside && region == *slab.region) {
+    if (!inside && region == slab.region) {
       out.push_back(slab);
       continue;
     }
     if (!inside && slab.bottom < lo) out.push_back({slab.bottom, lo, slab.region});
-    if (!region.empty()) {
-      auto shared = region == *slab.region ? slab.region
-          : std::make_shared<const wave::Paths64>(std::move(region));
-      out.push_back({lo, hi, std::move(shared)});
-    }
+    if (!region->empty()) out.push_back({lo, hi, region});
     if (!inside && hi < slab.top) out.push_back({hi, slab.top, slab.region});
   }
   return out;
@@ -88,7 +94,12 @@ std::vector<StockSlab> active_stock(const JobGeometry& geometry,
   for (std::size_t i=1;i<cuts.size();++i) {
     auto region = stock_after_operations_at_z(geometry.stock_outline(cuts[i-1],grid),
                                                (cuts[i-1]+cuts[i])/2,previous);
-    if (!region.empty()) result.push_back({cuts[i-1],cuts[i],std::make_shared<const wave::Paths64>(std::move(region))});
+    if (!region.empty()) {
+      auto shared = !result.empty() && region == *result.back().region
+          ? result.back().region
+          : std::make_shared<const wave::Paths64>(std::move(region));
+      result.push_back({cuts[i-1],cuts[i],std::move(shared)});
+    }
   }
   return result;
 }

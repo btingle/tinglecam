@@ -22,7 +22,10 @@ class Background {
   ~Background() { cancel_and_join(); }
 
   bool running() const { return running_.load(); }
-  double fraction() const { return fraction_.load(); }
+  cam::PlanningProgress progress() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return progress_;
+  }
   std::string stage() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return stage_;
@@ -32,10 +35,10 @@ class Background {
     cancel_and_join();
     cancelled_.store(false);
     running_.store(true);
-    fraction_.store(0.0);
     finished_.store(false);
     {
       std::lock_guard<std::mutex> lock(mutex_);
+      progress_ = {};
       stage_ = "Starting";
     }
     worker_ = std::thread([this, task = std::move(task)]() mutable {
@@ -72,9 +75,9 @@ class Background {
 
  private:
   cam::ProgressCallback report() {
-    return [this](double fraction, const std::string& stage) {
-      fraction_.store(fraction);
+    return [this](cam::PlanningProgress progress, const std::string& stage) {
       std::lock_guard<std::mutex> lock(mutex_);
+      progress_ = progress;
       stage_ = stage;
       return !cancelled_.load();
     };
@@ -91,7 +94,7 @@ class Background {
   std::atomic<bool> running_{false};
   std::atomic<bool> finished_{false};
   std::atomic<bool> cancelled_{false};
-  std::atomic<double> fraction_{0.0};
+  cam::PlanningProgress progress_;
   std::string stage_;
   Result result_;
 };
@@ -297,6 +300,7 @@ struct App {
   int selected_level = 0;
   int selected_plan_operation = 0;
   Colouring colouring = Colouring::Feed;
+  int engagement_display = 0;  // planned, area, contact, absolute difference
   // Set from the command line so a screenshot can be told which view to take.
   int force_tab = -1;
   bool show_stock = true;

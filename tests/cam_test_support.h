@@ -39,11 +39,14 @@ wave::FrontLineage single_front_lineage(const wave::Path64& front,
                                         const wave::Path64& band);
 wave::FrontLineage railed_node(double band_inset);
 
+void check_parallel_progress();
 void check_engagement_feeds();
 void check_feed_compatible_merge();
 void check_path_resampling();
 void check_level_floors();
 void check_axial_allowance();
+void check_adaptive_roughing();
+void check_roughing_links();
 void check_boundary_rail_slack();
 void check_entry_front_selection();
 void check_box_stock(const std::filesystem::path& part_mesh);

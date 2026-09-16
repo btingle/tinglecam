@@ -4,6 +4,7 @@
 
 #include <cmath>
 #include <iostream>
+#include <future>
 #include <stdexcept>
 
 namespace {
@@ -43,6 +44,25 @@ int main() {
     const auto middle = slicer.slice(4.0f, 8);
     require(middle.candidate_triangles == 2, "middle slice should query two retained prisms");
     require(!middle.polygons.empty(), "middle slice should produce polygons");
+
+    // Concurrent layers reuse one GPU handle. Each query must retain its own
+    // candidate count and polygons through the shared-buffer download.
+    std::vector<std::future<void>> queries;
+    for (int worker = 0; worker < 6; ++worker) {
+      queries.push_back(std::async(std::launch::async, [&, worker] {
+        for (int i = 0; i < 16; ++i) {
+          const bool upper = (worker + i) % 2 == 0;
+          const auto actual = slicer.slice(upper ? 9.0f : 4.0f, 8);
+          const auto& expected = upper ? high : middle;
+          require(actual.candidate_triangles == expected.candidate_triangles,
+                  "concurrent slices must not exchange candidate buffers");
+          require(Clipper2Lib::Xor(actual.polygons, expected.polygons,
+                                  Clipper2Lib::FillRule::NonZero).empty(),
+                  "concurrent slices must agree with serial geometry");
+        }
+      }));
+    }
+    for (auto& query : queries) query.get();
 
     const auto empty = slicer.slice(11.0f, 8);
     require(empty.polygons.empty(), "slice above the mesh should be empty");

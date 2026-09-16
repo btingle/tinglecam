@@ -25,7 +25,20 @@ void aliases() {
   check(outside.size()==3,"Two boundary aliases plus clipped middle");
   check(outside.front().region==shape && outside.back().region==shape,"Height aliases share original polygons");
   near(volume(outside)+volume(inside),volume(stock));
-  OperationPlan op; op.composed_stock=true; op.preview_context=outside;
+  // Repeated height bands must receive the same XY cut, including partially
+  // intersected bands and untouched caps, without duplicating their polygons.
+  const std::vector<StockSlab> bands{{0,3,shape},{3,7,shape},{7,10,shape}};
+  const auto band_cut=stock_outside(bands,hole,2,8);
+  const auto band_inside=stock_inside(bands,hole,2,8);
+  near(volume(band_cut),volume(outside));
+  near(volume(band_inside),volume(inside));
+  check(band_cut.size()==5 && band_inside.size()==3,"Clipping retains height boundaries");
+  check(band_cut[1].region==band_cut[2].region && band_cut[2].region==band_cut[3].region,
+        "Identical height bands share the clipped XY geometry");
+  check(band_cut.front().region==shape && band_cut.back().region==shape,
+        "Partial cuts leave original caps intact");
+  check(*shape==rect(0,0,20,20),"Shared input stock is immutable");
+  OperationPlan op; op.composed_stock=true; op.preview_context=stock;
   LevelPlan first; first.floor_z=5; first.axial_depth=3; first.stock_slice=hole;
   first.local_stock=stock_inside(stock,hole,5,8); first.simulation.removed_material=hole;
   LevelPlan second=first; second.floor_z=2; second.local_stock=stock_inside(stock,hole,2,5);
@@ -38,6 +51,38 @@ void aliases() {
   auto duplicate=first; duplicate.local_stock.clear(); op.levels.insert(op.levels.begin()+1,duplicate);
   near(volume(preview_before_level(op,0)),4000);
   near(volume(preview_before_level(op,3)),3400);
+}
+void many_pockets() {
+  std::vector<StockSlab> stock;
+  for (int i=0;i<100;++i)
+    stock.push_back({0,10,std::make_shared<const wave::Paths64>(rect(i*20,0,10,10))});
+  const auto cut=rect(1,1,8,8);
+  const auto after=stock_outside(stock,cut,2,8);
+  check(after.size()==102,"Only the intersected pocket is split in Z");
+  near(volume(stock)-volume(after),8*8*6);
+  for (std::size_t i=1;i<stock.size();++i) {
+    const auto& unchanged=after[i+2];
+    check(unchanged.region==stock[i].region && unchanged.bottom==0 && unchanged.top==10,
+          "Unrelated pockets retain geometry identity and full height");
+  }
+  // Touching bounds have no area of intersection. A cut outside all pockets
+  // must preserve the complete stack, even if its Z interval crosses them.
+  const auto touching=stock_outside(stock,rect(10,0,10,10),3,7);
+  check(touching.size()==stock.size(),"Touching pocket bounds do not fragment stock");
+  for (std::size_t i=0;i<stock.size();++i)
+    check(touching[i].region==stock[i].region,"Touching bounds retain render geometry");
+  check(stock_inside(stock,rect(10,0,10,10),3,7).empty(),
+        "Touching bounds do not create positive-volume stock");
+  // Retain a complete initial snapshot and replay cuts across distinct pockets.
+  OperationPlan op;op.composed_stock=true;op.preview_context=stock;
+  for (int i=0;i<100;++i) {
+    LevelPlan level;level.floor_z=2;level.axial_depth=6;
+    level.simulation.removed_material=rect(i*20+1,1,8,8);
+    op.levels.push_back(std::move(level));
+  }
+  for (std::size_t at : {0,1,50,100})
+    near(volume(preview_before_level(op,at)),volume(stock)-at*8*8*6);
+  near(volume(preview_before_level(op,0)),volume(stock));
 }
 void integration() {
   const auto file=std::filesystem::temp_directory_path()/"tinglecam-stock-test.obj";
@@ -174,4 +219,4 @@ void partial_replan() {
           "An operation nothing has been asked of is not warned about");
   near(partial.stats.removed_volume,whole.operations[0].stats.removed_volume);
 }
-int main() { try { aliases(); integration(); partial_replan(); } catch(const std::exception& e) { std::cerr<<e.what()<<'\n';return 1;} }
+int main() { try { aliases(); many_pockets(); integration(); partial_replan(); } catch(const std::exception& e) { std::cerr<<e.what()<<'\n';return 1;} }

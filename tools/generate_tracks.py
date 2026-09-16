@@ -217,20 +217,55 @@ def create_all_tracks(grid_size, elevation_gain, profile, resolution=256):
 
     return all_template_names, all_results
 
-def main(grid_size, elevation_gain, profile_obj_path, save_dir, resolution, gcode):
+def main(grid_size, elevation_gain, profile_obj_path, save_dir, resolution, gcode, open_path, translate):
     def load_profile_obj(profile_obj_path):
         profile = []
+        # profile_t for evenly sampling the toolpath- meshing doesn't really care
+        profile_t = []
         with open(profile_obj_path, "r") as f:
+            def dist(a, b):
+                xdist = abs(a[0] - b[0])
+                ydist = abs(a[1] - b[1])
+                return sqrt(xdist**2+ydist**2)
+            pv = None
+            d = 0
             for line in f:
                 if line.startswith("v"):
-                    profile.append([float(x) for x in line.strip().split()[1:3]])
-        profile.append(profile[0])
-        return np.array(profile)
+                    v = [float(x) for x in line.strip().split()[1:3]]
+                    if pv:
+                        d += dist(v, pv)
+                    profile_t.append(d)
+                    profile.append(v)
+                    pv = v
+        if not open_path:
+            profile.append(profile[0])
+            d += dist(profile[-1], profile[-2])
+            profile_t.append(d)
+        return np.array(profile), np.array(profile_t)
+
+    profile_resolution_mm = 0.25
 
     if not profile_obj_path:
         profile = np.array([[-12, -6], [-12, 6], [12, 6], [12, -6], [-12, -6]], dtype=np.float64)
+        profile_t = np.array([0, 12, 36, 48, 72], dtype=np.float64)
     else:
-        profile = load_profile_obj(profile_obj_path)
+        profile, profile_t = load_profile_obj(profile_obj_path)
+
+    profile_resolution = int(profile_t[-1] / profile_resolution_mm)
+    def sample_profile(i):
+        cur_d = i*profile_resolution_mm
+        idx = np.searchsorted(profile_t, cur_d)
+        if idx <= 0:
+            idx = 1
+        if idx >= profile_t.size:
+            idx = profile_t.size - 1
+        seg_d = profile_t[idx] - profile_t[idx-1]
+        t = (cur_d - profile_t[idx-1]) / seg_d
+        return (profile[idx] - profile[idx-1]) * t + profile[idx-1]
+
+    if gcode:
+        new_profile = np.array([sample_profile(i) for i in range(profile_resolution)])
+        profile = new_profile
 
     names, results = create_all_tracks(grid_size, elevation_gain, profile, resolution)
 
@@ -251,7 +286,7 @@ def main(grid_size, elevation_gain, profile_obj_path, save_dir, resolution, gcod
         obj_data += ''.join([yield_face_obj_data(i) for i in np.ndindex(I-1, J-1)])
         return obj_data
 
-    def save_gcode(contours, datum=1, tool=1, spindle_speed=12000, feed=1000, retract=30):
+    def save_gcode(contours, datum=1, tool=1, spindle_speed=12000, feed=500, retract=30):
         def form_gcode(pt):
             x, y, z = pt
             return f"X{x:.3f} Y{y:.3f} Z{z:.3f}\n"
@@ -259,27 +294,32 @@ def main(grid_size, elevation_gain, profile_obj_path, save_dir, resolution, gcod
             x, y, z = pt
             return f"v {x:.3f} {y:.3f} {z:.3f}\n"
         
-        first_pos = contours[0,0]
+        first_pos = contours[0,0]+translate
         gcode = f"""
-        G21 G90 G94 G17 G{53+datum}
-        M6 T{tool}
-        G28
-        G0 X{first_pos[0]} Y{first_pos[1]}
-        Z{retract}
-        """
+G21 G90 G94 G17 G{53+datum}
+M6 T{tool}
+G28
+G0 X{first_pos[0]} Y{first_pos[1]}
+Z{retract}
+M3 S{spindle_speed} F{feed}
+G4 P3.0
+"""
         obj = ""
         I, J = contours.shape[:2]
         for i in range(0, I, 2):
             for j in range(J):
-                gcode += form_gcode(contours[i,j])
-                obj += form_obj(contours[i,j])
+                gcode += form_gcode(contours[i,j] + translate)
+                obj += form_obj(contours[i,j] + translate)
             i += 1
+            if i >= I:
+                break
             for j in reversed(range(J)):
-                gcode += form_gcode(contours[i,j])
-                obj += form_obj(contours[i,j])
+                gcode += form_gcode(contours[i,j] + translate)
+                obj += form_obj(contours[i,j] + translate)
         # emit ze lines
-        for i in range(0, I*J, 100):
-            obj += f"f {" ".join([str(_i+1) for _i in range(i, min(I*J, i+100))])}"
+        chunksize=1000
+        for chunk in range(0, I*J, chunksize):
+            obj += f"l {" ".join([str(_i+1) for _i in range(chunk, min(I*J,chunk+chunksize+1001))])}\n"
         return gcode, obj
 
 
@@ -304,6 +344,12 @@ def main(grid_size, elevation_gain, profile_obj_path, save_dir, resolution, gcod
                 f.write(data)
 
 if __name__ == "__main__":
+    def trans_type(s):
+        v = [0, 0, 0]
+        for i, t in enumerate(s.split(',')):
+            f = float(t)
+            v[i] = f
+        return v
     parser = argparse.ArgumentParser()
     parser.add_argument("--grid-size", type=int, default=40)
     parser.add_argument("--elevation-gain", type=int, default=6)
@@ -311,9 +357,11 @@ if __name__ == "__main__":
     parser.add_argument("--save-dir", type=str, default=".")
     parser.add_argument("--resolution", type=int, default=256)
     parser.add_argument("--gcode", action="store_true")
+    parser.add_argument("--open-path", action="store_true")
+    parser.add_argument("--translate", type=trans_type, default=[0,0,0])
 
     args = parser.parse_args()
-    main(args.grid_size, args.elevation_gain, args.profile_obj_path, args.save_dir, args.resolution, args.gcode)
+    main(args.grid_size, args.elevation_gain, args.profile_obj_path, args.save_dir, args.resolution, args.gcode, args.open_path, args.translate)
 
 
 

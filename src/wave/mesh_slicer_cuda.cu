@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -179,6 +180,7 @@ float elapsed_ms(cudaEvent_t start, cudaEvent_t stop) {
 }  // namespace
 
 struct Handle {
+  std::mutex query_mutex;
   bvh3f bvh;
   GpuTriangle* triangles = nullptr;
   box3f* boxes = nullptr;
@@ -282,6 +284,10 @@ std::vector<std::uint32_t> query(Handle* handle, float z, int grid_resolution,
     milliseconds = 0.0;
     return {};
   }
+  // Concurrent cleanup layers share the BVH and its reusable query buffers.
+  // Protect the flags/count/output transaction through the host download;
+  // polygon construction and the expensive CAM stages run outside this lock.
+  std::unique_lock<std::mutex> lock(handle->query_mutex);
   const std::size_t bytes = handle->triangle_count * sizeof(std::uint32_t);
   check(cudaMemset(handle->flags, 0, bytes), "clear slice candidate flags");
   check(cudaMemset(handle->output_count, 0, sizeof(std::uint32_t)), "clear slice candidate count");
@@ -309,6 +315,7 @@ std::vector<std::uint32_t> query(Handle* handle, float z, int grid_resolution,
   if (count)
     check(cudaMemcpy(result.data(), handle->output, count * sizeof(std::uint32_t),
                      cudaMemcpyDeviceToHost), "download slice candidates");
+  lock.unlock();
   std::sort(result.begin(), result.end());
   return result;
 }

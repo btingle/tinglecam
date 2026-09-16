@@ -335,7 +335,11 @@ void check_serialisation() {
   cam::Job job;
   cam::Operation operation;
   operation.path_pitch = 0.15;
+  operation.simulation_method = wave::SimulationMethod::Compare;
   operation.finishing_subdivisions = 4;
+  operation.depth_breaks = {1.25, 3.5};
+  operation.adaptive_cleanup_stepover = false;
+  operation.cleanup_stepover_limit = 0.65;
   operation.cleanup_tolerance = 0.2;
   operation.mode = cam::OperationMode::ContourFinishing;
   operation.entry_front_match_tolerance = 0.12;
@@ -353,10 +357,17 @@ void check_serialisation() {
           "job files contain reconstruction data, not models or plan results");
   require(job_back.operations.size() == 1, "job operations survive");
   if (!job_back.operations.empty()) {
+    require(job_back.operations[0].simulation_method == wave::SimulationMethod::Compare,
+            "engagement method survives serialization");
     require_near(job_back.operations[0].path_pitch, 0.15, 1e-9,
                  "path pitch survives");
     require(job_back.operations[0].finishing_subdivisions == 4,
             "finishing subdivisions survive");
+    require(job_back.operations[0].depth_breaks == operation.depth_breaks &&
+                !job_back.operations[0].adaptive_cleanup_stepover,
+            "depth breaks and cleanup adaptation survive");
+    require_near(job_back.operations[0].cleanup_stepover_limit, 0.65, 1e-9,
+                 "cleanup width ceiling survives");
     require_near(job_back.operations[0].cleanup_tolerance, 0.2, 1e-9,
                  "cleanup tolerance survives");
     require(job_back.operations[0].mode == cam::OperationMode::ContourFinishing,

@@ -53,8 +53,8 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
     const double floor_z = floors[index];
     if (progress) {
       const double fraction =
-          progress_from + span * (static_cast<double>(index) / floors.size());
-      if (!progress(fraction, operation.name + ": depth " +
+          progress_from + span * 0.15 * (static_cast<double>(index) / floors.size());
+      if (!progress(fraction, operation.name + ": slicing at depth " +
                                   std::to_string(floor_z) + " mm")) {
         plan.error = "Cancelled";
         return plan;
@@ -149,7 +149,7 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
   const double lead_in =
       operation.lead_in ? radius + first_bite_allowance : 0.0;
   const auto wavefront_start = PlanningClock::now();
-  parallel_for_levels(wave_levels, [&](std::size_t index) {
+  if (!parallel_for_levels(wave_levels, [&](std::size_t index, const LevelProgress&) {
     LevelPlan& level = plan.levels[index];
     try {
       wave::WavefrontAnalysis analysis = wave::analyze_wavefront(
@@ -170,7 +170,11 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
     } catch (...) {
       wave_errors[index] = std::current_exception();
     }
-  });
+  }, progress, progress_from + span * 0.15, progress_to,
+     operation.name + ": wavefronts")) {
+    plan.error = "Cancelled";
+    return plan;
+  }
   plan.metrics.wavefront_milliseconds +=
       elapsed_milliseconds(wavefront_start);
 
@@ -268,7 +272,8 @@ void plan_toolpaths(OperationPlan& plan,
                     double progress_to,
                     double rapid_plane,
                     const PriorOperations& prior_operations,
-                    const OperationPlan* prior_subdivisions) {
+                    const OperationPlan* prior_subdivisions,
+                    bool defer_links) {
   const bool finishing_subdivision = prior_subdivisions != nullptr;
   if (!plan.ok()) return;
   if (!std::isfinite(rapid_plane)) {
@@ -297,7 +302,7 @@ void plan_toolpaths(OperationPlan& plan,
   // built. Simulation and feeds come last, after the seams have been settled,
   // which is what keeps a transition an ordinary part of the pass it belongs to
   // rather than motion that nothing ever checks.
-  const double build_share = 0.7;
+
   std::vector<std::size_t> toolpath_levels;
   toolpath_levels.reserve(plan.levels.size());
   for (std::size_t index = 0; index < plan.levels.size(); ++index) {
@@ -309,22 +314,12 @@ void plan_toolpaths(OperationPlan& plan,
       level.nothing_to_cut = true;
       continue;
     }
-    if (progress) {
-      const double fraction =
-          progress_from +
-          span * build_share * (static_cast<double>(index) / plan.levels.size());
-      if (!progress(fraction, operation.name + ": toolpath at depth " +
-                                  std::to_string(level.floor_z) + " mm")) {
-        plan.error = "Cancelled";
-        return;
-      }
-    }
     toolpath_levels.push_back(index);
   }
 
   std::vector<std::exception_ptr> toolpath_errors(plan.levels.size());
   const auto toolpath_start = PlanningClock::now();
-  parallel_for_levels(toolpath_levels, [&](std::size_t index) {
+  if (!parallel_for_levels(toolpath_levels, [&](std::size_t index, const LevelProgress&) {
     LevelPlan& level = plan.levels[index];
     try {
       // A depth the part does not reach is cleared rather than finished, in
@@ -382,7 +377,11 @@ void plan_toolpaths(OperationPlan& plan,
     } catch (...) {
       toolpath_errors[index] = std::current_exception();
     }
-  });
+  }, progress, progress_from, progress_from + span * 0.30,
+     operation.name + ": toolpaths")) {
+    plan.error = "Cancelled";
+    return;
+  }
   plan.metrics.toolpath_milliseconds += elapsed_milliseconds(toolpath_start);
 
   std::vector<std::size_t> cleanup_levels;
@@ -400,7 +399,7 @@ void plan_toolpaths(OperationPlan& plan,
 
   std::vector<std::exception_ptr> cleanup_errors(plan.levels.size());
   const auto cleanup_start = PlanningClock::now();
-  parallel_for_levels(cleanup_levels, [&](std::size_t index) {
+  if (!parallel_for_levels(cleanup_levels, [&](std::size_t index, const LevelProgress&) {
     LevelPlan& level = plan.levels[index];
     try {
       // A centreline inside stock is safe only where the wave opened a route to
@@ -458,7 +457,11 @@ void plan_toolpaths(OperationPlan& plan,
     } catch (...) {
       cleanup_errors[index] = std::current_exception();
     }
-  });
+  }, progress, progress_from + span * 0.30, progress_from + span * 0.38,
+     operation.name + ": boundary cleanup")) {
+    plan.error = "Cancelled";
+    return;
+  }
   plan.metrics.cleanup_milliseconds += elapsed_milliseconds(cleanup_start);
 
   for (const std::size_t index : toolpath_levels) {
@@ -498,7 +501,7 @@ void plan_toolpaths(OperationPlan& plan,
   }
 
   const auto stitching_start = PlanningClock::now();
-  stitch_passes(plan, setup, machine, rapid_plane);
+  if (!defer_links) stitch_passes(plan, setup, machine, rapid_plane);
   plan.metrics.stitching_milliseconds +=
       elapsed_milliseconds(stitching_start);
 
@@ -513,10 +516,10 @@ void plan_toolpaths(OperationPlan& plan,
     if (level.nothing_to_cut) continue;
     if (progress) {
       const double fraction =
-          progress_from + span * build_share +
-          span * (1.0 - build_share) *
+          progress_from + span * 0.38 +
+          span * 0.02 *
               (static_cast<double>(index) / plan.levels.size());
-      if (!progress(fraction, operation.name + ": feeds at depth " +
+      if (!progress(fraction, operation.name + ": resampling at depth " +
                                   std::to_string(level.floor_z) + " mm")) {
         plan.error = "Cancelled";
         return;
@@ -561,32 +564,21 @@ void plan_toolpaths(OperationPlan& plan,
   // Clipper working set by the number of levels in a deep job.
   std::vector<std::exception_ptr> simulation_errors(plan.levels.size());
   const auto simulation_start = PlanningClock::now();
-  if (!simulated_levels.empty()) {
-    std::atomic<std::size_t> next{0};
-    const std::size_t workers =
-        std::min<std::size_t>(4, simulated_levels.size());
-    std::vector<std::thread> threads;
-    threads.reserve(workers);
-    for (std::size_t worker = 0; worker < workers; ++worker) {
-      threads.emplace_back([&] {
-        for (;;) {
-          const std::size_t work = next.fetch_add(1, std::memory_order_relaxed);
-          if (work >= simulated_levels.size()) return;
-          const std::size_t index = simulated_levels[work];
-          LevelPlan& level = plan.levels[index];
-          try {
-            const wave::Paths64& final_subject =
-                level.part_slice.empty() ? level.wave.subject : level.part_slice;
-            level.simulation = wave::simulate_material(
-                level.incoming_stock, final_subject, level.toolpath, radius,
-                operation.simulation_stock_inflation);
-          } catch (...) {
-            simulation_errors[index] = std::current_exception();
-          }
-        }
-      });
+  if (!parallel_for_levels(simulated_levels, [&](std::size_t index, const LevelProgress& report) {
+    LevelPlan& level = plan.levels[index];
+    try {
+      const wave::Paths64& final_subject =
+          level.part_slice.empty() ? level.wave.subject : level.part_slice;
+      level.simulation = wave::simulate_material(
+          level.incoming_stock, final_subject, level.toolpath, radius,
+          operation.simulation_stock_inflation, operation.simulation_method, report);
+    } catch (...) {
+      simulation_errors[index] = std::current_exception();
     }
-    for (std::thread& thread : threads) thread.join();
+  }, progress, progress_from + span * 0.40, progress_from + span * 0.97,
+     operation.name + ": material simulation")) {
+    plan.error = "Cancelled";
+    return;
   }
   plan.metrics.simulation_milliseconds +=
       elapsed_milliseconds(simulation_start);
@@ -628,8 +620,15 @@ void plan_toolpaths(OperationPlan& plan,
   // carried; the height is the one already set above.
   if (prior_subdivisions != nullptr)
     link.from = resting_position(*prior_subdivisions);
+  std::size_t feeds_completed = 0;
   for (const std::size_t index : simulated_levels) {
     LevelPlan& level = plan.levels[index];
+    if (progress && !progress(progress_from + span *
+            (0.97 + 0.03 * feeds_completed++ / simulated_levels.size()),
+            operation.name + ": feeds")) {
+      plan.error = "Cancelled";
+      return;
+    }
     if (level.nothing_to_cut) continue;
     try {
       link.stay_down_after = level.stays_down_after;
@@ -732,7 +731,8 @@ OperationPlan plan_operation(const JobGeometry& geometry,
                              double progress_to,
                              double rapid_plane,
                              const PriorOperations& prior_operations,
-                             const OperationPlan* prior_subdivisions) {
+                             const OperationPlan* prior_subdivisions,
+                             bool defer_links) {
   const auto planning_start = PlanningClock::now();
   // Wavefronts are the cheaper half; give the toolpaths the larger share of the
   // reported progress so the bar does not stall in the second stage.
@@ -741,7 +741,8 @@ OperationPlan plan_operation(const JobGeometry& geometry,
                                        material, progress, progress_from, seam,
                                        prior_operations, prior_subdivisions);
   plan_toolpaths(plan, operation, tool, machine, material, progress, seam,
-                 progress_to, rapid_plane, prior_operations, prior_subdivisions);
+                 progress_to, rapid_plane, prior_operations, prior_subdivisions,
+                 defer_links);
   plan.metrics.total_milliseconds = elapsed_milliseconds(planning_start);
   return plan;
 }
@@ -793,7 +794,18 @@ OperationPlan plan_subdivided_operation(
     return result;
   const std::size_t groups = 1 + floors.size() * (count - 1);
   const std::size_t total_levels = floors.size() * count;
-  const double span = progress_to - progress_from;
+  const double planning_to = operation.mode == OperationMode::Roughing
+      ? progress_from + (progress_to - progress_from) * 0.9 : progress_to;
+  const double span = planning_to - progress_from;
+  const auto planning_start = PlanningClock::now();
+  struct CleanupGroup {
+    Operation pass;
+    std::size_t coarse;
+    int finishing;
+    double shift;
+  };
+  std::vector<CleanupGroup> schedule;
+  schedule.reserve(groups);
   for (std::size_t group = 0; group < groups; ++group) {
     Operation pass = operation;
     pass.finishing_subdivisions = 1;
@@ -826,45 +838,111 @@ OperationPlan plan_subdivided_operation(
                    std::to_string(count - 1);
     }
 
-    const double pass_from = progress_from +
-        span * result.levels.size() / total_levels;
-    const std::size_t group_levels = group == 0 ? floors.size() : 1;
-    const double pass_to = progress_from +
-        span * (result.levels.size() + group_levels) / total_levels;
-    OperationPlan planned = plan_operation(
-        geometry, pass, tool, machine, material, progress, pass_from, pass_to,
-        rapid_plane, prior_operations,
-        result.levels.empty() ? nullptr : &result);
+    schedule.push_back({std::move(pass), coarse, finishing, shift});
+  }
+  result.levels.reserve(total_levels);
+  result.subdivisions.resize(groups);
+  std::vector<wave::InterLayerTopology> topologies(groups);
+  std::vector<std::vector<std::string>> warnings(groups);
+  const auto collect = [&](std::size_t group, OperationPlan&& planned) {
+    const auto& entry = schedule[group];
     if (!planned.ok()) {
       result.error = planned.error == "Cancelled" ? planned.error
-          : pass.name + ": " + planned.error;
-      return result;
+          : entry.pass.name + ": " + planned.error;
+      return false;
     }
-
-    const std::size_t first = result.levels.size();
-    result.subdivisions.push_back(
-        {first, planned.levels.size(), shift});
-    append_inter_layer(result.inter_layer, std::move(planned.inter_layer),
-                       first);
+    result.subdivisions[group] =
+        {result.levels.size(), planned.levels.size(), entry.shift};
+    topologies[group] = std::move(planned.inter_layer);
     for (std::size_t local = 0; local < planned.levels.size(); ++local) {
-      planned.levels[local].subdivision = group;
-      planned.levels[local].coarse_level = group == 0 ? local : coarse;
-      planned.levels[local].finishing_index = finishing;
-      planned.levels[local].subdivision_level = local;
-      result.levels.push_back(std::move(planned.levels[local]));
+      auto& level = planned.levels[local];
+      level.subdivision = group;
+      level.coarse_level = group == 0 ? local : entry.coarse;
+      level.finishing_index = entry.finishing;
+      level.subdivision_level = local;
+      result.levels.push_back(std::move(level));
     }
     accumulate(result.stats, planned.stats);
     accumulate(result.metrics, planned.metrics);
     result.spindle_rpm = std::max(result.spindle_rpm, planned.spindle_rpm);
-    for (const std::string& warning : planned.warnings) {
-      // Engagement limits apply to the whole operation. Keep layer-specific
-      // diagnostics, but don't repeat identical setup notes for every group.
-      if (std::find(setup_warnings.begin(), setup_warnings.end(), warning) !=
-          setup_warnings.end())
-        continue;
-      result.warnings.push_back(
-          group == 0 ? warning : pass.name + ": " + warning);
+    warnings[group] = std::move(planned.warnings);
+    return true;
+  };
+  const double coarse_to = progress_from + span / count;
+  if (!collect(0, plan_operation(geometry, schedule[0].pass, tool, machine,
+          material, progress, progress_from, coarse_to, rapid_plane,
+          prior_operations, nullptr, operation.mode == OperationMode::Roughing)))
+    return result;
+
+  // Different coarse terraces occupy disjoint open Z intervals. At a cleanup
+  // floor only its own coarse cut and earlier subdivisions of that terrace
+  // affect stock. All tasks in this round share the completed history read-only;
+  // none can see another task's unfinished cuts. No stock/plan clone per worker.
+  for (int finishing = 1; finishing < count; ++finishing) {
+    std::vector<std::size_t> round;
+    for (std::size_t terrace = 0; terrace < floors.size(); ++terrace)
+      round.push_back(terrace);
+    std::vector<OperationPlan> planned(round.size());
+    const auto round_start = PlanningClock::now();
+    if (!parallel_for_levels(round, [&](std::size_t terrace, const LevelProgress& report) {
+          const std::size_t group = 1 + terrace * (count - 1) + finishing - 1;
+          const ProgressCallback worker_progress =
+              [&](PlanningProgress p, const std::string&) { return report(p.fraction); };
+          planned[terrace] = plan_operation(geometry, schedule[group].pass,
+              tool, machine, material, worker_progress, 0, 1, rapid_plane,
+              prior_operations, &result, true);
+        }, progress, progress_from + span * finishing / count,
+        progress_from + span * (finishing + 1) / count,
+        operation.name + ": cleanup subdivision " + std::to_string(finishing) +
+            "/" + std::to_string(count - 1))) {
+      result.error = "Cancelled";
+      return result;
     }
+    result.metrics.parallel_cleanup_milliseconds += elapsed_milliseconds(round_start);
+    for (std::size_t terrace : round) {
+      const std::size_t group = 1 + terrace * (count - 1) + finishing - 1;
+      result.metrics.cleanup_work_milliseconds += planned[terrace].metrics.total_milliseconds;
+      if (!collect(group, std::move(planned[terrace]))) return result;
+    }
+  }
+
+  // Planning order is subdivision-major, execution remains terrace-major:
+  // coarse descent, then every upward cleanup of the deepest terrace, etc.
+  // Move the results (including their large geometry buffers) into that order.
+  std::vector<LevelPlan> execution;
+  execution.reserve(result.levels.size());
+  for (std::size_t group = 0; group < groups; ++group) {
+    auto& subdivision = result.subdivisions[group];
+    const std::size_t first = execution.size();
+    for (std::size_t i = 0; i < subdivision.level_count; ++i)
+      execution.push_back(std::move(result.levels[subdivision.first_level + i]));
+    subdivision.first_level = first;
+    append_inter_layer(result.inter_layer, std::move(topologies[group]), first);
+    for (const auto& warning : warnings[group]) {
+      if (std::find(setup_warnings.begin(), setup_warnings.end(), warning) ==
+          setup_warnings.end())
+        result.warnings.push_back(group == 0 ? warning : schedule[group].pass.name + ": " + warning);
+    }
+  }
+  result.levels = std::move(execution);
+  if (count > 1) {
+    // Worker-local arrival moves used planning order. Rebuild feeds against the
+    // actual execution predecessor before the stock-validated linker runs.
+    const auto feeds_start = PlanningClock::now();
+    PassLink link;
+    link.from_z = rapid_plane;
+    for (auto& level : result.levels) {
+      if (level.nothing_to_cut || level.feeds.motion.empty()) continue;
+      level.feeds = plan_feeds(level.toolpath, level.simulation, machine,
+          setup.full_engagement_feed, setup.no_engagement_feed,
+          operation.spindle_rpm, operation.plunge_feed, level.floor_z,
+          rapid_plane, link, false);
+      if (!level.feeds.motion.empty()) {
+        link.from = level.feeds.motion.back().to;
+        link.from_z = rapid_plane;
+      }
+    }
+    result.metrics.feeds_milliseconds += elapsed_milliseconds(feeds_start);
   }
   if (operation.mode == OperationMode::Roughing) {
     // Compose physical slabs independently of execution order. In particular,
@@ -874,14 +952,21 @@ OperationPlan plan_subdivided_operation(
       boundaries.push_back(level.floor_z);
       boundaries.push_back(level.floor_z + level.axial_depth);
     }
-    if (progress && !progress(progress_to, operation.name + ": stock preview")) {
+    if (progress && !progress(planning_to, operation.name + ": stock preview")) {
       result.error = "Cancelled";
       return result;
     }
     result.preview_context = active_stock(geometry, prior_operations,
                                            operation.slice_grid, boundaries);
     result.composed_stock = true;
+    const auto linking_start = PlanningClock::now();
+    link_roughing_levels(result, geometry, operation, setup, machine, rapid_plane,
+                         progress, planning_to, progress_to);
+    const double linking_ms = elapsed_milliseconds(linking_start);
+    result.metrics.stitching_milliseconds += linking_ms;
+    result.metrics.total_milliseconds += linking_ms;
   }
+  result.metrics.total_milliseconds = elapsed_milliseconds(planning_start);
   return result;
 }
 

@@ -1,4 +1,6 @@
 #include "job_internal.h"
+#include "cam/stock.h"
+#include <unordered_set>
 namespace cam { namespace detail {
 
 using PlanningClock = std::chrono::steady_clock;
@@ -70,6 +72,8 @@ void accumulate(PlanningMetrics& into, const PlanningMetrics& from) {
   into.resampling_milliseconds += from.resampling_milliseconds;
   into.simulation_milliseconds += from.simulation_milliseconds;
   into.feeds_milliseconds += from.feeds_milliseconds;
+  into.parallel_cleanup_milliseconds += from.parallel_cleanup_milliseconds;
+  into.cleanup_work_milliseconds += from.cleanup_work_milliseconds;
   into.total_milliseconds += from.total_milliseconds;
   into.wave_generations += from.wave_generations;
   into.fronts += from.fronts;
@@ -435,6 +439,258 @@ void stitch_passes(OperationPlan& plan, const OperationSetup& setup,
     earlier->transition = *route;
     earlier->stays_down_after = true;
   }
+}
+
+void link_roughing_levels(OperationPlan& plan, const JobGeometry& geometry,
+    const Operation& operation, const OperationSetup& setup,
+    const Machine& machine, double rapid_plane, const ProgressCallback& progress,
+    double progress_from, double progress_to) {
+  const bool trace = std::getenv("TINGLECAM_TRACE_LINKS");
+  std::size_t active_layer = 0;
+  auto stock = plan.preview_context;
+  const double travel = std::max(setup.no_engagement_feed, 1.0);
+  const double vertical_rate = std::max(rapid_feed_z(machine), 1.0);
+  const double slack = link_slack(setup.stepover);
+  // Only the integer geometry's one-unit rounding allowance is admitted by
+  // the final swept-volume check, never the router's much larger slack.
+  const double sweep_radius = std::max(0.0, double(wave::to_integer(setup.radius)) - 1.0);
+  std::map<double, wave::Paths64> protected_slices;
+  const auto obstacles = [&](double floor, const Clipper2Lib::Rect64* bounds = nullptr) {
+    wave::Paths64 blocked;
+    const auto append = [&](const wave::Paths64& region) {
+      for (const auto& ring : region) {
+        if (bounds) {
+          const auto b = Clipper2Lib::GetBounds(ring);
+          if (b.right < bounds->left || b.left > bounds->right ||
+              b.bottom < bounds->top || b.top > bounds->bottom) continue;
+        }
+        blocked.push_back(ring);
+      }
+    };
+    std::unordered_set<const wave::Paths64*> seen;
+    for (const auto& slab : stock) {
+      // Project all remaining stock above the tip. This conservatively checks
+      // the cutter column, including material above both transition heights.
+      if (slab.top <= floor + 1e-9) continue;
+      if (seen.insert(slab.region.get()).second) append(*slab.region);
+    }
+    if (geometry.has_part()) {
+      auto [entry, inserted] = protected_slices.try_emplace(floor);
+      if (inserted) {
+        const double z = std::nextafter(
+            static_cast<float>(floor - operation.axial_stock_to_leave),
+            std::numeric_limits<float>::infinity());
+        // Remaining stock already contains the radial allowance. Re-inflating
+        // the nominal part would recreate allowance material that earlier cuts
+        // removed (including differences between rounded offset polygons), and
+        // falsely obstruct travel out of those cuts. Protect the actual part
+        // independently; every remaining stock slab is still checked above.
+        entry->second = geometry.part_outline(z, operation.slice_grid);
+      }
+      append(entry->second);
+    }
+    // Collision queries need only rings whose bounds meet the cutter sweep.
+    // Intersect applies NonZero winding to all clips together, so a preliminary
+    // union of the entire stock column is unnecessary. Retain enclosing rings
+    // and holes; only wholly disjoint bounds may be discarded. Routing still
+    // needs the complete, united obstacle boundary.
+    return bounds ? blocked : Union(blocked, FillRule::NonZero);
+  };
+  // Stock subtraction approximates round caps with polygons. A new sweep at a
+  // different angle can meet tiny remnants inside a cutter capsule that has
+  // already physically passed through. Prove those remnants were swept; never
+  // discard collisions merely because their area is small.
+  const auto previously_swept = [&](const wave::Path64& ring, const StockSlab& slab) {
+    const auto bounds = Clipper2Lib::GetBounds(ring);
+    const long double radius = setup.radius * wave::kIntegerScale;
+    const long double radius2 = radius * radius;
+    for (std::size_t prior = 0; prior < active_layer; ++prior) {
+      const auto& cut = plan.levels[prior];
+      if (cut.nothing_to_cut || cut.floor_z > slab.bottom + 1e-9 ||
+          cut.floor_z + cut.axial_depth < slab.top - 1e-9) continue;
+      for (const auto& move : cut.simulation.moves) for (const auto& step : move.steps) {
+        // Convex capsule bounds must contain the whole collision polygon.
+        if (bounds.left < std::min(step.from.x, step.to.x) - radius ||
+            bounds.right > std::max(step.from.x, step.to.x) + radius ||
+            bounds.top < std::min(step.from.y, step.to.y) - radius ||
+            bounds.bottom > std::max(step.from.y, step.to.y) + radius) continue;
+        const long double dx = step.to.x - step.from.x;
+        const long double dy = step.to.y - step.from.y;
+        const long double length2 = dx * dx + dy * dy;
+        bool contained = true;
+        for (const auto& point : ring) {
+          const long double px = point.x - step.from.x;
+          const long double py = point.y - step.from.y;
+          const long double t = length2 > 0 ?
+              std::clamp((px * dx + py * dy) / length2, 0.0L, 1.0L) : 0;
+          const long double ex = px - t * dx, ey = py - t * dy;
+          if (ex * ex + ey * ey >= radius2) { contained = false; break; }
+        }
+        // A capsule is convex: all vertices inside this SAME capsule proves
+        // the entire ring interior lies inside an already-executed cut.
+        if (contained) return true;
+      }
+    }
+    return false;
+  };
+  const auto clear = [&](const wave::Path64& path, double floor) {
+    const auto sweep = path.front() == path.back() && path.size() <= 2
+        ? wave::Paths64{Clipper2Lib::Ellipse(path.front(), sweep_radius, sweep_radius, 48)}
+        : InflatePaths(wave::Paths64{path}, sweep_radius, JoinType::Round, EndType::Round);
+    const auto bounds = Clipper2Lib::GetBounds(sweep);
+    const auto blocked = obstacles(floor, &bounds);
+    if (blocked.empty()) return true;
+    const auto collision = Clipper2Lib::Intersect(sweep, blocked, FillRule::NonZero);
+    if (trace) std::fprintf(stderr, "link_clear layer=%zu floor=%.3f from=%.3f,%.3f to=%.3f,%.3f collision_mm2=%.9f\n",
+        active_layer, floor, wave::to_world(path.front().x), wave::to_world(path.front().y),
+        wave::to_world(path.back().x), wave::to_world(path.back().y),
+        std::abs(Clipper2Lib::Area(collision)) / (wave::kIntegerScale * wave::kIntegerScale));
+    if (collision.empty()) return true;
+    // Finished-part protection is independent of stock-removal evidence.
+    if (geometry.has_part()) {
+      const auto protected_hit = Clipper2Lib::Intersect(sweep, protected_slices.at(floor), FillRule::NonZero);
+      if (!protected_hit.empty()) {
+        if (trace) std::fprintf(stderr, "link_protected_hit layer=%zu area=%.9f\n", active_layer,
+            std::abs(Clipper2Lib::Area(protected_hit)) / (wave::kIntegerScale * wave::kIntegerScale));
+        return false;
+      }
+    }
+    for (const auto& slab : stock) {
+      if (slab.top <= floor + 1e-9) continue;
+      const auto hits = Clipper2Lib::Intersect(sweep, *slab.region, FillRule::NonZero);
+      for (const auto& ring : hits)
+        if (!previously_swept(ring, slab)) {
+          if (trace) std::fprintf(stderr, "link_unswept layer=%zu slab=%.3f,%.3f area=%.9f\n", active_layer, slab.bottom, slab.top,
+              std::abs(Clipper2Lib::Area(ring)) / (wave::kIntegerScale * wave::kIntegerScale));
+          return false;
+        }
+    }
+    if (trace) std::fprintf(stderr, "link_proven_swept layer=%zu floor=%.3f\n", active_layer, floor);
+    return true;
+  };
+  const auto account = [](FeedStats& stats, const MotionPhase& phase) {
+    if (phase.rapid || phase.from_z != phase.to_z) {
+      stats.rapid_distance += phase.length;
+      stats.rapid_minutes += phase.length / phase.rate;
+    } else {
+      stats.cutting_distance += phase.length;
+      stats.cutting_minutes += phase.length / phase.rate;
+      stats.minimum_feed = stats.minimum_feed > 0
+          ? std::min(stats.minimum_feed, phase.rate) : phase.rate;
+      stats.maximum_feed = std::max(stats.maximum_feed, phase.rate);
+    }
+  };
+
+  LevelPlan* previous = nullptr;
+  for (std::size_t index = 0; index < plan.levels.size(); ++index) {
+    if (progress && !progress(progress_from + (progress_to - progress_from) *
+                               double(index) / plan.levels.size(),
+                               operation.name + ": linking layers")) {
+      plan.error = "Cancelled";
+      return;
+    }
+    active_layer = index;
+    auto& level = plan.levels[index];
+    if (trace) std::fprintf(stderr, "link_level layer=%zu z=%.3f subdivision=%d empty=%d\n", index, level.floor_z, level.finishing_index, level.nothing_to_cut);
+    level.feeds.authoritative_motion = true;
+    if (level.nothing_to_cut || level.feeds.motion.empty()) continue;
+    if (previous) {
+      auto& before = previous->feeds;
+      auto& after = level.feeds;
+      // Preserve every cutting move. Only replace the preceding departure
+      // and following arrival, which must consist entirely of rapid motion.
+      const auto last_cut = std::find_if(before.motion.rbegin(), before.motion.rend(),
+                                         [](const auto& p) { return !p.rapid; });
+      const auto first_cut = std::find_if(after.motion.begin(), after.motion.end(),
+                                          [](const auto& p) { return !p.rapid; });
+      if (last_cut != before.motion.rend() && first_cut != after.motion.end() &&
+          last_cut->to_z == previous->floor_z && first_cut->from_z == level.floor_z) {
+        const auto from = last_cut->to, to = first_cut->from;
+        const double low = std::min(previous->floor_z, level.floor_z);
+        const double high = std::max(previous->floor_z, level.floor_z);
+        // Lift first when moving up; descend last when moving down. Proving
+        // the lower endpoint's entire column clear proves the vertical leg.
+        const auto lower_point = previous->floor_z < level.floor_z ? from : to;
+        if (high < rapid_plane && sweep_radius > 0 && clear({lower_point}, low)) {
+          std::optional<wave::Path64> route = wave::Path64{from, to};
+          const bool direct_clear = clear(*route, high);
+          if (!direct_clear) {
+            const auto upper_obstacles = obstacles(high);
+            auto bounds = Clipper2Lib::GetBounds(upper_obstacles);
+            bounds.left = std::min({bounds.left, from.x, to.x});
+            bounds.right = std::max({bounds.right, from.x, to.x});
+            bounds.top = std::min({bounds.top, from.y, to.y});
+            bounds.bottom = std::max({bounds.bottom, from.y, to.y});
+            const auto margin = wave::to_integer(setup.radius * 4 + 10);
+            bounds.left -= margin; bounds.right += margin;
+            bounds.top -= margin; bounds.bottom += margin;
+            const wave::Paths64 world{{{bounds.left, bounds.top}, {bounds.right, bounds.top},
+                                       {bounds.right, bounds.bottom}, {bounds.left, bounds.bottom}}};
+            const auto free = Clipper2Lib::Difference(world,
+                offset_outward(upper_obstacles, setup.radius), FillRule::NonZero);
+            const wave::Router router(wave::routable_region(free, slack, {from, to}), slack);
+            route = router.route(from, to);
+          }
+          if (trace && !route) std::fprintf(stderr, "link_no_route layer=%zu\n", index);
+          if (route && !route->empty() && (direct_clear || clear(*route, high))) {
+            std::vector<MotionPhase> seam;
+            const double path_distance = first_cut->path_distance_begin;
+            const auto add = [&](const wave::Point64& a, const wave::Point64& b,
+                                 double za, double zb) {
+              MotionPhase phase;
+              phase.from = a; phase.to = b; phase.from_z = za; phase.to_z = zb;
+              phase.path_distance_begin = phase.path_distance_end = path_distance;
+              phase.length = std::hypot(distance_mm(a, b), zb - za);
+              phase.rapid = za != zb;
+              phase.rate = phase.rapid ? vertical_rate : travel;
+              phase.kind = wave::MoveKind::Link;
+              phase.inter_layer = true;
+              if (phase.length > 0) seam.push_back(phase);
+            };
+            add(from, from, previous->floor_z, high);
+            for (std::size_t i = 1; i < route->size(); ++i)
+              add((*route)[i-1], (*route)[i], high, high);
+            add(to, to, high, level.floor_z);
+            const auto departure = last_cut.base();
+            double old_minutes = 0, new_minutes = 0;
+            for (auto i = departure; i != before.motion.end(); ++i) old_minutes += i->length / i->rate;
+            for (auto i = after.motion.begin(); i != first_cut; ++i) old_minutes += i->length / i->rate;
+            for (const auto& phase : seam) new_minutes += phase.length / phase.rate;
+            if (trace) std::fprintf(stderr, "link_cost layer=%zu old_seconds=%.6f new_seconds=%.6f\n", index, old_minutes*60, new_minutes*60);
+            if (new_minutes < old_minutes) {
+              before.motion.erase(departure, before.motion.end());
+              after.motion.erase(after.motion.begin(), first_cut);
+              if (!seam.empty()) seam.front().arrival = true;
+              after.motion.insert(after.motion.begin(), seam.begin(), seam.end());
+              previous->stays_down_after = before.ends_at_depth = true;
+              after.begins_at_depth = true;
+            }
+          }
+        }
+      }
+    }
+    stock = stock_outside(stock, level.simulation.removed_material,
+                           level.floor_z, level.floor_z + level.axial_depth);
+    previous = &level;
+  }
+  plan.stats.cutting_distance = plan.stats.rapid_distance = 0;
+  plan.stats.cutting_minutes = plan.stats.rapid_minutes = 0;
+  for (auto& level : plan.levels) {
+    if (level.nothing_to_cut) continue;
+    // Planar segments can be merged at slightly different unrounded feeds.
+    // The XYZ timeline is authoritative now, so derive travel and timing
+    // directly from it rather than adjusting those older segment totals.
+    auto& stats = level.feeds.stats;
+    stats.cutting_distance = stats.rapid_distance = 0;
+    stats.cutting_minutes = stats.rapid_minutes = 0;
+    for (const auto& phase : level.feeds.motion) account(stats, phase);
+    plan.stats.cutting_distance += level.feeds.stats.cutting_distance;
+    plan.stats.rapid_distance += level.feeds.stats.rapid_distance;
+    plan.stats.cutting_minutes += level.feeds.stats.cutting_minutes;
+    plan.stats.rapid_minutes += level.feeds.stats.rapid_minutes;
+  }
+  if (progress && !progress(progress_to, operation.name + ": linked layers"))
+    plan.error = "Cancelled";
 }
 
 }  // namespace detail

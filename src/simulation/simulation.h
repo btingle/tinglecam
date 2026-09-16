@@ -3,9 +3,13 @@
 #include "planning/toolpath.h"
 
 #include <cstddef>
+#include <functional>
 #include <vector>
 
 namespace wave {
+
+enum class SimulationMethod { LocalArea, Contact, Compare, ReferenceArea };
+const char* simulation_method_name(SimulationMethod method);
 
 // One normalized straight portion of an engaged toolpath move. Load is a
 // dimensionless
@@ -20,6 +24,8 @@ struct MaterialStep {
   double removed_area = 0.0;
   double gouge_area = 0.0;
   double load = 0.0;
+  double area_load = 0.0;
+  double contact_load = 0.0;
 };
 
 struct SimulatedMove {
@@ -48,6 +54,10 @@ struct SimulationStats {
   std::size_t gouging_steps = 0;
   std::size_t unsafe_plunges = 0;
   std::size_t unresolved_entries = 0;
+  std::size_t stock_batches = 0;
+  std::size_t contact_fallbacks = 0;
+  double contact_mean_abs_difference = 0.0;
+  double contact_max_abs_difference = 0.0;
 };
 
 struct SimulationResult {
@@ -63,18 +73,23 @@ struct SimulationResult {
   std::vector<SimulationCheckpoint> checkpoints;
   double tool_radius = 0.0;
   double stock_inflation = 0.0;
+  SimulationMethod method = SimulationMethod::LocalArea;
   SimulationStats stats;
 };
 
 // Sweeps the circular tool through Cut, Step and Link moves. Retracts are above
 // the work and are checked only for a stock collision at their destination.
 // Entry moves cannot be subtracted until the planner supplies their real ramp
-// or helix, so they are reported as unresolved.
+// or helix, so they are reported as unresolved. Optional progress counts input
+// intervals, reports at most every 64 intervals plus move boundaries, and throws
+// "Cancelled" if the callback returns false. It runs on the calling thread.
 SimulationResult simulate_material(const Paths64& raw_stock,
                                    const Paths64& raw_final_subject,
                                    const Toolpath& toolpath,
                                    double tool_radius,
-                                   double simulation_stock_inflation = 0.0);
+                                   double simulation_stock_inflation = 0.0,
+                                   SimulationMethod method = SimulationMethod::LocalArea,
+                                   const std::function<bool(double)>& progress = {});
 
 // Remaining stock at a distance along the toolpath. This is intended for UI
 // playback; distances outside the path are clamped in the same way as

@@ -169,6 +169,7 @@ struct Operation {
   double no_engagement_feed = 2000.0;
   int slice_grid = 32;
   double simulation_stock_inflation = 0.0;
+  wave::SimulationMethod simulation_method = wave::SimulationMethod::LocalArea;
 };
 
 struct BoxStockMargins {
@@ -246,9 +247,8 @@ struct LevelPlan {
   wave::SimulationResult simulation;
   FeedSchedule feeds;
   bool nothing_to_cut = false;
-  // This pass reaches the next one without lifting: `transition` is the way
-  // across at this pass's own floor, ending at the next pass's first point, so
-  // all that separates them is one pass depth of descent.
+  // This pass leaves the cutter at its floor. Roughing's next motion schedule
+  // carries the validated XYZ link; legacy planar linking uses `transition`.
   bool stays_down_after = false;
   // Pocket layers share a known opening, so prefer that stay-down connection
   // whenever the router can prove it is safe.
@@ -290,7 +290,7 @@ struct PlanStats {
   double excess_area = 0.0;
 };
 
-// Wall-clock measurements and scale counters for one planning run. These are
+// Timing measurements and scale counters for one planning run. These are
 // deliberately part of the result rather than printed from deep inside the
 // geometry code: command-line benchmarks can report them, while GUI plans and
 // tests remain quiet and can inspect the same authoritative numbers.
@@ -306,6 +306,10 @@ struct PlanningMetrics {
   double resampling_milliseconds = 0.0;
   double simulation_milliseconds = 0.0;
   double feeds_milliseconds = 0.0;
+  // Phase times sum elapsed work across concurrently planned cleanup passes.
+  // Total and parallel_cleanup remain wall-clock time, not summed worker time.
+  double parallel_cleanup_milliseconds = 0.0;
+  double cleanup_work_milliseconds = 0.0;
   double total_milliseconds = 0.0;
 
   std::size_t wave_generations = 0;
@@ -377,10 +381,23 @@ struct JobPlan {
   bool ok() const { return error.empty(); }
 };
 
-// Called as planning proceeds. `fraction` runs 0 to 1 across the whole job and
-// `stage` says what is happening. Returning false asks planning to stop, and a
-// cancelled plan comes back with an error saying so.
-using ProgressCallback = std::function<bool(double fraction, const std::string& stage)>;
+// Fractions cover the whole job. The interval from fraction to active_until
+// represents work currently assigned to workers, not completed work or an ETA.
+struct PlanningProgress {
+  double fraction = 0.0;
+  double active_until = 0.0;
+  std::size_t active_workers = 0;
+  std::size_t completed_levels = 0;
+  std::size_t total_levels = 0;
+
+  PlanningProgress(double value = 0.0) : fraction(value), active_until(value) {}
+  // Keep existing callers interested only in the overall fraction compatible.
+  operator double() const { return fraction; }
+};
+
+// Called only on the planning coordinator, including during parallel work.
+// Returning false cancels planning; all workers finish/stop before it returns.
+using ProgressCallback = std::function<bool(PlanningProgress, const std::string& stage)>;
 
 // Holds the sliced meshes so a replan does not rebuild the BVH, and the slices
 // themselves so repeated planning does not re-cut them. One instance per job.
@@ -537,7 +554,8 @@ void plan_toolpaths(OperationPlan& plan,
                     double progress_to = 1.0,
                     double rapid_plane = 10.0,
                     const PriorOperations& prior_operations = {},
-                    const OperationPlan* prior_subdivisions = nullptr);
+                    const OperationPlan* prior_subdivisions = nullptr,
+                    bool defer_links = false);
 
 // Both stages back to back.
 OperationPlan plan_operation(const JobGeometry& geometry,
@@ -550,7 +568,8 @@ OperationPlan plan_operation(const JobGeometry& geometry,
                              double progress_to = 1.0,
                              double rapid_plane = 10.0,
                              const PriorOperations& prior_operations = {},
-                             const OperationPlan* prior_subdivisions = nullptr);
+                             const OperationPlan* prior_subdivisions = nullptr,
+                             bool defer_links = false);
 
 // Resolves the material present at one Z plane after a sequence of operations.
 // A level removes material only through the axial slab it represents. This is

@@ -2,6 +2,7 @@
 #include "wave/topology.h"
 
 #include <cmath>
+#include <algorithm>
 #include <cstdlib>
 #include <iostream>
 #include <stdexcept>
@@ -37,10 +38,103 @@ wave::ToolpathMove move(wave::MoveKind kind, wave::Path64 path) {
   return result;
 }
 
+void check_methods() {
+  using namespace Clipper2Lib;
+  using wave::SimulationMethod;
+  const wave::Paths64 stock{box(0,0,20000,10000)};
+  const wave::Paths64 subject{box(8000,4000,12000,6000)};
+  wave::Toolpath path;
+  path.moves.push_back(move(wave::MoveKind::Cut,{{-2000,-600},{22000,-600}}));
+  path.moves.push_back(move(wave::MoveKind::Cut,{{22000,-600},{-2000,-600}}));
+  path.moves.push_back(move(wave::MoveKind::Retract,{{-2000,-600},{-2000,5000}}));
+  path.moves.push_back(move(wave::MoveKind::Cut,{{-2000,5000},{22000,5000}}));
+  path.moves.push_back(move(wave::MoveKind::Retract,{{22000,5000},{10000,5000}}));
+  path.moves.push_back(move(wave::MoveKind::Cut,{{10000,5000},{10000,12000},{5000,12000},{5000,-2000}}));
+  path = wave::resample_toolpath(path,0.2);
+  const auto reference = wave::simulate_material(stock,subject,path,1,0,SimulationMethod::ReferenceArea);
+  double last_progress = 0.0;
+  std::size_t reports = 0;
+  const auto local = wave::simulate_material(stock,subject,path,1,0,SimulationMethod::LocalArea,
+      [&](double fraction) {
+        require(fraction >= last_progress && fraction <= 1.0,
+                "simulation progress counts intervals monotonically");
+        last_progress = fraction;
+        ++reports;
+        return true;
+      });
+  require(last_progress == 1.0 && reports > path.moves.size() + 1,
+          "simulation reports progress inside long moves and reaches completion");
+  bool cancelled = false;
+  try {
+    wave::simulate_material(stock,subject,path,1,0,SimulationMethod::LocalArea,
+        [](double fraction) { return fraction < 0.1; });
+  } catch (const std::runtime_error& error) {
+    cancelled = std::string(error.what()) == "Cancelled";
+  }
+  require(cancelled, "simulation cooperatively cancels between interval batches");
+  const auto contact = wave::simulate_material(stock,subject,path,1,0,SimulationMethod::Contact);
+  const auto compare = wave::simulate_material(stock,subject,path,1,0,SimulationMethod::Compare);
+  require(local.stats.stock_batches > 1 && local.stats.stock_batches < local.stats.cutting_steps/4,
+          "local simulation batches many input intervals per global update");
+  for (const auto* result : {&local,&contact,&compare}) {
+    require(result->stats.cutting_steps==reference.stats.cutting_steps,
+            "simulation modes retain every input interval");
+    require_near(wave::material_area(Xor(result->remaining_stock,reference.remaining_stock,FillRule::NonZero)),
+                 0,0.02,"batching agrees with reference stock within integer clipping tolerance");
+    require_near(result->stats.gouge_area,reference.stats.gouge_area,0.02,
+                 "all methods retain swept-interval gouge detection");
+    require(result->stats.unsafe_plunges==reference.stats.unsafe_plunges,
+            "pending stock cuts are committed before checking a plunge");
+    require(wave::paths_equal_canonical(result->remaining_stock,local.remaining_stock),
+            "contact estimates never change final stock geometry");
+    for (std::size_t m=0;m<result->moves.size();++m) {
+      require(result->moves[m].steps.size()==reference.moves[m].steps.size(),"sample layout stays comparable");
+      for (std::size_t i=0;i<result->moves[m].steps.size();++i) {
+        const auto& step=result->moves[m].steps[i];
+        require(std::isfinite(step.load) && step.load>=0,"engagement is finite and nonnegative");
+        require_near(step.area_load,reference.moves[m].steps[i].area_load,0.025,
+                     "local material accounting agrees with reference samples");
+        if (m==0 && step.to.x>step.from.x && step.from.x>2000 && step.to.x<18000)
+          require_near(step.load,0.2,0.01,"steady side cutting measures radial engagement / diameter");
+        if (m==0 && step.to.x<step.from.x && step.to.x>2000 && step.from.x<18000)
+          require_near(step.load,0,0.01,"reverse travel through a previous cut remains air");
+      }
+    }
+    const auto final_preview=wave::simulation_stock_at(*result,path,wave::toolpath_length(path));
+    require(wave::paths_equal_canonical(final_preview,result->remaining_stock),"completed preview matches batched stock");
+  }
+  require(compare.stats.contact_mean_abs_difference<0.02,"contact and area agree on simple cuts");
+  for (std::size_t m=0; m<local.moves.size(); ++m)
+    for (std::size_t i=0; i<local.moves[m].steps.size(); ++i)
+      require(compare.moves[m].steps[i].load == local.moves[m].steps[i].load,
+              "comparison retains area engagement for feed assignment");
+  // Holes, islands, reversals, and a small stock island between contact sample
+  // locations exercise winding and the independent swept-volume safety check.
+  auto hole=box(4000,2000,16000,8000); std::reverse(hole.begin(),hole.end());
+  auto hollow=stock; hollow.push_back(hole); hollow.push_back(box(9990,4800,10010,5200));
+  const auto hollow_ref=wave::simulate_material(hollow,subject,path,1,0,SimulationMethod::ReferenceArea);
+  const auto hollow_contact=wave::simulate_material(hollow,subject,path,1,0,SimulationMethod::Contact);
+  require(hollow_contact.stats.gouge_area > 0.0075,
+          "the complete thin island is reported as gouged");
+  require_near(hollow_contact.stats.gouge_area,hollow_ref.stats.gouge_area,0.001,
+               "contact sampling cannot hide gouging a thin island");
+  require_near(wave::material_area(Xor(hollow_contact.remaining_stock,hollow_ref.remaining_stock,FillRule::NonZero)),
+               0,0.02,"local clipping preserves holes and islands");
+  wave::Toolpath fractional;
+  fractional.moves.push_back(move(wave::MoveKind::Cut,{{-3000,-953},{23000,-953}}));
+  fractional=wave::resample_toolpath(fractional,0.2);
+  const auto fractional_contact=wave::simulate_material(stock,subject,fractional,1.5875,0,SimulationMethod::Contact);
+  for (const auto& step : fractional_contact.moves.front().steps)
+    if (step.from.x>3000 && step.to.x<17000)
+      require_near(step.load,0.2,1e-6,
+                   "contact uses the configured diameter after geometric radius rounding");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   try {
+    check_methods();
     const wave::Paths64 stock{box(0, 0, 10000, 10000)};
     const wave::Paths64 subject{box(4000, 4000, 6000, 6000)};
 
