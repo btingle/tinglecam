@@ -12,6 +12,7 @@ namespace {
 using namespace Clipper2Lib;
 
 constexpr std::size_t kCheckpointMoveStride = 4;
+constexpr std::size_t kPlaybackSweepBatchSize = 64;
 
 bool engaged(MoveKind kind) {
   return kind == MoveKind::Cut || kind == MoveKind::Step ||
@@ -39,6 +40,13 @@ Paths64 tool_sweep(const Point64& from, const Point64& to, double radius) {
     return Paths64{Ellipse(from, radius, radius, 48)};
   return InflatePaths(Paths64{Path64{from, to}}, radius, JoinType::Round,
                       EndType::Round);
+}
+
+void append_sweep(Paths64& sweeps, const Point64& from, const Point64& to,
+                  double radius) {
+  Paths64 sweep = tool_sweep(from, to, radius);
+  sweeps.insert(sweeps.end(), std::make_move_iterator(sweep.begin()),
+                std::make_move_iterator(sweep.end()));
 }
 
 Point64 interpolate(const Point64& from, const Point64& to, double ratio) {
@@ -398,12 +406,20 @@ Paths64 simulation_stock_at(const SimulationResult& simulation,
     remaining = Difference(remaining, completed_sweeps, FillRule::NonZero);
 
   const SimulatedMove& move = simulation.moves[cursor.move];
+  Paths64 current_sweeps;
+  std::size_t current_sweep_count = 0;
+  const auto flush_current_sweeps = [&] {
+    if (current_sweeps.empty()) return;
+    remaining = Difference(remaining, current_sweeps, FillRule::NonZero);
+    current_sweeps.clear();
+    current_sweep_count = 0;
+  };
   for (const auto& step : move.steps) {
     if (cursor.move_distance <= step.move_distance_begin) break;
     if (cursor.move_distance >= step.move_distance_end) {
-      remaining = Difference(
-          remaining, tool_sweep(step.from, step.to, radius_integer),
-          FillRule::NonZero);
+      append_sweep(current_sweeps, step.from, step.to, radius_integer);
+      if (++current_sweep_count == kPlaybackSweepBatchSize)
+        flush_current_sweeps();
       continue;
     }
     const double span = step.move_distance_end - step.move_distance_begin;
@@ -411,12 +427,70 @@ Paths64 simulation_stock_at(const SimulationResult& simulation,
                              ? (cursor.move_distance - step.move_distance_begin) / span
                              : 0.0;
     const Point64 partial_to = interpolate(step.from, step.to, ratio);
-    remaining = Difference(remaining,
-                           tool_sweep(step.from, partial_to, radius_integer),
-                           FillRule::NonZero);
+    append_sweep(current_sweeps, step.from, partial_to, radius_integer);
     break;
   }
-  return normalized(remaining);
+  flush_current_sweeps();
+  return remaining;
+}
+
+Paths64 advance_simulation_stock(const SimulationResult& simulation,
+                                 const Toolpath& toolpath,
+                                 const Paths64& remaining_stock,
+                                 double from_distance,
+                                 double to_distance) {
+  if (simulation.moves.size() != toolpath.moves.size())
+    throw std::invalid_argument("Simulation and toolpath moves do not match");
+  if (remaining_stock.empty() || toolpath.moves.empty()) return remaining_stock;
+
+  const double total = toolpath_length(toolpath);
+  from_distance = std::clamp(from_distance, 0.0, total);
+  to_distance = std::clamp(to_distance, 0.0, total);
+  if (to_distance <= from_distance) return remaining_stock;
+
+  const double radius_integer = static_cast<double>(to_integer(simulation.tool_radius));
+  Paths64 remaining = remaining_stock;
+  Paths64 pending_sweeps;
+  std::size_t sweep_count = 0;
+  const auto flush = [&] {
+    if (pending_sweeps.empty()) return;
+    remaining = Difference(remaining, pending_sweeps, FillRule::NonZero);
+    pending_sweeps.clear();
+    sweep_count = 0;
+  };
+  const auto append = [&](const Point64& from, const Point64& to) {
+    append_sweep(pending_sweeps, from, to, radius_integer);
+    if (++sweep_count == kPlaybackSweepBatchSize) flush();
+  };
+
+  double move_start = 0.0;
+  for (std::size_t move_index = 0; move_index < toolpath.moves.size(); ++move_index) {
+    const ToolpathMove& path_move = toolpath.moves[move_index];
+    const double move_end = move_start + path_move.length;
+    if (move_end <= from_distance) {
+      move_start = move_end;
+      continue;
+    }
+    if (move_start >= to_distance) break;
+
+    for (const MaterialStep& step : simulation.moves[move_index].steps) {
+      const double step_begin = move_start + step.move_distance_begin;
+      const double step_end = move_start + step.move_distance_end;
+      const double begin = std::max(from_distance, step_begin);
+      const double end = std::min(to_distance, step_end);
+      if (end <= begin) continue;
+      const double span = step.move_distance_end - step.move_distance_begin;
+      if (!(span > 0.0)) continue;
+      const Point64 from = interpolate(step.from, step.to,
+          (begin - step_begin) / span);
+      const Point64 to = interpolate(step.from, step.to,
+          (end - step_begin) / span);
+      if (from != to) append(from, to);
+    }
+    move_start = move_end;
+  }
+  flush();
+  return remaining;
 }
 
 }  // namespace wave

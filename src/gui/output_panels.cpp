@@ -1,5 +1,42 @@
 #include "gui_internal.h"
 namespace tinglecam_gui {
+namespace {
+
+// The playback-rate slider is intentionally not one logarithmic range: its
+// useful landmarks are 1x in the middle, 20x at three quarters, and 100x at
+// the end. Each span is logarithmic, so the slow and fast ends remain easy to
+// select without making the middle overly sensitive.
+constexpr float kMinimumPlaybackRate = 0.01f;
+constexpr float kNormalPlaybackRate = 1.0f;
+constexpr float kFastPlaybackRate = 20.0f;
+constexpr float kMaximumPlaybackRate = 100.0f;
+
+float playback_rate_at(float position) {
+  position = std::clamp(position, 0.0f, 1.0f);
+  if (position <= 0.5f)
+    return kMinimumPlaybackRate * std::pow(
+        kNormalPlaybackRate / kMinimumPlaybackRate, position / 0.5f);
+  if (position <= 0.75f)
+    return kNormalPlaybackRate * std::pow(
+        kFastPlaybackRate / kNormalPlaybackRate, (position - 0.5f) / 0.25f);
+  return kFastPlaybackRate * std::pow(
+      kMaximumPlaybackRate / kFastPlaybackRate, (position - 0.75f) / 0.25f);
+}
+
+float playback_rate_position(float rate) {
+  rate = std::clamp(rate, kMinimumPlaybackRate, kMaximumPlaybackRate);
+  if (rate <= kNormalPlaybackRate)
+    return 0.5f * std::log(rate / kMinimumPlaybackRate) /
+           std::log(kNormalPlaybackRate / kMinimumPlaybackRate);
+  if (rate <= kFastPlaybackRate)
+    return 0.5f + 0.25f * std::log(rate / kNormalPlaybackRate) /
+                        std::log(kFastPlaybackRate / kNormalPlaybackRate);
+  return 0.75f + 0.25f * std::log(rate / kFastPlaybackRate) /
+                     std::log(kMaximumPlaybackRate / kFastPlaybackRate);
+}
+
+}  // namespace
+
 void output_panel(App& app) {
   if (!app.has_plan) return;
   ImGui::SeparatorText("Output");
@@ -301,11 +338,15 @@ void view_panel(App& app) {
       "engagement is heavy and opens out where there is nothing in the way. "
       "Off, it runs at a fixed distance per second instead.");
   if (app.playback.real_time) {
-    float scale = static_cast<float>(app.playback.time_scale);
+    float rate_position = playback_rate_position(
+        static_cast<float>(app.playback.time_scale));
     ImGui::SetNextItemWidth(-160.0f);
-    if (ImGui::SliderFloat("Rate", &scale, 0.1f, 20.0f, "%.2fx",
-                           ImGuiSliderFlags_Logarithmic))
-      app.playback.time_scale = scale;
+    if (ImGui::SliderFloat("Rate", &rate_position, 0.0f, 1.0f,
+                           "", ImGuiSliderFlags_NoInput))
+      app.playback.time_scale = playback_rate_at(rate_position);
+    ImGui::SetItemTooltip("1x is centred; 20x is three quarters across; 100x is the maximum.");
+    ImGui::SameLine();
+    ImGui::Text("%.2gx", app.playback.time_scale);
     if (level && !level->nothing_to_cut) {
       const double elapsed = app.playback.motion_seconds;
       const double whole = cam::feed_schedule_seconds(level->feeds);

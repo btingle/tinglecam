@@ -190,8 +190,17 @@ void refresh_material(App& app) {
       std::abs(app.material_distance - app.playback.distance) < 1e-9)
     return;
   try {
-    app.material = wave::simulation_stock_at(level->simulation, level->toolpath,
-                                             app.playback.distance);
+    const bool advancing =
+        app.material_operation == app.selected_plan_operation &&
+        app.material_level == app.selected_level &&
+        app.material_distance >= 0.0 &&
+        app.playback.distance > app.material_distance;
+    app.material = advancing
+        ? wave::advance_simulation_stock(level->simulation, level->toolpath,
+                                         app.material, app.material_distance,
+                                         app.playback.distance)
+        : wave::simulation_stock_at(level->simulation, level->toolpath,
+                                    app.playback.distance);
   } catch (const std::exception&) {
     app.material = level->simulation.remaining_stock;
   }

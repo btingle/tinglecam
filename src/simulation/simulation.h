@@ -98,6 +98,17 @@ Paths64 simulation_stock_at(const SimulationResult& simulation,
                             const Toolpath& toolpath,
                             double distance);
 
+// Advances an already reconstructed playback stock from `from_distance` to
+// `to_distance`. It is for forward UI playback: all newly crossed cutter
+// sweeps are collected into bounded batches before subtracting them, rather
+// than rebuilding the current move from a checkpoint every frame. Backward
+// seeking should use simulation_stock_at().
+Paths64 advance_simulation_stock(const SimulationResult& simulation,
+                                 const Toolpath& toolpath,
+                                 const Paths64& remaining_stock,
+                                 double from_distance,
+                                 double to_distance);
+
 // Non-zero polygon area in world units squared. Input is unioned first so
 // overlaps and holes are accounted for consistently.
 double material_area(const Paths64& paths);

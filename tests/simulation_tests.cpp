@@ -183,6 +183,22 @@ int main(int argc, char** argv) {
     require(wave::paths_equal_canonical(finished, simulation.remaining_stock),
             "animated stock at the end must equal final simulated stock");
 
+    // Playback normally advances, so it should only subtract the new cutter
+    // travel. Compare several incremental updates to independent seeks.
+    wave::Paths64 advanced = simulation.initial_stock;
+    double previous = 0.0;
+    for (const double fraction : {0.13, 0.39, 0.71, 1.0}) {
+      const double target = toolpath.moves[0].length * fraction;
+      advanced = wave::advance_simulation_stock(
+          simulation, toolpath, advanced, previous, target);
+      const auto sought = wave::simulation_stock_at(simulation, toolpath, target);
+      require_near(wave::material_area(
+                       Xor(advanced, sought, Clipper2Lib::FillRule::NonZero)),
+                   0.0, 0.02,
+                   "incremental playback agrees with a direct stock seek");
+      previous = target;
+    }
+
     wave::Toolpath safe_plunge;
     safe_plunge.moves.push_back(
         move(wave::MoveKind::Link, {{0, 5000}, {10000, 5000}}));

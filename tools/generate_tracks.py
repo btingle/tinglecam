@@ -263,9 +263,10 @@ def main(grid_size, elevation_gain, profile_obj_path, save_dir, resolution, gcod
         t = (cur_d - profile_t[idx-1]) / seg_d
         return (profile[idx] - profile[idx-1]) * t + profile[idx-1]
 
-    if gcode:
-        new_profile = np.array([sample_profile(i) for i in range(profile_resolution)])
-        profile = new_profile
+
+    new_profile = np.array([sample_profile(i) for i in range(profile_resolution)] + [[0, 0]])
+    new_profile[-1] = new_profile[0]
+    profile = new_profile
 
     names, results = create_all_tracks(grid_size, elevation_gain, profile, resolution)
 
