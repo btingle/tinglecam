@@ -1,0 +1,44 @@
+{
+  "tools": [
+    {
+      "id": "6mm-3f",
+      "name": "6 mm 3-flute aluminium",
+      "diameter": 6.0,
+      "flute_length": 16.0,
+      "flutes": 3,
+      "type": "flat"
+    },
+    {
+      "id": "6mm-4f",
+      "name": "6 mm 4-flute AlTiN",
+      "diameter": 6.0,
+      "flute_length": 15.0,
+      "flutes": 4,
+      "type": "flat"
+    },
+    {
+      "id": "3mm-2f",
+      "name": "3 mm 2-flute aluminium",
+      "diameter": 3.0,
+      "flute_length": 10.0,
+      "flutes": 2,
+      "type": "flat"
+    },
+    {
+      "id": "6mm-ball",
+      "name": "6 mm ball nose",
+      "diameter": 6.0,
+      "flute_length": 16.0,
+      "flutes": 2,
+      "type": "ball"
+    },
+    {
+      "id": "3.175mm-1f",
+      "name": "3.175 square end mill",
+      "diameter": 3.175,
+      "flute_length": 25,
+      "flutes": 1,
+      "type": "flat"
+    }
+  ]
+}

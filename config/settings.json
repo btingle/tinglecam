@@ -1,0 +1,326 @@
+{
+  "custom_theme": "",
+  "custom_themes": [],
+  "operation_defaults": {
+    "contour_finishing": {
+      "adaptive_cleanup_stepover": true,
+      "auto_identify_pockets": false,
+      "axial_stock_to_leave": 0.0,
+      "cleanup_stepover_limit": 0.5,
+      "cleanup_tolerance": 0.15,
+      "clip_contours_to_stock": true,
+      "contour_direction": "either",
+      "coolant": false,
+      "depth_breaks": [],
+      "depth_from": 0.0,
+      "depth_to": 5.0,
+      "entry_front_match_tolerance": 3.0,
+      "finishing_subdivisions": 1,
+      "full_engagement_feed": 500.0,
+      "lead_in": true,
+      "length_offset": 1,
+      "machine": "makera-z1",
+      "manual_feed_range": true,
+      "material": "hdpe",
+      "mode": "contour_finishing",
+      "name": "Rough",
+      "no_engagement_feed": 1200.0,
+      "path_pitch": 1.0,
+      "plane": {
+        "areas": [
+          {
+            "center_x": 0.0,
+            "center_y": 0.0,
+            "depth": 1.0,
+            "height": 30.0,
+            "top_z": 0.0,
+            "width": 30.0
+          }
+        ],
+        "depth": 1.0,
+        "top_z": 0.0
+      },
+      "plunge_feed": 100.0,
+      "pocket_auto": {
+        "check_depth": 1.0,
+        "exclusions": [
+          {
+            "center_x": 0.0,
+            "center_y": 0.0,
+            "enabled": false,
+            "height": 30.0,
+            "width": 30.0
+          }
+        ],
+        "helix_angle_degrees": 3.0
+      },
+      "pocket_radial_margin": 0.0,
+      "pockets": [
+        {
+          "center_x": 0.0,
+          "center_y": 0.0,
+          "depth": 5.0,
+          "height": 30.0,
+          "helix_angle_degrees": 3.0,
+          "radius": 0.0,
+          "shape": "rounded_rectangle",
+          "top_z": 0.0,
+          "width": 30.0
+        }
+      ],
+      "radial_stock_to_leave": 0.2,
+      "rough_boundary_cleanup": true,
+      "simulation_stock_inflation": 0.0,
+      "slice_grid": 32,
+      "spindle_rpm": 12000.0,
+      "stepdown": 1.0,
+      "stepover_ratio": 0.4,
+      "stock_deviation": 0.2,
+      "tiny_split_area_factor": 0.5,
+      "tool": "3.175mm-1f",
+      "tool_number": 1
+    },
+    "plane_clearing": {
+      "adaptive_cleanup_stepover": true,
+      "auto_identify_pockets": false,
+      "axial_stock_to_leave": 0.0,
+      "cleanup_stepover_limit": 0.5,
+      "cleanup_tolerance": 0.15,
+      "clip_contours_to_stock": true,
+      "contour_direction": "either",
+      "coolant": false,
+      "depth_breaks": [],
+      "depth_from": 0.0,
+      "depth_to": 5.0,
+      "entry_front_match_tolerance": 3.0,
+      "finishing_subdivisions": 1,
+      "full_engagement_feed": 500.0,
+      "lead_in": true,
+      "length_offset": 1,
+      "machine": "makera-z1",
+      "manual_feed_range": true,
+      "material": "hdpe",
+      "mode": "plane_clearing",
+      "name": "Rough",
+      "no_engagement_feed": 1200.0,
+      "path_pitch": 1.0,
+      "plane": {
+        "areas": [
+          {
+            "center_x": 0.0,
+            "center_y": 0.0,
+            "depth": 1.0,
+            "height": 30.0,
+            "top_z": 0.0,
+            "width": 30.0
+          }
+        ],
+        "depth": 1.0,
+        "top_z": 0.0
+      },
+      "plunge_feed": 100.0,
+      "pocket_auto": {
+        "check_depth": 1.0,
+        "exclusions": [
+          {
+            "center_x": 0.0,
+            "center_y": 0.0,
+            "enabled": false,
+            "height": 30.0,
+            "width": 30.0
+          }
+        ],
+        "helix_angle_degrees": 3.0
+      },
+      "pocket_radial_margin": 0.0,
+      "pockets": [
+        {
+          "center_x": 0.0,
+          "center_y": 0.0,
+          "depth": 5.0,
+          "height": 30.0,
+          "helix_angle_degrees": 3.0,
+          "radius": 0.0,
+          "shape": "rounded_rectangle",
+          "top_z": 0.0,
+          "width": 30.0
+        }
+      ],
+      "radial_stock_to_leave": 0.2,
+      "rough_boundary_cleanup": true,
+      "simulation_stock_inflation": 0.0,
+      "slice_grid": 32,
+      "spindle_rpm": 12000.0,
+      "stepdown": 1.0,
+      "stepover_ratio": 0.4,
+      "stock_deviation": 0.2,
+      "tiny_split_area_factor": 0.5,
+      "tool": "3.175mm-1f",
+      "tool_number": 1
+    },
+    "pocket": {
+      "adaptive_cleanup_stepover": true,
+      "auto_identify_pockets": false,
+      "axial_stock_to_leave": 0.0,
+      "cleanup_stepover_limit": 0.5,
+      "cleanup_tolerance": 0.15,
+      "clip_contours_to_stock": true,
+      "contour_direction": "either",
+      "coolant": false,
+      "depth_breaks": [],
+      "depth_from": 0.0,
+      "depth_to": 5.0,
+      "entry_front_match_tolerance": 3.0,
+      "finishing_subdivisions": 1,
+      "full_engagement_feed": 500.0,
+      "lead_in": true,
+      "length_offset": 1,
+      "machine": "makera-z1",
+      "manual_feed_range": true,
+      "material": "hdpe",
+      "mode": "pocket",
+      "name": "Rough",
+      "no_engagement_feed": 1200.0,
+      "path_pitch": 1.0,
+      "plane": {
+        "areas": [
+          {
+            "center_x": 0.0,
+            "center_y": 0.0,
+            "depth": 1.0,
+            "height": 30.0,
+            "top_z": 0.0,
+            "width": 30.0
+          }
+        ],
+        "depth": 1.0,
+        "top_z": 0.0
+      },
+      "plunge_feed": 500.0,
+      "pocket_auto": {
+        "check_depth": 1.0,
+        "exclusions": [
+          {
+            "center_x": 0.0,
+            "center_y": 0.0,
+            "enabled": false,
+            "height": 30.0,
+            "width": 30.0
+          }
+        ],
+        "helix_angle_degrees": 3.0
+      },
+      "pocket_radial_margin": 0.0,
+      "pockets": [
+        {
+          "center_x": 0.0,
+          "center_y": 0.0,
+          "depth": 5.0,
+          "height": 30.0,
+          "helix_angle_degrees": 3.0,
+          "radius": 5.0,
+          "shape": "rounded_rectangle",
+          "top_z": 0.0,
+          "width": 30.0
+        }
+      ],
+      "radial_stock_to_leave": 0.2,
+      "rough_boundary_cleanup": true,
+      "simulation_stock_inflation": 0.0,
+      "slice_grid": 32,
+      "spindle_rpm": 12000.0,
+      "stepdown": 1.0,
+      "stepover_ratio": 0.4,
+      "stock_deviation": 0.2,
+      "tiny_split_area_factor": 0.5,
+      "tool": "3.175mm-1f",
+      "tool_number": 1
+    },
+    "roughing": {
+      "adaptive_cleanup_stepover": true,
+      "auto_identify_pockets": false,
+      "axial_stock_to_leave": 0.0,
+      "cleanup_stepover_limit": 0.5,
+      "cleanup_tolerance": 0.2,
+      "clip_contours_to_stock": true,
+      "contour_direction": "either",
+      "coolant": false,
+      "depth_breaks": [],
+      "depth_from": 0.0,
+      "depth_to": 5.0,
+      "entry_front_match_tolerance": 3.0,
+      "finishing_subdivisions": 12,
+      "full_engagement_feed": 500.0,
+      "lead_in": true,
+      "length_offset": 1,
+      "machine": "makera-z1",
+      "manual_feed_range": true,
+      "material": "hdpe",
+      "mode": "roughing",
+      "name": "Rough",
+      "no_engagement_feed": 1200.0,
+      "path_pitch": 0.2,
+      "plane": {
+        "areas": [
+          {
+            "center_x": 0.0,
+            "center_y": 0.0,
+            "depth": 1.0,
+            "height": 30.0,
+            "top_z": 0.0,
+            "width": 30.0
+          }
+        ],
+        "depth": 1.0,
+        "top_z": 0.0
+      },
+      "plunge_feed": 100.0,
+      "pocket_auto": {
+        "check_depth": 1.0,
+        "exclusions": [
+          {
+            "center_x": 0.0,
+            "center_y": 0.0,
+            "enabled": false,
+            "height": 30.0,
+            "width": 30.0
+          }
+        ],
+        "helix_angle_degrees": 3.0
+      },
+      "pocket_radial_margin": 0.0,
+      "pockets": [
+        {
+          "center_x": 0.0,
+          "center_y": 0.0,
+          "depth": 5.0,
+          "height": 30.0,
+          "helix_angle_degrees": 3.0,
+          "radius": 0.0,
+          "shape": "rounded_rectangle",
+          "top_z": 0.0,
+          "width": 30.0
+        }
+      ],
+      "radial_stock_to_leave": 0.2,
+      "rough_boundary_cleanup": true,
+      "simulation_stock_inflation": 0.0,
+      "slice_grid": 32,
+      "spindle_rpm": 12000.0,
+      "stepdown": 3.0,
+      "stepover_ratio": 0.2,
+      "stock_deviation": 0.2,
+      "tiny_split_area_factor": 0.5,
+      "tool": "3.175mm-1f",
+      "tool_number": 1
+    }
+  },
+  "panel_layout": {
+    "left_program_fraction": 0.5631641149520874,
+    "left_width": 499.0303056240082,
+    "right_settings_fraction": 0.6031640768051147,
+    "right_width": 484.09090924263
+  },
+  "ui_scale": 1.59,
+  "ui_theme": "Slate"
+}
