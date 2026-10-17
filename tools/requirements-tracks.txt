@@ -1,0 +1,7 @@
+# Python 3.10+. SciPy supports STEP fitting and DXF splines; OCP writes STEP.
+numpy>=1.26
+numba>=0.60
+scipy>=1.13
+cadquery-ocp>=7.8,<7.9
+# DXF profile input and OBJ-to-DXF conversion.
+ezdxf>=1.4,<2

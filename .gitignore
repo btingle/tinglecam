@@ -4,3 +4,5 @@
 /objs/
 *.obj
 *.mtl
+__pycache__/
+/.venv-tracks/

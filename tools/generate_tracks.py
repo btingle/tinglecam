@@ -12,11 +12,10 @@
 # |
 # +--------> X
 
-import os, sys, argparse
-from math import *
-from abc import ABC, abstractmethod
+import argparse
+from math import cos, pi, sin, sqrt
 import numpy as np
-from numba import njit, vectorize, float64, int64, bool, types
+from numba import njit, float64, int64, bool, types
 from numba.experimental import jitclass
 
 # math helpers
@@ -144,6 +143,7 @@ class StraightCurveTransitionTrackTemplate:
     def __init__(self, left, rising, grid_size=40, elevation_gain=6): 
         self.gs = grid_size
         self.elev = elevation_gain
+        self.rising = rising
         self.curve_segment = CurveTrackTemplate(not (left ^ rising), False, grid_size, elevation_gain)
         self.straight_segment = StraightTrackTemplate(False, grid_size, elevation_gain)
 
@@ -179,7 +179,7 @@ class StraightCurveTransitionTrackTemplate:
 
         return base_pt
 
-def create_all_tracks(grid_size, elevation_gain, profile, resolution=256):
+def create_track_templates(grid_size, elevation_gain):
     s = StraightTrackTemplate(False, grid_size=grid_size, elevation_gain=elevation_gain)
     sSs = StraightTrackTemplate(True, grid_size=grid_size, elevation_gain=elevation_gain)
     lr = CurveTrackTemplate(False, False, grid_size=grid_size, elevation_gain=elevation_gain)
@@ -190,181 +190,112 @@ def create_all_tracks(grid_size, elevation_gain, profile, resolution=256):
     Ls = StraightCurveTransitionTrackTemplate(True, False, grid_size=grid_size, elevation_gain=elevation_gain)
     Rs = StraightCurveTransitionTrackTemplate(False, False, grid_size=grid_size, elevation_gain=elevation_gain)
 
-    # dumb but whatever
     all_template_names = ["s", "sSs", "lr", "L", "R", "sL", "sR", "Ls", "Rs"]
     all_templates = [s, sSs, lr, L, R, sL, sR, Ls, Rs]
-    all_results = np.empty((len(all_templates),profile.shape[0],resolution,3))
+    return all_template_names, all_templates
 
-    @njit
-    def compute_contours(result, template, resolution, profile):
-        min_z = min(profile[:,1]) - elevation_gain
-        max_z = max(profile[:,1]) + elevation_gain
-        for j in range(profile.shape[0]):
-            pt = profile[j]
-            template.set_sample_pt(pt)
-            for k in range(resolution):
-                t = k / (resolution - 1)
-                sample = template.sample_path_t(t)
-                result[j,k,0] = sample[0]
-                result[j,k,1] = sample[1]
-                result[j,k,2] = max(min(sample[2], max_z), min_z)
 
-    for i in range(len(all_templates)):
-        template = all_templates[i]
-        print(i, all_template_names[i])
+@njit
+def compute_contours(result, template, resolution, profile, elevation_gain):
+    min_z = min(profile[:, 1]) - elevation_gain
+    max_z = max(profile[:, 1]) + elevation_gain
+    for j in range(profile.shape[0]):
+        template.set_sample_pt(profile[j])
+        for k in range(resolution):
+            sample = template.sample_path_t(k / (resolution - 1))
+            sample[2] = max(min(sample[2], max_z), min_z)
+            result[j, k] = sample
 
-        compute_contours(all_results[i], template, resolution, profile)
 
-    return all_template_names, all_results
+def create_all_tracks(grid_size, elevation_gain, profile, resolution=256):
+    if resolution < 2:
+        raise ValueError("Contour resolution must be at least 2")
+    names, templates = create_track_templates(grid_size, elevation_gain)
+    results = np.empty((len(templates), profile.shape[0], resolution, 3))
+    for i, (name, template) in enumerate(zip(names, templates)):
+        print(i, name)
+        compute_contours(results[i], template, resolution, profile, elevation_gain)
+    return names, results
 
-def main(grid_size, elevation_gain, profile_obj_path, save_dir, resolution, gcode, open_path, translate):
-    def load_profile_obj(profile_obj_path):
-        profile = []
-        # profile_t for evenly sampling the toolpath- meshing doesn't really care
-        profile_t = []
-        with open(profile_obj_path, "r") as f:
-            def dist(a, b):
-                xdist = abs(a[0] - b[0])
-                ydist = abs(a[1] - b[1])
-                return sqrt(xdist**2+ydist**2)
-            pv = None
-            d = 0
-            for line in f:
-                if line.startswith("v"):
-                    v = [float(x) for x in line.strip().split()[1:3]]
-                    if pv:
-                        d += dist(v, pv)
-                    profile_t.append(d)
-                    profile.append(v)
-                    pv = v
-        if not open_path:
-            profile.append(profile[0])
-            d += dist(profile[-1], profile[-2])
-            profile_t.append(d)
-        return np.array(profile), np.array(profile_t)
 
-    profile_resolution_mm = 0.25
-
-    if not profile_obj_path:
-        profile = np.array([[-12, -6], [-12, 6], [12, 6], [12, -6], [-12, -6]], dtype=np.float64)
-        profile_t = np.array([0, 12, 36, 48, 72], dtype=np.float64)
+def main(grid_size, elevation_gain, profile_obj_path, save_dir, resolution=256,
+         gcode=False, open_path=False, translate=(0, 0, 0), step=False,
+         step_tolerance=0.01, step_max_samples=129, cap_ends=False,
+         profile_layer=None, profile_join_tolerance=1e-5):
+    if __package__:
+        from .track_profiles import default_profile, load_profile, resample_profile
+        from .track_curves import as_curve_profile
     else:
-        profile, profile_t = load_profile_obj(profile_obj_path)
+        from track_profiles import default_profile, load_profile, resample_profile
+        from track_curves import as_curve_profile
 
-    profile_resolution = int(profile_t[-1] / profile_resolution_mm)
-    def sample_profile(i):
-        cur_d = i*profile_resolution_mm
-        idx = np.searchsorted(profile_t, cur_d)
-        if idx <= 0:
-            idx = 1
-        if idx >= profile_t.size:
-            idx = profile_t.size - 1
-        seg_d = profile_t[idx] - profile_t[idx-1]
-        t = (cur_d - profile_t[idx-1]) / seg_d
-        return (profile[idx] - profile[idx-1]) * t + profile[idx-1]
-
-
-    new_profile = np.array([sample_profile(i) for i in range(profile_resolution)] + [[0, 0]])
-    new_profile[-1] = new_profile[0]
-    profile = new_profile
-
-    names, results = create_all_tracks(grid_size, elevation_gain, profile, resolution)
-
-    def save_obj(contours):
-        print(contours.shape)
-        def yield_vertex_obj_data(vertex):
-            def form(x):
-                return f"{x:.3f}".rjust(8, " ")
-            return "v" + " ".join([form(vertex[0]), form(vertex[1]), form(vertex[2])]) + "\n"
-
-        obj_data = ''.join(np.apply_along_axis(yield_vertex_obj_data, -1, contours).flatten())
-
-        I, J = contours.shape[:2]
-        def yield_face_obj_data(index):
-            i, j = index
-            return f"f {i*J+j+1} {(i+1)*J+j+1} {(i+1)*J+j+2} {i*J+j+2}\n"
-
-        obj_data += ''.join([yield_face_obj_data(i) for i in np.ndindex(I-1, J-1)])
-        return obj_data
-
-    def save_gcode(contours, datum=1, tool=1, spindle_speed=12000, feed=500, retract=30):
-        def form_gcode(pt):
-            x, y, z = pt
-            return f"X{x:.3f} Y{y:.3f} Z{z:.3f}\n"
-        def form_obj(pt):
-            x, y, z = pt
-            return f"v {x:.3f} {y:.3f} {z:.3f}\n"
-        
-        first_pos = contours[0,0]+translate
-        gcode = f"""
-G21 G90 G94 G17 G{53+datum}
-M6 T{tool}
-G28
-G0 X{first_pos[0]} Y{first_pos[1]}
-Z{retract}
-M3 S{spindle_speed} F{feed}
-G4 P3.0
-"""
-        obj = ""
-        I, J = contours.shape[:2]
-        for i in range(0, I, 2):
-            for j in range(J):
-                gcode += form_gcode(contours[i,j] + translate)
-                obj += form_obj(contours[i,j] + translate)
-            i += 1
-            if i >= I:
-                break
-            for j in reversed(range(J)):
-                gcode += form_gcode(contours[i,j] + translate)
-                obj += form_obj(contours[i,j] + translate)
-        # emit ze lines
-        chunksize=1000
-        for chunk in range(0, I*J, chunksize):
-            obj += f"l {" ".join([str(_i+1) for _i in range(chunk, min(I*J,chunk+chunksize+1001))])}\n"
-        return gcode, obj
-
-
-    if gcode:
-
-        for i in range(results.shape[0]):
-            name = names[i]
-            print("saving", name)
-            gcode_data, obj_data = save_gcode(results[i])
-            with open(os.path.join(save_dir, name + ".nc"), "w") as nc_f:
-                nc_f.write(gcode_data)
-            with open(os.path.join(save_dir, name + '.nc.obj'), "w") as nc_obj_f:
-                nc_obj_f.write(obj_data)
-
+    if grid_size <= 0:
+        raise ValueError("Grid size must be positive")
+    if gcode and step:
+        raise ValueError("Choose either G-code or STEP output")
+    if cap_ends and gcode:
+        raise ValueError("End caps apply to STEP and OBJ output, not G-code")
+    profile = (load_profile(profile_obj_path, open_path, profile_layer, profile_join_tolerance) if profile_obj_path
+               else default_profile(open_path))
+    if cap_ends and not as_curve_profile(profile).closed:
+        raise ValueError("End caps require a closed profile")
+    if step:
+        if __package__:
+            from .track_step import export_step_tracks
+        else:
+            from track_step import export_step_tracks
+        names, templates = create_track_templates(grid_size, elevation_gain)
+        export_step_tracks(names, templates, profile, save_dir,
+                           step_tolerance, step_max_samples, cap_ends)
     else:
+        if __package__:
+            from .track_exports import export_sampled_tracks
+        else:
+            from track_exports import export_sampled_tracks
+        names, results = create_all_tracks(grid_size, elevation_gain,
+                                           resample_profile(profile), resolution)
+        export_sampled_tracks(names, results, save_dir, gcode, translate, cap_ends)
 
-        for i in range(results.shape[0]):
-            name = names[i]
-            print("saving", name)
-            data = save_obj(results[i])
-            with open(os.path.join(save_dir, name + ".obj"), "w") as f:
-                f.write(data)
+
+def trans_type(value):
+    try:
+        coordinates = [float(part) for part in value.split(",")]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Translation must be comma-separated numbers") from exc
+    if not 1 <= len(coordinates) <= 3 or not np.isfinite(coordinates).all():
+        raise argparse.ArgumentTypeError("Translation needs 1 to 3 finite coordinates")
+    return coordinates + [0.0] * (3 - len(coordinates))
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Generate marble tracks as OBJ, G-code, or STEP surfaces.")
+    parser.add_argument("--grid-size", type=int, default=40, help="Grid size in mm (default: 40)")
+    parser.add_argument("--elevation-gain", type=int, default=6, help="Elevation gain in mm (default: 6)")
+    parser.add_argument("--profile-path", "--profile-obj-path", dest="profile_obj_path", type=str,
+                        help="OBJ or DXF profile: X/Y become width/height in mm")
+    parser.add_argument("--profile-layer", help="Read geometry from this DXF layer only")
+    parser.add_argument("--profile-join-tolerance", type=float, default=1e-5,
+                        help="DXF endpoint joining tolerance in mm (default: 0.00001)")
+    parser.add_argument("--save-dir", type=str, default=".")
+    parser.add_argument("--resolution", type=int, default=256, help="Longitudinal samples for OBJ/G-code only")
+    formats = parser.add_mutually_exclusive_group()
+    formats.add_argument("--gcode", action="store_true", help="Export G-code and OBJ toolpath previews")
+    formats.add_argument("--step", action="store_true", help="Export sewn B-spline surface bodies in STEP format")
+    parser.add_argument("--step-tolerance", type=float, default=0.01,
+                        help="Maximum sampled surface deviation in mm (default: 0.01)")
+    parser.add_argument("--step-max-samples", type=int, default=129,
+                        help="Maximum adaptive samples per patch axis (default: 129)")
+    parser.add_argument("--open-path", action="store_true", help="Do not close the input profile")
+    parser.add_argument("--cap-ends", "--cap", action="store_true",
+                        help="Cap both ends of a closed profile (STEP solid or capped OBJ)")
+    parser.add_argument("--translate", type=trans_type, default=[0, 0, 0],
+                        help="G-code/preview translation X,Y,Z in mm")
+    return parser.parse_args(argv)
+
 
 if __name__ == "__main__":
-    def trans_type(s):
-        v = [0, 0, 0]
-        for i, t in enumerate(s.split(',')):
-            f = float(t)
-            v[i] = f
-        return v
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--grid-size", type=int, default=40)
-    parser.add_argument("--elevation-gain", type=int, default=6)
-    parser.add_argument("--profile-obj-path", type=str)
-    parser.add_argument("--save-dir", type=str, default=".")
-    parser.add_argument("--resolution", type=int, default=256)
-    parser.add_argument("--gcode", action="store_true")
-    parser.add_argument("--open-path", action="store_true")
-    parser.add_argument("--translate", type=trans_type, default=[0,0,0])
-
-    args = parser.parse_args()
-    main(args.grid_size, args.elevation_gain, args.profile_obj_path, args.save_dir, args.resolution, args.gcode, args.open_path, args.translate)
-
-
-
-
-
+    args = parse_args()
+    try:
+        main(**vars(args))
+    except (ValueError, ImportError, OSError, RuntimeError) as exc:
+        raise SystemExit(str(exc)) from exc

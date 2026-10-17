@@ -30,3 +30,8 @@ Try the included example or generate G-code without opening a window:
 ```
 
 Run the tests with `ctest --test-dir build --output-on-failure`.
+
+The standalone [marble track generator](tools/README-tracks.md) in
+`tools/generate_tracks.py` exports track contours as OBJ, G-code, or STEP surfaces
+for CAD applications such as SolidWorks. It accepts continuous DXF profiles and
+can cap closed profiles to produce STEP solids.
