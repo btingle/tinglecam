@@ -21,19 +21,37 @@ from numba.experimental import jitclass
 # math helpers
 # simple cubic bezier curve generator for transitioning between slopes
 @njit
-def sample_bezier(start, start_slope, end, end_slope, t):
+def sample_bezier(start, start_slope, end, end_slope, t, quadratic=False):
 
     pl = end[0] - start[0]
-    b0 = start[1]
-    b3 = end[1]
-    b1 = b0 + (pl * start_slope[1]) / 3
-    b2 = b3 - (pl * end_slope[1]) / 3
+    m1 = np.array(start_slope)
+    m2 = np.array(end_slope)
+
+    if quadratic:
+        # convert from normalized vector into xy slope
+        m1 = m1[1] / m1[0] # the ole rise over run
+        m2 = m2[1] / m2[0]
+        p0 = np.array(start)
+        p2 = np.array(end)
+        x1 = m1 * p0[0] - m2 * p2[0] + p2[1] - p0[1]
+        y1 = m1 * (x1 - p0[0]) + p0[1]
+        p1 = np.array([x1, y1])
+        return (
+            (1 - t)**2 * p0 + 
+            2 * (1 - t) * t * p1 + 
+            t**2 * p2
+        )
+
+    p0 = np.array(start)
+    p3 = np.array(end)
+    p1 = p0 + (pl * m1) / 3
+    p2 = p3 - (pl * m2) / 3
 
     return (
-        (1 - t) ** 3 * b0
-        + (3 * (1 - t) ** 2 * t) * b1
-        + 3 * (1 - t) * t**2 * b2
-        + t**3 * b3
+        (1 - t) ** 3 * p0
+        + (3 * (1 - t) ** 2 * t) * p1
+        + 3 * (1 - t) * t**2 * p2
+        + t**3 * p3
     )
 
 
@@ -64,10 +82,15 @@ class StraightTrackTemplate:
         return np.array([self.pt[0], t * self.gs - (self.gs/2), self.pt[1]])
 
     def sample_path_t(self, t):
-        base_pt = self.sample_base_path_t(t)
+        #base_pt = self.sample_base_path_t(t)
         if self.scurve:
-            base_pt[2] += sample_bezier((0, 0), (1, 0), (self.pl, self.elev), (1, 0), t)
-        return base_pt
+            xy = sample_bezier((0, 0), (1, 0), (self.pl, self.elev), (1, 0), t)
+            basepath_t = xy[0] / self.pl
+            base_pt = self.sample_base_path_t(basepath_t)
+            base_pt[2] += xy[1]
+            return base_pt
+        else:
+            return self.sample_base_path_t(t)
             
 
 # lr,L,R
@@ -158,8 +181,10 @@ class StraightCurveTransitionTrackTemplate:
         self.slope_end = self.curve_segment.get_slope(pt, elevated=True)
         self.curve_segment.set_sample_pt(pt)
         self.straight_segment.set_sample_pt(pt)
-        if not self.rising:
+        if not self.rising: # clamp the slope for certain cases with very small inner curve radius (like our jig extrusions)
             self.slope_end = (self.slope_end[0], -self.slope_end[1])
+        if abs(self.slope_end[1]) > 0.5:
+            self.slope_end = (sqrt(3)/2, -0.5 if not self.rising else 0.5)
 
     def sample_base_path_t(self, t):
 
@@ -171,11 +196,14 @@ class StraightCurveTransitionTrackTemplate:
 
     def sample_path_t(self, t):
 
-        base_pt = self.sample_base_path_t(t)
+        #base_pt = self.sample_base_path_t(t)
         if self.rising:
-            base_pt[2] += sample_bezier((0, 0), (1, 0), (self.pl, self.elev), self.slope_end, t) 
+            xy = sample_bezier([0, 0], [1, 0], [self.pl, self.elev], self.slope_end, t)
         else:
-            base_pt[2] += sample_bezier((0, self.elev), (1, 0), (self.pl, 0), self.slope_end, t) 
+            xy = sample_bezier([0, self.elev], [1, 0], [self.pl, 0], self.slope_end, t) 
+        t_basepath = xy[0] / self.pl
+        base_pt = self.sample_base_path_t(t_basepath)
+        base_pt[2] += xy[1]
 
         return base_pt
 
@@ -183,7 +211,7 @@ def create_track_templates(grid_size, elevation_gain):
     s = StraightTrackTemplate(False, grid_size=grid_size, elevation_gain=elevation_gain)
     sSs = StraightTrackTemplate(True, grid_size=grid_size, elevation_gain=elevation_gain)
     lr = CurveTrackTemplate(False, False, grid_size=grid_size, elevation_gain=elevation_gain)
-    L = CurveTrackTemplate(True, False, grid_size=grid_size, elevation_gain=elevation_gain)
+    L = CurveTrackTemplate(True, True, grid_size=grid_size, elevation_gain=elevation_gain)
     R = CurveTrackTemplate(False, True, grid_size=grid_size, elevation_gain=elevation_gain)
     sL = StraightCurveTransitionTrackTemplate(True, True, grid_size=grid_size, elevation_gain=elevation_gain)
     sR = StraightCurveTransitionTrackTemplate(False, True, grid_size=grid_size, elevation_gain=elevation_gain)
@@ -196,32 +224,44 @@ def create_track_templates(grid_size, elevation_gain):
 
 
 @njit
-def compute_contours(result, template, resolution, profile, elevation_gain):
-    min_z = min(profile[:, 1]) - elevation_gain
-    max_z = max(profile[:, 1]) + elevation_gain
+def compute_contours(result, template, resolution, profile, elevation_gain, clamp_bottom):
+    min_z = min(profile[:, 1])
+    max_z = max(profile[:, 1])
+
     for j in range(profile.shape[0]):
         template.set_sample_pt(profile[j])
+        _p0 = template.sample_path_t(0)
+        _p1 = template.sample_path_t(1)
+        _min_z = min(_p0[2], _p1[2])
+        _max_z = max(_p0[2], _p1[2])
+        if abs(profile[j][1] - min_z) < 0.01 and clamp_bottom:
+            _clampmin = True
+        else:
+            _clampmin = False
         for k in range(resolution):
             sample = template.sample_path_t(k / (resolution - 1))
-            sample[2] = max(min(sample[2], max_z), min_z)
+            if _clampmin:
+                sample[2] = _min_z
+            else:
+                sample[2] = max(min(sample[2], _max_z), _min_z)
             result[j, k] = sample
 
 
-def create_all_tracks(grid_size, elevation_gain, profile, resolution=256):
+def create_all_tracks(grid_size, elevation_gain, profile, resolution=256, clamp_bottom=False):
     if resolution < 2:
         raise ValueError("Contour resolution must be at least 2")
     names, templates = create_track_templates(grid_size, elevation_gain)
     results = np.empty((len(templates), profile.shape[0], resolution, 3))
     for i, (name, template) in enumerate(zip(names, templates)):
         print(i, name)
-        compute_contours(results[i], template, resolution, profile, elevation_gain)
+        compute_contours(results[i], template, resolution, profile, elevation_gain, clamp_bottom)
     return names, results
 
 
 def main(grid_size, elevation_gain, profile_obj_path, save_dir, resolution=256,
          gcode=False, open_path=False, translate=(0, 0, 0), step=False,
          step_tolerance=0.01, step_max_samples=129, cap_ends=False,
-         profile_layer=None, profile_join_tolerance=1e-5):
+         profile_layer=None, profile_join_tolerance=1e-5, clamp_bottom=False):
     if __package__:
         from .track_profiles import default_profile, load_profile, resample_profile
         from .track_curves import as_curve_profile
@@ -253,7 +293,7 @@ def main(grid_size, elevation_gain, profile_obj_path, save_dir, resolution=256,
         else:
             from track_exports import export_sampled_tracks
         names, results = create_all_tracks(grid_size, elevation_gain,
-                                           resample_profile(profile), resolution)
+                                           resample_profile(profile), resolution, clamp_bottom)
         export_sampled_tracks(names, results, save_dir, gcode, translate, cap_ends)
 
 
@@ -290,6 +330,7 @@ def parse_args(argv=None):
                         help="Cap both ends of a closed profile (STEP solid or capped OBJ)")
     parser.add_argument("--translate", type=trans_type, default=[0, 0, 0],
                         help="G-code/preview translation X,Y,Z in mm")
+    parser.add_argument("--clamp-bottom", action="store_true", help="clamp the bottommost points of the profile to the minimum z of the swept track (not available for STEP mode)")
     return parser.parse_args(argv)
 
 

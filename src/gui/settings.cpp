@@ -136,6 +136,10 @@ bool save_settings(App& app) { return save_settings_impl(app); }
 
 void settings_panel(App& app) {
   ImGui::SeparatorText("Application");
+  if (!app.graphics_renderer.empty())
+    ImGui::TextWrapped("Graphics renderer: %s", app.graphics_renderer.c_str());
+  if (app.software_graphics)
+    ImGui::TextWrapped("Software OpenGL rendering is active; 3D playback may be slow.");
   ImGui::TextWrapped("Preferences are saved automatically to %s",
                      app.settings_file.string().c_str());
 

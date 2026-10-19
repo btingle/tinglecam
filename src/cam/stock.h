@@ -2,6 +2,8 @@
 #include "cam/job.h"
 
 namespace cam {
+std::vector<StockSlab> heightmap_slabs(const wave::Heightmap&,
+    const std::vector<double>& boundaries = {});
 // Height-only splits share immutable polygon storage. XY clipping allocates only
 // the intersected piece, leaving the original operation's layers untouched.
 std::vector<StockSlab> stock_inside(const std::vector<StockSlab>& stock,

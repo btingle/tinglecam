@@ -49,7 +49,32 @@ std::vector<StockSlab> stock_inside(const std::vector<StockSlab>& s,
     const wave::Paths64& p, double b, double t) { return clip(s,p,b,t,true); }
 std::vector<StockSlab> stock_outside(const std::vector<StockSlab>& s,
     const wave::Paths64& p, double b, double t) { return clip(s,p,b,t,false); }
+std::vector<StockSlab> heightmap_slabs(const wave::Heightmap& stock,
+    const std::vector<double>& boundaries) {
+  if(stock.empty()) return {};
+  std::vector<double> cuts{stock.lowest(),stock.highest()};
+  for(double z:boundaries) if(z>cuts[0]&&z<cuts[1]) cuts.push_back(z);
+  std::sort(cuts.begin(),cuts.end());
+  cuts.erase(std::unique(cuts.begin(),cuts.end()),cuts.end());
+  std::vector<StockSlab> result;
+  for(std::size_t i=1;i<cuts.size();++i) {
+    // A conservative projection for each planning slab. The authoritative
+    // top heights remain in the grid; this is only a routing boundary.
+    auto region=stock.slice_shared(cuts[i-1]);
+    if(!region->empty()) result.push_back({cuts[i-1],cuts[i],std::move(region)});
+  }
+  return result;
+}
 std::vector<StockSlab> preview_before_level(const OperationPlan& operation, std::size_t active) {
+  if(operation.stock_before) {
+    const wave::Heightmap* map=operation.stock_before.get();
+    if(active>=operation.levels.size()&&operation.stock_after) map=operation.stock_after.get();
+    else if(active<operation.levels.size()&&!operation.levels[active].stock_checkpoints.empty())
+      map=operation.levels[active].stock_checkpoints.front().stock.get();
+    std::vector<double> boundaries;
+    for(const auto& level:operation.levels) boundaries.push_back(level.floor_z);
+    return heightmap_slabs(*map,boundaries);
+  }
   auto stock = operation.preview_context;
   // Planning retains the complete incoming stack, including overlapping
   // pocket areas. Playback only needs to apply the executed removals.
@@ -63,6 +88,11 @@ std::vector<StockSlab> preview_before_level(const OperationPlan& operation, std:
 std::vector<StockSlab> active_stock(const JobGeometry& geometry,
     const PriorOperations& previous, int grid,
     const std::vector<double>& extra_boundaries) {
+  for(auto i=previous.rbegin();i!=previous.rend();++i) if(*i&&(*i)->ok()&&(*i)->stock_after) {
+    auto boundaries=extra_boundaries;
+    for(const auto* op:previous) if(op&&op->ok()) for(const auto& level:op->levels) boundaries.push_back(level.floor_z);
+    return heightmap_slabs(*(*i)->stock_after,boundaries);
+  }
   if (!geometry.has_stock()) return {};
   for (std::size_t i=previous.size(); i>0; --i) {
     const auto* op = previous[i-1];

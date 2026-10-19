@@ -52,6 +52,8 @@ struct FeedStats {
 // the corresponding distance through the planar toolpath and deliberately
 // remains constant while the cutter is moving vertically.
 struct MotionPhase {
+  double removed_volume = 0.0;
+  double engagement = 0.0;
   wave::Point64 from;
   wave::Point64 to;
   double from_z = 0.0;

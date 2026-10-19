@@ -1,6 +1,7 @@
 #pragma once
 
 #include "cam/feeds.h"
+#include "cam/cad.h"
 #include "cam/contours.h"
 #include "cam/machine.h"
 #include "cam/material.h"
@@ -29,6 +30,7 @@ enum class OperationMode {
   ContourFinishing,
   Pocket,
   PlaneClearing,
+  SurfaceFinishing,
 };
 
 // A rounded rectangle covers the former circle and square cases as well:
@@ -85,6 +87,19 @@ struct PocketAutoParameters {
   std::vector<PocketExclusionArea> exclusions{{}};
 };
 
+// A native CAD face selection is bound to its source file, since face numbers
+// can change after a model is edited or re-exported.
+struct SurfaceParameters {
+  std::vector<std::size_t> faces;
+  std::string model_fingerprint;
+  double stepover = 0.3;
+  double chord_tolerance = 0.01;
+  double allowance = 0.0;
+  bool along_v = true;
+  bool bidirectional = true;
+  bool flip_normals = false;
+};
+
 struct Operation {
   std::string name = "Rough";
   std::string tool_id;
@@ -111,6 +126,8 @@ struct Operation {
   // for a pocket that has to end up oversize.
   double pocket_radial_margin = 0.0;
   PlaneParameters plane;
+  SurfaceParameters surface;
+  double simulation_pitch = 0.1;
   // Descend through all coarse floors, then clean each terrace upward,
   // deepest first. N divides each actual coarse interval into N equal parts.
   int finishing_subdivisions = 1;
@@ -169,7 +186,7 @@ struct Operation {
   double no_engagement_feed = 2000.0;
   int slice_grid = 32;
   double simulation_stock_inflation = 0.0;
-  wave::SimulationMethod simulation_method = wave::SimulationMethod::LocalArea;
+  wave::SimulationMethod simulation_method = wave::SimulationMethod::Heightmap;
 };
 
 struct BoxStockMargins {
@@ -211,7 +228,15 @@ struct StockSlab {
   std::shared_ptr<const wave::Paths64> region;
 };
 
+struct StockCheckpoint {
+  std::size_t phase = 0;
+  std::shared_ptr<const wave::Heightmap> stock;
+  double motion_distance = 0.0;
+};
+
 struct LevelPlan {
+  std::vector<StockCheckpoint> stock_checkpoints;
+  std::vector<double> motion_distances;
   std::vector<StockSlab> local_stock;
   // Parametric operations carry their actual XYZ path in feeds.motion. The
   // planar projection remains available for stock simulation and 2D views.
@@ -295,6 +320,15 @@ struct PlanStats {
 // geometry code: command-line benchmarks can report them, while GUI plans and
 // tests remain quiet and can inspect the same authoritative numbers.
 struct PlanningMetrics {
+  // Sampling time sums work across finishing workers.
+  double surface_sampling_milliseconds = 0.0;
+  double surface_linking_milliseconds = 0.0;
+  std::size_t surface_samples = 0;
+  std::size_t surface_seam_joins = 0;
+  std::size_t surface_stay_down_links = 0;
+  std::size_t surface_retracts = 0;
+
+
   double slicing_milliseconds = 0.0;
   double preparation_milliseconds = 0.0;
   double wavefront_milliseconds = 0.0;
@@ -305,6 +339,7 @@ struct PlanningMetrics {
   double stitching_milliseconds = 0.0;
   double resampling_milliseconds = 0.0;
   double simulation_milliseconds = 0.0;
+  double xyz_simulation_milliseconds = 0.0;
   double feeds_milliseconds = 0.0;
   // Phase times sum elapsed work across concurrently planned cleanup passes.
   // Total and parallel_cleanup remain wall-clock time, not summed worker time.
@@ -330,6 +365,7 @@ struct OperationPlan {
   // this one too; the flag is what tells a failure apart from a gap.
   bool planned = false;
   bool composed_stock = false;
+  std::shared_ptr<const wave::Heightmap> stock_before, stock_after;
   // Complete incoming stock, including previous operations' cuts. Playback
   // applies this operation's sweeps in order, without rebuilding area ownership.
   std::vector<StockSlab> preview_context;
@@ -435,6 +471,7 @@ class JobGeometry {
   bool has_stock() const { return !stock_.empty() || (box_stock_ && !part_.empty()); }
   double stock_bottom() const;
   const wave::MeshSlicer& part() const { return part_; }
+  const std::shared_ptr<CadModel>& part_cad() const { return part_cad_; }
   const wave::MeshSlicer& stock() const { return stock_; }
   // The Z range spanned by either mesh, which is what an operation may cover.
   // The union rather than the overlap: a blank standing proud of the part is
@@ -464,6 +501,7 @@ class JobGeometry {
   void take(JobGeometry&& other) noexcept {
     std::scoped_lock lock(slices_, other.slices_);
     part_ = std::move(other.part_);
+    part_cad_ = std::move(other.part_cad_);
     stock_ = std::move(other.stock_);
     box_stock_ = other.box_stock_;
     box_margins_ = other.box_margins_;
@@ -477,6 +515,7 @@ class JobGeometry {
   // thread. Both are reads as far as the caller is concerned; only the
   // remembering underneath is a write, and this is what makes it one.
   mutable std::mutex slices_;
+  std::shared_ptr<CadModel> part_cad_;
   wave::MeshSlicer part_;
   wave::MeshSlicer stock_;
   bool box_stock_ = false;

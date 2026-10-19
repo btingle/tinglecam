@@ -126,8 +126,8 @@ void check_methods() {
   const auto fractional_contact=wave::simulate_material(stock,subject,fractional,1.5875,0,SimulationMethod::Contact);
   for (const auto& step : fractional_contact.moves.front().steps)
     if (step.from.x>3000 && step.to.x<17000)
-      require_near(step.load,0.2,1e-6,
-                   "contact uses the configured diameter after geometric radius rounding");
+      require_near(step.load,0.2, fractional_contact.heightmap_before->pitch()/1.5875,
+                   "fractional-diameter engagement agrees within one stock-grid cell");
 }
 
 }  // namespace

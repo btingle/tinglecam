@@ -9,18 +9,26 @@ const char* operation_mode_name(OperationMode value) {
     case OperationMode::ContourFinishing: return "contour_finishing";
     case OperationMode::Pocket: return "pocket";
     case OperationMode::PlaneClearing: return "plane_clearing";
+    case OperationMode::SurfaceFinishing: return "surface_finishing";
   }
   return "unknown";
 }
 
 void JobGeometry::load_part(const std::filesystem::path& file) {
-  part_.set_mesh(wave::load_triangle_mesh(file));
+  auto cad = step_filename(file) ? CadModel::load(file) : nullptr;
+  wave::MeshSlicer imported;
+  imported.set_mesh(cad ? cad->mesh() : wave::load_triangle_mesh(file));
+  part_ = std::move(imported);
+  part_cad_ = std::move(cad);
   part_slices_.clear();
   box_.clear();
 }
 
 void JobGeometry::load_stock(const std::filesystem::path& file) {
-  stock_.set_mesh(wave::load_triangle_mesh(file));
+  auto cad = step_filename(file) ? CadModel::load(file) : nullptr;
+  wave::MeshSlicer imported;
+  imported.set_mesh(cad ? cad->mesh() : wave::load_triangle_mesh(file));
+  stock_ = std::move(imported);
   stock_slices_.clear();
 }
 

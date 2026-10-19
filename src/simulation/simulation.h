@@ -1,6 +1,7 @@
 #pragma once
 
 #include "planning/toolpath.h"
+#include "simulation/heightmap.h"
 
 #include <cstddef>
 #include <functional>
@@ -8,7 +9,9 @@
 
 namespace wave {
 
-enum class SimulationMethod { LocalArea, Contact, Compare, ReferenceArea };
+// Legacy method keys remain readable; all production simulation uses the
+// heightmap backend. The old polygon/contact implementations have been removed.
+enum class SimulationMethod { LocalArea, Contact, Compare, ReferenceArea, Heightmap };
 const char* simulation_method_name(SimulationMethod method);
 
 // One normalized straight portion of an engaged toolpath move. Load is a
@@ -39,6 +42,7 @@ struct SimulationCheckpoint {
   // Number of complete toolpath moves already reflected in remaining_stock.
   std::size_t moves_completed = 0;
   Paths64 remaining_stock;
+  std::shared_ptr<const Heightmap> heightmap;
 };
 
 struct SimulationStats {
@@ -61,6 +65,7 @@ struct SimulationStats {
 };
 
 struct SimulationResult {
+  std::shared_ptr<const Heightmap> heightmap_before,heightmap_after;
   Paths64 initial_stock;
   Paths64 final_subject;
   Paths64 remaining_stock;
@@ -89,7 +94,8 @@ SimulationResult simulate_material(const Paths64& raw_stock,
                                    double tool_radius,
                                    double simulation_stock_inflation = 0.0,
                                    SimulationMethod method = SimulationMethod::LocalArea,
-                                   const std::function<bool(double)>& progress = {});
+                                   const std::function<bool(double)>& progress = {},
+                                   bool retain_playback = true);
 
 // Remaining stock at a distance along the toolpath. This is intended for UI
 // playback; distances outside the path are clamped in the same way as

@@ -48,7 +48,7 @@ struct UserSettings {
   std::string custom_theme;
   std::vector<CustomUiTheme> custom_themes;
   PanelLayout panel_layout{};
-  std::array<Operation, 4> operation_defaults{};
+  std::array<Operation, 5> operation_defaults{};
 };
 
 UserSettings default_user_settings();

@@ -17,7 +17,7 @@ using nlohmann::json;
 
 std::optional<wave::SimulationMethod> simulation_method_from_name(const std::string& name) {
   for (auto method : {wave::SimulationMethod::LocalArea, wave::SimulationMethod::Contact,
-                      wave::SimulationMethod::Compare, wave::SimulationMethod::ReferenceArea})
+                      wave::SimulationMethod::Compare, wave::SimulationMethod::ReferenceArea, wave::SimulationMethod::Heightmap})
     if (name == wave::simulation_method_name(method)) return method;
   return std::nullopt;
 }
@@ -27,6 +27,7 @@ std::optional<OperationMode> operation_mode_from_name(const std::string& name) {
   if (name == "contour_finishing") return OperationMode::ContourFinishing;
   if (name == "pocket") return OperationMode::Pocket;
   if (name == "plane_clearing") return OperationMode::PlaneClearing;
+  if (name == "surface_finishing") return OperationMode::SurfaceFinishing;
   return std::nullopt;
 }
 
@@ -44,13 +45,14 @@ std::size_t operation_default_index(OperationMode mode) {
     case OperationMode::ContourFinishing: return 1;
     case OperationMode::Pocket: return 2;
     case OperationMode::PlaneClearing: return 3;
+    case OperationMode::SurfaceFinishing: return 4;
   }
   return 0;
 }
 
-constexpr std::array<OperationMode, 4> kOperationModes{
+constexpr std::array<OperationMode, 5> kOperationModes{
     OperationMode::Roughing, OperationMode::ContourFinishing,
-    OperationMode::Pocket, OperationMode::PlaneClearing};
+    OperationMode::Pocket, OperationMode::PlaneClearing, OperationMode::SurfaceFinishing};
 
 template <typename T>
 void read(const json& node, const char* key, T& target) {
@@ -214,6 +216,15 @@ json to_json(const Operation& operation) {
               {"tool", operation.tool_id},
               {"machine", operation.machine_id},
               {"material", operation.material_id},
+              {"simulation_pitch", operation.simulation_pitch},
+              {"surface", {{"faces", operation.surface.faces},
+                           {"model_fingerprint", operation.surface.model_fingerprint},
+                           {"stepover", operation.surface.stepover},
+                           {"chord_tolerance", operation.surface.chord_tolerance},
+                           {"allowance", operation.surface.allowance},
+                           {"along_v", operation.surface.along_v},
+                           {"bidirectional", operation.surface.bidirectional},
+                           {"flip_normals", operation.surface.flip_normals}}},
               {"stepover_ratio", operation.stepover_ratio},
               {"stepdown", operation.stepdown},
               {"spindle_rpm", operation.spindle_rpm},
@@ -290,6 +301,18 @@ Operation operation_from(const json& node) {
   read(node, "tool", operation.tool_id);
   read(node, "machine", operation.machine_id);
   read(node, "material", operation.material_id);
+  read(node, "simulation_pitch", operation.simulation_pitch);
+  if (node.contains("surface")) {
+    const auto& surface = node.at("surface");
+    read(surface, "faces", operation.surface.faces);
+    read(surface, "model_fingerprint", operation.surface.model_fingerprint);
+    read(surface, "stepover", operation.surface.stepover);
+    read(surface, "chord_tolerance", operation.surface.chord_tolerance);
+    read(surface, "allowance", operation.surface.allowance);
+    read(surface, "along_v", operation.surface.along_v);
+    read(surface, "bidirectional", operation.surface.bidirectional);
+    read(surface, "flip_normals", operation.surface.flip_normals);
+  }
   read(node, "stepover_ratio", operation.stepover_ratio);
   read(node, "stepdown", operation.stepdown);
   read(node, "spindle_rpm", operation.spindle_rpm);

@@ -195,6 +195,14 @@ void view_panel(App& app) {
   if (stale_operations(app) > 0)
     ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.35f, 1.0f),
                        "From the last plan; the job has been edited since.");
+  if (shown.stock_after) {
+    const auto& grid = *shown.stock_after;
+    ImGui::TextWrapped("Simulated grid: %.5g mm (%d x %d cells)",
+                       grid.pitch(), grid.columns(), grid.rows());
+    ImGui::TextWrapped("3D stock: full simulation resolution");
+    if (!app.graphics_renderer.empty())
+      ImGui::TextWrapped("Renderer: %s", app.graphics_renderer.c_str());
+  }
   const auto& levels = app.plan.operations[app.selected_plan_operation].levels;
   if (!levels.empty()) {
     int last = static_cast<int>(levels.size()) - 1;

@@ -9,6 +9,10 @@ namespace wave::cuda_slicer {
 
 struct Handle;
 
+// Best-effort device hint for matching the GUI's WSL graphics adapter to the
+// device already used for mesh work. An unavailable CUDA runtime returns empty.
+std::string current_device_name();
+
 Handle* create(const std::vector<Triangle3f>& triangles, const Bounds3f& bounds,
                MeshBuildStats& stats);
 void destroy(Handle* handle);

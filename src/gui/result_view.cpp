@@ -23,6 +23,7 @@ void angles_from_direction(const Vec3& direction, float current_yaw,
 
 #include "prism_view.h"
 PrismView prism_view;
+std::unique_ptr<wave::heightfield::Renderer> heightmap_view;
 
 // A convex piece to paint, as a run of points in a shared pool. A frame builds
 // tens of thousands of these, so they carry an offset rather than a vector of
@@ -268,10 +269,29 @@ void append_ribbon(std::vector<Facet>& facets, std::vector<ImVec2>& pool,
 // read as a cylinder under the same orthographic projection as the slabs.
 void append_cutter(std::vector<Facet>& facets, std::vector<ImVec2>& pool,
                    const Vec3& centre, float radius, float bottom, float top,
-                   const Projection& projection, const Vec3& light) {
+                   const Projection& projection, const Vec3& light, bool ball) {
   constexpr std::size_t kSides = 40;
   constexpr float kPi = 3.14159265358979323846f;
   const float colour[3] = {0.48f, 0.86f, 1.0f};
+
+  if (ball) {
+    wave::Mesh nose;
+    constexpr int bands=10;
+    const float tip=bottom;
+    const auto vertex=[&](int ring,int side) {
+      const float phi=-kPi/2+(kPi/2)*ring/bands;
+      const float theta=2*kPi*side/kSides;
+      return wave::Vec3f{centre.x+radius*std::cos(phi)*std::cos(theta),
+                         centre.y+radius*std::cos(phi)*std::sin(theta),
+                         tip+radius+radius*std::sin(phi)};
+    };
+    for(int ring=0;ring<bands;++ring) for(int side=0;side<int(kSides);++side) {
+      const auto a=vertex(ring,side),b=vertex(ring,side+1),c=vertex(ring+1,side+1),d=vertex(ring+1,side);
+      nose.triangles.push_back({a,b,c});nose.triangles.push_back({a,c,d});
+    }
+    append_mesh(facets,pool,nose,projection,light,colour,70,false);
+    bottom+=radius;
+  }
 
   const auto point = [&](std::size_t side, float z) {
     const float angle = 2.0f * kPi * static_cast<float>(side) /

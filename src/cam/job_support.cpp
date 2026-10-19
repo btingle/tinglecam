@@ -61,6 +61,14 @@ void accumulate(PlanStats& into, const PlanStats& from) {
 }
 
 void accumulate(PlanningMetrics& into, const PlanningMetrics& from) {
+  into.surface_sampling_milliseconds += from.surface_sampling_milliseconds;
+  into.surface_linking_milliseconds += from.surface_linking_milliseconds;
+  into.surface_samples += from.surface_samples;
+  into.surface_seam_joins += from.surface_seam_joins;
+  into.surface_stay_down_links += from.surface_stay_down_links;
+  into.surface_retracts += from.surface_retracts;
+
+
   into.slicing_milliseconds += from.slicing_milliseconds;
   into.preparation_milliseconds += from.preparation_milliseconds;
   into.wavefront_milliseconds += from.wavefront_milliseconds;
@@ -71,6 +79,7 @@ void accumulate(PlanningMetrics& into, const PlanningMetrics& from) {
   into.stitching_milliseconds += from.stitching_milliseconds;
   into.resampling_milliseconds += from.resampling_milliseconds;
   into.simulation_milliseconds += from.simulation_milliseconds;
+  into.xyz_simulation_milliseconds += from.xyz_simulation_milliseconds;
   into.feeds_milliseconds += from.feeds_milliseconds;
   into.parallel_cleanup_milliseconds += from.parallel_cleanup_milliseconds;
   into.cleanup_work_milliseconds += from.cleanup_work_milliseconds;
@@ -311,6 +320,10 @@ wave::Paths64 stock_after_operation_at_z(
     const wave::Paths64& nominal_stock, double z,
     const OperationPlan& operation) {
   if (nominal_stock.empty() || !operation.ok()) return nominal_stock;
+  if (operation.stock_after)
+    return Clipper2Lib::Intersect(nominal_stock,
+                                 *operation.stock_after->slice_shared(z),
+                                 Clipper2Lib::FillRule::NonZero);
   wave::Paths64 removed;
   for (const LevelPlan& level : operation.levels) {
     if (level.nothing_to_cut || level.simulation.removed_material.empty())

@@ -1,4 +1,5 @@
 #include "cam/config.h"
+#include "cam/heightmap_simulation.h"
 #include "cam/auto_pockets.h"
 #include "cam/parametric.h"
 #include "cam/post.h"
@@ -49,6 +50,18 @@ cam::JobPlan plan(const cam::Operation& op) {
   cam::Job job; job.operations = {op};
   return cam::plan_job({}, job, {{tool()}}, {{machine()}},
                        {{{"material", "Test material"}}}, {});
+}
+void check_arc_replay(const cam::OperationPlan& plan) {
+  if(plan.levels.empty())return;
+  const auto& level=plan.levels.front();
+  auto stock=*level.stock_checkpoints.front().stock;
+  const auto t=tool();const wave::MillingCutter cutter{wave::CutterShape::Flat,t.diameter/2,t.flute_length};
+  double previous=0;const double length=cam::feed_motion_length(level.feeds);
+  for(double fraction:{.01,.04,.13,.39,.71,1.0}) {
+    cam::advance_stock_motion(stock,level,cutter,previous,length*fraction);
+    near(stock.volume(),cam::stock_at_motion(level,cutter,length*fraction).volume(),"Helical forward replay agrees with checkpoint seeks",1e-4);
+    previous=length*fraction;
+  }
 }
 void check_timeline(const cam::JobPlan& result) {
   check(result.ok(), result.error);
@@ -103,6 +116,7 @@ void pockets() {
     pocket.radius = radius;
     const auto result = plan(op);
     check_timeline(result);
+    check_arc_replay(result.operations.front());
     const auto& levels = result.operations.front().levels;
     check(levels.size() == 3, "Pocket depth is divided by requested stepdown");
     check(levels[0].stays_down_after && levels[1].stays_down_after &&

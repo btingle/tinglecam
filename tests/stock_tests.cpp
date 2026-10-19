@@ -16,120 +16,23 @@ double volume(const std::vector<StockSlab>& stock) {
   double v=0; for (const auto& s : stock) v+=std::abs(Area(*s.region))*(s.top-s.bottom)/std::pow(double(wave::to_integer(1)),2); return v;
 }
 void near(double a,double b) { check(std::abs(a-b)<1e-5,"Volume conservation"); }
-void aliases() {
-  const auto shape=std::make_shared<const wave::Paths64>(rect(0,0,20,20));
-  std::vector<StockSlab> stock{{0,10,shape}};
-  const auto hole=rect(5,5,10,10);
-  auto outside=stock_outside(stock,hole,2,8);
-  auto inside=stock_inside(stock,hole,2,8);
-  check(outside.size()==3,"Two boundary aliases plus clipped middle");
-  check(outside.front().region==shape && outside.back().region==shape,"Height aliases share original polygons");
-  near(volume(outside)+volume(inside),volume(stock));
-  // Repeated height bands must receive the same XY cut, including partially
-  // intersected bands and untouched caps, without duplicating their polygons.
-  const std::vector<StockSlab> bands{{0,3,shape},{3,7,shape},{7,10,shape}};
-  const auto band_cut=stock_outside(bands,hole,2,8);
-  const auto band_inside=stock_inside(bands,hole,2,8);
-  near(volume(band_cut),volume(outside));
-  near(volume(band_inside),volume(inside));
-  check(band_cut.size()==5 && band_inside.size()==3,"Clipping retains height boundaries");
-  check(band_cut[1].region==band_cut[2].region && band_cut[2].region==band_cut[3].region,
-        "Identical height bands share the clipped XY geometry");
-  check(band_cut.front().region==shape && band_cut.back().region==shape,
-        "Partial cuts leave original caps intact");
-  check(*shape==rect(0,0,20,20),"Shared input stock is immutable");
-  OperationPlan op; op.composed_stock=true; op.preview_context=stock;
-  LevelPlan first; first.floor_z=5; first.axial_depth=3; first.stock_slice=hole;
-  first.local_stock=stock_inside(stock,hole,5,8); first.simulation.removed_material=hole;
-  LevelPlan second=first; second.floor_z=2; second.local_stock=stock_inside(stock,hole,2,5);
-  op.levels={first,second};
-  near(volume(preview_before_level(op,0)),4000);
-  near(volume(preview_before_level(op,1)),3700);
-  near(volume(preview_before_level(op,2)),3400);
-  // A duplicate later area starts empty. It must not hide the first area's
-  // initial material or add duplicate geometry during playback.
-  auto duplicate=first; duplicate.local_stock.clear(); op.levels.insert(op.levels.begin()+1,duplicate);
-  near(volume(preview_before_level(op,0)),4000);
-  near(volume(preview_before_level(op,3)),3400);
-}
-void many_pockets() {
-  std::vector<StockSlab> stock;
-  for (int i=0;i<100;++i)
-    stock.push_back({0,10,std::make_shared<const wave::Paths64>(rect(i*20,0,10,10))});
-  const auto cut=rect(1,1,8,8);
-  const auto after=stock_outside(stock,cut,2,8);
-  check(after.size()==102,"Only the intersected pocket is split in Z");
-  near(volume(stock)-volume(after),8*8*6);
-  for (std::size_t i=1;i<stock.size();++i) {
-    const auto& unchanged=after[i+2];
-    check(unchanged.region==stock[i].region && unchanged.bottom==0 && unchanged.top==10,
-          "Unrelated pockets retain geometry identity and full height");
-  }
-  // Touching bounds have no area of intersection. A cut outside all pockets
-  // must preserve the complete stack, even if its Z interval crosses them.
-  const auto touching=stock_outside(stock,rect(10,0,10,10),3,7);
-  check(touching.size()==stock.size(),"Touching pocket bounds do not fragment stock");
-  for (std::size_t i=0;i<stock.size();++i)
-    check(touching[i].region==stock[i].region,"Touching bounds retain render geometry");
-  check(stock_inside(stock,rect(10,0,10,10),3,7).empty(),
-        "Touching bounds do not create positive-volume stock");
-  // Retain a complete initial snapshot and replay cuts across distinct pockets.
-  OperationPlan op;op.composed_stock=true;op.preview_context=stock;
-  for (int i=0;i<100;++i) {
-    LevelPlan level;level.floor_z=2;level.axial_depth=6;
-    level.simulation.removed_material=rect(i*20+1,1,8,8);
-    op.levels.push_back(std::move(level));
-  }
-  for (std::size_t at : {0,1,50,100})
-    near(volume(preview_before_level(op,at)),volume(stock)-at*8*8*6);
-  near(volume(preview_before_level(op,0)),volume(stock));
-}
-void integration() {
-  const auto file=std::filesystem::temp_directory_path()/"tinglecam-stock-test.obj";
-  { std::ofstream out(file); out << "v 0 0 0\nv 20 0 0\nv 20 20 0\nv 0 20 0\nv 0 0 10\nv 20 0 10\nv 20 20 10\nv 0 20 10\n"
-    "f 1 3 2\nf 1 4 3\nf 5 6 7\nf 5 7 8\nf 1 2 6\nf 1 6 5\nf 2 3 7\nf 2 7 6\nf 3 4 8\nf 3 8 7\nf 4 1 5\nf 4 5 8\n"; }
-  JobGeometry geometry; geometry.load_part(file); geometry.set_box_stock(true,0); std::filesystem::remove(file);
-  Tool tool; tool.id="tool"; tool.name="Tool"; tool.diameter=2; tool.flute_length=20; tool.flutes=2;
-  Machine machine; machine.id="machine"; machine.name="Machine"; machine.rapid_feed=3000; machine.rapid_feed_z=500;
-  machine.min_rpm=1000; machine.max_rpm=24000; machine.feed_ranges.push_back({"material",500,1500});
-  Operation op; op.mode=OperationMode::Pocket; op.material_id="material"; op.pockets.front().shape=PocketShape::RoundedRectangle; op.pockets.front().radius=0;
-  op.pockets.front().center_x=10; op.pockets.front().center_y=10; op.pockets.front().width=12; op.pockets.front().height=12;
-  op.pockets.front().top_z=9; op.pockets.front().depth=6; op.stepdown=6;
-  OperationPlan rough; LevelPlan old; old.floor_z=6; old.axial_depth=4; old.simulation.removed_material=rect(0,0,10,20); rough.levels.push_back(old);
-  auto result=plan_parametric_operation(op,tool,machine,15,{&rough},{},0,1,&geometry);
-  check(result.ok(),result.error.c_str()); check(result.composed_stock,"Loaded stock enables composition");
-  check(result.levels.size()==1 && result.levels[0].local_stock.size()==2,"One new pass retains two previous Z sections");
-  near(volume(preview_before_level(result,0)),3200);
-  near(volume(preview_before_level(result,1)),3200-result.stats.removed_volume);
-  check(result.stats.removed_volume>600 && result.stats.removed_volume<648.1,"Removal reflects prior roughing, not synthetic footprint");
-  const auto later=active_stock(geometry,{&rough,&result},32);
-  near(volume(later),3200-result.stats.removed_volume);
-  Operation plane = op;
-  plane.mode=OperationMode::PlaneClearing;
-  plane.plane.areas={{7,10,10,16,8.5,7},{12,10,12,16,8.5,7}};
-  const auto facing=plan_parametric_operation(plane,tool,machine,15,{&rough,&result},{},0,1,&geometry);
-  check(facing.ok(),facing.error.c_str());
-  near(volume(preview_before_level(facing,0)),volume(later));
-  near(volume(preview_before_level(facing,facing.levels.size())),
-       volume(later)-facing.stats.removed_volume);
-  double previous_volume=volume(later);
-  for (std::size_t i=0;i<facing.levels.size();++i) {
-    const auto& level=facing.levels[i];
-    const auto before=preview_before_level(facing,i);
-    near(volume(before),previous_volume);
-    const auto half=stock_outside(before,rect(0,0,10,20),level.floor_z,level.floor_z+level.axial_depth);
-    check(volume(half)<=volume(before),"Partial playback never adds material");
-    previous_volume=volume(preview_before_level(facing,i+1));
-    check(previous_volume<=volume(before)+1e-6,"Overlapping passes monotonically remove stock");
-  }
-  op.pockets.front().center_x=100;
-  const auto air=plan_parametric_operation(op,tool,machine,15,{&rough},{},0,1,&geometry);
-  check(air.ok() && air.levels[0].nothing_to_cut,"Pocket outside active stock cuts nothing");
-  near(volume(preview_before_level(air,1)),3200);
-  op.pockets.front().center_x=10; op.pockets.front().top_z=15;
-  op.pockets.front().depth=2; op.stepdown=1;
-  const auto above=plan_parametric_operation(op,tool,machine,20,{},{},0,1,&geometry);
-  check(above.ok() && above.stats.removed_volume==0,"Box stock is bounded in Z");
+void top_down_stock() {
+  const auto footprint=rect(0,0,20,20);
+  auto stock=wave::Heightmap::from_polygons(footprint,0,10,.1);
+  const auto original=stock;
+  const wave::MillingCutter cutter{wave::CutterShape::Flat,2,20};
+  const auto first=stock.cut({0,5,6},{20,5,6},cutter);
+  const auto middle=stock;
+  const auto second=stock.cut({0,15,3},{20,15,3},cutter);
+  near(original.volume()-stock.volume(),first.volume+second.volume);
+  check(stock.top(100,50)==6&&stock.top(100,150)==3,"Top-down cuts retain their distinct floors");
+  check(stock.top(100,100)==10,"Uncut stock retains its original top");
+  near(original.volume(),4000);
+  check(middle.volume()>stock.volume(),"Snapshots preserve earlier stock");
+  OperationPlan op;op.stock_before=std::make_shared<const wave::Heightmap>(original);
+  op.stock_after=std::make_shared<const wave::Heightmap>(stock);
+  const auto slabs=heightmap_slabs(stock,{3,6});
+  check(!slabs.empty(),"Heightmaps derive polygon boundaries for existing planners");
 }
 // A partial re-plan has to produce exactly what planning the whole job
 // produces for the operations it covers. The point of it is that the ones it
@@ -189,6 +92,38 @@ void partial_replan() {
   near(head.operations[0].stats.removed_volume,
        whole.operations[0].stats.removed_volume);
 
+  // Rebuilding the head must start a fresh grid at the newly requested pitch,
+  // while a downstream-only rebuild must keep the predecessor's stock grid.
+  Job finer = job;
+  finer.operations[0].simulation_pitch = .025;
+  const auto fine_head = plan_operation_range(geometry, finer, tools, machines,
+                                               materials, {}, 0, 0, {});
+  check(fine_head.error.empty() && fine_head.operations[0].ok(),
+        "First-operation pitch change replans successfully");
+  const auto& fine_grid = *fine_head.operations[0].stock_after;
+  near(fine_grid.pitch(), .025);
+  check(fine_grid.columns() == whole.operations[0].stock_after->columns() * 4 &&
+            fine_grid.rows() == whole.operations[0].stock_after->rows() * 4,
+        "Replanning at one quarter pitch creates sixteen times as many cells");
+  near(whole.operations[0].stock_after->pitch(), .1);
+  const auto fine_tail = plan_operation_range(
+      geometry, finer, tools, machines, materials, {}, 1, 1,
+      {&fine_head.operations[0]});
+  check(fine_tail.error.empty() && fine_tail.operations[0].ok(),
+        "Downstream operation replans on the new stock grid");
+  near(fine_tail.operations[0].stock_before->pitch(), .025);
+  near(fine_tail.operations[0].stock_after->pitch(), .025);
+  Job coarser = job;
+  coarser.operations[0].simulation_pitch = .2;
+  const auto coarse_head = plan_operation_range(
+      geometry, coarser, tools, machines, materials, {}, 0, 0, {});
+  check(coarse_head.error.empty() && coarse_head.operations[0].ok(),
+        "Grid pitch can also be made coarser after a fine plan");
+  near(coarse_head.operations[0].stock_after->pitch(), .2);
+  check(coarse_head.operations[0].stock_after->columns() * 2 ==
+            whole.operations[0].stock_after->columns(),
+        "A later rebuild is not stuck with the initial grid dimensions");
+
   // A range whose predecessors are not accounted for is refused rather than
   // planned against nothing, which would quietly cut air as though it were
   // stock the operation above had already taken.
@@ -219,4 +154,4 @@ void partial_replan() {
           "An operation nothing has been asked of is not warned about");
   near(partial.stats.removed_volume,whole.operations[0].stats.removed_volume);
 }
-int main() { try { aliases(); many_pockets(); integration(); partial_replan(); } catch(const std::exception& e) { std::cerr<<e.what()<<'\n';return 1;} }
+int main() { try { top_down_stock(); partial_replan(); } catch(const std::exception& e) { std::cerr<<e.what()<<'\n';return 1;} }

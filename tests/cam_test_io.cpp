@@ -78,55 +78,29 @@ void check_operation_stock_handoff() {
   std::cout << "operation stock handoff\n";
   const wave::Paths64 nominal{box(0.0, 0.0, 10.0, 10.0)};
 
+  auto stock=wave::Heightmap::from_polygons(nominal,-5,0,.05);
+  const wave::MillingCutter cutter{wave::CutterShape::Flat,1,20};
   cam::OperationPlan shallow;
-  cam::LevelPlan shallow_level;
-  shallow_level.floor_z = -2.0;
-  shallow_level.axial_depth = 1.0;
-  shallow_level.simulation.removed_material =
-      wave::Paths64{box(0.0, 0.0, 2.0, 10.0)};
-  shallow.levels.push_back(shallow_level);
-
+  stock.cut({1,0,-2},{1,10,-2},cutter);
+  shallow.stock_after=std::make_shared<const wave::Heightmap>(stock);
   cam::OperationPlan deep;
-  cam::LevelPlan deep_level;
-  deep_level.floor_z = -4.0;
-  deep_level.axial_depth = 2.0;
-  deep_level.simulation.removed_material =
-      wave::Paths64{box(8.0, 0.0, 10.0, 10.0)};
-  deep.levels.push_back(deep_level);
-
-  const cam::PriorOperations operations{&shallow, &deep};
-  const wave::Paths64 above =
-      cam::stock_after_operations_at_z(nominal, -0.5, operations);
-  require_near(area(above), 100.0, 0.001,
-               "cuts outside a level's axial slab do not affect that Z");
-
-  const wave::Paths64 shallow_stock =
-      cam::stock_after_operations_at_z(nominal, -1.5, operations);
-  require_near(area(shallow_stock), 80.0, 0.001,
-               "a later operation receives material removed in the shallow slab");
-  require(!inside(point(1.0, 5.0), shallow_stock) &&
-              inside(point(9.0, 5.0), shallow_stock),
-          "the shallow handoff removes only the shallow operation's sweep");
-
-  const wave::Paths64 deep_stock =
-      cam::stock_after_operations_at_z(nominal, -3.0, operations);
-  require_near(area(deep_stock), 80.0, 0.001,
-               "the deeper slab receives its own prior swept material");
-  require(inside(point(1.0, 5.0), deep_stock) &&
-              !inside(point(9.0, 5.0), deep_stock),
-          "stock handoff respects the axial range of each planned level");
-
-  const wave::Paths64 boundary_stock =
-      cam::stock_after_operations_at_z(nominal, -2.0, operations);
-  require_near(area(boundary_stock), 60.0, 0.001,
-               "shared slab boundaries include both physical cutter sweeps");
-
-  cam::OperationPlan failed = shallow;
-  failed.error = "deliberate failure";
-  const wave::Paths64 after_failure =
-      cam::stock_after_operations_at_z(nominal, -1.5, {&failed});
-  require_near(area(after_failure), 100.0, 0.001,
-               "a failed operation cannot mutate downstream stock");
+  stock.cut({9,0,-4},{9,10,-4},cutter);
+  deep.stock_after=std::make_shared<const wave::Heightmap>(stock);
+  const cam::PriorOperations operations{&shallow,&deep};
+  const auto above=cam::stock_after_operations_at_z(nominal,-.5,operations);
+  require_near(area(above),60,.001,"Both top-down sweeps remove all material above their floors");
+  const auto below=cam::stock_after_operations_at_z(nominal,-3,operations);
+  require_near(area(below),80,.001,"Stock remains below the shallow floor");
+  require(inside(point(1,5),below)&&!inside(point(9,5),below),
+          "Downstream stock follows the actual heightmap columns");
+  const auto shallow_conversions=shallow.stock_after->slice_conversions();
+  const auto deep_conversions=deep.stock_after->slice_conversions();
+  cam::stock_after_operations_at_z(nominal,-.5,operations);
+  require(shallow.stock_after->slice_conversions()==shallow_conversions&&deep.stock_after->slice_conversions()==deep_conversions,
+          "Repeated layer queries reuse only the latest composed stock polygon");
+  cam::OperationPlan failed=shallow;failed.error="deliberate failure";
+  require_near(area(cam::stock_after_operations_at_z(nominal,-1,{&failed})),100,.001,
+               "A failed operation cannot mutate downstream stock");
 }
 
 void check_schedule_timing() {

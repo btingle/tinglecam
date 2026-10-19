@@ -117,6 +117,7 @@ target_compile_options(wave_planning PRIVATE
 
 add_library(wave_simulation
   src/simulation/simulation.cpp
+  src/simulation/heightmap.cpp
 )
 target_link_libraries(wave_simulation PUBLIC wave_planning)
 target_include_directories(wave_simulation PUBLIC src)
@@ -132,6 +133,16 @@ target_link_libraries(wave_rendering PUBLIC wave_geometry PRIVATE cuBQL_cuda_flo
 target_include_directories(wave_rendering PUBLIC src)
 target_compile_definitions(wave_rendering PUBLIC WAVE_HAVE_CUDA=1)
 set_target_properties(wave_rendering PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
+
+# Native heightfield rendering uses portable OpenGL fragment shaders. CUDA
+# remains confined to the existing mesh slicer and legacy prism renderer.
+add_library(heightmap_rendering src/rendering/heightmap_renderer.cpp)
+target_link_libraries(heightmap_rendering PUBLIC wave_simulation PRIVATE SDL2::SDL2 OpenGL::GL)
+target_include_directories(heightmap_rendering PUBLIC src)
+
+add_library(graphics_startup src/rendering/graphics_startup.cpp)
+target_link_libraries(graphics_startup PRIVATE SDL2::SDL2)
+target_include_directories(graphics_startup PUBLIC src)
 
 add_library(imgui_sdl_opengl STATIC
   ${imgui_SOURCE_DIR}/imgui.cpp
@@ -151,6 +162,11 @@ target_link_libraries(imgui_sdl_opengl PUBLIC SDL2::SDL2 OpenGL::GL)
 # TingleCAM: the CAM application over the same engine. The demo above stays as
 # a way of looking at a wavefront generation by generation when a plan is wrong.
 add_library(tinglecam_core
+  src/cam/profiling.cpp
+  src/cam/cad.cpp
+  src/cam/surface_finishing.cpp
+  src/cam/surface_linking.cpp
+  src/cam/heightmap_simulation.cpp
   src/cam/contours.cpp
   src/cam/config.cpp
   src/cam/auto_pockets.cpp
@@ -168,6 +184,15 @@ add_library(tinglecam_core
 )
 target_link_libraries(tinglecam_core PUBLIC wave_geometry wave_planning wave_simulation nlohmann_json::nlohmann_json)
 target_include_directories(tinglecam_core PUBLIC src)
+option(TINGLECAM_WITH_OCCT "Enable native STEP models and surface finishing" ON)
+if(TINGLECAM_WITH_OCCT)
+  include(cmake/FindTingleOCCT.cmake)
+  if(NOT TINGLE_OCCT_FOUND)
+    message(FATAL_ERROR "Open CASCADE SDK not found. Install libocct-data-exchange-dev or set TINGLECAM_OCCT_ROOT; use TINGLECAM_WITH_OCCT=OFF for mesh-only builds.")
+  endif()
+  target_link_libraries(tinglecam_core PUBLIC tinglecam_occt)
+  target_compile_definitions(tinglecam_core PUBLIC TINGLECAM_HAVE_OCCT=1)
+endif()
 target_compile_definitions(tinglecam_core PRIVATE
   TINGLECAM_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
 target_compile_options(tinglecam_core PRIVATE
@@ -215,7 +240,7 @@ add_library(tinglecam_app_ui STATIC
   src/gui/tool_builder.cpp
 )
 target_link_libraries(tinglecam_app_ui PUBLIC tinglecam_core tinglecam_gui imgui_sdl_opengl)
-target_link_libraries(tinglecam_app_ui PUBLIC wave_rendering)
+target_link_libraries(tinglecam_app_ui PUBLIC wave_rendering heightmap_rendering graphics_startup)
 target_include_directories(tinglecam_app_ui PUBLIC src)
 
 add_executable(tinglecam src/apps/tinglecam_main.cpp)
@@ -262,6 +287,10 @@ add_executable(tool_library_tests tests/tool_library_tests.cpp)
 target_link_libraries(tool_library_tests PRIVATE tinglecam_app_ui)
 add_test(NAME tool_library_tests COMMAND tool_library_tests)
 
+add_executable(graphics_startup_tests tests/graphics_startup_tests.cpp)
+target_link_libraries(graphics_startup_tests PRIVATE graphics_startup SDL2::SDL2)
+add_test(NAME graphics_startup_tests COMMAND graphics_startup_tests)
+
 add_executable(parametric_tests tests/parametric_tests.cpp)
 target_link_libraries(parametric_tests PRIVATE tinglecam_core)
 add_test(NAME parametric_tests COMMAND parametric_tests)
@@ -278,3 +307,25 @@ add_test(NAME stock_tests COMMAND stock_tests)
 add_executable(prism_renderer_tests tests/prism_renderer_tests.cpp)
 target_link_libraries(prism_renderer_tests PRIVATE wave_rendering)
 add_test(NAME prism_renderer_tests COMMAND prism_renderer_tests)
+
+add_executable(heightmap_renderer_tests tests/heightmap_renderer_tests.cpp)
+target_link_libraries(heightmap_renderer_tests PRIVATE heightmap_rendering SDL2::SDL2 OpenGL::GL)
+add_test(NAME heightmap_renderer_tests COMMAND heightmap_renderer_tests)
+# Exercise the portable GLSL path on Mesa rather than relying on CUDA/GL
+# interop or an NVIDIA GL driver in the test environment.
+if(UNIX AND NOT APPLE)
+  set_tests_properties(heightmap_renderer_tests PROPERTIES
+    ENVIRONMENT "SDL_VIDEODRIVER=offscreen;LIBGL_ALWAYS_SOFTWARE=1;MESA_GL_VERSION_OVERRIDE=3.2;MESA_GLSL_VERSION_OVERRIDE=150")
+endif()
+
+add_executable(heightmap_tests tests/heightmap_tests.cpp)
+target_link_libraries(heightmap_tests PRIVATE wave_simulation)
+add_test(NAME heightmap_tests COMMAND heightmap_tests)
+if(TINGLECAM_WITH_OCCT)
+  add_executable(cad_finishing_tests tests/cad_finishing_tests.cpp)
+  target_link_libraries(cad_finishing_tests PRIVATE tinglecam_core)
+  add_test(NAME cad_finishing_tests COMMAND cad_finishing_tests
+           ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/cad/vertical_track_wall.step
+           ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/cad/track_finish_faces.step)
+  set_tests_properties(cad_finishing_tests PROPERTIES TIMEOUT 30)
+endif()

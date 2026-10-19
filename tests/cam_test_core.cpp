@@ -347,29 +347,28 @@ void check_adaptive_roughing() {
     require(cam::post_job(result, job, tools, machines).ok(),
             "the combined downward/upward operation posts");
 
-    const auto volume = [](const std::vector<cam::StockSlab>& stock) {
-      double sum = 0;
-      for (const auto& slab : stock) sum += area(*slab.region) * (slab.top - slab.bottom);
-      return sum;
-    };
-    double before = volume(cam::preview_before_level(rough, 0));
-    require_near(before, 48.0 * 48.0 * 12.0, 1e-3,
-                 "preview begins with the entire blank including Z margins");
-    for (std::size_t i = 0; i < rough.levels.size(); ++i) {
-      const double after = volume(cam::preview_before_level(rough, i + 1));
-      const auto& level = rough.levels[i];
-      require_near(before - after,
-                   area(level.simulation.removed_material) * level.axial_depth,
-                   0.05, "preview removes only the next executed slab sweep");
-      before = after;
+    require(rough.stock_before && rough.stock_after,"A roughing operation retains XYZ stock snapshots");
+    if (!rough.stock_before || !rough.stock_after) return;
+    double before=rough.stock_before->volume();
+    require_near(before,48.0*48.0*12.0,1e-3,"Preview begins with the complete blank");
+    for (const auto& level:rough.levels) {
+      require(!level.stock_checkpoints.empty(),"Each level retains playback checkpoints");
+      if(level.stock_checkpoints.empty()) continue;
+      const auto after=level.stock_checkpoints.back().stock->volume();
+      double removed=0;
+      for(const auto& phase:level.feeds.motion) removed+=phase.removed_volume;
+      require_near(before-after,removed,1e-3,"XYZ playback removes the executed cutter volume");
+      before=after;
     }
-    const auto final_stock = cam::preview_before_level(rough, rough.levels.size());
-    for (const auto& slab : final_stock) {
-      const auto expected = cam::stock_after_planned_operation_at_z(
-          geometry.stock_outline(slab.bottom, op.slice_grid),
-          (slab.bottom + slab.top) * 0.5, rough);
-      require(wave::paths_equal_canonical(*slab.region, expected),
-              "final preview and downstream stock handoff agree");
+    require_near(rough.stock_before->volume()-before,rough.stats.removed_volume,1e-3,
+                 "Operation removal agrees with its heightmap history");
+    for(double z:{1.5,3.5,6.5,10.5}) {
+      const auto expected=cam::stock_after_planned_operation_at_z(
+          geometry.stock_outline(z,op.slice_grid),z,rough);
+      const auto actual=Clipper2Lib::Intersect(geometry.stock_outline(z,op.slice_grid),
+          rough.stock_after->slice(z),Clipper2Lib::FillRule::NonZero);
+      require(wave::paths_equal_canonical(actual,expected),
+              "Downstream stock queries use the final XYZ snapshot");
     }
   };
   const char* worker_env = std::getenv("TINGLECAM_PLANNING_WORKERS");

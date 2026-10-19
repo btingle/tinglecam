@@ -1,4 +1,5 @@
 #include "gui_internal.h"
+#include "cam/heightmap_simulation.h"
 namespace tinglecam_gui {
 // ---------------------------------------------------------------------------
 // Drawing
@@ -182,14 +183,30 @@ void refresh_material(App& app) {
   const cam::LevelPlan* level = current_level(app);
   if (!level || level->nothing_to_cut) {
     app.material.clear();
+    app.material_heightmap.reset();
     app.material_distance = -1.0;
     return;
   }
   if (app.material_operation == app.selected_plan_operation &&
       app.material_level == app.selected_level &&
-      std::abs(app.material_distance - app.playback.distance) < 1e-9)
+      std::abs(app.material_distance - app.playback.distance) < 1e-9 &&
+      std::abs(app.material_motion_seconds - app.playback.motion_seconds) < 1e-9)
     return;
   try {
+    const cam::Tool* tool = app.tools.find(app.plan.operations[app.selected_plan_operation].tool_id);
+    if (!level->stock_checkpoints.empty() && tool) {
+      const wave::MillingCutter cutter{tool->type == cam::ToolType::BallEndMill ? wave::CutterShape::Ball : wave::CutterShape::Flat,
+                                      tool->diameter/2, tool->flute_length};
+      const auto cursor = cam::feed_motion_at_seconds(level->feeds, app.playback.motion_seconds);
+      if(app.material_heightmap&&app.material_operation==app.selected_plan_operation&&app.material_level==app.selected_level&&
+         app.material_motion_seconds>=0&&cursor.motion_distance>=app.material_motion_distance) {
+        auto stock=*app.material_heightmap;
+        cam::advance_stock_motion(stock,*level,cutter,app.material_motion_distance,cursor.motion_distance);
+        if(stock.volume()!=app.material_heightmap->volume())app.material_heightmap=std::make_shared<const wave::Heightmap>(std::move(stock));
+      } else app.material_heightmap=std::make_shared<const wave::Heightmap>(cam::stock_at_motion(*level,cutter,cursor.motion_distance));
+      app.material_motion_distance=cursor.motion_distance;app.material_section_dirty=true;
+    } else {
+    app.material_heightmap.reset();
     const bool advancing =
         app.material_operation == app.selected_plan_operation &&
         app.material_level == app.selected_level &&
@@ -201,9 +218,11 @@ void refresh_material(App& app) {
                                          app.playback.distance)
         : wave::simulation_stock_at(level->simulation, level->toolpath,
                                     app.playback.distance);
+    }
   } catch (const std::exception&) {
     app.material = level->simulation.remaining_stock;
   }
+  app.material_motion_seconds = app.playback.motion_seconds;
   app.material_distance = app.playback.distance;
   app.material_level = app.selected_level;
   app.material_operation = app.selected_plan_operation;
@@ -329,6 +348,13 @@ void fit_view(App& app, ImVec2 canvas) {
   // the stock and a part can reach past it, and framing on the stock alone
   // crops both off the edge of the view.
   Paths64 reference = level->stock_slice;
+  if (!level->stock_checkpoints.empty()) {
+    const auto& stock=*level->stock_checkpoints.front().stock;
+    const auto x0=wave::to_integer(stock.lower_x()),y0=wave::to_integer(stock.lower_y());
+    const auto x1=wave::to_integer(stock.lower_x()+stock.columns()*stock.pitch());
+    const auto y1=wave::to_integer(stock.lower_y()+stock.rows()*stock.pitch());
+    reference.push_back({{x0,y0},{x1,y0},{x1,y1},{x0,y1}});
+  }
   reference.insert(reference.end(), level->part_slice.begin(),
                    level->part_slice.end());
   for (const auto& segment : level->feeds.segments)
@@ -408,6 +434,9 @@ void draw_canvas(App& app) {
   app.fill_failures = 0;
 
   const cam::LevelPlan* level = current_level(app);
+  if(app.material_section_dirty&&app.material_heightmap&&level) {
+    app.material=app.material_heightmap->slice(level->floor_z);app.material_section_dirty=false;
+  }
   if (level) {
     // What is left of the stock, drawn as the solid it is rather than as an
     // outline. This is the whole point of simulating: the outline of a pocket
@@ -505,11 +534,11 @@ void draw_canvas(App& app) {
 
     double walked = 0.0;
     for (const auto& segment : level->feeds.segments) {
-      const double segment_start = walked;
+      const double segment_start = segment.start_distance;
       walked += segment.length;
       if (segment.rapid ? !app.show_rapid_travel : !app.show_cutting_paths)
         continue;
-      if (app.colouring == Colouring::Load && !level->explicit_motion &&
+      if (app.colouring == Colouring::Load && !level->explicit_motion && level->stock_checkpoints.empty() &&
           !segment.rapid && segment.kind != wave::MoveKind::Entry) continue;
       // Anything still ahead of the cutter is drawn faintly, so the part of the
       // pass that has happened reads apart from the part that has not.
@@ -545,7 +574,7 @@ void draw_canvas(App& app) {
       list->AddLine(to_screen(segment.from), to_screen(segment.to), colour, width);
     }
 
-    if (app.colouring == Colouring::Load && !level->explicit_motion && app.show_cutting_paths) {
+    if (app.colouring == Colouring::Load && !level->explicit_motion && level->stock_checkpoints.empty() && app.show_cutting_paths) {
       const bool comparison = level->simulation.method == wave::SimulationMethod::Compare ||
                               level->simulation.method == wave::SimulationMethod::Contact;
       double move_start = 0;

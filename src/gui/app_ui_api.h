@@ -8,6 +8,7 @@
 #include <clipper2/clipper.h>
 #include <imgui.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>

@@ -121,6 +121,70 @@ void operation_settings_panel(App& app) {
     ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.35f, 1.0f),
                        "This machine profile carries unverified limits");
 
+  if (app.selected_operation == 0) {
+    const double minimum_pitch = .001;
+    ImGui::DragScalar("Stock grid pitch (mm)", ImGuiDataType_Double,
+                      &operation.simulation_pitch, 0.001f, &minimum_pitch,
+                      nullptr, "%.5f", ImGuiSliderFlags_AlwaysClamp);
+    ImGui::SetItemTooltip(
+        "XY simulation spacing. Replan this operation and those below it with "
+        "Plan all. The 3D stock renderer uses the full simulation grid.");
+  } else {
+    ImGui::TextWrapped("Stock grid pitch is inherited from earlier operations.");
+    if (ImGui::SmallButton("Edit first operation's grid")) {
+      select_operation(app, 0);
+      return;
+    }
+    ImGui::SetItemTooltip("Change its pitch, then choose Plan all.");
+  }
+  if (app.selected_operation < static_cast<int>(app.plan.operations.size())) {
+    const auto& planned = app.plan.operations[app.selected_operation];
+    if (planned.stock_after)
+      ImGui::TextWrapped("Last planned grid: %.5g mm (%d x %d cells)",
+                         planned.stock_after->pitch(),
+                         planned.stock_after->columns(),
+                         planned.stock_after->rows());
+  }
+  if (operation.mode == cam::OperationMode::SurfaceFinishing) {
+    auto& surface = operation.surface;
+    const auto& cad = app.geometry.part_cad();
+    ImGui::TextWrapped("Select faces in the setup view or in the list below. Paths follow the face's native U or V direction, using a vertical ball end mill.");
+    if (!cad) ImGui::TextDisabled("Load a STEP part to select parametric faces.");
+    else {
+      if (surface.model_fingerprint != cad->fingerprint() && !surface.faces.empty())
+        ImGui::TextColored(ImVec4(1,0.6f,0.2f,1), "Model changed: reselect finishing faces.");
+      if (ImGui::Button("Clear face selection")) {
+        surface.faces.clear(); surface.model_fingerprint = cad->fingerprint();
+      }
+      if (ImGui::BeginChild("CAD faces", ImVec2(0, 160), true)) {
+        for (const auto& face : cad->faces()) {
+          auto found = std::find(surface.faces.begin(), surface.faces.end(), face.id);
+          bool selected = found != surface.faces.end() && surface.model_fingerprint == cad->fingerprint();
+          const auto label = "Face " + std::to_string(face.id+1) + " - " + face.type;
+          if (ImGui::Checkbox(label.c_str(), &selected)) {
+            if (surface.model_fingerprint != cad->fingerprint()) surface.faces.clear();
+            surface.model_fingerprint = cad->fingerprint();
+            if (selected) surface.faces.push_back(face.id);
+            else std::erase(surface.faces, face.id);
+          }
+        }
+      }
+      ImGui::EndChild();
+    }
+    ImGui::DragScalar("Surface stepover (mm)", ImGuiDataType_Double, &surface.stepover, 0.01f);
+    ImGui::DragScalar("Chord tolerance (mm)", ImGuiDataType_Double, &surface.chord_tolerance, 0.001f);
+    ImGui::DragScalar("Normal stock allowance (mm)", ImGuiDataType_Double, &surface.allowance, 0.01f);
+    ImGui::Checkbox("Follow V direction", &surface.along_v);
+    ImGui::Checkbox("Bidirectional passes", &surface.bidirectional);
+    ImGui::SetItemTooltip("Allows alternating joined contours. Neighbouring passes connect along the selected surfaces, including across shared face boundaries.");
+    ImGui::Checkbox("Reverse face normals", &surface.flip_normals);
+    ImGui::SetItemTooltip("For open surfaces whose exported orientation faces into the cutter. Solid face orientations normally need no reversal.");
+    ImGui::DragScalar("Maximum path segment (mm)", ImGuiDataType_Double, &operation.path_pitch, 0.05f);
+    if (tool && tool->type != cam::ToolType::BallEndMill)
+      ImGui::TextColored(ImVec4(1,0.6f,0.2f,1), "Choose a ball end mill for surface finishing.");
+    feeds_panel(app);
+    return;
+  }
   ImGui::DragScalar("Stepover (of diameter)", ImGuiDataType_Double,
                     &operation.stepover_ratio, 0.01f);
   ImGui::DragScalar("Stepdown (mm)", ImGuiDataType_Double,
@@ -346,14 +410,6 @@ void operation_settings_panel(App& app) {
   ImGui::SetItemTooltip(
       "The complete at-depth path is resampled at this travelled-distance "
       "interval before simulation and feed assignment.");
-  int simulation_method = static_cast<int>(operation.simulation_method);
-  const char* simulation_methods[]{"Area / local stock", "Contact boundary (experimental)",
-                                    "Compare both (area feeds)", "Area / original reference"};
-  if (ImGui::Combo("Engagement method", &simulation_method, simulation_methods, 4))
-    operation.simulation_method = static_cast<wave::SimulationMethod>(simulation_method);
-  ImGui::SetItemTooltip("Compare both retains both engagement estimates for instant preview comparison; "
-                       "feeds use area. Contact boundary uses an experimental estimate for feeds. "
-                       "All modes check complete swept intervals for gouging.");
   if (operation.mode == cam::OperationMode::Roughing) {
     ImGui::DragScalar("Entry-front Z match (mm)", ImGuiDataType_Double,
                       &operation.entry_front_match_tolerance, 0.01f);
@@ -453,6 +509,8 @@ void start_plan(App& app, int first, int last) {
 
 // Can this operation be planned at all, whatever the state of the rest?
 bool plannable(const App& app, const cam::Operation& operation) {
+  if (operation.mode == cam::OperationMode::SurfaceFinishing)
+    return app.geometry.part_cad() && app.geometry.has_stock();
   return cam::is_parametric(operation.mode) ||
          (app.geometry.has_part() && app.geometry.has_stock());
 }

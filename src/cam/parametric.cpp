@@ -190,7 +190,7 @@ void finish_level(LevelPlan& level, const Operation& operation, const Tool& tool
       level.stock_slice, FillRule::NonZero);
   level.part_slice = level.stock_slice;
   level.simulation = wave::simulate_material(level.incoming_stock, protected_frame,
-                                             level.toolpath, tool.diameter/2);
+                                             level.toolpath, tool.diameter/2,0,wave::SimulationMethod::Heightmap,{},false);
   // The 2D simulator cannot evaluate changing Z. The explicit entry is already
   // resolved here; material at the floor is subtracted by its final flat turn.
   level.simulation.stats.unresolved_entries = 0;

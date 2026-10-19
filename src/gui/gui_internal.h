@@ -7,6 +7,7 @@
 #include "cam/post.h"
 #include "cam/stock.h"
 #include "rendering/prism_renderer.h"
+#include "rendering/heightmap_renderer.h"
 #include "result_types.h"
 
 #include "clipper2/clipper.triangulation.h"
@@ -35,6 +36,8 @@
 #include <vector>
 
 namespace tinglecam_gui {
+
+extern std::unique_ptr<wave::heightfield::Renderer> heightmap_view;
 
 struct Transform {
   ImVec2 origin;
@@ -75,7 +78,7 @@ void append_slab(std::vector<Facet>& facets, std::vector<ImVec2>& pool,
                  int alpha = 255, bool wireframe = false);
 void append_cutter(std::vector<Facet>& facets, std::vector<ImVec2>& pool,
                    const Vec3& centre, float radius, float bottom, float top,
-                   const Projection& projection, const Vec3& light);
+                   const Projection& projection, const Vec3& light, bool ball = false);
 void paint_facets(ImDrawList* list, std::vector<Facet>& facets,
                   const std::vector<ImVec2>& pool);
 void append_models(const App& app, StackModels which, std::vector<Facet>& facets,

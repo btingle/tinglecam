@@ -1,4 +1,7 @@
 #include "job_internal.h"
+#include "cam/profiling.h"
+#include "cam/surface_finishing.h"
+#include "cam/heightmap_simulation.h"
 namespace cam {
 using namespace detail;
 double job_rapid_plane(const Job& job, const JobGeometry& geometry) {
@@ -81,13 +84,37 @@ PartialPlan plan_operation_range(const JobGeometry& geometry,
     else if (!material) result.error = "Unknown material: " + operation.material_id;
 
     if (result.ok()) {
-      if (is_parametric(operation.mode))
+      const auto operation_started=PlanningClock::now();
+      const auto stage_progress = [&](PlanningProgress p, const std::string& stage) {
+        if (!progress) return true;
+        const double local = std::clamp((p.fraction-from)/std::max(to-from,1e-9),0.0,1.0);
+        PlanningProgress scaled=p;
+        scaled.fraction=from+(to-from)*0.85*local;
+        scaled.active_until=std::max(scaled.fraction,from+(to-from)*0.85*
+            std::clamp((p.active_until-from)/std::max(to-from,1e-9),0.0,1.0));
+        return progress(scaled,stage);
+      };
+      const auto surface_progress = [&](PlanningProgress p,const std::string& stage) {
+        return stage_progress(from+(to-from)*p.fraction,stage);
+      };
+      const auto simulation_progress = [&](PlanningProgress p,const std::string& stage) {
+        return !progress || progress(from+(to-from)*(0.85+0.15*p.fraction),stage);
+      };
+      if (operation.mode == OperationMode::SurfaceFinishing)
+        result = plan_surface_finishing(geometry, operation, *tool, *machine, produced.rapid_plane, surface_progress);
+      else if (is_parametric(operation.mode))
         result = plan_parametric_operation(operation, *tool, *machine,
-            produced.rapid_plane, prior, progress, from, to, &geometry);
+            produced.rapid_plane, prior, stage_progress, from, to, &geometry);
       else
         result = plan_subdivided_operation(
-            geometry, operation, *tool, *machine, *material, progress,
+            geometry, operation, *tool, *machine, *material, stage_progress,
             from, to, produced.rapid_plane, prior);
+      if(result.ok()) {
+        const auto simulation_started=PlanningClock::now();
+        simulate_operation_xyz(result,geometry,job,operation,*tool,*machine,prior,simulation_progress);
+        result.metrics.xyz_simulation_milliseconds=elapsed_milliseconds(simulation_started);
+      }
+      result.metrics.total_milliseconds=elapsed_milliseconds(operation_started);
       result.planned = true;
       if (result.error == "Cancelled") {
         produced.operations.clear();
@@ -105,6 +132,7 @@ PartialPlan plan_operation_range(const JobGeometry& geometry,
     produced.operations.push_back(std::move(result));
     prior.push_back(&produced.operations.back());
   }
+  release_planning_scratch();
   return produced;
 }
 

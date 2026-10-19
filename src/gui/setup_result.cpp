@@ -1,4 +1,5 @@
 #include "gui_internal.h"
+#include "cam/heightmap_simulation.h"
 namespace tinglecam_gui {
 #include "prism_view.h"
 // ---------------------------------------------------------------------------
@@ -120,6 +121,27 @@ void append_cut_volumes(const std::vector<CutVolume>& volumes,
 
 // The Z range the operation will actually cut, so the depth range being set can
 // be seen against the models rather than read off two numbers.
+// Orthographic ray picking shares the exact projection used for display.
+std::optional<std::size_t> pick_cad_face(const cam::CadModel& cad,
+    const Projection& projection, ImVec2 mouse) {
+  std::optional<std::size_t> face;
+  float best = -std::numeric_limits<float>::infinity();
+  const auto& mesh = cad.mesh();
+  for (std::size_t i=0;i<mesh.triangles.size();++i) {
+    const auto& t=mesh.triangles[i];
+    const Vec3 a{t.a.x,t.a.y,t.a.z},b{t.b.x,t.b.y,t.b.z},c{t.c.x,t.c.y,t.c.z};
+    const auto p=projection.point(a),q=projection.point(b),r=projection.point(c);
+    const float det=(q.y-r.y)*(p.x-r.x)+(r.x-q.x)*(p.y-r.y);
+    if(std::abs(det)<1e-8f) continue;
+    const float u=((q.y-r.y)*(mouse.x-r.x)+(r.x-q.x)*(mouse.y-r.y))/det;
+    const float v=((r.y-p.y)*(mouse.x-r.x)+(p.x-r.x)*(mouse.y-r.y))/det;
+    if(u<0||v<0||u+v>1) continue;
+    const float depth=u*projection.depth(a)+v*projection.depth(b)+(1-u-v)*projection.depth(c);
+    if(depth>best) {best=depth;face=cad.triangle_faces()[i];}
+  }
+  return face;
+}
+
 void draw_setup(App& app) {
   OrbitScene scene;
   begin_scene(app, scene, "setup");
@@ -206,15 +228,48 @@ void draw_setup(App& app) {
   }
   aim_scene(app, scene, extent, low, high);
 
+  const auto& cad = app.geometry.part_cad();
+  const bool selecting = operation && operation->mode == cam::OperationMode::SurfaceFinishing && cad;
+  const auto hovered_face = selecting && scene.hovered && !app.orbit.cube_pressed
+      ? pick_cad_face(*cad, scene.projection, ImGui::GetIO().MousePos) : std::optional<std::size_t>{};
+  const auto drag = ImGui::GetMouseDragDelta(ImGuiMouseButton_Left);
+  const auto mouse = ImGui::GetIO().MousePos;
+  const bool over_controls = mouse.x > scene.top_left.x+scene.size.x-160 &&
+      mouse.y < scene.top_left.y+160;
+  if (hovered_face && !over_controls && !app.planner.running() &&
+      ImGui::IsMouseReleased(ImGuiMouseButton_Left) && drag.x*drag.x+drag.y*drag.y < 9) {
+    auto& selection = app.job.operations[app.selected_operation].surface;
+    if (selection.model_fingerprint != cad->fingerprint()) selection.faces.clear();
+    selection.model_fingerprint = cad->fingerprint();
+    const auto found = std::find(selection.faces.begin(),selection.faces.end(),*hovered_face);
+    if(found == selection.faces.end()) selection.faces.push_back(*hovered_face);
+    else selection.faces.erase(found);
+  }
   // Both bodies whole, and the stock made see-through when both are on. Cutting
   // a part-shaped hole in the stock instead gave every wall of the part an
   // exact coincident twin on the hole's inside for the depth sort to pick
   // between; letting the two solids simply overlap has no coincidence in it.
   if (draw_part) {
     const float colour[3]{0.42f, 0.60f, 0.80f};
-    append_mesh(scene.facets, scene.pool, app.geometry.part().mesh(),
-                scene.projection, scene.light, colour,
-                app.wireframe ? 190 : 255, app.wireframe);
+    if (selecting) {
+      wave::Mesh normal,selected,hover;
+      const auto& selection = operation->surface;
+      for (std::size_t i=0;i<cad->mesh().triangles.size();++i) {
+        const auto id=cad->triangle_faces()[i];
+        auto* target = hovered_face && id==*hovered_face ? &hover :
+            (selection.model_fingerprint==cad->fingerprint() &&
+             std::find(selection.faces.begin(),selection.faces.end(),id)!=selection.faces.end() ? &selected : &normal);
+        target->triangles.push_back(cad->mesh().triangles[i]);
+      }
+      const float selected_colour[3]{0.2f,0.85f,0.5f},hover_colour[3]{0.95f,0.7f,0.25f};
+      append_mesh(scene.facets,scene.pool,normal,scene.projection,scene.light,colour,255,app.wireframe);
+      append_mesh(scene.facets,scene.pool,selected,scene.projection,scene.light,selected_colour,255,app.wireframe);
+      append_mesh(scene.facets,scene.pool,hover,scene.projection,scene.light,hover_colour,255,app.wireframe);
+    } else {
+      append_mesh(scene.facets, scene.pool, app.geometry.part().mesh(),
+                  scene.projection, scene.light, colour,
+                  app.wireframe ? 190 : 255, app.wireframe);
+    }
   }
   if (draw_stock) {
     const float colour[3]{0.34f, 0.38f, 0.45f};
@@ -268,7 +323,9 @@ void draw_setup(App& app) {
                 models_loaded ? "Part and stock" : "Cutting volumes", low, high);
   scene.list->AddText({scene.top_left.x + 12.0f, scene.top_left.y + 10.0f},
                       IM_COL32(130, 142, 158, 255), caption);
-  if (operation) {
+  if (operation && operation->mode == cam::OperationMode::SurfaceFinishing) {
+    scene.list->AddText({scene.top_left.x+12,scene.top_left.y+28},IM_COL32(120,190,150,255),"Click: select face   Drag: orbit");
+  } else if (operation) {
     std::snprintf(caption, sizeof caption,
                   "This operation cuts depth %.2f to %.2f mm (Z %.2f to %.2f)",
                   operation->depth_from, operation->depth_to,
@@ -433,6 +490,12 @@ void draw_result(App& app) {
     for (const auto& slab : planned_operation.preview_context) include(slab);
     for (const auto& level : levels) for (const auto& slab : level.local_stock) include(slab);
   }
+  if (planned_operation.stock_before && !planned_operation.stock_before->empty()) {
+    const auto& map=*planned_operation.stock_before;
+    extent_2d={wave::to_integer(map.lower_x()),wave::to_integer(map.lower_y()),
+               wave::to_integer(map.lower_x()+map.columns()*map.pitch()),wave::to_integer(map.lower_y()+map.rows()*map.pitch())};
+    lowest=map.lowest();highest=map.highest();any=true;
+  }
   const double material_lowest = lowest;
   double material_highest = highest;
   if (!planned_operation.composed_stock && !planned_operation.subdivisions.empty() &&
@@ -540,7 +603,7 @@ void draw_result(App& app) {
   std::vector<ImVec2> pool;
   std::size_t untriangulated = 0;
   std::vector<cam::StockSlab> shader_stock;
-  if (!planned_operation.composed_stock) {
+  if (!planned_operation.stock_after && !planned_operation.composed_stock) {
     for (std::size_t i=0;i<display_levels.size();++i) {
       if (!leftover[i]) continue;
       const auto& level=levels[display_levels[i]];
@@ -550,7 +613,7 @@ void draw_result(App& app) {
           std::make_shared<const Paths64>(*leftover[i])});
     }
   }
-  if (planned_operation.composed_stock) {
+  if (!planned_operation.stock_after && planned_operation.composed_stock) {
     const int before = app.stack_follows_playback ? active_level : static_cast<int>(levels.size());
     bool stock_changed = false;
     if (app.stock_cache_operation != app.selected_plan_operation || app.stock_cache_level != before) {
@@ -583,17 +646,100 @@ void draw_result(App& app) {
     }
     shader_stock = app.stock_display_cache;
   }
-  try {
-    const GLuint texture=prism_view.render(shader_stock,projection,light,top_left,size,float(span*4));
-    list->AddImage(static_cast<ImTextureID>(texture),top_left,
-        ImVec2(top_left.x+size.x,top_left.y+size.y),ImVec2(0,1),ImVec2(1,0));
-    if (prism_view.failed_layers())
-      list->AddText(top_left,IM_COL32(255,150,80,255),"Some stock layers could not be triangulated; details in terminal.");
-  } catch (const std::exception& error) {
-    list->AddText(top_left,IM_COL32(255,90,90,255),error.what());
-    std::fprintf(stderr,"Prism renderer: %s\n",error.what());
+  if (planned_operation.stock_after) {
+    auto map = planned_operation.stock_after;
+    if (app.stack_follows_playback) {
+      if (app.material_heightmap)
+        map = app.material_heightmap;
+      else if (!active.stock_checkpoints.empty())
+        map = active.stock_checkpoints.front().stock;
+    }
+    try {
+      if (!heightmap_view)
+        heightmap_view = std::make_unique<wave::heightfield::Renderer>();
+      const auto vec = [](Vec3 v) { return wave::Vec3f{v.x, v.y, v.z}; };
+      const auto framebuffer_scale = ImGui::GetIO().DisplayFramebufferScale;
+      const float pixel_scale =
+          std::max({1.f, framebuffer_scale.x, framebuffer_scale.y});
+      const wave::heightfield::Camera camera{
+          vec(projection.model_centre),
+          vec(projection.right),
+          vec(projection.up),
+          vec(projection.toward),
+          vec(light),
+          projection.scale * pixel_scale,
+          float(span * 4),
+          (projection.centre.x - top_left.x) * pixel_scale,
+          (projection.centre.y - top_left.y) * pixel_scale};
+      std::vector<wave::heightfield::MeshDraw> models;
+      wave::Mesh box;
+      if (app.stack_models == StackModels::Part ||
+          app.stack_models == StackModels::Both)
+        if (app.geometry.has_part())
+          models.push_back({&app.geometry.part().mesh(),
+                            {},
+                            {.82f, .62f, .34f, .37f},
+                            app.wireframe});
+      if (app.stack_models == StackModels::Stock ||
+          app.stack_models == StackModels::Both) {
+        if (!app.geometry.box_stock() && app.geometry.has_stock())
+          models.push_back({&app.geometry.stock().mesh(),
+                            {},
+                            {.34f, .38f, .45f, .22f},
+                            app.wireframe});
+        else if (planned_operation.stock_before) {
+          const auto& blank = *planned_operation.stock_before;
+          const float x0 = blank.lower_x(), y0 = blank.lower_y();
+          const float x1 = x0 + blank.columns() * blank.pitch();
+          const float y1 = y0 + blank.rows() * blank.pitch();
+          const float z0 = blank.lowest(), z1 = blank.highest();
+          const wave::Vec3f points[]{{x0, y0, z0}, {x1, y0, z0}, {x1, y1, z0},
+                                     {x0, y1, z0}, {x0, y0, z1}, {x1, y0, z1},
+                                     {x1, y1, z1}, {x0, y1, z1}};
+          const int faces[][3]{{0, 2, 1}, {0, 3, 2}, {4, 5, 6}, {4, 6, 7},
+                               {0, 1, 5}, {0, 5, 4}, {1, 2, 6}, {1, 6, 5},
+                               {2, 3, 7}, {2, 7, 6}, {3, 0, 4}, {3, 4, 7}};
+          for (const auto& f : faces)
+            box.triangles.push_back({points[f[0]], points[f[1]], points[f[2]]});
+          models.push_back({&box, {}, {.34f, .38f, .45f, .22f}, app.wireframe});
+        }
+      }
+      wave::heightfield::Cutter cutter;
+      if (cutter_cursor && active_tool)
+        cutter = {{float(wave::to_world(cutter_cursor->position.x)),
+                   float(wave::to_world(cutter_cursor->position.y)),
+                   float(cutter_cursor->z)},
+                  float(active_tool->diameter / 2),
+                  float(active_tool->flute_length),
+                  active_tool->type == cam::ToolType::BallEndMill};
+      const auto texture = heightmap_view->render(
+          *map, camera, int(std::ceil(size.x * pixel_scale)),
+          int(std::ceil(size.y * pixel_scale)), models, cutter);
+      list->AddImage(static_cast<ImTextureID>(texture), top_left,
+                     ImVec2(top_left.x + size.x, top_left.y + size.y),
+                     ImVec2(0, 1), ImVec2(1, 0));
+    } catch (const std::exception& error) {
+      heightmap_view.reset();
+      list->AddText(top_left, IM_COL32(255, 90, 90, 255), error.what());
+    }
+  } else {
+    try {
+      const GLuint texture = prism_view.render(shader_stock, projection, light,
+                                               top_left, size, float(span * 4));
+      list->AddImage(static_cast<ImTextureID>(texture), top_left,
+                     ImVec2(top_left.x + size.x, top_left.y + size.y),
+                     ImVec2(0, 1), ImVec2(1, 0));
+      if (prism_view.failed_layers())
+        list->AddText(top_left, IM_COL32(255, 150, 80, 255),
+                      "Some stock layers could not be triangulated; details in "
+                      "terminal.");
+    } catch (const std::exception& error) {
+      list->AddText(top_left, IM_COL32(255, 90, 90, 255), error.what());
+      std::fprintf(stderr, "Prism renderer: %s\n", error.what());
+    }
   }
-  if (cutter_cursor && active_tool != nullptr) {
+  if (!planned_operation.stock_after && cutter_cursor &&
+      active_tool != nullptr) {
     append_cutter(
         facets, pool,
         Vec3{static_cast<float>(wave::to_world(cutter_cursor->position.x)),
@@ -602,12 +748,12 @@ void draw_result(App& app) {
         static_cast<float>(active_tool->diameter * 0.5),
         static_cast<float>(cutter_cursor->z),
         static_cast<float>(cutter_cursor->z + active_tool->flute_length),
-        projection, light);
+        projection, light, active_tool->type == cam::ToolType::BallEndMill);
   }
   paint_facets(list, facets, pool);
 
   // And the models over the finished stack, sorted among themselves alone.
-  if (app.stack_models != StackModels::None) {
+  if (!planned_operation.stock_after && app.stack_models != StackModels::None) {
     std::vector<Facet> model_facets;
     std::vector<ImVec2> model_pool;
     append_models(app, app.stack_models, model_facets, model_pool, projection,
@@ -642,16 +788,25 @@ void draw_result(App& app) {
     // roughing pass also has. Read off the planar path the retracts and the
     // traversals at the safe plane are invisible, which is most of what there
     // is to see in three dimensions.
-    const bool engagement_view = app.colouring == Colouring::Load && !active.explicit_motion;
+    const bool engagement_view = app.colouring == Colouring::Load;
+    const bool xyz_stock = !active.stock_checkpoints.empty();
     for (const cam::MotionPhase& phase : active.feeds.motion) {
       if (phase.rapid ? !app.show_rapid_travel : !app.show_cutting_paths)
         continue;
-      if (engagement_view && !phase.rapid && !phase.inter_layer &&
+      if (engagement_view && !xyz_stock && !phase.rapid && !phase.inter_layer &&
           phase.kind != wave::MoveKind::Entry) continue;
-      list->AddLine(project(phase.from, phase.from_z), project(phase.to, phase.to_z),
-                    move_colour(phase.kind), phase.kind == wave::MoveKind::Entry ? 1.8f : 1.0f);
+      wave::MaterialStep sample;sample.load=phase.engagement;
+      const auto colour=engagement_view && xyz_stock && !phase.rapid ? engagement_colour(sample,0) : move_colour(phase.kind);
+      const int pieces=phase.arc?64:1;
+      auto previous=cam::motion_point(phase,0);
+      for(int j=1;j<=pieces;++j) {
+        const auto next=cam::motion_point(phase,double(j)/pieces);
+        const auto screen=[&](wave::Vec3d p){return projection.point({float(p.x),float(p.y),float(p.z)});};
+        list->AddLine(screen(previous),screen(next),colour,phase.kind==wave::MoveKind::Entry?1.8f:1.0f);
+        previous=next;
+      }
     }
-    if (engagement_view && app.show_cutting_paths) {
+    if (engagement_view && !xyz_stock && app.show_cutting_paths) {
       const bool comparison = active.simulation.method == wave::SimulationMethod::Compare ||
                               active.simulation.method == wave::SimulationMethod::Contact;
       for (const auto& move : active.simulation.moves) for (const auto& step : move.steps)

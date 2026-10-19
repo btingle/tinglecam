@@ -334,6 +334,7 @@ cam::Operation make_operation(App& app, cam::OperationMode mode) {
     case cam::OperationMode::ContourFinishing: operation.name = "Contour finish"; break;
     case cam::OperationMode::Pocket: operation.name = "Pocket"; break;
     case cam::OperationMode::PlaneClearing: operation.name = "Plane clearing"; break;
+    case cam::OperationMode::SurfaceFinishing: operation.name = "Surface finish"; break;
   }
   if (operation.tool_id.empty() && !app.tools.tools.empty())
     operation.tool_id = app.tools.tools.front().id;

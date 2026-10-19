@@ -203,6 +203,17 @@ struct Handle {
   }
 };
 
+std::string current_device_name() {
+  int device = 0;
+  cudaDeviceProp properties{};
+  if (cudaGetDevice(&device) != cudaSuccess ||
+      cudaGetDeviceProperties(&properties, device) != cudaSuccess) {
+    cudaGetLastError();
+    return {};
+  }
+  return properties.name;
+}
+
 Handle* create(const std::vector<Triangle3f>& triangles, const Bounds3f& bounds,
                MeshBuildStats& stats) {
   if (triangles.empty()) throw std::invalid_argument("Cannot build a BVH for an empty mesh");

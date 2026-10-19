@@ -141,6 +141,7 @@ constexpr cam::OperationMode kOperationModes[]{
     cam::OperationMode::ContourFinishing,
     cam::OperationMode::Pocket,
     cam::OperationMode::PlaneClearing,
+    cam::OperationMode::SurfaceFinishing,
 };
 
 // `cam::operation_mode_name` is the name the job file carries, which is the
@@ -152,6 +153,7 @@ inline const char* operation_mode_label(cam::OperationMode value) {
     case cam::OperationMode::ContourFinishing: return "Contour finishing";
     case cam::OperationMode::Pocket: return "Pocket";
     case cam::OperationMode::PlaneClearing: return "Plane clearing";
+    case cam::OperationMode::SurfaceFinishing: return "Surface finishing (STEP)";
   }
   return "Unknown";
 }
@@ -285,6 +287,8 @@ struct App {
   bool banner_is_error = false;
   std::vector<LogMessage> messages;
   int message_filter = 0;  // 0 all, 1 info, 2 warnings, 3 errors
+  std::string graphics_renderer;
+  bool software_graphics = false;
 
   std::array<char, 512> part_path{};
   std::array<char, 512> stock_path{};
@@ -343,6 +347,10 @@ struct App {
   Playback playback;
   // Remaining stock for the pass being watched, recomputed only when the
   // playback distance actually moves.
+  std::shared_ptr<const wave::Heightmap> material_heightmap;
+  double material_motion_seconds = -1;
+  double material_motion_distance = 0;
+  bool material_section_dirty = false;
   Paths64 material;
   double material_distance = -1.0;
   int material_level = -1;

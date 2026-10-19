@@ -571,7 +571,8 @@ void plan_toolpaths(OperationPlan& plan,
           level.part_slice.empty() ? level.wave.subject : level.part_slice;
       level.simulation = wave::simulate_material(
           level.incoming_stock, final_subject, level.toolpath, radius,
-          operation.simulation_stock_inflation, operation.simulation_method, report);
+          operation.simulation_stock_inflation, operation.simulation_method,
+          report, false);
     } catch (...) {
       simulation_errors[index] = std::current_exception();
     }
@@ -754,9 +755,19 @@ wave::Paths64 stock_after_operations_at_z(
 
   wave::Paths64 remaining =
       Clipper2Lib::Union(nominal_stock, Clipper2Lib::FillRule::NonZero);
-  for (const OperationPlan* operation : operations) {
-    if (operation == nullptr) continue;
-    remaining = stock_after_operation_at_z(remaining, z, *operation);
+  std::size_t start = 0;
+  // The newest snapshot already contains every earlier operation. Read its
+  // cached layer polygon once; keep subsequent planar changes in Clipper.
+  for (std::size_t i = operations.size(); i > 0; --i) {
+    if (operations[i - 1] && operations[i - 1]->ok() &&
+        operations[i - 1]->stock_after) {
+      start = i - 1;
+      break;
+    }
+  }
+  for (std::size_t i = start; i < operations.size(); ++i) {
+    if (!operations[i]) continue;
+    remaining = stock_after_operation_at_z(remaining, z, *operations[i]);
     if (remaining.empty()) break;
   }
   return remaining;
