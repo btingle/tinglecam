@@ -9,6 +9,10 @@ namespace wave::cuda_slicer {
 
 struct Handle;
 
+// True only when this build has CUDA and its kernels can load on the current
+// device. Missing drivers, devices and incompatible architectures return false.
+bool available();
+
 // Best-effort device hint for matching the GUI's WSL graphics adapter to the
 // device already used for mesh work. An unavailable CUDA runtime returns empty.
 std::string current_device_name();
@@ -20,7 +24,7 @@ std::vector<std::uint32_t> query(Handle* handle, float z, int grid_resolution,
                                  double& milliseconds);
 // Casts downward from each origin and returns the first mesh hit as a Z value.
 // A NaN means that the ray reached the supplied lower bound without hitting
-// retained geometry. The query is intentionally GPU-only, just like slicing.
+// retained geometry. The MeshSlicer facade chooses CPU queries when unavailable.
 std::vector<float> vertical_raycast(Handle* handle,
                                     const std::vector<Vec3f>& origins,
                                     float lower_z, double& milliseconds);

@@ -155,7 +155,10 @@ Stock, optional model meshes and the translucent cutter share a depth buffer;
 paths and view controls remain explicit UI overlays.
 
 This makes the stock renderer independent of CUDA hardware and CUDA/OpenGL
-interop. The application still requires CUDA for the mesh slicer.
+interop. The mesh slicer prefers CUDA when built and usable, and otherwise
+uses the cuBQL CPU backend. Builds without a CUDA toolkit work automatically;
+`-DTINGLECAM_WITH_CUDA=OFF` explicitly selects a CPU-only build. The stock preview
+still uses OpenGL acceleration in either case.
 The full grid must fit the graphics driver's texture-buffer and memory limits.
 Reconstruction is always enabled in the preview and changes only its displayed
 surface. Stock removal, collision queries, engagement and generated motion use

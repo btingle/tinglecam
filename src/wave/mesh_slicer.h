@@ -53,11 +53,17 @@ struct MeshSlice {
 // Loads triangulated OBJ, binary STL, or ASCII STL geometry.
 Mesh load_triangle_mesh(const std::filesystem::path& filename);
 
+enum class MeshSlicerBackend { Default, CPU, CUDA };
+// Includes build support, runtime/driver availability and kernel compatibility.
+bool cuda_slicer_available();
+
 // Persistent downward-prism slicer. The BVH and containment pruning are built
 // once; each slice only queries candidates and reconstructs their 2D union.
 class MeshSlicer {
  public:
-  MeshSlicer();
+  // Default prefers CUDA and falls back to CPU when unavailable. Override with
+  // TINGLECAM_SLICER=auto|cpu|cuda; explicit CUDA requests fail rather than fall back.
+  explicit MeshSlicer(MeshSlicerBackend backend = MeshSlicerBackend::Default);
   ~MeshSlicer();
   MeshSlicer(MeshSlicer&&) noexcept;
   MeshSlicer& operator=(MeshSlicer&&) noexcept;
@@ -69,7 +75,7 @@ class MeshSlicer {
   // slicer is emptied once it has been given one.
   void clear();
   MeshSlice slice(float z, int grid_resolution = 32) const;
-  // GPU-accelerated downward ray query against the retained mesh. Misses are
+  // Downward ray query against the retained mesh on the chosen backend. Misses are
   // returned as NaN; callers decide whether the lower bound is the stock floor.
   std::vector<float> vertical_raycast(const std::vector<Vec3f>& origins,
                                       float lower_z,

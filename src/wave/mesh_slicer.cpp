@@ -1,6 +1,7 @@
 #include "mesh_slicer.h"
 
 #include "mesh_slicer_cuda.h"
+#include "mesh_slicer_cpu.h"
 
 #include <clipper2/clipper.h>
 
@@ -11,6 +12,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
+#include <cstdio>
 #include <fstream>
 #include <limits>
 #include <sstream>
@@ -229,30 +232,60 @@ struct MeshSlicer::Impl {
   Mesh mesh;
   MeshBuildStats stats;
   cuda_slicer::Handle* gpu = nullptr;
+  cpu_slicer::Handle* cpu = nullptr;
+  MeshSlicerBackend backend;
 
-  ~Impl() { cuda_slicer::destroy(gpu); }
+  explicit Impl(MeshSlicerBackend selected) : backend(selected) {
+    if (backend != MeshSlicerBackend::Default) return;
+    const char* value = std::getenv("TINGLECAM_SLICER");
+    if (!value || std::string_view(value) == "auto") return;
+    if (std::string_view(value) == "cuda") backend = MeshSlicerBackend::CUDA;
+    else if (std::string_view(value) == "cpu") backend = MeshSlicerBackend::CPU;
+    else throw std::invalid_argument("TINGLECAM_SLICER must be auto, cpu or cuda");
+  }
+  ~Impl() {
+    cuda_slicer::destroy(gpu);
+    cpu_slicer::destroy(cpu);
+  }
 };
 
-MeshSlicer::MeshSlicer() : impl_(std::make_unique<Impl>()) {}
+MeshSlicer::MeshSlicer(MeshSlicerBackend backend) : impl_(std::make_unique<Impl>(backend)) {}
 MeshSlicer::~MeshSlicer() = default;
 MeshSlicer::MeshSlicer(MeshSlicer&&) noexcept = default;
 MeshSlicer& MeshSlicer::operator=(MeshSlicer&&) noexcept = default;
+
+bool cuda_slicer_available() { return cuda_slicer::available(); }
 
 void MeshSlicer::set_mesh(Mesh mesh) {
   if (mesh.triangles.empty()) throw std::invalid_argument("Mesh is empty");
   cuda_slicer::destroy(impl_->gpu);
   impl_->gpu = nullptr;
+  cpu_slicer::destroy(impl_->cpu);
+  impl_->cpu = nullptr;
   impl_->mesh = std::move(mesh);
   impl_->stats = {};
   impl_->stats.input_triangles = impl_->mesh.triangles.size();
-  impl_->gpu = cuda_slicer::create(impl_->mesh.triangles, impl_->mesh.bounds, impl_->stats);
+  if (impl_->backend == MeshSlicerBackend::CPU ||
+      (impl_->backend == MeshSlicerBackend::Default && !cuda_slicer::available())) {
+    impl_->cpu = cpu_slicer::create(impl_->mesh.triangles, impl_->mesh.bounds, impl_->stats);
+  } else if (impl_->backend == MeshSlicerBackend::CUDA) {
+    impl_->gpu = cuda_slicer::create(impl_->mesh.triangles, impl_->mesh.bounds, impl_->stats);
+  } else {
+    try {
+      impl_->gpu = cuda_slicer::create(impl_->mesh.triangles, impl_->mesh.bounds, impl_->stats);
+    } catch (const std::runtime_error& error) {
+      std::fprintf(stderr, "CUDA mesh slicer unavailable (%s); using cuBQL CPU.\n", error.what());
+      impl_->cpu = cpu_slicer::create(impl_->mesh.triangles, impl_->mesh.bounds, impl_->stats);
+    }
+  }
 }
 
 MeshSlice MeshSlicer::slice(float z, int grid_resolution) const {
   if (empty()) throw std::runtime_error("No mesh has been loaded");
   MeshSlice result;
-  auto candidates = cuda_slicer::query(impl_->gpu, z, grid_resolution,
-                                        result.query_milliseconds);
+  auto candidates = impl_->cpu
+      ? cpu_slicer::query(impl_->cpu, z, result.query_milliseconds)
+      : cuda_slicer::query(impl_->gpu, z, grid_resolution, result.query_milliseconds);
   result.candidate_triangles = candidates.size();
   const auto start = std::chrono::steady_clock::now();
   result.polygons = polygons_from_candidates(impl_->mesh, candidates, z,
@@ -266,8 +299,8 @@ std::vector<float> MeshSlicer::vertical_raycast(
     const std::vector<Vec3f>& origins, float lower_z,
     double& milliseconds) const {
   if (empty()) throw std::runtime_error("No mesh has been loaded");
-  return cuda_slicer::vertical_raycast(impl_->gpu, origins, lower_z,
-                                       milliseconds);
+  return impl_->cpu ? cpu_slicer::vertical_raycast(impl_->cpu, origins, lower_z, milliseconds)
+                    : cuda_slicer::vertical_raycast(impl_->gpu, origins, lower_z, milliseconds);
 }
 
 const Mesh& MeshSlicer::mesh() const { return impl_->mesh; }
@@ -275,6 +308,8 @@ const MeshBuildStats& MeshSlicer::stats() const { return impl_->stats; }
 void MeshSlicer::clear() {
   cuda_slicer::destroy(impl_->gpu);
   impl_->gpu = nullptr;
+  cpu_slicer::destroy(impl_->cpu);
+  impl_->cpu = nullptr;
   impl_->mesh = {};
   impl_->stats = {};
 }

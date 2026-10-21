@@ -18,29 +18,33 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 include(FetchContent)
 include(CheckLanguage)
 
-# Mesh preprocessing relies on the cuBQL BVH. There is deliberately no CPU
-# fallback: its all-pairs containment pass made application startup quadratic.
-# Prefer the active /usr/local CUDA toolkit over an older distribution nvcc.
-# CUDACXX or an explicit CMAKE_CUDA_COMPILER still takes precedence.
-if(NOT DEFINED CMAKE_CUDA_COMPILER AND NOT DEFINED ENV{CUDACXX})
-  find_program(WAVE_LOCAL_NVCC nvcc HINTS /usr/local/cuda/bin NO_DEFAULT_PATH)
-  if(WAVE_LOCAL_NVCC)
-    set(CMAKE_CUDA_COMPILER "${WAVE_LOCAL_NVCC}" CACHE FILEPATH "CUDA compiler")
+# CUDA accelerates mesh queries when available; the cuBQL host backend always
+# builds. Compiler detection does not require a compatible GPU on the build host.
+option(TINGLECAM_WITH_CUDA "Build CUDA mesh acceleration when the toolkit is available" ON)
+set(TINGLECAM_HAVE_CUDA OFF)
+if(TINGLECAM_WITH_CUDA)
+  # Prefer the active toolkit; CUDACXX or an explicit compiler takes precedence.
+  if(NOT DEFINED CMAKE_CUDA_COMPILER AND NOT DEFINED ENV{CUDACXX})
+    find_program(WAVE_LOCAL_NVCC nvcc HINTS /usr/local/cuda/bin NO_DEFAULT_PATH)
+    if(WAVE_LOCAL_NVCC)
+      set(CMAKE_CUDA_COMPILER "${WAVE_LOCAL_NVCC}" CACHE FILEPATH "CUDA compiler")
+    endif()
   endif()
-endif()
-if(NOT CMAKE_CUDA_ARCHITECTURES)
-  if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.24)
-    set(CMAKE_CUDA_ARCHITECTURES native CACHE STRING "CUDA architectures")
+  check_language(CUDA)
+  if(CMAKE_CUDA_COMPILER)
+    if(CMAKE_VERSION VERSION_LESS 3.24 AND NOT CMAKE_CUDA_ARCHITECTURES
+        AND NOT DEFINED ENV{CUDAARCHS})
+      # Older CMake commonly defaults to sm_52, which cuBQL's subproject rejects.
+      set(CMAKE_CUDA_ARCHITECTURES 75 CACHE STRING "CUDA architectures")
+    endif()
+    # Let CMake select the compiler's default architecture rather than "native",
+    # which fails when a toolkit is installed on a host without a CUDA device.
+    enable_language(CUDA)
+    set(TINGLECAM_HAVE_CUDA ON)
   else()
-    set(CMAKE_CUDA_ARCHITECTURES "70;80" CACHE STRING "CUDA architectures")
+    message(STATUS "CUDA compiler not found; building the cuBQL CPU mesh slicer")
   endif()
 endif()
-check_language(CUDA)
-if(NOT CMAKE_CUDA_COMPILER)
-  message(FATAL_ERROR
-    "CUDA is required: TingleCAM's mesh slicer uses the cuBQL CUDA BVH and has no CPU fallback")
-endif()
-enable_language(CUDA)
 
 # Keep third-party builds small and deterministic.
 set(CLIPPER2_UTILS OFF CACHE BOOL "" FORCE)
@@ -78,26 +82,40 @@ FetchContent_Declare(
 )
 
 FetchContent_MakeAvailable(clipper2 imgui nlohmann_json)
+# Prevent cuBQL from enabling CUDA independently in a CPU-only build.
+if(TINGLECAM_HAVE_CUDA)
+  set(CUBQL_DISABLE_CUDA OFF)
+else()
+  set(CUBQL_DISABLE_CUDA ON)
+endif()
 FetchContent_MakeAvailable(cubql)
 
 find_package(SDL2 REQUIRED CONFIG)
 find_package(OpenGL REQUIRED)
+find_package(Threads REQUIRED)
 
 add_library(wave_geometry
   src/wave/analysis.cpp
   src/wave/geometry.cpp
   src/wave/mesh_slicer.cpp
+  src/wave/mesh_slicer_cpu.cpp
   src/wave/topology_engine.cpp
   src/wave/topology_detail.cpp
   src/wave/topology_lineage.cpp
   src/wave/topology_public.cpp
 )
-target_sources(wave_geometry PRIVATE src/wave/mesh_slicer_cuda.cu)
-target_link_libraries(wave_geometry PRIVATE cuBQL_cuda_float3_static)
-target_compile_definitions(wave_geometry PUBLIC WAVE_HAVE_CUDA=1)
-set_target_properties(wave_geometry PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
+if(TINGLECAM_HAVE_CUDA)
+  target_sources(wave_geometry PRIVATE src/wave/mesh_slicer_cuda.cu)
+  target_link_libraries(wave_geometry PRIVATE cuBQL_cuda_float3_static)
+  target_compile_definitions(wave_geometry PUBLIC WAVE_HAVE_CUDA=1)
+  set_target_properties(wave_geometry PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
+else()
+  target_sources(wave_geometry PRIVATE src/wave/mesh_slicer_cuda_stub.cpp)
+endif()
 target_include_directories(wave_geometry PUBLIC src)
+target_include_directories(wave_geometry SYSTEM PRIVATE ${cubql_SOURCE_DIR})
 target_link_libraries(wave_geometry PUBLIC Clipper2)
+target_link_libraries(wave_geometry PRIVATE Threads::Threads)
 target_compile_options(wave_geometry PRIVATE
   $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:GNU,Clang>>:-Wall;-Wextra;-Wpedantic>
   $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/W4>
@@ -261,6 +279,12 @@ add_test(NAME routing_tests COMMAND routing_tests)
 add_executable(mesh_slicer_tests tests/mesh_slicer_tests.cpp)
 target_link_libraries(mesh_slicer_tests PRIVATE wave_geometry)
 add_test(NAME mesh_slicer_tests COMMAND mesh_slicer_tests)
+add_test(NAME mesh_slicer_no_cuda_device COMMAND mesh_slicer_tests --expect-cpu)
+set_tests_properties(mesh_slicer_no_cuda_device PROPERTIES
+  ENVIRONMENT "CUDA_VISIBLE_DEVICES=;TINGLECAM_SLICER=auto")
+
+add_executable(mesh_slicer_benchmark EXCLUDE_FROM_ALL tools/benchmarks/mesh_slicer.cpp)
+target_link_libraries(mesh_slicer_benchmark PRIVATE tinglecam_core)
 
 add_executable(cam_tests
   tests/cam_tests.cpp

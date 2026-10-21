@@ -5,8 +5,7 @@ holes and counterbores, plane clearing, and native STEP surface finishing. Load 
 preview toolpaths and material removal, and export G-code. Jobs save as JSON;
 pockets, planes and manual holes can also be defined without a mesh.
 
-Requires CMake 3.20+, a C++20 compiler, the CUDA toolkit and a compatible NVIDIA
-GPU, SDL2 development files, OpenGL, and the Open CASCADE C++ SDK
+Requires CMake 3.20+, a C++20 compiler, SDL2 development files, OpenGL 3.2+, and the Open CASCADE C++ SDK
 (`libocct-data-exchange-dev` on Debian/Ubuntu). CMake fetches the remaining dependencies
 (Git and internet access required).
 
@@ -17,6 +16,13 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
 ./build/tinglecam
 ```
+
+CUDA mesh acceleration is built when a CUDA toolkit is detected. Without one,
+the build uses the cuBQL CPU slicer. To explicitly disable CUDA, configure with
+`-DTINGLECAM_WITH_CUDA=OFF`. At runtime, compatible CUDA devices are preferred;
+missing/incompatible devices or drivers use the CPU slicer automatically.
+`TINGLECAM_SLICER=cpu` forces CPU queries, while `TINGLECAM_SLICER=cuda` requires
+CUDA and reports an error if it cannot be used. The default is `auto`.
 
 In the GUI, open a job or start one: choose the part model, the stock, the
 machine and the material in the setup panel, add operations, press **Plan**
@@ -52,7 +58,7 @@ simulator, SDK options and CLI examples, see
 [STEP finishing and heightmap simulation](docs/step-finishing-heightmap.md).
 The 3D heightmap result is raycast directly at full resolution using OpenGL 3.2
 fragment shaders; this renderer does not require CUDA or CUDA/OpenGL interop.
-The existing mesh slicer still requires CUDA.
+The mesh slicer uses CUDA when available, with a cuBQL CPU fallback.
 Under WSL, startup automatically selects Mesa's D3D12 driver and the mesh GPU.
 The active renderer is shown under Tools > Settings; explicit
 Mesa/driver environment overrides take precedence.

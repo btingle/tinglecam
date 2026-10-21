@@ -214,6 +214,22 @@ std::string current_device_name() {
   return properties.name;
 }
 
+bool available() {
+  int count = 0;
+  if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) {
+    cudaGetLastError();
+    return false;
+  }
+  // Enumeration alone can succeed on a GPU unsupported by this binary or
+  // driver. Resolve an actual kernel before selecting the accelerated backend.
+  cudaFuncAttributes attributes{};
+  if (cudaFuncGetAttributes(&attributes, make_bounds) != cudaSuccess) {
+    cudaGetLastError();
+    return false;
+  }
+  return true;
+}
+
 Handle* create(const std::vector<Triangle3f>& triangles, const Bounds3f& bounds,
                MeshBuildStats& stats) {
   if (triangles.empty()) throw std::invalid_argument("Cannot build a BVH for an empty mesh");
