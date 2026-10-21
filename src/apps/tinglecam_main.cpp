@@ -15,7 +15,6 @@ int main(int argc, char** argv) {
   std::string view_name;
   double progress_fraction = -1.0;
   double stepdown = 0.0;
-  std::string simulation_method;
   int finishing_subdivisions = 0;
   std::vector<double> depth_breaks;
   std::optional<double> cleanup_stepover_limit;
@@ -35,8 +34,7 @@ int main(int argc, char** argv) {
   std::optional<double> box_margin_plus_y;
   std::optional<double> box_margin_minus_z;
   std::optional<double> box_margin_plus_z;
-  double full_feed = 0.0;
-  double no_feed = 0.0;
+  std::optional<double> spindle_rpm, chip_load, plunge_feed;
   bool profile_planning = false;
   std::string tool_id;
   std::string machine_id;
@@ -50,25 +48,17 @@ int main(int argc, char** argv) {
       return argv[++i];
     };
     try {
-      if (argument == "--part") std::snprintf(app.part_path.data(), app.part_path.size(), "%s", value().c_str());
-      else if (argument == "--stock") std::snprintf(app.stock_path.data(), app.stock_path.size(), "%s", value().c_str());
+      if (argument == "--part") app.job.part_mesh = value();
+      else if (argument == "--stock") app.job.stock_mesh = value();
       else if (argument == "--screenshot") screenshot = value();
       else if (argument == "--view") view_name = value();
-      else if (argument == "--engagement-display") {
-        const auto name = value();
-        const std::array<std::string,4> names{"planned","area","contact","difference"};
-        const auto found = std::find(names.begin(),names.end(),name);
-        if (found == names.end()) throw std::invalid_argument("Unknown engagement display");
-        app.engagement_display = static_cast<int>(found-names.begin());
-        app.colouring = Colouring::Load;
-      }
       else if (argument == "--at") progress_fraction = std::stod(value());
       else if (argument == "--follow") app.stack_follows_playback = true;
       else if (argument == "--models") {
         const std::string which = value();
-        app.models = which == "stock"  ? ModelShow::Stock
-                     : which == "part" ? ModelShow::Part
-                                       : ModelShow::Both;
+        app.setup_models = which == "stock"  ? ModelShow::Stock
+                           : which == "part" ? ModelShow::Part
+                                             : ModelShow::Both;
       }
       else if (argument == "--box-stock") {
         box_stock_uniform = std::stod(value());
@@ -98,7 +88,6 @@ int main(int argc, char** argv) {
         cleanup_stepover_limit = std::stod(value());
       else if (argument == "--fixed-cleanup-stepover") fixed_cleanup_stepover = true;
       else if (argument == "--stepover") stepover = std::stod(value());
-      else if (argument == "--simulation-method") simulation_method = value();
       else if (argument == "--simulation-pitch") simulation_pitch = std::stod(value());
       else if (argument == "--surface-stepover") surface_stepover = std::stod(value());
       else if (argument == "--surface-tolerance") surface_tolerance = std::stod(value());
@@ -118,8 +107,9 @@ int main(int argc, char** argv) {
       else if (argument == "--rapid-clearance") rapid_clearance = std::stod(value());
       else if (argument == "--mode") mode_name = value();
       else if (argument == "--contour-direction") direction_name = value();
-      else if (argument == "--full-feed") full_feed = std::stod(value());
-      else if (argument == "--no-feed") no_feed = std::stod(value());
+      else if (argument == "--spindle-rpm") spindle_rpm = std::stod(value());
+      else if (argument == "--chip-load") chip_load = std::stod(value());
+      else if (argument == "--plunge-feed") plunge_feed = std::stod(value());
       else if (argument == "--profile-planning") profile_planning = true;
       else if (argument == "--help" || argument == "-h") {
         std::printf(
@@ -128,10 +118,9 @@ int main(int argc, char** argv) {
             "  --stock PATH       Stock model (OBJ, STL or STEP)\n"
             "  --job PATH         Load a job JSON, including pocket/plane dimensions\n"
             "  --tool ID          Tool from the library\n"
-            "  --machine ID       Machine profile\n"
-            "  --material ID      Workpiece material\n"
+            "  --machine ID       Machine profile for the job\n"
+            "  --material ID      Workpiece material for the job\n"
             "  --stepover RATIO   Radial engagement as a fraction of diameter\n"
-            "  --simulation-method NAME  heightmap (legacy keys remain readable)\n"
             "  --stepdown MM      Axial depth per pass\n"
             "  --finishing-subdivisions N\n"
             "                     Coarse descent, then N-1 upward cuts per terrace\n"
@@ -139,15 +128,15 @@ int main(int argc, char** argv) {
             "  --cleanup-stepover-limit RATIO\n"
             "                     Adaptive cleanup width ceiling (default 0.5 diameter)\n"
             "  --fixed-cleanup-stepover  Keep the base width on cleanup layers\n"
-            "  --path-pitch MM    Simulation/feed sampling interval (default 1.0)\n"
-            "  --simulation-pitch MM  XY stock-grid spacing (default 0.1)\n"
+            "  --path-pitch MM    Engagement and feed sampling interval (default 1.0)\n"
+            "  --simulation-pitch MM  XY stock-grid spacing for the job (default 0.02)\n"
             "  --cad-info         Print imported STEP face IDs and source identity\n"
             "  --face N           Select CAD face N (1-based, repeatable)\n"
             "  --surface-stepover MM / --surface-tolerance MM\n"
             "                     Physical stepover / XYZ chord tolerance\n"
             "  --flow-u / --reverse-normals  Surface finishing direction controls\n"
-            "  --mode rough|finish|pocket|plane|surface\n"
-            "                     Operation mode (pocket/plane need no mesh)\n"
+            "  --mode rough|finish|pocket|plane|surface|hole\n"
+            "                     Operation mode (pocket/plane/manual holes need no mesh)\n"
             "  --contour-direction either|climb|conventional\n"
             "                     Permitted contour traversal direction\n"
             "  --entry-front-tolerance MM\n"
@@ -158,8 +147,8 @@ int main(int argc, char** argv) {
             "  --rapid-clearance MM\n"
             "                     Safe rapid height above the tallest of part and\n"
             "                     blank (default 10)\n"
-            "  --full-feed RATE   Manual feed at full engagement, mm/min\n"
-            "  --no-feed RATE     Manual feed at zero engagement, mm/min\n"
+            "  --spindle-rpm RPM / --chip-load MM / --plunge-feed MM_PER_MIN\n"
+            "                     Override the tool's cutting data for the material\n"
             "  --gcode PATH       Plan and post without opening a window, then exit\n"
             "  --profile-planning Print planning phase timings and scale counters\n"
             "  --screenshot PATH  Render one frame to a binary PPM and exit\n"
@@ -169,11 +158,9 @@ int main(int argc, char** argv) {
             "  --box-margin-minus-y MM / --box-margin-plus-y MM\n"
             "  --box-margin-minus-z MM / --box-margin-plus-z MM\n"
             "                     Directional box-stock margins\n"
-            "  --models stock|part|both   What the plan view shows\n"
-            "  --view models|pass|result\n"
+            "  --models stock|part|both   What the setup view shows\n"
+            "  --view setup|pass|result\n"
             "                     Which view a screenshot should capture\n"
-            "  --engagement-display planned|area|contact|difference\n"
-            "                     Engagement colours for preview/screenshots\n"
             "  --at FRACTION      How far through the pass to place the cutter, 0 to 1\n"
             "  -h, --help         Show this help and exit\n\n"
             "Tools live in %s\n"
@@ -189,18 +176,26 @@ int main(int argc, char** argv) {
       return EXIT_FAILURE;
     }
   }
-  if (!view_name.empty() && view_name != "models" && view_name != "pass" &&
+  if (!view_name.empty() && view_name != "setup" && view_name != "pass" &&
       view_name != "result") {
-    std::fprintf(stderr, "--view must be models, pass, or result\n");
+    std::fprintf(stderr, "--view must be setup, pass, or result\n");
     return EXIT_FAILURE;
   }
+  // Interactive startup reads job metadata now and loads geometry after the
+  // window is visible, so long STEP imports can show their progress.
+  const bool defer_models = gcode_out.empty() && !cad_info;
   if (!job_in.empty()) {
-    try { load_job_into(app, job_in); }
+    try { load_job_into(app, job_in, !defer_models); }
     catch (const std::exception& error) {
       std::fprintf(stderr, "%s\n", error.what());
       return EXIT_FAILURE;
     }
-  } else if (app.part_path[0] != '\0' || app.stock_path[0] != '\0') load_meshes(app);
+  } else if (!defer_models && (!app.job.part_mesh.empty() || !app.job.stock_mesh.empty()))
+    load_meshes(app);
+  if (!machine_id.empty()) app.job.machine_id = machine_id;
+  if (!material_id.empty()) app.job.material_id = material_id;
+  if (simulation_pitch > 0.0) app.job.simulation_pitch = simulation_pitch;
+  if (rapid_clearance > 0.0) app.job.rapid_clearance_height = rapid_clearance;
   if (box_stock_uniform) {
     const double margin = *box_stock_uniform;
     app.job.box_stock = true;
@@ -240,9 +235,10 @@ int main(int argc, char** argv) {
       requested_mode = cam::OperationMode::Pocket;
     else if (mode_name == "plane")
       requested_mode = cam::OperationMode::PlaneClearing;
+    else if(mode_name=="hole" || mode_name=="holes") requested_mode=cam::OperationMode::Hole;
     else if (mode_name == "surface") requested_mode = cam::OperationMode::SurfaceFinishing;
     else {
-      std::fprintf(stderr, "--mode must be rough, finish, pocket, plane or surface\n");
+      std::fprintf(stderr, "--mode must be rough, finish, pocket, plane, surface or hole\n");
       return EXIT_FAILURE;
     }
   }
@@ -259,8 +255,6 @@ int main(int argc, char** argv) {
     }
     cam::Operation& operation = app.job.operations.front();
     if (!tool_id.empty()) operation.tool_id = tool_id;
-    if (!machine_id.empty()) operation.machine_id = machine_id;
-    if (!material_id.empty()) operation.material_id = material_id;
     if (stepdown > 0.0) operation.stepdown = stepdown;
     if (finishing_subdivisions > 0)
       operation.finishing_subdivisions = finishing_subdivisions;
@@ -269,7 +263,6 @@ int main(int argc, char** argv) {
     if (fixed_cleanup_stepover) operation.adaptive_cleanup_stepover = false;
     if (stepover > 0.0) operation.stepover_ratio = stepover;
     if (path_pitch > 0.0) operation.path_pitch = path_pitch;
-    if (simulation_pitch > 0.0) operation.simulation_pitch = simulation_pitch;
     if (surface_stepover > 0.0) operation.surface.stepover = surface_stepover;
     if (surface_tolerance > 0.0) operation.surface.chord_tolerance = surface_tolerance;
     if (flow_u) operation.surface.along_v = false;
@@ -278,24 +271,10 @@ int main(int argc, char** argv) {
       operation.surface.faces=selected_faces;
       if(app.geometry.part_cad()) operation.surface.model_fingerprint=app.geometry.part_cad()->fingerprint();
     }
-    if (!simulation_method.empty()) {
-      bool found = false;
-      for (auto method : {wave::SimulationMethod::LocalArea, wave::SimulationMethod::Contact,
-                          wave::SimulationMethod::Compare, wave::SimulationMethod::ReferenceArea, wave::SimulationMethod::Heightmap})
-        if (simulation_method == wave::simulation_method_name(method)) {
-          operation.simulation_method = method; found = true;
-        }
-      if (!found) {
-        std::fprintf(stderr, "--simulation-method: use heightmap (or a legacy method key)\n");
-        return EXIT_FAILURE;
-      }
-    }
     if (entry_front_tolerance > 0.0)
       operation.entry_front_match_tolerance = entry_front_tolerance;
     if (tiny_split_area_factor)
       operation.tiny_split_area_factor = *tiny_split_area_factor;
-    if (rapid_clearance > 0.0)
-      app.job.rapid_clearance_height = rapid_clearance;
     if (!mode_name.empty()) operation.mode = requested_mode;
     if (!direction_name.empty()) {
       if (direction_name == "either")
@@ -310,11 +289,9 @@ int main(int argc, char** argv) {
         return EXIT_FAILURE;
       }
     }
-    if (full_feed > 0.0 || no_feed > 0.0) {
-      operation.manual_feed_range = true;
-      if (full_feed > 0.0) operation.full_engagement_feed = full_feed;
-      if (no_feed > 0.0) operation.no_engagement_feed = no_feed;
-    }
+    if (spindle_rpm) operation.cutting.spindle_rpm = spindle_rpm;
+    if (chip_load) operation.cutting.chip_load = chip_load;
+    if (plunge_feed) operation.cutting.plunge_feed = plunge_feed;
   }
 
   // Planning and posting with no window at all, which is how this gets checked
@@ -355,49 +332,30 @@ int main(int argc, char** argv) {
           stderr,
           "planning_profile_ms total=%.3f slicing=%.3f preparation=%.3f "
           "wavefront=%.3f lineage=%.3f inter_layer=%.3f toolpath=%.3f "
-          "cleanup=%.3f stitching=%.3f resampling=%.3f simulation=%.3f "
+          "cleanup=%.3f stitching=%.3f resampling=%.3f "
           "feeds=%.3f parallel_cleanup=%.3f cleanup_work=%.3f xyz_simulation=%.3f\n",
           m.total_milliseconds, m.slicing_milliseconds,
           m.preparation_milliseconds, m.wavefront_milliseconds,
           m.lineage_milliseconds, m.inter_layer_milliseconds,
           m.toolpath_milliseconds, m.cleanup_milliseconds,
           m.stitching_milliseconds, m.resampling_milliseconds,
-          m.simulation_milliseconds, m.feeds_milliseconds,
+          m.feeds_milliseconds,
           m.parallel_cleanup_milliseconds, m.cleanup_work_milliseconds, m.xyz_simulation_milliseconds);
       std::fprintf(
           stderr,
           "planning_profile_counts wave_generations=%zu fronts=%zu "
           "analysis_layers=%zu analysis_trials=%zu analysis_accepted=%zu "
-          "toolpath_moves=%zu simulation_intervals=%zu "
-          "empty_simulation_intervals=%zu gouge_bounds_rejections=%zu\n",
+          "toolpath_moves=%zu\n",
           m.wave_generations, m.fronts, m.analysis_layers, m.analysis_trials,
-          m.accepted_analysis_trials, m.toolpath_moves,
-          m.simulation_intervals, m.empty_simulation_intervals,
-          m.gouge_bounds_rejections);
+          m.accepted_analysis_trials, m.toolpath_moves);
     }
     if (profile_planning) {
-      for (std::size_t index=0; index<plan.operations.size(); ++index) {
-        std::size_t batches=0,fallbacks=0;
-        double distance=0,mean=0,maximum=0;
-        for (const auto& level : plan.operations[index].levels) {
-          batches += level.simulation.stats.stock_batches;
-          fallbacks += level.simulation.stats.contact_fallbacks;
-          for (const auto& move : level.simulation.moves) for (const auto& step : move.steps) {
-            const double length = step.move_distance_end-step.move_distance_begin;
-            const double difference = std::abs(std::clamp(step.area_load,0.0,1.0)-
-                                               std::clamp(step.contact_load,0.0,1.0));
-            distance += length; mean += length*difference;
-            maximum = std::max(maximum,difference);
-          }
-        }
-        const auto& operation_metrics=plan.operations[index].metrics;
-        std::fprintf(stderr,"operation_profile index=%zu total_ms=%.3f toolpath_ms=%.3f xyz_ms=%.3f\n",
-                     index,operation_metrics.total_milliseconds,
-                     operation_metrics.toolpath_milliseconds,operation_metrics.xyz_simulation_milliseconds);
-        std::fprintf(stderr,"simulation_profile operation=%zu method=%s batches=%zu contact_fallbacks=%zu "
-                            "mean_difference_pp=%.5f max_difference_pp=%.5f\n",index,
-            wave::simulation_method_name(app.job.operations[index].simulation_method),batches,fallbacks,
-            distance>0 ? 100*mean/distance : 0,100*maximum);
+      for (std::size_t index = 0; index < plan.operations.size(); ++index) {
+        const auto& metrics = plan.operations[index].metrics;
+        std::fprintf(stderr,
+                     "operation_profile index=%zu total_ms=%.3f toolpath_ms=%.3f xyz_ms=%.3f\n",
+                     index, metrics.total_milliseconds, metrics.toolpath_milliseconds,
+                     metrics.xyz_simulation_milliseconds);
       }
     }
     const cam::PostResult post = cam::post_job(plan, app.job, app.tools, app.machines);
@@ -411,14 +369,12 @@ int main(int argc, char** argv) {
     // Everything the simulation flags, printed whether or not it fired, so a
     // clean run says so rather than being read off an absence of output.
     std::printf(
-        "Safety: %zu unsafe plunge(s), %zu entry(s) into solid, %zu roughing "
-        "entry point(s) skipped, %zu rapid(s) over "
-        "the part, %zu front(s) never reached, %.3f mm2 gouged, %.0f mm2 left "
-        "standing\n",
-        plan.stats.unsafe_plunges, plan.stats.unresolved_entries,
-        plan.stats.skipped_entries, plan.stats.lifts_over_subject,
-        plan.stats.unreachable_fronts,
-        plan.stats.gouge_area, plan.stats.excess_area);
+        "Safety: %zu roughing plunge(s) onto stock, %zu roughing entry "
+        "point(s) skipped, %zu rapid(s) over the part, %zu front(s) never "
+        "reached, %.3f mm2 gouged\n",
+        plan.stats.unsafe_plunges, plan.stats.skipped_entries,
+        plan.stats.lifts_over_subject, plan.stats.unreachable_fronts,
+        plan.stats.gouge_area);
     std::printf(
         "%zu passes cut of %zu, %.0f mm of cutting in %.1f min, peak load %.2f\n"
         "%zu node Z-chain(s), %zu entry-front Z-chain(s)\n"
@@ -518,16 +474,18 @@ int main(int argc, char** argv) {
   ImGui_ImplOpenGL3_Init("#version 150");
 
   bool running = true;
-  // Declared above SDL initialisation, which needs to know.
   int screenshot_delay = 0;
   auto previous_frame = std::chrono::steady_clock::now();
-  if (screenshot_pending && !app.job.operations.empty())
-    start_plan(app, 0, static_cast<int>(app.job.operations.size()) - 1);
+  app.screenshot_mode = screenshot_pending;
+  if (defer_models && (!app.job.part_mesh.empty() || !app.job.stock_mesh.empty()))
+    start_model_loading(app, job_in.empty());
+  bool startup_loading = app.model_loading;
+  bool screenshot_plan_pending = screenshot_pending;
   if (!view_name.empty()) {
-    if (view_name == "result") app.force_tab = 2;
-    else if (view_name == "models") app.force_tab = 0;
-    else app.force_tab = 1;
+    app.force_tab = view_name == "result" ? 2 : view_name == "setup" ? 0 : 1;
+    app.force_tab_hold = screenshot_pending;
   }
+  std::string title;
   while (running) {
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
@@ -535,71 +493,31 @@ int main(int argc, char** argv) {
       if (event.type == SDL_QUIT ||
           (event.type == SDL_WINDOWEVENT &&
            event.window.event == SDL_WINDOWEVENT_CLOSE &&
-           event.window.windowID == SDL_GetWindowID(window)))
-        running = false;
+           event.window.windowID == SDL_GetWindowID(window))) {
+        if (screenshot_pending) running = false;
+        else request_quit(app);
+      }
     }
 
+    if (take_model_load(app) && startup_loading) {
+      startup_loading = false;
+      if (!selected_faces.empty() && !app.job.operations.empty() && app.geometry.part_cad())
+        app.job.operations.front().surface.model_fingerprint = app.geometry.part_cad()->fingerprint();
+    }
+    if (screenshot_plan_pending && !app.model_loading) {
+      screenshot_plan_pending = false;
+      if (app.model_load_error.empty() && !app.job.operations.empty())
+        start_plan(app, 0, static_cast<int>(app.job.operations.size()) - 1);
+    }
     cam::PartialPlan produced;
     if (app.planner.take(produced)) {
-      app.stock_cache_operation = -1;
-      // A run that could not be made -- cancelled, or overtaken by an edit to
-      // the list -- changes nothing. The plan on screen is still the plan.
-      if (!produced.error.empty()) {
-        if (produced.error != "Cancelled") {
-          std::fprintf(stderr, "Planning failed:\n%s\n", produced.error.c_str());
-          say(app, produced.error, true);
-        } else {
-          say(app, "Planning cancelled");
-        }
-      } else {
-        // Each planned operation takes the place of its own entry and nothing
-        // else. The signature recorded is the one taken when the run was asked
-        // for, so an operation edited while it ran comes back marked edited
-        // rather than pretending the plan describes the new settings.
-        const std::uint64_t serial = ++app.plan_serial;
-        std::size_t planned_count = 0;
-        for (std::size_t i = 0; i < produced.operations.size(); ++i) {
-          const std::size_t at = produced.first + i;
-          if (at >= app.plan.operations.size()) break;
-          app.plan.operations[at] = std::move(produced.operations[i]);
-          app.planned[at] = {i < app.planning_signatures.size()
-                                 ? app.planning_signatures[i]
-                                 : std::string(),
-                             serial};
-          if (app.plan.operations[at].ok()) ++planned_count;
-        }
-        app.plan.rapid_plane = produced.rapid_plane;
-        cam::summarise_job(app.plan);
-        log_warnings(app, "Planning", app.plan.warnings);
-        refresh_plan_states(app);
-        select_operation(app, app.selected_operation);
-        app.view.needs_fit = true;
-        app.playback.distance = 0.0;
-        app.playback.motion_seconds = 0.0;
-        app.material.clear();
-        app.material_distance = -1.0;
-        app.material_level = -1;
-        if (progress_fraction >= 0.0) {
-          const cam::LevelPlan* level = current_level(app);
-          app.playback.distance =
-              std::clamp(progress_fraction, 0.0, 1.0) * level_length(level);
-          sync_playback_time(app);
-        }
-        if (planned_count == 0) {
-          std::fprintf(stderr, "Planning failed:\n%s\n", app.plan.error.c_str());
-          say(app, app.plan.error.empty()
-                       ? "No operation in that range could be planned"
-                       : app.plan.error,
-              true);
-        } else if (screenshot_pending) {
-          // The view was chosen on the command line; leave it alone.
-        } else {
-          app.force_tab = 2;
-          say(app, "Planned " + std::to_string(app.plan.stats.cut_levels) +
-                       " passes");
-        }
+      take_plan_result(app, std::move(produced), screenshot_pending);
+      if (progress_fraction >= 0.0) {
+        const cam::LevelPlan* level = current_level(app);
+        app.playback.distance =
+            std::clamp(progress_fraction, 0.0, 1.0) * level_length(level);
+        sync_playback_time(app);
       }
-      app.planning_signatures.clear();
     }
 
     const auto now = std::chrono::steady_clock::now();
@@ -608,112 +526,22 @@ int main(int argc, char** argv) {
     advance_playback(app, std::min(elapsed, 0.1));
     advance_camera(app, std::min(elapsed, 0.1));
     if (app.has_plan) refresh_material(app);
-    // Once a frame, before anything reads it: three panels ask which
-    // operations the plan still describes, and they must not be able to
-    // disagree within one frame.
+    // Once a frame, before anything reads it, so panels cannot disagree.
     refresh_plan_states(app);
 
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplSDL2_NewFrame();
     ImGui::NewFrame();
-
     // A press that landed on the view cube blocks orbiting until it is let go.
-    // The release is normally consumed by the cube itself, but the view it was
-    // in may have been switched away from in the meantime, and a press nobody
-    // is left to release would block orbiting for good.
     if (!ImGui::IsMouseDown(ImGuiMouseButton_Left) &&
         !ImGui::IsMouseReleased(ImGuiMouseButton_Left))
       app.orbit.cube_pressed = false;
-
-    const ImGuiViewport* viewport = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(viewport->WorkPos);
-    ImGui::SetNextWindowSize(viewport->WorkSize);
-    ImGui::Begin("TingleCAM", nullptr,
-                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
-                     ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus);
-    const float content_width = ImGui::GetContentRegionAvail().x;
-    const float content_height = ImGui::GetContentRegionAvail().y;
-    const float splitter_width = ui_size(app, 6.0f);
-    const float spacing = ImGui::GetStyle().ItemSpacing.x;
-    const float usable_width = std::max(
-        1.0f, content_width - 2.0f * splitter_width - 4.0f * spacing);
-    const float minimum_left = ui_size(app, 260.0f);
-    const float minimum_centre = ui_size(app, 200.0f);
-    const float minimum_right = ui_size(app, 280.0f);
-    const float maximum_left =
-        std::max(minimum_left, usable_width - minimum_centre - minimum_right);
-    float left_panel_width = std::clamp(
-        ui_size(app, static_cast<float>(app.settings.panel_layout.left_width)),
-        minimum_left, maximum_left);
-    const float maximum_right =
-        std::max(minimum_right, usable_width - minimum_centre - left_panel_width);
-    float right_panel_width = std::clamp(
-        ui_size(app, static_cast<float>(app.settings.panel_layout.right_width)),
-        minimum_right, maximum_right);
-    float centre_width = std::max(
-        1.0f, usable_width - left_panel_width - right_panel_width);
-
-    ImGui::BeginChild("left-panel", ImVec2(left_panel_width, content_height));
-    ImGui::PushItemWidth(left_panel_width * 0.48f);
-    left_panel(app);
-    ImGui::PopItemWidth();
-    ImGui::EndChild();
-    ImGui::SameLine();
-    float delta = 0.0f;
-    layout_splitter(app, "left-column-splitter", true, content_height, delta);
-    if (delta != 0.0f) {
-      app.settings.panel_layout.left_width = std::clamp(
-          app.settings.panel_layout.left_width +
-              delta / static_cast<float>(app.settings.ui_scale),
-          260.0, 1200.0);
+    draw_main_window(app);
+    if (app.quit) running = false;
+    if (const std::string wanted = window_title(app); wanted != title) {
+      title = wanted;
+      SDL_SetWindowTitle(window, title.c_str());
     }
-    ImGui::SameLine();
-    ImGui::BeginChild("views", ImVec2(centre_width, content_height));
-    if (ImGui::BeginTabBar("view-tabs")) {
-      const auto flag = [&](int index) -> ImGuiTabItemFlags {
-        return app.force_tab == index ? ImGuiTabItemFlags_SetSelected : 0;
-      };
-      if (ImGui::BeginTabItem("Plan", nullptr, flag(0))) {
-        draw_setup(app);
-        ImGui::EndTabItem();
-      }
-      if (ImGui::BeginTabItem("Pass", nullptr, flag(1))) {
-        draw_canvas(app);
-        ImGui::EndTabItem();
-      }
-      if (ImGui::BeginTabItem("Stacked result", nullptr, flag(2))) {
-        draw_result(app);
-        ImGui::EndTabItem();
-      }
-      ImGui::EndTabBar();
-    }
-    // One frame of forcing is enough; leaving it set would pin the tab against
-    // the mouse. A screenshot keeps asking, since the view it wants is chosen
-    // before there is a plan to show in it.
-    if (!screenshot_pending) app.force_tab = -1;
-    ImGui::EndChild();
-    ImGui::SameLine();
-    delta = 0.0f;
-    layout_splitter(app, "right-column-splitter", true, content_height, delta);
-    if (delta != 0.0f) {
-      app.settings.panel_layout.right_width = std::clamp(
-          app.settings.panel_layout.right_width -
-              delta / static_cast<float>(app.settings.ui_scale),
-          280.0, 1400.0);
-    }
-    ImGui::SameLine();
-    ImGui::BeginChild("right-panel", ImVec2(right_panel_width, content_height));
-    ImGui::PushItemWidth(right_panel_width * 0.44f);
-    right_panel(app);
-    ImGui::PopItemWidth();
-    ImGui::EndChild();
-    ImGui::End();
-    if (app.panel_layout_dragging &&
-        !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-      save_settings(app);
-      app.panel_layout_dragging = false;
-    }
-    tool_builder(app);
 
     ImGui::Render();
     int width = 0;
@@ -724,7 +552,7 @@ int main(int argc, char** argv) {
     glClear(GL_COLOR_BUFFER_BIT);
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
-    if (screenshot_pending && app.planner.running()) {
+    if (screenshot_pending && (app.model_loading || app.planner.running() || app.surface_previewer.running())) {
       // Wait for the plan so the captured frame has something in it.
     } else if (screenshot_pending && ++screenshot_delay < 3) {
       // One more frame, so the panels have laid out against the finished plan.
@@ -741,12 +569,12 @@ int main(int argc, char** argv) {
       screenshot_pending = false;
       running = false;
     }
-
     SDL_GL_SwapWindow(window);
   }
 
   app.planner.cancel();
-  release_prism_view();
+  app.model_loader.cancel();
+  release_render_resources();
   ImGui_ImplOpenGL3_Shutdown();
   ImGui_ImplSDL2_Shutdown();
   ImGui::DestroyContext();

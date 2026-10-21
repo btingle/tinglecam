@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
+#include <string>
 
 namespace cam {
 namespace {
@@ -89,19 +90,70 @@ const char* feed_limit_name(FeedLimit value) {
     case FeedLimit::Engagement: return "engagement";
     case FeedLimit::Rapid: return "rapid";
     case FeedLimit::Plunge: return "plunge";
+    case FeedLimit::Machine: return "machine maximum";
   }
   return "unknown";
 }
 
-bool feed_limit_is_binding(FeedLimit) { return false; }
+// The most chip thinning is allowed to speed a cut up. Without a ceiling a cut
+// grazing the stock would ask for an unbounded feed.
+constexpr double kMaximumThinning = 4.0;
+
+double CuttingFeeds::full_feed() const {
+  return std::min(spindle_rpm * flutes * chip_load, maximum_feed);
+}
+
+double CuttingFeeds::feed_at(double engagement, FeedLimit* limit) const {
+  const double full = spindle_rpm * flutes * chip_load;
+  double factor = 1.0;
+  if (!(engagement >= 0.5)) {
+    const double e = std::max(engagement, 0.0);
+    const double chord = 1.0 - 2.0 * e;
+    const double thinning = std::sqrt(std::max(0.0, 1.0 - chord * chord));
+    factor = thinning > 1.0 / kMaximumThinning ? 1.0 / thinning : kMaximumThinning;
+  }
+  const double feed = full * factor;
+  if (limit) *limit = feed > maximum_feed ? FeedLimit::Machine : FeedLimit::Engagement;
+  return std::min(feed, maximum_feed);
+}
+
+CuttingFeeds resolve_cutting_feeds(const Tool& tool, const Machine& machine,
+                                   const std::string& material_id,
+                                   const CuttingOverrides& overrides) {
+  const CuttingData* data = tool.cutting_for(material_id);
+  const auto pick = [&](const std::optional<double>& override_value,
+                        double CuttingData::*field, const char* what) {
+    if (override_value) return *override_value;
+    if (!data)
+      throw std::runtime_error(tool.name + " has no cutting data for " +
+                               (material_id.empty() ? std::string("the job material")
+                                                    : material_id) +
+                               "; add it to the tool or set the " + what +
+                               " on the operation");
+    return data->*field;
+  };
+  CuttingFeeds feeds;
+  feeds.spindle_rpm = commandable_rpm(
+      machine, pick(overrides.spindle_rpm, &CuttingData::spindle_rpm, "spindle speed"));
+  feeds.chip_load = pick(overrides.chip_load, &CuttingData::chip_load, "chip load");
+  feeds.plunge_feed =
+      pick(overrides.plunge_feed, &CuttingData::plunge_feed, "plunge feed");
+  feeds.flutes = std::max(tool.flutes, 1);
+  feeds.maximum_feed = rapid_feed(machine);
+  if (!(feeds.spindle_rpm > 0.0) || !std::isfinite(feeds.spindle_rpm))
+    throw std::runtime_error("Spindle speed must be positive");
+  if (!(feeds.chip_load > 0.0) || !std::isfinite(feeds.chip_load))
+    throw std::runtime_error("Chip load must be positive");
+  if (!(feeds.plunge_feed > 0.0) || !std::isfinite(feeds.plunge_feed))
+    throw std::runtime_error("Plunge feed must be positive");
+  if (!(feeds.maximum_feed > 0.0))
+    throw std::runtime_error("The machine's rapid feed must be positive");
+  return feeds;
+}
 
 FeedSchedule plan_feeds(const wave::Toolpath& toolpath,
-                        const wave::SimulationResult& simulation,
                         const Machine& machine,
-                        double full_engagement_feed,
-                        double no_engagement_feed,
-                        double spindle_rpm,
-                        double plunge_feed,
+                        const CuttingFeeds& feeds,
                         double floor_z,
                         double rapid_plane,
                         PassLink link,
@@ -109,12 +161,11 @@ FeedSchedule plan_feeds(const wave::Toolpath& toolpath,
   FeedSchedule schedule;
   if (toolpath.moves.empty()) return schedule;
 
-  const double slow = std::max(full_engagement_feed, 1.0);
-  const double fast = std::max(no_engagement_feed, slow);
-  const double plunge = std::max(plunge_feed, 1.0);
+  const double travel = std::max(feeds.travel_feed(), 1.0);
+  const double plunge = std::max(std::min(feeds.plunge_feed, feeds.maximum_feed), 1.0);
   const double rapid = std::max(rapid_feed(machine), 1.0);
   const double rapid_z = std::max(rapid_feed_z(machine), 1.0);
-  schedule.stats.spindle_rpm = commandable_rpm(machine, spindle_rpm);
+  schedule.stats.spindle_rpm = feeds.spindle_rpm;
 
   std::vector<double> move_start(toolpath.moves.size(), 0.0);
   for (std::size_t index = 1; index < toolpath.moves.size(); ++index)
@@ -126,18 +177,9 @@ FeedSchedule plan_feeds(const wave::Toolpath& toolpath,
 
     if (move.kind == wave::MoveKind::Retract ||
         move.kind == wave::MoveKind::Entry) {
-      bool emitted = false;
-      const bool safe_retract =
-          move.kind == wave::MoveKind::Retract &&
-          index < simulation.moves.size() &&
-          !(simulation.moves[index].plunge_collision_area > 0.0);
       if (!allow_plunge && move.kind == wave::MoveKind::Entry)
         throw std::runtime_error(
             "roughing pass contained an entry move; the move was omitted");
-      if (!allow_plunge && move.kind == wave::MoveKind::Retract &&
-          !safe_retract)
-        throw std::runtime_error(
-            "roughing pass has an unsafe retract landing; the level was omitted");
       for (std::size_t i = 1; i < move.path.size(); ++i) {
         FeedSegment segment;
         segment.from = move.path[i - 1];
@@ -145,52 +187,29 @@ FeedSchedule plan_feeds(const wave::Toolpath& toolpath,
         segment.move_index = index;
         segment.kind = move.kind;
         segment.rapid = move.kind == wave::MoveKind::Retract;
-        segment.safe_retract = safe_retract;
         segment.limit = segment.rapid ? FeedLimit::Rapid : FeedLimit::Plunge;
         segment.length = distance_mm(segment.from, segment.to);
         segment.start_distance = move_start[index] + along;
         segment.feed = segment.rapid ? 0.0 : plunge;
         segment.rate = segment.rapid ? rapid : plunge;
         along += segment.length;
-        if (segment.length > 0.0) {
-          schedule.segments.push_back(segment);
-          emitted = true;
-        }
-      }
-      // Keep a marker for an opening retract whose XY endpoints coincide.
-      // Although it has no planar length, it is the proof that the following
-      // descent lands in cleared air and is therefore eligible for G0.
-      if (!emitted && move.kind == wave::MoveKind::Retract &&
-          !move.path.empty()) {
-        FeedSegment marker;
-        marker.from = move.path.front();
-        marker.to = move.path.back();
-        marker.move_index = index;
-        marker.kind = wave::MoveKind::Retract;
-        marker.rapid = true;
-        marker.safe_retract = safe_retract;
-        marker.limit = FeedLimit::Rapid;
-        marker.start_distance = move_start[index];
-        marker.rate = rapid;
-        schedule.segments.push_back(marker);
+        if (segment.length > 0.0) schedule.segments.push_back(segment);
       }
       continue;
     }
 
-    if (!engaged_kind(move.kind) || index >= simulation.moves.size()) continue;
-    for (const wave::MaterialStep& step : simulation.moves[index].steps) {
+    if (!engaged_kind(move.kind)) continue;
+    for (std::size_t i = 1; i < move.path.size(); ++i) {
       FeedSegment segment;
-      segment.from = step.from;
-      segment.to = step.to;
+      segment.from = move.path[i - 1];
+      segment.to = move.path[i];
       segment.move_index = index;
       segment.kind = move.kind;
-      segment.length = distance_mm(step.from, step.to);
-      segment.start_distance = move_start[index] + step.move_distance_begin;
+      segment.length = distance_mm(segment.from, segment.to);
+      segment.start_distance = move_start[index] + along;
+      along += segment.length;
       if (!(segment.length > 0.0)) continue;
-      segment.engagement = std::clamp(step.load, 0.0, 1.0);
-      segment.feed =
-          slow + (fast - slow) * (1.0 - segment.engagement);
-      segment.rate = segment.feed;
+      segment.feed = segment.rate = travel;
       segment.limit = FeedLimit::Engagement;
       schedule.segments.push_back(segment);
     }
@@ -255,8 +274,9 @@ FeedSchedule plan_feeds(const wave::Toolpath& toolpath,
                       segment.start_distance + segment.length, rapid,
                       wave::MoveKind::Retract, true);
       }
-      rapid_descent = first_segment < segment_index &&
-                      unmerged_segments[first_segment].safe_retract;
+      // Offered as a rapid; the stock simulation turns a descent that lands on
+      // stock into a plunge.
+      rapid_descent = true;
       position = move.path.back();
       have_position = true;
       at_depth = false;
@@ -433,6 +453,7 @@ MotionCursor feed_motion_at_seconds(const FeedSchedule& schedule,
     cursor.kind = phase.kind;
     cursor.rapid = phase.rapid;
     cursor.rate = phase.rate;
+    cursor.engagement = phase.engagement;
     cursor.phase_length = phase.length;
     cursor.from_z = phase.from_z;
     cursor.to_z = phase.to_z;
@@ -456,6 +477,7 @@ MotionCursor feed_motion_at_seconds(const FeedSchedule& schedule,
       cursor.kind = phase.kind;
       cursor.rapid = phase.rapid;
       cursor.rate = phase.rate;
+      cursor.engagement = phase.engagement;
       cursor.phase_distance = phase.length * t;
       cursor.phase_length = phase.length;
       cursor.motion_distance = travelled + cursor.phase_distance;
@@ -474,6 +496,7 @@ MotionCursor feed_motion_at_seconds(const FeedSchedule& schedule,
   cursor.kind = phase.kind;
   cursor.rapid = phase.rapid;
   cursor.rate = phase.rate;
+  cursor.engagement = phase.engagement;
   cursor.phase_distance = phase.length;
   cursor.phase_length = phase.length;
   cursor.motion_distance = travelled;

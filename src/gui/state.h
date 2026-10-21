@@ -105,52 +105,36 @@ class Background {
 
 enum class Colouring { Feed, Limit, Load, Move };
 
-// Which body the plan view draws. The stock encloses the part, so showing both
+// Which models a 3D view draws. The stock encloses the part, so showing both
 // means showing the stock through, not showing it on top.
-enum class ModelShow { Stock, Part, Both };
+enum class ModelShow { None, Part, Stock, Both };
 
 inline const char* model_show_name(ModelShow value) {
   switch (value) {
-    case ModelShow::Stock: return "Stock";
+    case ModelShow::None: return "None";
     case ModelShow::Part: return "Part";
-    case ModelShow::Both: return "Both";
+    case ModelShow::Stock: return "Stock";
+    case ModelShow::Both: return "Part and stock";
   }
-  return "Both";
+  return "None";
 }
 
-// And which the stacked result superimposes on the passes. A fourth state the
-// plan view has no use for: there the model is the subject, here it is an
-// overlay on something else, so it has to be possible to have neither.
-enum class StackModels { None, Part, Stock, Both };
-
-inline const char* stack_models_name(StackModels value) {
-  switch (value) {
-    case StackModels::None: return "No model";
-    case StackModels::Part: return "Part";
-    case StackModels::Stock: return "Stock";
-    case StackModels::Both: return "Both";
-  }
-  return "No model";
-}
-
-// The operation modes, in the order they are offered. One list, so the Add
-// picker, the Mode combo and anything else that has to enumerate them cannot
-// come to differ.
+// The operation modes, in the order they are offered.
 constexpr cam::OperationMode kOperationModes[]{
     cam::OperationMode::Roughing,
     cam::OperationMode::ContourFinishing,
     cam::OperationMode::Pocket,
+    cam::OperationMode::Hole,
     cam::OperationMode::PlaneClearing,
     cam::OperationMode::SurfaceFinishing,
 };
 
-// `cam::operation_mode_name` is the name the job file carries, which is the
-// wrong thing to put in front of an operator: `plane_clearing` is a key, not a
-// label. The file keeps its name and the window gets this one.
+// `cam::operation_mode_name` is the job file's key; this is the label.
 inline const char* operation_mode_label(cam::OperationMode value) {
   switch (value) {
     case cam::OperationMode::Roughing: return "Roughing";
     case cam::OperationMode::ContourFinishing: return "Contour finishing";
+    case cam::OperationMode::Hole: return "Hole";
     case cam::OperationMode::Pocket: return "Pocket";
     case cam::OperationMode::PlaneClearing: return "Plane clearing";
     case cam::OperationMode::SurfaceFinishing: return "Surface finishing (STEP)";
@@ -159,11 +143,8 @@ inline const char* operation_mode_label(cam::OperationMode value) {
 }
 
 // How an operation stands against the plan on screen. A plan is kept when
-// settings change rather than thrown away: what came out of the last run is
-// still the best picture of the job there is, and the only thing an edit
-// actually changes is which operations that picture still describes. Saying so
-// costs one marker per row; discarding it costs the operator the preview they
-// were editing against.
+// settings change: it is still the best picture of the job, and an edit only
+// changes which operations it still describes.
 enum class PlanState {
   None,        // this operation has no result at all
   Planned,     // this operation's passes came from exactly these settings
@@ -173,18 +154,14 @@ enum class PlanState {
 };
 
 // What one operation's plan was built from, and when. The signature notices an
-// edit; the serial orders the operations against each other, which is what
-// tells an untouched operation that the one above it has been re-planned since
-// -- and therefore that the stock it inherited is no longer what it was handed.
+// edit; the serial orders the operations against each other.
 struct PlannedRecord {
   std::string signature;
   std::uint64_t serial = 0;
 };
 
-// The error an operation's entry in the plan carries when there is no result
-// for it: one added since the plan was made, or one no re-plan has reached.
-// Written into the entry rather than left blank so that everything already
-// skipping a failed operation -- the post included -- skips this too.
+// The error an unplanned operation's entry carries, so everything that skips a
+// failed operation skips it too.
 constexpr const char* kUnplanned = "Not planned yet";
 
 enum class NodeDebugColouring { None, Node, ZGroup };
@@ -195,53 +172,35 @@ struct View {
   bool needs_fit = true;
 };
 
-// The stacked result view. Orthographic, painter-sorted onto the draw list, the
-// same way the wave demo shows its slice, because a depth buffer and shaders
-// would be a lot of machinery for a dozen extruded outlines.
+// The orbited 3D views. Orthographic.
 struct Orbit {
-  // Azimuth roams: there is no edge to the turntable, and a view that stops
-  // short of coming round again is a view that has to be dragged back.
   float yaw = 0.85f;
-  // Elevation runs the whole quarter turn either way, so straight down and
-  // straight up are both reachable and both exact. Nothing needs it kept off
-  // the poles: the basis stays orthonormal there, the painter's sort still
-  // separates the slabs by height, and the raycaster already handles a ray
-  // parallel to a prism's faces.
+  // Elevation runs the whole quarter turn either way.
   float pitch = 0.62f;
   float zoom = 1.0f;
-  // A view-cube snap turns the camera over a few frames rather than teleporting
-  // it. Which way the model went is most of what the snap has to say, and a cut
-  // between two orientations does not say it.
+  // A view-cube snap turns the camera over a few frames.
   bool turning = false;
   float turn = 0.0f;  // 0 to 1 across the movement
   float from_yaw = 0.0f, from_pitch = 0.0f;
   float to_yaw = 0.0f, to_pitch = 0.0f;
-  // A left press that landed on the view cube. Held so the drag it may turn
-  // into orbits nothing: pressing the cube is asking for a view, not steering.
+  // A left press that landed on the view cube orbits nothing.
   bool cube_pressed = false;
-  // Where the framed centre sits on screen, in pixels from the middle of the
-  // canvas. Held in screen space rather than as a point in the model, because
-  // the gesture is screen space: a drag should move what is under the pointer
-  // by exactly that many pixels whatever the orbit and zoom happen to be.
+  // Screen-space pan of the framed centre, in pixels.
   ImVec2 pan{0.0f, 0.0f};
 };
 
-// Playback along one pass. The distance is measured along that pass's toolpath,
-// which is what the simulation snapshots are indexed by.
+// Playback along one pass. Distance is along that pass's toolpath.
 struct Playback {
   bool playing = false;
   double distance = 0.0;
-  // Elapsed commanded-machine time within this pass.  This is distinct from
-  // distance because the latter stands still during retracts and plunges.
+  // Commanded-machine time within this pass. Distinct from distance, which
+  // stands still during retracts and plunges.
   double motion_seconds = 0.0;
   double speed = 40.0;  // mm of toolpath per second of wall clock
-  // Run the cutter at the feeds the plan actually commands rather than at a
-  // fixed distance per second. Those feeds came out of what the simulation
-  // measured the cutter removing, so this is the job at its real pace: it
-  // crawls where the engagement is heavy and opens out where it is not.
+  // Run at the commanded feeds rather than a fixed distance per second.
   bool real_time = true;
   double time_scale = 1.0;  // multiples of real time
-  bool follow = true;   // keep the whole job's passes advancing, not just one
+  bool follow = true;   // carry on into the next pass
 };
 
 enum class LogSeverity {
@@ -256,6 +215,38 @@ struct LogMessage {
   std::string text;
 };
 
+// A modal question with one action. `action` runs on confirm.
+struct Confirmation {
+  bool pending = false;
+  std::string title;
+  std::string text;
+  std::string accept = "OK";
+  std::function<void()> action;
+};
+
+// The in-app file browser. One at a time; `accept` receives the chosen path.
+struct FileDialog {
+  bool pending = false;
+  bool saving = false;
+  std::string title;
+  std::vector<std::string> extensions;  // lower case, with the dot
+  std::filesystem::path directory;
+  std::array<char, 512> name{};
+  std::array<char, 1024> location{};
+  std::string selected;
+  std::string error;
+  std::function<void(const std::filesystem::path&)> accept;
+};
+
+struct LoadedModels {
+  cam::Job job;
+  cam::JobGeometry geometry;
+  std::filesystem::path job_file;
+  std::vector<std::string> warnings;
+  bool opened_job = false, reset_setup = false;
+  std::string error;
+};
+
 struct App {
   cam::ToolLibrary tools;
   cam::MachineLibrary machines;
@@ -264,89 +255,83 @@ struct App {
   cam::Job job;
   cam::JobGeometry geometry;
   // One entry per operation in the job, always: an operation with no result
-  // carries an entry saying so. Keeping the two lists in step is what lets a
-  // re-plan replace one operation's passes and leave the rest standing.
+  // carries an entry saying so.
   cam::JobPlan plan;
   bool has_plan = false;
-  // What each of those entries was planned from. Dirtiness is the difference
-  // between this and the job now, worked out once a frame, rather than a flag
-  // every edit path has to remember to set -- and there is an edit path for
-  // every field in the settings panel.
+  // What each entry was planned from. Dirtiness is the difference between
+  // this and the job now, worked out once a frame.
   std::vector<PlannedRecord> planned;
   std::uint64_t plan_serial = 0;
   std::vector<PlanState> plan_states;
 
   Background<cam::PartialPlan> planner;
+  Background<LoadedModels> model_loader;
+  bool model_loading = false, model_load_cancelled = false;
+  std::string model_load_label, model_load_error;
+  Background<cam::HoleDetection> hole_detector;
+  std::string hole_detection_id;
+  cam::HoleDetection hole_detection;
+  Background<cam::SurfaceContourPreview> surface_previewer;
+  cam::SurfaceContourPreview surface_preview;
+  cam::SurfaceContourOrder surface_order;
+  std::string surface_preview_key, surface_order_key;
+  std::vector<std::size_t> surface_order_roots;
+  // Cached screen depth of the part for visible-surface contour picking.
+  std::shared_ptr<const cam::CadModel> surface_depth_model;
+  Projection surface_depth_projection{};
+  ImVec2 surface_depth_origin{}, surface_depth_size{};
+  int surface_depth_width = 0, surface_depth_height = 0;
+  std::vector<float> surface_depth;
   // The range in flight, and what its operations said when it was asked for.
-  // Taken at the start rather than read back at the end: the settings panel
-  // stays live while the planner runs, and a plan describes the settings it
-  // was given, not the ones it happens to land among.
   std::size_t planning_first = 0;
   std::vector<std::string> planning_signatures;
-  std::string banner;
-  bool banner_is_error = false;
   std::vector<LogMessage> messages;
   int message_filter = 0;  // 0 all, 1 info, 2 warnings, 3 errors
+  bool show_messages = false;
   std::string graphics_renderer;
   bool software_graphics = false;
 
-  std::array<char, 512> part_path{};
-  std::array<char, 512> stock_path{};
+  // Where the job lives; empty until it is first saved or opened.
+  std::filesystem::path job_file;
+  // The job as last saved or opened, for noticing unsaved changes.
+  std::string saved_job;
   int selected_operation = 0;
-  // Separate from the focused row: these are the operations used by the
-  // multi-operation planning and G-code actions.
+  // Separate from the focused row: the operations the multi-operation
+  // planning and export actions use.
   std::vector<char> operation_selection;
-  // What the Add button will add. One picker and one button rather than a
-  // button per mode: the modes are a list that grows, and a row of buttons is
-  // not.
-  cam::OperationMode add_mode = cam::OperationMode::Roughing;
-  cam::OperationMode settings_mode = cam::OperationMode::Roughing;
   int selected_level = 0;
   int selected_plan_operation = 0;
   Colouring colouring = Colouring::Feed;
-  int engagement_display = 0;  // planned, area, contact, absolute difference
   // Set from the command line so a screenshot can be told which view to take.
   int force_tab = -1;
+  // Keep forcing the tab every frame, which a screenshot needs.
+  bool force_tab_hold = false;
+  // Rendering one frame to a file: nothing is saved.
+  bool screenshot_mode = false;
   bool show_stock = true;
   bool show_part = true;
-  // What the plan view shows. Separate from the pass view's own toggles above:
-  // that view draws outlines and can afford both at once, while a solid needs
-  // to be told which of two nested bodies is the subject.
-  ModelShow models = ModelShow::Both;
-  // The plan view drawn as edges rather than surfaces. What it is for is
-  // seeing one body through another -- a pocket volume standing inside the
-  // blank, or the part inside it -- which no amount of translucency in a
-  // painter-sorted solid does honestly.
-  bool wireframe = false;
-  // What the stacked result draws over the passes. Off to begin with: the
-  // stack is the thing being looked at, and a model over it is a question
-  // asked of that stack rather than the default way to read it.
-  StackModels stack_models = StackModels::None;
-  // Cutting motion and rapid travel are separate questions, and both views
-  // answer them the same way. A stack read for where the tool went wants the
-  // cuts alone; one read for how much of the job is lifting wants the rapids.
-  bool show_rapid_travel = true;
   bool show_material = true;
   bool show_cutting_paths = true;
+  bool show_rapid_travel = true;
+  // Draw every pass of the operation rather than only the current one.
+  bool show_all_passes = false;
+  ModelShow setup_models = ModelShow::Both;
+  ModelShow result_models = ModelShow::None;
+  bool wireframe = false;
   NodeDebugColouring node_debug_colouring = NodeDebugColouring::None;
-  // Which corner, edge or centre of the blank the origin picker is aimed at,
-  // one choice per axis: 0 low, 1 middle, 2 high. A pick on its own moves
-  // nothing -- it is applied on the button, so a stray click cannot silently
-  // shift where the program thinks the work is.
+  // Which corner, edge or centre of the blank the origin picker is aimed at:
+  // 0 low, 1 middle, 2 high per axis.
   std::array<int, 3> origin_pick{1, 1, 2};
   bool show_entry_front_chains = false;
   bool show_boundary_contacts = false;
-  // Follow the cutter by default so the stacked view and playback describe the
-  // same instant. It can still be switched off to inspect the finished stack.
+  // Follow the cutter, so the stacked view and playback describe one instant.
   bool stack_follows_playback = true;
-  // Regions the triangulator refused this frame, so a fill that silently went
-  // missing is reported rather than left to be spotted by eye.
   std::size_t fill_failures = 0;
   View view;
   Orbit orbit;
   Playback playback;
   // Remaining stock for the pass being watched, recomputed only when the
-  // playback distance actually moves.
+  // playback position actually moves.
   std::shared_ptr<const wave::Heightmap> material_heightmap;
   double material_motion_seconds = -1;
   double material_motion_distance = 0;
@@ -355,12 +340,12 @@ struct App {
   double material_distance = -1.0;
   int material_level = -1;
   int material_operation = -1;
-  int stock_cache_operation = -1, stock_cache_level = -1;
-  std::vector<cam::StockSlab> stock_cache;
-  std::vector<cam::StockSlab> stock_display_cache;
-  double stock_display_distance = -1.0;
 
-  // Tool Builder
+  // Windows
+  bool show_tool_library = false;
+  bool show_material_library = false;
+  bool show_settings = false;
+  bool show_gcode_preview = false;
   bool builder_open = false;
   bool builder_is_new = false;
   cam::Tool builder_tool;
@@ -368,12 +353,16 @@ struct App {
   std::string gcode;
   cam::PostResult post;
   std::vector<int> posted_operations;
-  std::array<char, 512> save_path{};
+  std::filesystem::path gcode_file;
+
+  Confirmation confirmation;
+  FileDialog file_dialog;
+  bool quit_requested = false;
+  bool quit = false;
 
   std::filesystem::path tools_file;
+  std::filesystem::path materials_file;
   std::filesystem::path settings_file;
-  std::string tools_import_file;
-  std::string job_file = "tinglecam-job.json";
   bool panel_layout_dragging = false;
   ImGuiStyle unscaled_style;
   bool unscaled_style_captured = false;
@@ -387,11 +376,14 @@ inline float ui_size(const App& app, float value) {
   return value * static_cast<float>(app.settings.ui_scale);
 }
 
+inline void log_message(App& app, LogSeverity severity, std::string source,
+                        std::string text) {
+  app.messages.push_back({severity, std::move(source), std::move(text)});
+}
+
 inline void say(App& app, std::string text, bool error = false) {
-  app.banner = std::move(text);
-  app.banner_is_error = error;
-  app.messages.push_back({error ? LogSeverity::Error : LogSeverity::Info,
-                          "Application", app.banner});
+  log_message(app, error ? LogSeverity::Error : LogSeverity::Info,
+              "Application", std::move(text));
 }
 
 inline void log_warnings(App& app, const char* source,
@@ -400,19 +392,4 @@ inline void log_warnings(App& app, const char* source,
     std::fprintf(stderr, "%s warning: %s\n", source, warning.c_str());
   for (const auto& warning : warnings)
     app.messages.push_back({LogSeverity::Warning, source, warning});
-}
-
-inline void show_warnings(const char* id, const std::vector<std::string>& warnings) {
-  if (warnings.empty()) return;
-  ImGui::PushID(id);
-  if (ImGui::SmallButton("Copy warnings")) {
-    std::string text;
-    for (const auto& warning : warnings) text += warning + '\n';
-    ImGui::SetClipboardText(text.c_str());
-  }
-  ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.72f, 0.35f, 1.0f));
-  for (const auto& warning : warnings)
-    ImGui::TextWrapped("! %s", warning.c_str());
-  ImGui::PopStyleColor();
-  ImGui::PopID();
 }

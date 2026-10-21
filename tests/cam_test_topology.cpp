@@ -323,19 +323,48 @@ void check_serialisation() {
   require(tool_back.id == tool.id, "tool identity survives a round trip");
   require(tool_back.flutes == tool.flutes && tool_back.type == tool.type,
           "flute count and tool type survive a round trip");
+  require(tool_back.cutting.size() == 1 && tool_back.cutting.front().material_id == "plastic",
+          "cutting data survives a round trip");
+  if (!tool_back.cutting.empty())
+    require_near(tool_back.cutting.front().chip_load, tool.cutting.front().chip_load, 1e-12,
+                 "chip load survives a round trip");
+
+  {
+    cam::MaterialLibrary materials;
+    materials.materials = {{"hdpe", "HDPE"}, {"pine", "Pine"}};
+    require(materials.unique_id_for("HDPE") == "hdpe-2" &&
+                materials.unique_id_for("Oak, quarter-sawn") == "oak-quarter-sawn",
+            "material IDs are readable and unique");
+    const auto file = std::filesystem::temp_directory_path() / "tinglecam-materials.json";
+    cam::save_material_library(file, materials);
+    const auto loaded = cam::load_material_library(file);
+    require(loaded.materials.size() == 2 && loaded.find("pine") &&
+                loaded.find("pine")->name == "Pine",
+            "the material library survives a round trip");
+    materials.erase("pine");
+    require(materials.materials.size() == 1, "a material can be deleted");
+    cam::write_file(file, R"({"materials":[{"id":"a","name":"A"},{"id":"a","name":"B"}]})");
+    bool rejected = false;
+    try { (void)cam::load_material_library(file); } catch (const std::exception&) { rejected = true; }
+    require(rejected, "duplicate material IDs are rejected");
+    std::filesystem::remove(file);
+  }
 
   const cam::Machine machine = test_machine();
   const cam::Machine machine_back =
       cam::machine_from_json_text(cam::to_json_text(machine));
   require(machine_back.controller == machine.controller,
           "machine controller survives");
-  require(machine_back.feed_ranges.size() == 1,
-          "machine feed ranges survive");
+  require_near(machine_back.max_rpm, machine.max_rpm, 1e-9, "machine limits survive");
 
   cam::Job job;
+  job.machine_id = "test";
+  job.material_id = "plastic";
+  job.simulation_pitch = 0.07;
+  job.tools = {{"test-tool", 4, 9}};
   cam::Operation operation;
   operation.path_pitch = 0.15;
-  operation.simulation_method = wave::SimulationMethod::Compare;
+  operation.cutting.chip_load = 0.031;
   operation.finishing_subdivisions = 4;
   operation.depth_breaks = {1.25, 3.5};
   operation.adaptive_cleanup_stepover = false;
@@ -344,9 +373,6 @@ void check_serialisation() {
   operation.mode = cam::OperationMode::ContourFinishing;
   operation.entry_front_match_tolerance = 0.12;
   operation.contour_direction = cam::ContourDirectionPolicy::Climb;
-  operation.manual_feed_range = true;
-  operation.full_engagement_feed = 450.0;
-  operation.no_engagement_feed = 1900.0;
   job.operations.push_back(operation);
   job.rapid_clearance_height = 12.0;
   const cam::Job job_back =
@@ -357,8 +383,10 @@ void check_serialisation() {
           "job files contain reconstruction data, not models or plan results");
   require(job_back.operations.size() == 1, "job operations survive");
   if (!job_back.operations.empty()) {
-    require(job_back.operations[0].simulation_method == wave::SimulationMethod::Compare,
-            "engagement method survives serialization");
+    require(job_back.operations[0].cutting.chip_load &&
+                !job_back.operations[0].cutting.spindle_rpm &&
+                !job_back.operations[0].cutting.plunge_feed,
+            "cutting overrides survive, and unset ones stay unset");
     require_near(job_back.operations[0].path_pitch, 0.15, 1e-9,
                  "path pitch survives");
     require(job_back.operations[0].finishing_subdivisions == 4,
@@ -377,11 +405,31 @@ void check_serialisation() {
     require(job_back.operations[0].contour_direction ==
                 cam::ContourDirectionPolicy::Climb,
             "contour direction survives");
-    require(job_back.operations[0].manual_feed_range,
-            "manual feed selection survives");
-    require_near(job_back.operations[0].no_engagement_feed, 1900.0, 1e-9,
-                 "manual feed endpoint survives");
   }
+  require(job_back.machine_id == "test" && job_back.material_id == "plastic",
+          "the job's machine and material survive");
+  require_near(job_back.simulation_pitch, 0.07, 1e-12, "the stock grid pitch survives");
+  require(job_back.tools.size() == 1 && job_back.tools.front().number == 4 &&
+              job_back.tools.front().length_offset == 9,
+          "the tool table survives");
+  std::vector<std::string> warnings;
+  const auto file = std::filesystem::temp_directory_path() / "tinglecam-unknown-field.json";
+  cam::write_file(file, R"({"name":"Old","operations":[{"name":"A","pocket":{}}]})");
+  (void)cam::load_job(file, &warnings);
+  std::filesystem::remove(file);
+  require(warnings.size() == 1 && warnings.front().find("pocket") != std::string::npos,
+          "fields a job does not know are reported, not silently dropped");
+  cam::Job table_job;
+  table_job.tools = {{"b", 5, 0}};
+  cam::Operation uses_a, uses_b;
+  uses_a.tool_id = "a";
+  uses_b.tool_id = "b";
+  table_job.operations = {uses_a, uses_b, uses_a};
+  const auto table = cam::resolved_tool_table(table_job);
+  require(table.size() == 2 && cam::find_tool_assignment(table, "b")->number == 5 &&
+              cam::find_tool_assignment(table, "a")->number == 6 &&
+              cam::find_tool_assignment(table, "a")->length_offset == 6,
+          "unlisted tools are numbered after the table in order of use");
   require_near(job_back.rapid_clearance_height, 12.0, 1e-9,
                "the single safe rapid height survives");
 

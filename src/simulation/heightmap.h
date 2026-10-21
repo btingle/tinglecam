@@ -15,11 +15,13 @@ namespace wave {
 struct Vec3d {
   double x = 0, y = 0, z = 0;
 };
-enum class CutterShape { Flat, Ball };
+enum class CutterShape { Flat, Ball, Drill };
 struct MillingCutter {
   CutterShape shape = CutterShape::Flat;
   double radius = 3;
   double flute_length = 20;
+  double point_angle_degrees = 118;
+  double tip_flat_radius = 0;
 };
 struct RemovalSample {
   double volume = 0;
@@ -100,8 +102,15 @@ class Heightmap {
   static MemoryUsage memory_usage(const std::vector<const Heightmap*>&);
   Paths64 footprint() const;
   RemovalSample cut(Vec3d from, Vec3d to, const MillingCutter& cutter);
+  // Conservative clearance grows the cutter by half a cell diagonal, so a
+  // touching sweep is never called clear. Sampled clearance asks only whether
+  // cutting the sweep would remove anything, cell centre by cell centre.
   bool clear(Vec3d from, Vec3d to, const MillingCutter& cutter,
-             double tolerance = 0.001) const;
+             double tolerance = 0.001, bool conservative = true) const;
+  // Tip Z at first contact during a vertical descent. Uses the same expanded
+  // flat/ball footprint as conservative clearance. Negative infinity means
+  // that there is no remaining stock under the cutter.
+  double plunge_contact_z(double x, double y, const MillingCutter&) const;
   int display_stride(std::size_t maximum_cells = 150000) const;
   Mesh display_mesh(std::size_t maximum_cells = 150000) const;
   // Immutable page snapshots for incremental render uploads. Holding these

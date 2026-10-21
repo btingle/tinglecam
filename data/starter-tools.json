@@ -6,7 +6,45 @@
       "diameter": 6.0,
       "flute_length": 16.0,
       "flutes": 3,
-      "type": "flat"
+      "type": "flat",
+      "cutting": [
+        {
+          "material": "aluminium-6082",
+          "spindle_rpm": 12000,
+          "chip_load": 0.03,
+          "plunge_feed": 150
+        },
+        {
+          "material": "brass-cz121",
+          "spindle_rpm": 10000,
+          "chip_load": 0.03,
+          "plunge_feed": 150
+        },
+        {
+          "material": "hdpe",
+          "spindle_rpm": 12000,
+          "chip_load": 0.08,
+          "plunge_feed": 300
+        },
+        {
+          "material": "mdf",
+          "spindle_rpm": 15000,
+          "chip_load": 0.1,
+          "plunge_feed": 400
+        },
+        {
+          "material": "steel-1018",
+          "spindle_rpm": 6000,
+          "chip_load": 0.02,
+          "plunge_feed": 60
+        },
+        {
+          "material": "stainless-304",
+          "spindle_rpm": 4000,
+          "chip_load": 0.015,
+          "plunge_feed": 40
+        }
+      ]
     },
     {
       "id": "6mm-4f-steel",
@@ -14,7 +52,45 @@
       "diameter": 6.0,
       "flute_length": 15.0,
       "flutes": 4,
-      "type": "flat"
+      "type": "flat",
+      "cutting": [
+        {
+          "material": "aluminium-6082",
+          "spindle_rpm": 12000,
+          "chip_load": 0.03,
+          "plunge_feed": 150
+        },
+        {
+          "material": "brass-cz121",
+          "spindle_rpm": 10000,
+          "chip_load": 0.03,
+          "plunge_feed": 150
+        },
+        {
+          "material": "hdpe",
+          "spindle_rpm": 12000,
+          "chip_load": 0.08,
+          "plunge_feed": 300
+        },
+        {
+          "material": "mdf",
+          "spindle_rpm": 15000,
+          "chip_load": 0.1,
+          "plunge_feed": 400
+        },
+        {
+          "material": "steel-1018",
+          "spindle_rpm": 6000,
+          "chip_load": 0.02,
+          "plunge_feed": 60
+        },
+        {
+          "material": "stainless-304",
+          "spindle_rpm": 4000,
+          "chip_load": 0.015,
+          "plunge_feed": 40
+        }
+      ]
     },
     {
       "id": "3mm-2f-alu",
@@ -22,7 +98,45 @@
       "diameter": 3.0,
       "flute_length": 10.0,
       "flutes": 2,
-      "type": "flat"
+      "type": "flat",
+      "cutting": [
+        {
+          "material": "aluminium-6082",
+          "spindle_rpm": 12000,
+          "chip_load": 0.015,
+          "plunge_feed": 100
+        },
+        {
+          "material": "brass-cz121",
+          "spindle_rpm": 10000,
+          "chip_load": 0.015,
+          "plunge_feed": 100
+        },
+        {
+          "material": "hdpe",
+          "spindle_rpm": 12000,
+          "chip_load": 0.05,
+          "plunge_feed": 200
+        },
+        {
+          "material": "mdf",
+          "spindle_rpm": 15000,
+          "chip_load": 0.06,
+          "plunge_feed": 300
+        },
+        {
+          "material": "steel-1018",
+          "spindle_rpm": 6000,
+          "chip_load": 0.01,
+          "plunge_feed": 40
+        },
+        {
+          "material": "stainless-304",
+          "spindle_rpm": 4000,
+          "chip_load": 0.008,
+          "plunge_feed": 30
+        }
+      ]
     },
     {
       "id": "6mm-ball-alu",
@@ -30,7 +144,45 @@
       "diameter": 6.0,
       "flute_length": 16.0,
       "flutes": 2,
-      "type": "ball"
+      "type": "ball",
+      "cutting": [
+        {
+          "material": "aluminium-6082",
+          "spindle_rpm": 12000,
+          "chip_load": 0.015,
+          "plunge_feed": 150
+        },
+        {
+          "material": "brass-cz121",
+          "spindle_rpm": 10000,
+          "chip_load": 0.015,
+          "plunge_feed": 150
+        },
+        {
+          "material": "hdpe",
+          "spindle_rpm": 12000,
+          "chip_load": 0.04,
+          "plunge_feed": 300
+        },
+        {
+          "material": "mdf",
+          "spindle_rpm": 15000,
+          "chip_load": 0.05,
+          "plunge_feed": 400
+        },
+        {
+          "material": "steel-1018",
+          "spindle_rpm": 6000,
+          "chip_load": 0.01,
+          "plunge_feed": 60
+        },
+        {
+          "material": "stainless-304",
+          "spindle_rpm": 4000,
+          "chip_load": 0.0075,
+          "plunge_feed": 40
+        }
+      ]
     },
     {
       "id": "3.175mm-square",
@@ -38,7 +190,45 @@
       "diameter": 3.175,
       "flute_length": 25,
       "flutes": 2,
-      "type": "flat"
+      "type": "flat",
+      "cutting": [
+        {
+          "material": "aluminium-6082",
+          "spindle_rpm": 12000,
+          "chip_load": 0.015,
+          "plunge_feed": 100
+        },
+        {
+          "material": "brass-cz121",
+          "spindle_rpm": 10000,
+          "chip_load": 0.015,
+          "plunge_feed": 100
+        },
+        {
+          "material": "hdpe",
+          "spindle_rpm": 12000,
+          "chip_load": 0.05,
+          "plunge_feed": 200
+        },
+        {
+          "material": "mdf",
+          "spindle_rpm": 15000,
+          "chip_load": 0.06,
+          "plunge_feed": 300
+        },
+        {
+          "material": "steel-1018",
+          "spindle_rpm": 6000,
+          "chip_load": 0.01,
+          "plunge_feed": 40
+        },
+        {
+          "material": "stainless-304",
+          "spindle_rpm": 4000,
+          "chip_load": 0.008,
+          "plunge_feed": 30
+        }
+      ]
     }
   ]
 }

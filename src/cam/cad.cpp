@@ -200,11 +200,90 @@ std::optional<std::array<std::array<double, 2>, 2>> CadModel::shared_boundary(
 #endif
 }
 
+std::vector<std::array<double, 2>> CadModel::matching_contour_parameters(
+    std::size_t a, std::size_t b, bool along_v,
+    const std::vector<double>& a_lanes,
+    const std::vector<double>& b_lanes) const {
+  std::vector<std::array<double, 2>> matches;
+#ifdef TINGLECAM_HAVE_OCCT
+  if (!adjacent(a, b)) return matches;
+  try {
+    const auto& fa = impl_->native_faces.at(a);
+    const auto& fb = impl_->native_faces.at(b);
+    for (TopExp_Explorer ea(fa, TopAbs_EDGE); ea.More(); ea.Next())
+      for (TopExp_Explorer eb(fb, TopAbs_EDGE); eb.More(); eb.Next()) {
+        if (!ea.Current().IsSame(eb.Current())) continue;
+        const auto edge = TopoDS::Edge(ea.Current());
+        double af, al, bf, bl;
+        const auto ca = BRep_Tool::CurveOnSurface(edge, fa, af, al);
+        const auto cb = BRep_Tool::CurveOnSurface(edge, fb, bf, bl);
+        if (ca.IsNull() || cb.IsNull()) continue;
+        const double first = std::max(af, bf), last = std::min(al, bl);
+        if (!std::isfinite(first) || !std::isfinite(last) || first >= last) continue;
+        auto uv = [&](bool second, double t) {
+          const auto p = (second ? cb : ca)->Value(t);
+          const auto& d = impl_->domains[second ? b : a];
+          const double u = (p.X() - d[0]) / (d[1] - d[0]),
+                       v = (p.Y() - d[2]) / (d[3] - d[2]);
+          return along_v ? std::array{u, v} : std::array{v, u};
+        };
+        // Only edges at constant along=0/1 are ends of the requested passes.
+        // Check monotonicity before inverting the across coordinate.
+        constexpr double epsilon = 1e-9;
+        bool compatible = true;
+        for (bool second : {false, true}) {
+          const auto start = uv(second, first), end = uv(second, last);
+          if (std::abs(start[0] - end[0]) < epsilon ||
+              std::min(std::abs(start[1]), std::abs(start[1] - 1)) > epsilon) {
+            compatible = false;
+            break;
+          }
+          auto previous = start;
+          for (int i = 1; i <= 16; ++i) {
+            const auto p = uv(second, first + (last - first) * i / 16.0);
+            if (std::abs(p[1] - start[1]) > epsilon || p[0] < -epsilon ||
+                p[0] > 1 + epsilon ||
+                (p[0] - previous[0]) * (end[0] - start[0]) < -epsilon)
+              compatible = false;
+            previous = p;
+          }
+        }
+        if (!compatible) continue;
+        for (bool second : {false, true}) {
+          const auto start = uv(second, first), end = uv(second, last);
+          for (double lane : second ? b_lanes : a_lanes) {
+            if (lane < std::min(start[0], end[0]) - epsilon ||
+                lane > std::max(start[0], end[0]) + epsilon) continue;
+            double low = first, high = last;
+            for (int i = 0; i < 48; ++i) {
+              const double middle = (low + high) / 2;
+              if ((uv(second, middle)[0] < lane) == (end[0] > start[0]))
+                low = middle;
+              else high = middle;
+            }
+            const double t = (low + high) / 2;
+            matches.push_back({std::clamp(uv(false, t)[0], 0.0, 1.0),
+                               std::clamp(uv(true, t)[0], 0.0, 1.0)});
+          }
+        }
+      }
+  } catch (const Standard_Failure& failure) {
+    throw std::runtime_error(std::string("CAD contour seam mapping failed: ") +
+                             failure.GetMessageString());
+  }
+#else
+  (void)a; (void)b; (void)along_v; (void)a_lanes; (void)b_lanes;
+#endif
+  return matches;
+}
+
 std::shared_ptr<CadModel> CadModel::load(const std::filesystem::path& path,
-                                         double tolerance) {
+                                         double tolerance,
+                                         const ModelLoadProgress& progress) {
 #ifndef TINGLECAM_HAVE_OCCT
   (void)path;
   (void)tolerance;
+  (void)progress;
   throw std::runtime_error(
       "STEP support requires Open CASCADE; rebuild with "
       "TINGLECAM_WITH_OCCT=ON");
@@ -212,9 +291,15 @@ std::shared_ptr<CadModel> CadModel::load(const std::filesystem::path& path,
   try {
     if (!std::isfinite(tolerance) || tolerance <= 0)
       throw std::invalid_argument("Invalid CAD triangulation tolerance");
+    const auto report = [&](double fraction, const char* stage) {
+      if (progress && !progress(fraction, stage)) throw std::runtime_error("Cancelled");
+    };
+    report(0, "Reading STEP file");
     STEPControl_Reader reader;
-    if (reader.ReadFile(path.string().c_str()) != IFSelect_RetDone ||
-        reader.TransferRoots() == 0)
+    if (reader.ReadFile(path.string().c_str()) != IFSelect_RetDone)
+      throw std::runtime_error("Could not import STEP: " + path.string());
+    report(.12, "Converting STEP geometry");
+    if (reader.TransferRoots() == 0)
       throw std::runtime_error("Could not import STEP: " + path.string());
     auto model = std::shared_ptr<CadModel>(new CadModel);
     auto& data = *model->impl_;
@@ -224,7 +309,8 @@ std::shared_ptr<CadModel> CadModel::load(const std::filesystem::path& path,
          solids.Next())
       data.solids.push_back(TopoDS::Solid(solids.Current()));
     data.solid = !data.solids.empty();
-    BRepMesh_IncrementalMesh mesher(data.shape, tolerance, false, 0.12, false);
+    report(.2, "Triangulating STEP surfaces");
+    BRepMesh_IncrementalMesh mesher(data.shape, tolerance, false, 0.12, true);
     if (!mesher.IsDone())
       throw std::runtime_error("Could not triangulate STEP geometry");
     TopTools_IndexedMapOfShape faces;
@@ -232,7 +318,9 @@ std::shared_ptr<CadModel> CadModel::load(const std::filesystem::path& path,
     const char* names[]{"Plane",     "Cylinder", "Cone",     "Sphere",
                         "Torus",     "Bezier",   "B-spline", "Revolution",
                         "Extrusion", "Offset",   "Other"};
+    Bnd_Box box;
     for (int index = 1; index <= faces.Extent(); ++index) {
+      report(.45 + .45 * (index - 1) / faces.Extent(), "Preparing STEP faces");
       const auto face = TopoDS::Face(faces(index));
       BRepAdaptor_Surface surface(face, true);
       GProp_GProps properties;
@@ -247,6 +335,7 @@ std::shared_ptr<CadModel> CadModel::load(const std::filesystem::path& path,
       data.domains.push_back(bounds);
       Impl::CollisionFace collision;
       BRepBndLib::AddOptimal(face, collision.bounds, false, false);
+      box.Add(collision.bounds);
       // Knot-span Bezier patches describe the exact underlying B-spline, not
       // its display mesh. Their control hulls bound every surface point. The
       // untrimmed patches are a superset of the face: they can prove clearance;
@@ -291,6 +380,7 @@ std::shared_ptr<CadModel> CadModel::load(const std::filesystem::path& path,
         data.triangle_faces.push_back(index - 1);
       }
     }
+    report(.9, "Connecting STEP faces");
     TopTools_IndexedMapOfShape edges;
     TopExp::MapShapes(data.shape, TopAbs_EDGE, edges);
     std::vector<std::vector<std::size_t>> owners(edges.Extent());
@@ -325,17 +415,20 @@ std::shared_ptr<CadModel> CadModel::load(const std::filesystem::path& path,
     if (has_loose) {
       data.loose_geometry = loose;
       BRepBndLib::AddOptimal(loose, data.loose_bounds, false, false);
+      box.Add(data.loose_bounds);
     }
     if (data.mesh.triangles.empty())
       throw std::runtime_error("STEP contains no triangulatable faces");
-    Bnd_Box box;
-    BRepBndLib::Add(data.shape, box);
+    // Reuse the exact face/loose-geometry bounds above. Recomputing optimal
+    // bounds for the complete shape repeats expensive B-spline extrema work.
+    // Mesh bounds would add triangulation deflection to the box blank.
     double x0, y0, z0, x1, y1, z1;
     box.Get(x0, y0, z0, x1, y1, z1);
     data.mesh.bounds = {{float(x0), float(y0), float(z0)},
                         {float(x1), float(y1), float(z1)},
                         true};
     data.mesh.source = path;
+    report(.97, "Identifying STEP model");
     // File content, not face numbering, binds a persisted selection to an
     // import.
     std::ifstream file(path, std::ios::binary);
@@ -349,6 +442,7 @@ std::shared_ptr<CadModel> CadModel::load(const std::filesystem::path& path,
     std::ostringstream text;
     text << std::hex << hash;
     data.fingerprint = text.str();
+    report(1, "STEP model ready");
     return model;
   } catch (const Standard_Failure& failure) {
     throw std::runtime_error(std::string("STEP import failed: ") +

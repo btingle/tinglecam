@@ -21,6 +21,10 @@ void validate_motion(Vec3d a, Vec3d b, const MillingCutter& tool) {
     if (!finite(value))
       throw std::invalid_argument(
           "Simulation motion and cutter must be finite");
+  if(tool.shape==CutterShape::Drill &&
+      (!finite(tool.point_angle_degrees) || tool.point_angle_degrees<=0 || tool.point_angle_degrees>180 ||
+       !finite(tool.tip_flat_radius) || tool.tip_flat_radius<0 || tool.tip_flat_radius>tool.radius))
+    throw std::invalid_argument("Invalid drill point geometry");
   if (tool.radius <= 0 || tool.flute_length <= 0)
     throw std::invalid_argument(
         "Simulation cutter dimensions must be positive");
@@ -323,7 +327,8 @@ namespace {
 struct SweepKernel {
   Vec3d a;
   double dx, dy, dz, length2, inverse_length2, radius, r2, critical;
-  bool ball;
+  bool ball, drill;
+  double cone_slope, tip_flat;
   SweepKernel(Vec3d from, Vec3d to, const MillingCutter& tool)
       : a(from),
         dx(to.x - from.x),
@@ -335,17 +340,21 @@ struct SweepKernel {
         r2(radius * radius),
         critical(length2 > 1e-24 ? dz / std::sqrt(length2 * (length2 + dz * dz))
                                  : 0),
-        ball(tool.shape == CutterShape::Ball) {}
+        ball(tool.shape == CutterShape::Ball), drill(tool.shape==CutterShape::Drill),
+        cone_slope(!drill || tool.point_angle_degrees>=180?0:
+                   1/std::tan(tool.point_angle_degrees*std::acos(-1.0)/360)),
+        tip_flat(tool.tip_flat_radius) {}
   double height(double x, double y) const {
     const double qx = x - a.x, qy = y - a.y;
     if (length2 < 1e-24) {
       const double rho2 = qx * qx + qy * qy;
       if (rho2 > r2) return infinity;
       return a.z + std::min(0.0, dz) +
-             (ball ? radius - std::sqrt(std::max(0.0, r2 - rho2)) : 0);
+             (ball ? radius - std::sqrt(std::max(0.0, r2 - rho2)) :
+              drill?std::max(0.0,std::sqrt(rho2)-tip_flat)*cone_slope:0);
     }
     const double projection = (qx * dx + qy * dy) * inverse_length2;
-    if (!ball && dz == 0) {
+    if (!ball && !drill && dz == 0) {
       const double t = std::clamp(projection, 0.0, 1.0), ex = qx - t * dx,
                    ey = qy - t * dy;
       return ex * ex + ey * ey <= r2 ? a.z : infinity;
@@ -358,6 +367,21 @@ struct SweepKernel {
     const double lo = std::max(0.0, projection - half),
                  hi = std::min(1.0, projection + half);
     if (lo > hi) return infinity;
+    if(drill) {
+      // The swept conical profile is convex along a straight segment. Drilling
+      // itself takes the analytic vertical branch above; this handles clearance
+      // queries and uncommon sloped motions with the same tip geometry.
+      const auto at=[&](double t) {
+        const double rho=std::hypot(qx-t*dx,qy-t*dy);
+        return a.z+t*dz+std::max(0.0,rho-tip_flat)*cone_slope;
+      };
+      double left=lo,right=hi;
+      for(int i=0;i<48;++i) {
+        const double l=(2*left+right)/3,r=(left+2*right)/3;
+        if(at(l)<at(r)) right=r;else left=l;
+      }
+      return std::min({at(lo),at(hi),at((left+right)*.5)});
+    }
     const double t = ball ? std::clamp(projection - critical * h, lo, hi)
                           : (dz >= 0 ? lo : hi);
     const double ex = qx - t * dx, ey = qy - t * dy;
@@ -584,13 +608,14 @@ RemovalSample Heightmap::cut(Vec3d a, Vec3d b, const MillingCutter& tool) {
   return result;
 }
 bool Heightmap::clear(Vec3d a, Vec3d b, const MillingCutter& tool,
-                      double tolerance) const {
+                      double tolerance, bool conservative) const {
   validate_motion(a, b, tool);
   if (!finite(tolerance) || tolerance < 0)
     throw std::invalid_argument("Invalid clearance tolerance");
-  const double diagonal = pitch_ * std::sqrt(0.5);
+  const double diagonal = conservative ? pitch_ * std::sqrt(0.5) : 0.0;
   auto expanded = tool;
   expanded.radius += diagonal;
+  if(tool.shape==CutterShape::Drill) expanded.tip_flat_radius+=diagonal;
   if (tool.shape == CutterShape::Ball) {
     a.z -= diagonal;
     b.z -= diagonal;
@@ -612,6 +637,33 @@ bool Heightmap::clear(Vec3d a, Vec3d b, const MillingCutter& tool,
                        return true;
                      });
 }
+double Heightmap::plunge_contact_z(double px, double py,
+                                  const MillingCutter& tool) const {
+  const Vec3d at{px, py, 0};
+  validate_motion(at, at, tool);
+  const double diagonal = pitch_ * std::sqrt(0.5);
+  auto expanded = tool;
+  expanded.radius += diagonal;
+  if(tool.shape==CutterShape::Drill) expanded.tip_flat_radius+=diagonal;
+  const Vec3d tip{px, py, tool.shape == CutterShape::Ball ? -diagonal : 0};
+  const SweepKernel profile(tip, tip, expanded);
+  double contact = -infinity;
+  visit_sweep(at, at, expanded.radius,
+              [&](std::size_t index, int c0, int c1, int r0, int r1) {
+                const auto& tile = *tile_at(index);
+                if (tile.maximum_top + diagonal <= contact) return true;
+                for (int r = r0; r <= r1; ++r)
+                  for (int c = c0; c <= c1; ++c) {
+                    const auto i = cell_index(c, r);
+                    const double top = tile.top.at(i);
+                    if (finite(top) && top > tile.bottom.at(i))
+                      contact = std::max(contact, top - profile.height(x(c), y(r)));
+                  }
+                return true;
+              });
+  return contact;
+}
+
 int Heightmap::display_stride(std::size_t maximum_cells) const {
   return std::max(1, int(std::ceil(std::sqrt(
                          double(columns_) * rows_ /

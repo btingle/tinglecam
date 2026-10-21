@@ -16,6 +16,20 @@
 
 namespace wave::heightfield {
 namespace {
+bool same_vector(Vec3f a, Vec3f b) {
+  return a.x == b.x && a.y == b.y && a.z == b.z;
+}
+bool same_camera(const Camera& a, const Camera& b) {
+  return same_vector(a.centre,b.centre) && same_vector(a.right,b.right) &&
+         same_vector(a.up,b.up) && same_vector(a.toward,b.toward) &&
+         same_vector(a.light,b.light) && a.scale == b.scale && a.reach == b.reach &&
+         a.pan_x == b.pan_x && a.pan_y == b.pan_y && a.background == b.background;
+}
+bool same_cutter(const Cutter& a, const Cutter& b) {
+  return same_vector(a.tip,b.tip) && a.radius == b.radius &&
+         a.length == b.length && a.ball == b.ball &&
+         a.point_height==b.point_height && a.tip_flat_radius==b.tip_flat_radius;
+}
 // Resolve post-1.1 entry points through SDL, including on Windows. Nothing in
 // this backend requires NVIDIA, CUDA/GL sharing, or OpenGL compute support.
 #define GL_FUNCTIONS(X)                                        \
@@ -231,7 +245,7 @@ Mesh cutter_mesh(const Cutter& cutter) {
   Mesh mesh;
   constexpr int sides = 40, rings = 10;
   constexpr float pi = 3.14159265358979323846f;
-  const float bottom = cutter.ball ? cutter.radius : 0;
+  const float bottom = cutter.ball ? cutter.radius : cutter.point_height;
   auto point = [&](int side, float z) {
     const float a = 2 * pi * side / sides;
     return Vec3f{cutter.radius * std::cos(a), cutter.radius * std::sin(a), z};
@@ -242,7 +256,15 @@ Mesh cutter_mesh(const Cutter& cutter) {
     mesh.triangles.push_back({a, b, c});
     mesh.triangles.push_back({a, c, d});
     mesh.triangles.push_back({{0, 0, cutter.length}, d, c});
-    if (!cutter.ball) mesh.triangles.push_back({{0, 0, 0}, b, a});
+    if(!cutter.ball && cutter.tip_flat_radius<=0)
+      mesh.triangles.push_back({{0,0,0},b,a});
+    else if (!cutter.ball) {
+      const float t=2*pi*i/sides,u=2*pi*(i+1)/sides;
+      const Vec3f p{cutter.tip_flat_radius*std::cos(t),cutter.tip_flat_radius*std::sin(t),0},
+                  q{cutter.tip_flat_radius*std::cos(u),cutter.tip_flat_radius*std::sin(u),0};
+      mesh.triangles.push_back({p,b,a});mesh.triangles.push_back({p,q,b});
+      mesh.triangles.push_back({{0,0,0},q,p});
+    }
   }
   if (cutter.ball)
     for (int ring = 0; ring < rings; ++ring)
@@ -274,12 +296,16 @@ struct Renderer::Impl {
   double origin_x = 0, origin_y = 0, pitch = 0;
   std::vector<F4> node_bounds;
   std::vector<I4> nodes, desc;
+  std::vector<std::array<float, 2>> tile_heights;
   std::vector<int> parents, leaves;
   std::vector<float> data;
   std::map<int, std::vector<int>> free_slots;
   std::vector<TileSlots> slots;
   std::vector<std::shared_ptr<const Heightmap::Page>> pages;
   Stats counters;
+  Camera drawn_camera;
+  Cutter drawn_cutter;
+  bool frame_valid = false;
   bool initialized = false;
   Impl() {
     GLint n;
@@ -348,8 +374,10 @@ struct Renderer::Impl {
   }
   void init() {
     if (initialized) return;
-    program = link(fullscreen_vertex, heightmap_fragment);
-    mesh_program = link(mesh_vertex, mesh_fragment);
+    program = link(fullscreen_vertex,
+                   (std::string(heightmap_fragment) + surface_lighting).c_str());
+    mesh_program = link(mesh_vertex,
+                        (std::string(mesh_fragment) + surface_lighting).c_str());
     gl.GenVertexArrays(1, &vao);
     gl.GenVertexArrays(1, &mesh_vao);
     gl.GenBuffers(1, &mesh_vbo);
@@ -420,6 +448,7 @@ struct Renderer::Impl {
   }
   void update(const Heightmap& stock) {
     counters.changed_tiles = counters.uploaded_bytes = 0;
+    counters.reused_frame = false;
     bool reset = columns != stock.columns() || rows != stock.rows() ||
                  pitch != stock.pitch() || origin_x != stock.lower_x() ||
                  origin_y != stock.lower_y();
@@ -430,6 +459,7 @@ struct Renderer::Impl {
     origin_y = stock.lower_y();
     auto incoming = stock.tile_pages();
     if (reset) {
+      frame_valid = false;
       pages.clear();
       nodes.clear();
       node_bounds.clear();
@@ -441,6 +471,7 @@ struct Renderer::Impl {
       const int tile_rows = (rows + 31) / 32;
       slots.assign(std::size_t(tile_columns) * tile_rows, {});
       desc.assign(slots.size(), {});
+      tile_heights.assign(slots.size(), {1, 0});
       leaves.resize(slots.size());
       if (!slots.empty()) build(0, 0, tile_columns, tile_rows, -1);
     }
@@ -457,8 +488,6 @@ struct Renderer::Impl {
         auto& s = slots[i];
         d = {store(tile->top, s.top), s.top.offset,
              store(tile->bottom, s.bottom), s.bottom.offset};
-        auto& lo = node_bounds[leaves[i] * 2];
-        auto& hi = node_bounds[leaves[i] * 2 + 1];
         float bottom = std::numeric_limits<float>::infinity();
         const auto& h = tile->bottom;
         if (h.samples)
@@ -469,16 +498,81 @@ struct Renderer::Impl {
             if (std::isfinite(v)) bottom = std::min(bottom, v);
         if (!h.samples && !h.pattern && std::isfinite(h.uniform))
           bottom = h.uniform;
-        lo[2] = bottom;
-        hi[2] = tile->maximum_top;
-        if (!(hi[2] > lo[2])) {
-          lo[2] = 1;
-          hi[2] = 0;
-        }
+        tile_heights[i] = bottom < tile->maximum_top
+            ? std::array<float, 2>{bottom, tile->maximum_top}
+            : std::array<float, 2>{1, 0};
       }
     }
+    // Interpolation reaches half a cell into neighbouring tiles. Their height
+    // ranges must participate in culling, including after a neighbour changes.
+    std::vector<int> affected;
+    const int tile_rows = (rows + 31) / 32;
+    for (int tile : changed)
+      for (int y = std::max(0, tile / tile_columns - 1);
+           y <= std::min(tile_rows - 1, tile / tile_columns + 1); ++y)
+        for (int x = std::max(0, tile % tile_columns - 1);
+             x <= std::min(tile_columns - 1, tile % tile_columns + 1); ++x)
+          affected.push_back(y * tile_columns + x);
+    std::sort(affected.begin(), affected.end());
+    affected.erase(std::unique(affected.begin(), affected.end()), affected.end());
+    for (int tile : affected) {
+      auto& lo = node_bounds[leaves[tile] * 2];
+      auto& hi = node_bounds[leaves[tile] * 2 + 1];
+      lo[2] = tile_heights[tile][0];
+      hi[2] = tile_heights[tile][1];
+      bool flat = desc[tile][0] == 0 && desc[tile][2] == 0;
+      for (int y = std::max(0, tile / tile_columns - 1);
+           y <= std::min(tile_rows - 1, tile / tile_columns + 1); ++y)
+        for (int x = std::max(0, tile % tile_columns - 1);
+             x <= std::min(tile_columns - 1, tile % tile_columns + 1); ++x) {
+          const int other = y * tile_columns + x;
+          const auto& range = tile_heights[other];
+          if (range[1] > range[0]) {
+            if (hi[2] <= lo[2]) {
+              lo[2] = range[0];
+              hi[2] = range[1];
+            } else {
+              lo[2] = std::min(lo[2], range[0]);
+              hi[2] = std::max(hi[2], range[1]);
+            }
+          }
+          flat &= desc[other][0] == 0 && desc[other][2] == 0 &&
+                  range == tile_heights[tile];
+        }
+      // Empty tiles only need the half-cell halo of occupied border samples,
+      // rather than a whole tile of expensive empty-space ray traversal.
+      const int x0=(tile%tile_columns)*32,y0=(tile/tile_columns)*32;
+      const int x1=std::min(x0+32,columns),y1=std::min(y0+32,rows);
+      lo[0]=float(x0*pitch);lo[1]=float(y0*pitch);
+      hi[0]=float(x1*pitch);hi[1]=float(y1*pitch);
+      if (!(tile_heights[tile][1]>tile_heights[tile][0])) {
+        lo={float(x1*pitch),float(y1*pitch),1,0};
+        hi={float(x0*pitch),float(y0*pitch),0,0};
+        for(int y=std::max(0,y0-1);y<=std::min(rows-1,y1);++y)
+          for(int x=std::max(0,x0-1);x<=std::min(columns-1,x1);++x) {
+            if(x>=x0 && x<x1 && y>=y0 && y<y1) continue;
+            const int other=(y/32)*tile_columns+x/32;
+            const auto& neighbour=incoming[other/Heightmap::page_width]
+                ->tiles[other%Heightmap::page_width];
+            const auto index=(y%32)*32+x%32;
+            const float low=neighbour->bottom.at(index),high=neighbour->top.at(index);
+            if(!(high>low)) continue;
+            const float lx=float(std::max(double(x0),x-.5)*pitch),
+                        ly=float(std::max(double(y0),y-.5)*pitch),
+                        hx=float(std::min(double(x1),x+1.5)*pitch),
+                        hy=float(std::min(double(y1),y+1.5)*pitch);
+            if(hi[2]<=lo[2]) {lo={lx,ly,low,0};hi={hx,hy,high,0};}
+            else {
+              lo[0]=std::min(lo[0],lx);lo[1]=std::min(lo[1],ly);lo[2]=std::min(lo[2],low);
+              hi[0]=std::max(hi[0],hx);hi[1]=std::max(hi[1],hy);hi[2]=std::max(hi[2],high);
+            }
+          }
+        flat=false;
+      }
+      nodes[leaves[tile]][3] = flat ? 1 : 0;
+    }
     std::vector<int> dirty;
-    for (int i : changed)
+    for (int i : affected)
       for (int n = leaves[i]; n >= 0; n = parents[n]) dirty.push_back(n);
     std::sort(dirty.begin(), dirty.end(), std::greater<int>());
     dirty.erase(std::unique(dirty.begin(), dirty.end()), dirty.end());
@@ -489,6 +583,14 @@ struct Renderer::Impl {
         auto& hi = node_bounds[n * 2 + 1];
         const bool va = node_bounds[a * 2 + 1][2] > node_bounds[a * 2][2],
                    vb = node_bounds[b * 2 + 1][2] > node_bounds[b * 2][2];
+        for(int axis=0;axis<2;++axis) {
+          lo[axis]=va?node_bounds[a*2][axis]:vb?node_bounds[b*2][axis]:0;
+          hi[axis]=va?node_bounds[a*2+1][axis]:vb?node_bounds[b*2+1][axis]:0;
+          if(va && vb) {
+            lo[axis]=std::min(lo[axis],node_bounds[b*2][axis]);
+            hi[axis]=std::max(hi[axis],node_bounds[b*2+1][axis]);
+          }
+        }
         lo[2] = va ? node_bounds[a * 2][2] : vb ? node_bounds[b * 2][2] : 1;
         hi[2] = va   ? node_bounds[a * 2 + 1][2]
                 : vb ? node_bounds[b * 2 + 1][2]
@@ -548,6 +650,11 @@ struct Renderer::Impl {
     grow =
         tree.reserve(gl, std::max(std::size_t{1}, nodes.size()), texture_limit);
     if (reset || grow) full(tree, nodes);
+    else {
+      std::vector<std::pair<std::size_t, std::size_t>> spans;
+      for (int i : affected) spans.emplace_back(leaves[i], leaves[i] + 1);
+      ranges(tree, nodes, std::move(spans));
+    }
     grow = bounds.reserve(gl, std::max(std::size_t{1}, node_bounds.size()),
                           texture_limit);
     if (reset || grow)
@@ -566,9 +673,15 @@ struct Renderer::Impl {
         tree.capacity * sizeof(I4) + bounds.capacity * sizeof(F4) +
         std::size_t(width) * height * 8;
   }
+  bool same_stock(const Heightmap& stock) const {
+    return columns == stock.columns() && rows == stock.rows() &&
+           pitch == stock.pitch() && origin_x == stock.lower_x() &&
+           origin_y == stock.lower_y() && pages == stock.tile_pages();
+  }
   void target(int w, int h) {
     gl.BindFramebuffer(GL_FRAMEBUFFER, fbo);
     if (w == width && h == height) return;
+    frame_valid = false;
     gl.BindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
     gl.ActiveTexture(GL_TEXTURE0);
     for (auto [texture, format, type, internal] :
@@ -642,10 +755,26 @@ unsigned Renderer::render(const Heightmap& stock, const Camera& camera,
       camera.scale <= 0 || !std::isfinite(camera.reach) || camera.reach <= 0)
     throw std::invalid_argument("Invalid heightmap viewport or camera");
   auto& r = *impl_;
+  if (r.frame_valid && r.width == width && r.height == height && meshes.empty() &&
+      same_camera(r.drawn_camera,camera) && same_cutter(r.drawn_cutter,cutter) &&
+      r.same_stock(stock)) {
+    r.counters.changed_tiles = r.counters.uploaded_bytes = 0;
+    r.counters.reused_frame = true;
+    return r.image;
+  }
   State saved(r.gl);
   r.init();
   r.target(width, height);
   r.update(stock);
+  // Mutable mesh pointers have no revision identifier, so frames with mesh
+  // overlays always redraw. Stock pages and the cutter/camera inputs have
+  // complete change detection and can safely reuse the rendered texture.
+  if (r.frame_valid && meshes.empty() && r.counters.changed_tiles == 0 &&
+      same_camera(r.drawn_camera,camera) && same_cutter(r.drawn_cutter,cutter)) {
+    r.counters.reused_frame = true;
+    return r.image;
+  }
+  r.frame_valid = false;
   glViewport(0, 0, width, height);
   glDisable(GL_SCISSOR_TEST);
   glDisable(GL_BLEND);
@@ -657,8 +786,7 @@ unsigned Renderer::render(const Heightmap& stock, const Camera& camera,
   glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
   const float clear_depth = 1;
   r.gl.ClearBufferfv(GL_DEPTH, 0, &clear_depth);
-  const float background[]{14.f / 255, 17.f / 255, 22.f / 255, 1};
-  r.gl.ClearBufferfv(GL_COLOR, 0, background);
+  r.gl.ClearBufferfv(GL_COLOR, 0, camera.background.data());
   r.gl.UseProgram(r.program);
   r.camera(r.program, camera);
   const char* names[]{"bounds_data", "tree_data", "tile_data", "heights"};
@@ -678,13 +806,16 @@ unsigned Renderer::render(const Heightmap& stock, const Camera& camera,
   r.gl.BindVertexArray(r.vao);
   glDrawArrays(GL_TRIANGLES, 0, 3);
   for (const auto& mesh : meshes) r.mesh(mesh, camera);
-  if (cutter.radius > 0 && cutter.length >= cutter.radius) {
+  if (cutter.radius > 0 && (cutter.ball?cutter.length>=cutter.radius:cutter.length>0)) {
     auto shape = cutter_mesh(cutter);
     r.mesh({&shape, cutter.tip, {.48f, .86f, 1.f, .38f}, false}, camera);
   }
   if (auto error = glGetError(); error != GL_NO_ERROR)
     throw std::runtime_error("OpenGL heightmap rendering failed (" +
                              std::to_string(error) + ")");
+  r.drawn_camera = camera;
+  r.drawn_cutter = cutter;
+  r.frame_valid = meshes.empty();
   return r.image;
 }
 Stats Renderer::stats() const { return impl_->counters; }

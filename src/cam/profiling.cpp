@@ -43,29 +43,16 @@ void release_planning_scratch() {
 }
 void report_plan_memory(const JobPlan& plan) {
   std::vector<const wave::Heightmap*> maps;
-  std::size_t motion = 0, samples = 0, geometry = 0, polygons = 0,
-              checkpoints = 0;
-  std::unordered_set<const wave::Paths64*> shared_polygons;
+  std::size_t motion = 0, geometry = 0, polygons = 0, checkpoints = 0;
   for (const auto& op : plan.operations) {
     maps.push_back(op.stock_before.get());
     maps.push_back(op.stock_after.get());
-    for (const auto& slab : op.preview_context)
-      if (shared_polygons.insert(slab.region.get()).second)
-        polygons += paths_bytes(*slab.region);
     for (const auto& level : op.levels) {
       for (const auto& checkpoint : level.stock_checkpoints)
         maps.push_back(checkpoint.stock.get());
-      for (const auto& checkpoint : level.simulation.checkpoints)
-        maps.push_back(checkpoint.heightmap.get());
-      maps.push_back(level.simulation.heightmap_before.get());
-      maps.push_back(level.simulation.heightmap_after.get());
       checkpoints += level.stock_checkpoints.size();
       motion += level.feeds.motion.capacity() * sizeof(MotionPhase) +
                 level.feeds.segments.capacity() * sizeof(FeedSegment);
-      samples +=
-          level.simulation.moves.capacity() * sizeof(wave::SimulatedMove);
-      for (const auto& move : level.simulation.moves)
-        samples += move.steps.capacity() * sizeof(wave::MaterialStep);
       geometry += wave_bytes(level.wave) + lineage_bytes(level.lineage);
       for (const auto& stage : level.wave_stages)
         geometry += wave_bytes(stage.wave) + lineage_bytes(stage.lineage);
@@ -73,12 +60,7 @@ void report_plan_memory(const JobPlan& plan) {
       for (const auto& move : level.toolpath.moves)
         geometry += move.path.capacity() * sizeof(wave::Point64);
       for (const auto* paths :
-           {&level.part_slice, &level.stock_slice, &level.incoming_stock,
-            &level.simulation.initial_stock, &level.simulation.final_subject,
-            &level.simulation.remaining_stock,
-            &level.simulation.removed_material,
-            &level.simulation.gouged_subject,
-            &level.simulation.excess_material})
+           {&level.part_slice, &level.stock_slice, &level.incoming_stock})
         polygons += paths_bytes(*paths);
     }
   }
@@ -87,9 +69,9 @@ void report_plan_memory(const JobPlan& plan) {
       stderr,
       "memory_profile heightmap_bytes=%zu maps=%zu pages=%zu tiles=%zu "
       "height_arrays=%zu checkpoints=%zu motion_bytes=%zu "
-      "simulation_sample_bytes=%zu wave_path_bytes=%zu polygon_bytes=%zu\n",
+      "wave_path_bytes=%zu polygon_bytes=%zu\n",
       memory.bytes, memory.maps, memory.pages, memory.tiles,
-      memory.height_arrays, checkpoints, motion, samples, geometry, polygons);
+      memory.height_arrays, checkpoints, motion, geometry, polygons);
 #ifdef __GLIBC__
   const auto heap = mallinfo2();
   std::fprintf(stderr,

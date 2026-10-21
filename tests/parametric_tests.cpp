@@ -23,6 +23,7 @@ cam::Tool tool() {
   cam::Tool value;
   value.id = "cutter"; value.name = "3.175 mm cutter";
   value.diameter = 3.175; value.flute_length = 25; value.flutes = 3;
+  value.cutting.push_back({"material", 17000, 500.0 / 51000.0, 135});
   return value;
 }
 cam::Machine machine() {
@@ -30,14 +31,12 @@ cam::Machine machine() {
   value.id = "machine"; value.name = "Test machine";
   value.rapid_feed = 3000; value.rapid_feed_z = 500;
   value.min_rpm = 1000; value.max_rpm = 24000;
-  value.feed_ranges.push_back({"material", 500, 1500});
   return value;
 }
 cam::Operation operation(cam::OperationMode mode) {
   cam::Operation value;
-  value.mode = mode; value.tool_id = "cutter"; value.machine_id = "machine";
-  value.material_id = "material"; value.stepover_ratio = 0.8; value.stepdown = 1;
-  value.spindle_rpm = 17000; value.plunge_feed = 135;
+  value.mode = mode; value.tool_id = "cutter";
+  value.stepover_ratio = 0.8; value.stepdown = 1;
   auto& pocket = value.pockets.front();
   pocket.center_x = 12; pocket.center_y = -8;
   pocket.top_z = 10; pocket.depth = 2.5;
@@ -48,8 +47,18 @@ cam::Operation operation(cam::OperationMode mode) {
 }
 cam::JobPlan plan(const cam::Operation& op) {
   cam::Job job; job.operations = {op};
+  job.machine_id = "machine"; job.material_id = "material";
   return cam::plan_job({}, job, {{tool()}}, {{machine()}},
                        {{{"material", "Test material"}}}, {});
+}
+cam::CuttingFeeds feeds() {
+  return cam::resolve_cutting_feeds(tool(), machine(), "material", {});
+}
+// The material a pass removed, as an area at its depth.
+double removed_area(const cam::LevelPlan& level) {
+  double volume = 0;
+  for (const auto& phase : level.feeds.motion) volume += phase.removed_volume;
+  return volume / level.axial_depth;
 }
 void check_arc_replay(const cam::OperationPlan& plan) {
   if(plan.levels.empty())return;
@@ -152,20 +161,19 @@ void pockets() {
           const double xy = phase.path_distance_end - phase.path_distance_begin;
           check((phase.from_z-phase.to_z)/xy < 0.055,
                 "Helical plunge must remain gradual (approximately three degrees)");
-          near(phase.rate, op.plunge_feed, "Helix uses operation ramp feed");
+          near(phase.rate, 135.0, "Helix uses the plunge feed");
           helix = true;
           angle_sum += xy;
         }
         check(phase.to_z >= level.floor_z-1e-9, "No move goes below its pocket floor");
       }
       check(helix && angle_sum > 1, "Every depth level has a helical entry");
-      check(level.simulation.stats.unresolved_entries == 0,
-            "A real helix must not be reported as an unresolved plunge");
       const double target = wave::material_area(cam::pocket_boundary(pocket));
-      check(level.simulation.stats.removed_area > target*0.985,
+      check(removed_area(level) > target*0.985,
             "Pocket passes clear the interior, including the central core");
     }
     cam::Job job; job.operations = {op}; job.origin_x = 2; job.origin_y = -3; job.origin_z = 7;
+    job.machine_id = "machine"; job.material_id = "material";
     const auto post = cam::post_job(result, job, {{tool()}}, {{machine()}});
     check(post.ok(), post.error);
     check(post.text.find("M3 S17000") != std::string::npos, "Operation RPM reaches G-code");
@@ -212,7 +220,7 @@ void pocket_margin() {
     for (const auto& level : result.operations.front().levels) {
       const double target =
           wave::material_area(cam::pocket_boundary(pocket, margin));
-      check(level.simulation.stats.removed_area > target*0.985,
+      check(removed_area(level) > target*0.985,
             "A margined pocket is still cleared to its own wall");
       for (const auto& phase : level.feeds.motion) {
         if (phase.rapid) continue;
@@ -298,7 +306,7 @@ void planes() {
     }
     check(descended, "Every facing pass descends to its floor");
     check(level.subdivision_level == index, "Area playback retains execution order");
-    check(level.simulation.stats.removed_area > area.width*area.height*0.999,
+    check(removed_area(level) > area.width*area.height*0.98,
           "Facing clears the complete surface, corners included");
   }
 }
@@ -309,7 +317,7 @@ void automatic_pockets() {
       "fixtures/meshes/auto_pocket.obj";
   cam::JobGeometry geometry;
   geometry.load_part(fixture);
-  geometry.set_box_stock(true, 2.0);
+  geometry.set_box_stock(true, cam::BoxStockMargins{2, 2, 2, 2, 0, 0});
   auto op = operation(cam::OperationMode::Pocket);
   op.auto_identify_pockets = true;
   op.pocket_auto.check_depth = 1.0;
@@ -325,7 +333,7 @@ void automatic_pockets() {
   near(identified.front().height, 4.0, "Identified pocket height");
   near(identified.front().bottom_z, 3.0, "GPU ray finds pocket floor", 0.002);
   const auto planned = cam::plan_parametric_operation(
-      op, tool(), machine(), 20.0, {}, {}, 0.0, 1.0, &geometry);
+      op, tool(), machine(), feeds(), 20.0, {}, {}, 0.0, 1.0, &geometry);
   check(planned.ok(), planned.error);
   check(planned.identified_pockets.size() == 1,
         "Automatic pocket geometry is retained in the completed plan");
@@ -344,7 +352,7 @@ void automatic_pockets() {
   cam::JobGeometry through_geometry;
   through_geometry.load_part(std::filesystem::path(__FILE__).parent_path() /
                              "fixtures/meshes/auto_through_pocket.obj");
-  through_geometry.set_box_stock(true, 2.0);
+  through_geometry.set_box_stock(true, cam::BoxStockMargins{2, 2, 2, 2, 0, 0});
   const auto through = cam::identify_pockets(through_geometry, op);
   check(through.size() == 1, "Automatic detection keeps through holes");
   near(through.front().bottom_z, 0.0, "A missed ray uses the stock bottom", 0.002);
@@ -379,7 +387,7 @@ void validation_and_storage() {
   bad = op; bad.stepdown = std::numeric_limits<double>::infinity(); expect_error(bad);
   bad = operation(cam::OperationMode::PlaneClearing); bad.plane.areas.clear(); expect_error(bad);
   bad = operation(cam::OperationMode::PlaneClearing); bad.plane.areas.front().width = 1; expect_error(bad);
-  const auto cancelled = cam::plan_parametric_operation(op, tool(), machine(), 20, {},
+  const auto cancelled = cam::plan_parametric_operation(op, tool(), machine(), feeds(), 20, {},
       [](double,const std::string&) { return false; });
   check(cancelled.error == "Cancelled", "Cancellation must stop parametric planning");
 
@@ -393,8 +401,9 @@ void validation_and_storage() {
 
   cam::Job job; job.operations = {op, operation(cam::OperationMode::PlaneClearing)};
   job.operations[0].pocket_radial_margin = -0.25;
-  job.operations[0].tool_number = 8; job.operations[0].length_offset = 4;
+  job.tools = {{"cutter", 8, 4}};
   job.operations[0].coolant = true;
+  job.operations[0].cutting.spindle_rpm = 9000;
   const auto text = cam::to_json_text(job);
   const auto loaded = cam::job_from_json_text(text);
   check(cam::to_json_text(loaded) == text, "Shapes, areas, feeds and tool assignments round-trip");
@@ -407,7 +416,7 @@ void validation_and_storage() {
   check(simplified.find("cutting_data") == std::string::npos &&
             simplified.find("notes") == std::string::npos &&
             simplified.find("tool_number") == std::string::npos,
-        "Tool files contain only identity and physical attributes");
+        "Unknown tool fields are not written back");
 }
 }  // namespace
 

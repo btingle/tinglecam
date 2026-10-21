@@ -7,6 +7,7 @@ const char* operation_mode_name(OperationMode value) {
   switch (value) {
     case OperationMode::Roughing: return "roughing";
     case OperationMode::ContourFinishing: return "contour_finishing";
+    case OperationMode::Hole: return "hole";
     case OperationMode::Pocket: return "pocket";
     case OperationMode::PlaneClearing: return "plane_clearing";
     case OperationMode::SurfaceFinishing: return "surface_finishing";
@@ -14,20 +15,38 @@ const char* operation_mode_name(OperationMode value) {
   return "unknown";
 }
 
-void JobGeometry::load_part(const std::filesystem::path& file) {
-  auto cad = step_filename(file) ? CadModel::load(file) : nullptr;
+void JobGeometry::load_part(const std::filesystem::path& file,
+                            const ModelLoadProgress& progress) {
+  const auto report = [&](double f, const std::string& stage) {
+    if (progress && !progress(f, stage)) throw std::runtime_error("Cancelled");
+    return true;
+  };
+  report(0, "Reading part model");
+  auto cad = step_filename(file) ? CadModel::load(file, .01,
+      [&](double f, const std::string& stage) { return report(.9 * f, stage); }) : nullptr;
+  report(.9, "Preparing part mesh");
   wave::MeshSlicer imported;
   imported.set_mesh(cad ? cad->mesh() : wave::load_triangle_mesh(file));
+  report(1, "Part model ready");
   part_ = std::move(imported);
   part_cad_ = std::move(cad);
   part_slices_.clear();
   box_.clear();
 }
 
-void JobGeometry::load_stock(const std::filesystem::path& file) {
-  auto cad = step_filename(file) ? CadModel::load(file) : nullptr;
+void JobGeometry::load_stock(const std::filesystem::path& file,
+                             const ModelLoadProgress& progress) {
+  const auto report = [&](double f, const std::string& stage) {
+    if (progress && !progress(f, stage)) throw std::runtime_error("Cancelled");
+    return true;
+  };
+  report(0, "Reading stock model");
+  auto cad = step_filename(file) ? CadModel::load(file, .01,
+      [&](double f, const std::string& stage) { return report(.9 * f, stage); }) : nullptr;
+  report(.9, "Preparing stock mesh");
   wave::MeshSlicer imported;
   imported.set_mesh(cad ? cad->mesh() : wave::load_triangle_mesh(file));
+  report(1, "Stock model ready");
   stock_ = std::move(imported);
   stock_slices_.clear();
 }
@@ -67,10 +86,6 @@ void JobGeometry::set_box_stock(bool enabled, const BoxStockMargins& margins) {
   box_margins_ = normalized;
   box_.clear();
   stock_slices_.clear();
-}
-
-void JobGeometry::set_box_stock(bool enabled, double margin) {
-  set_box_stock(enabled, BoxStockMargins{margin, margin, margin, margin, 0.0, 0.0});
 }
 
 void JobGeometry::forget_slices() {

@@ -1,8 +1,9 @@
 #include "cam/tooling.h"
+#include "cam/material.h"
 
 #include <algorithm>
-#include <cctype>
 #include <cmath>
+#include <numbers>
 #include <utility>
 
 namespace cam {
@@ -30,6 +31,12 @@ constexpr std::pair<ToolType, const char*> kTypes[]{
 
 }  // namespace
 
+double drill_tip_height(const Tool& tool) {
+  if (tool.point_angle_degrees >= 180.0) return 0.0;
+  return (tool.diameter-tool.tip_flat_diameter)*.5 /
+      std::tan(tool.point_angle_degrees*std::numbers::pi/360.0);
+}
+
 const char* tool_type_name(ToolType value) { return name_of(value, kTypes); }
 std::optional<ToolType> tool_type_from_name(const std::string& text) {
   return value_of(text, kTypes);
@@ -49,7 +56,35 @@ std::vector<std::string> validate(const Tool& tool) {
   require(tool.flutes > 0, "Number of flutes must be positive");
   require(tool_type_from_name(tool_type_name(tool.type)).has_value(),
           "Unknown tool type");
+  if (tool.type == ToolType::Drill) {
+    require(std::isfinite(tool.point_angle_degrees) && tool.point_angle_degrees>0 &&
+            tool.point_angle_degrees<=180, "Drill point angle must be in (0, 180] degrees");
+    require(std::isfinite(tool.tip_flat_diameter) && tool.tip_flat_diameter>=0 &&
+            tool.tip_flat_diameter<=tool.diameter, "Drill tip flat must fit inside its diameter");
+    if(tool.point_angle_degrees>0 && tool.point_angle_degrees<=180)
+      require(drill_tip_height(tool)<=tool.flute_length,"Drill point must fit within its flute length");
+  }
+  std::vector<std::string> seen;
+  for (const auto& data : tool.cutting) {
+    const std::string where = " for " + data.material_id;
+    require(!data.material_id.empty(), "Cutting data is missing its material");
+    require(std::isfinite(data.spindle_rpm) && data.spindle_rpm > 0.0,
+            "Spindle speed must be positive" + where);
+    require(std::isfinite(data.chip_load) && data.chip_load > 0.0,
+            "Chip load must be positive" + where);
+    require(std::isfinite(data.plunge_feed) && data.plunge_feed > 0.0,
+            "Plunge feed must be positive" + where);
+    require(std::find(seen.begin(), seen.end(), data.material_id) == seen.end(),
+            "Two cutting data entries name " + data.material_id);
+    seen.push_back(data.material_id);
+  }
   return problems;
+}
+
+const CuttingData* Tool::cutting_for(const std::string& material_id) const {
+  for (const auto& data : cutting)
+    if (data.material_id == material_id) return &data;
+  return nullptr;
 }
 
 const Tool* ToolLibrary::find(const std::string& id) const {
@@ -79,25 +114,7 @@ bool ToolLibrary::erase(const std::string& id) {
   return true;
 }
 std::string ToolLibrary::unique_id_for(const std::string& name) const {
-  std::string base;
-  bool separated = true;
-  for (const unsigned char character : name) {
-    if (std::isalnum(character)) {
-      base.push_back(static_cast<char>(std::tolower(character)));
-      separated = false;
-    } else if (!separated) {
-      base.push_back('-');
-      separated = true;
-    }
-  }
-  while (!base.empty() && base.back() == '-') base.pop_back();
-  if (base.empty()) base = "tool";
-  if (!find(base)) return base;
-  for (int suffix = 2; suffix < 10000; ++suffix) {
-    const std::string candidate = base + "-" + std::to_string(suffix);
-    if (!find(candidate)) return candidate;
-  }
-  return base;
+  return library_id(name, "tool", [&](const std::string& id) { return find(id) != nullptr; });
 }
 
 }  // namespace cam

@@ -1,11 +1,12 @@
 #pragma once
 
 #include "cam/machine.h"
+#include "cam/tooling.h"
 #include "planning/toolpath.h"
-#include "simulation/simulation.h"
 
 #include <cstddef>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace cam {
@@ -14,10 +15,43 @@ enum class FeedLimit {
   Engagement,
   Rapid,
   Plunge,
+  // Held at the machine's maximum feed.
+  Machine,
 };
 
+// Per-operation replacements for the tool's cutting data. Empty means "use the
+// tool's figure for the job material".
+struct CuttingOverrides {
+  std::optional<double> spindle_rpm;
+  std::optional<double> chip_load;
+  std::optional<double> plunge_feed;
+};
+
+// The feeds one operation runs at, resolved from the tool, the job material,
+// the operation's overrides and the machine's limits.
+struct CuttingFeeds {
+  double spindle_rpm = 0.0;  // as the machine can command it
+  double chip_load = 0.0;
+  int flutes = 1;
+  double plunge_feed = 0.0;
+  double maximum_feed = 0.0;
+  // mm/min at full radial engagement.
+  double full_feed() const;
+  // Radial chip thinning: at lighter engagement the same chip needs a faster
+  // feed. Engagement is removed volume over a full slot, so 0.5 and above is
+  // treated as full.
+  double feed_at(double engagement, FeedLimit* limit = nullptr) const;
+  // Feed through cleared material.
+  double travel_feed() const { return feed_at(0.0); }
+};
+
+// Throws with a message naming what is missing when the tool has no cutting
+// data for the material and the overrides do not cover it.
+CuttingFeeds resolve_cutting_feeds(const Tool& tool, const Machine& machine,
+                                   const std::string& material_id,
+                                   const CuttingOverrides& overrides);
+
 const char* feed_limit_name(FeedLimit value);
-bool feed_limit_is_binding(FeedLimit value);
 
 struct FeedSegment {
   wave::Point64 from;
@@ -25,9 +59,6 @@ struct FeedSegment {
   std::size_t move_index = 0;
   wave::MoveKind kind = wave::MoveKind::Cut;
   bool rapid = false;
-  // A Retract lands in already-cleared space when its simulation check found
-  // no stock under the cutter. The post may then return to depth with G0.
-  bool safe_retract = false;
   double length = 0.0;
   double feed = 0.0;
   double start_distance = 0.0;
@@ -84,6 +115,8 @@ struct MotionCursor {
   wave::MoveKind kind = wave::MoveKind::Cut;
   bool rapid = false;
   double rate = 0.0;
+  // Of the phase the cursor is in, as the stock simulation measured it.
+  double engagement = 0.0;
   double phase_distance = 0.0;
   double phase_length = 0.0;
   double motion_distance = 0.0;
@@ -122,17 +155,13 @@ struct PassLink {
   bool stay_down_after = false;
 };
 
-// Maps simulation engagement directly onto the configured feed range. At full
-// engagement the commanded feed is `full_engagement_feed`; at zero engagement
-// it is `no_engagement_feed`. Collinear pieces are merged only after feeds
-// have been assigned, and only when those feeds are compatible.
+// Builds the commanded motion for one pass at its floor. Rates here are
+// provisional: the XYZ stock simulation measures engagement and assigns the
+// final feeds. Every retract is offered as a rapid descent; the simulation
+// turns one that lands on stock into a plunge.
 FeedSchedule plan_feeds(const wave::Toolpath& toolpath,
-                        const wave::SimulationResult& simulation,
                         const Machine& machine,
-                        double full_engagement_feed,
-                        double no_engagement_feed,
-                        double spindle_rpm,
-                        double plunge_feed,
+                        const CuttingFeeds& feeds,
                         double floor_z = 0.0,
                         double rapid_plane = 0.0,
                         PassLink link = {},

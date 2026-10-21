@@ -2,6 +2,7 @@
 
 #include <array>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -10,6 +11,7 @@
 #include "simulation/heightmap.h"
 
 namespace cam {
+using ModelLoadProgress = std::function<bool(double, const std::string&)>;
 // Counters for the calling thread; snapshots can be differenced per planning
 // task without global atomics or cross-worker attribution.
 struct CadQueryStatistics {
@@ -31,7 +33,8 @@ struct CadFace {
 class CadModel {
  public:
   static std::shared_ptr<CadModel> load(const std::filesystem::path& path,
-                                        double tolerance = 0.01);
+                                        double tolerance = 0.01,
+                                        const ModelLoadProgress& progress = {});
   ~CadModel();
   const wave::Mesh& mesh() const;
   const std::vector<std::size_t>& triangle_faces() const;
@@ -51,6 +54,13 @@ class CadModel {
   // the requested contact point. Used to follow a surface across face seams.
   std::optional<std::array<std::array<double, 2>, 2>> shared_boundary(
       std::size_t a, std::size_t b, wave::Vec3d near) const;
+  // Corresponding across parameters for passes that cross an isoparametric
+  // shared edge. Uses both native pcurves, including reversed/nonlinear UV
+  // mappings. Edges running along the passes do not synchronize their lanes.
+  std::vector<std::array<double, 2>> matching_contour_parameters(
+      std::size_t a, std::size_t b, bool along_v,
+      const std::vector<double>& a_lanes,
+      const std::vector<double>& b_lanes) const;
   bool solid() const;
 
  private:

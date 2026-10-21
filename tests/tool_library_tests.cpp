@@ -1,5 +1,5 @@
-// Exercise the actual tool-builder widgets without a display or GPU backend.
-#include "../src/gui/app_ui_api.h"
+// Exercise the actual tool editor widgets without a display or GPU backend.
+#include "../src/gui/gui_internal.h"
 
 using namespace tinglecam_gui;
 #include "imgui_internal.h"
@@ -16,7 +16,7 @@ void check(bool condition, const char* message) {
 void frame(App& app) {
   ImGui::NewFrame();
   ImGui::SetNextWindowPos(ImVec2(20, 20));
-  tool_builder(app);
+  tool_library_window(app);
   ImGui::Render();
 }
 
@@ -30,15 +30,16 @@ void click(App& app, ImVec2 position) {
   frame(app);
 }
 
-void type_number(App& app, const char* label, int row, const char* text) {
-  auto* window = ImGui::FindWindowByName("Tool builder");
+// Rows of the editor's property table: Name, Type, Diameter, Flute length.
+void type_number(App& app, int row, const char* text) {
+  auto* window = ImGui::FindWindowByName("Tool");
   const auto& style = ImGui::GetStyle();
-  const float line = ImGui::GetFrameHeightWithSpacing();
-  click(app, ImVec2(window->Pos.x + style.WindowPadding.x + 40,
-                   window->Pos.y + window->TitleBarHeight +
-                       style.WindowPadding.y + row * line +
-                       ImGui::GetFrameHeight() * 0.5f));
-  check(ImGui::GetActiveID() == window->GetID(label),
+  const float line = ImGui::GetFrameHeight() + style.CellPadding.y * 2.0f;
+  click(app, ImVec2(window->Pos.x + window->Size.x * 0.75f,
+                   window->Pos.y + window->TitleBarHeight + style.WindowPadding.y +
+                       row * line + line * 0.5f));
+  check(ImGui::GetActiveID() != 0 &&
+            ImGui::GetInputTextState(ImGui::GetActiveID()) != nullptr,
         "A single click must activate numeric text entry");
   auto& io = ImGui::GetIO();
   io.AddKeyEvent(ImGuiMod_Ctrl, true);
@@ -56,7 +57,7 @@ void type_number(App& app, const char* label, int row, const char* text) {
 }
 
 void save(App& app) {
-  const auto* window = ImGui::FindWindowByName("Tool builder");
+  const auto* window = ImGui::FindWindowByName("Tool");
   click(app, ImVec2(window->Pos.x + ImGui::GetStyle().WindowPadding.x + 25,
                    window->DC.CursorMaxPos.y - ImGui::GetFrameHeight() * 0.5f));
 }
@@ -78,19 +79,16 @@ void run(const std::filesystem::path& directory) {
   app.builder_open = true;
   app.builder_is_new = true;
   app.builder_tool.name = "Fractional cutter";
-  // New tool intentionally has no ID, as in the Libraries tab.
+  // A new tool has no ID until it is saved.
   frame(app);
   frame(app);
-  type_number(app, "Diameter (mm)", 1, "3.175");
-  type_number(app, "Flute length (mm)", 2, "25.1234567");
+  type_number(app, 2, "3.175");
+  type_number(app, 3, "25.1234567");
   check(app.builder_tool.diameter == 3.175, "Exact diameter must be editable");
   check(app.builder_tool.flute_length == 25.1234567,
         "Numeric entry must retain more than three decimal places");
-  app.has_plan = true;
-  app.gcode = "old program";
   save(app);
   check(!app.builder_open, "New tool Save button must be enabled");
-  check(!app.has_plan && app.gcode.empty(), "Saving must invalidate the old plan");
   auto disk = cam::load_tools(app.tools_file);
   check(disk.tools.size() == 1 && disk.tools.front().id == "fractional-cutter",
         "New tool must persist with an automatically generated ID");
@@ -136,22 +134,23 @@ void run(const std::filesystem::path& directory) {
   frame(app);
   frame(app);
   save(app);
-  check(app.builder_open && app.banner_is_error &&
+  check(app.builder_open && !app.messages.empty() &&
+            app.messages.back().severity == LogSeverity::Error &&
             app.tools.find("fractional-cutter")->diameter == 4.125 &&
             cam::read_file(actual_file) == original,
         "Failed save must leave the editor open and preserve memory and disk");
   app.tools_file = actual_file;
   app.builder_open = false;
 
-  app.tools_import_file = (directory / "import.json").string();
+  const auto import_file = directory / "import.json";
   cam::ToolLibrary imported;
   cam::Tool tool = app.tools.tools.front();
   tool.diameter = 8.375;
   imported.upsert(tool);
   tool.id = "imported-tool";
   imported.upsert(tool);
-  cam::save_tools(app.tools_import_file, imported);
-  import_tools(app);
+  cam::save_tools(import_file, imported);
+  import_tools(app, import_file);
   check(app.tools.tools.size() == 3 && app.tools.find("fractional-cutter-2") &&
             app.tools.find("fractional-cutter")->diameter == 8.375 &&
             cam::load_tools(actual_file).find("imported-tool"),
@@ -160,49 +159,27 @@ void run(const std::filesystem::path& directory) {
   const std::string after_import = cam::read_file(actual_file);
   for (const std::string bad : {"{", "{}", "{\"tools\":{}}",
                                "{\"tools\":[{\"id\":\"bad\"}]}"}) {
-    cam::write_file(app.tools_import_file, bad);
-    must_fail([&] { import_tools(app); });
+    cam::write_file(import_file, bad);
+    must_fail([&] { import_tools(app, import_file); });
     check(app.tools.tools.size() == 3 && cam::read_file(actual_file) == after_import,
           "Malformed imports must preserve the active library");
   }
   imported.tools.push_back(imported.tools.front());
-  cam::save_tools(app.tools_import_file, imported);
-  must_fail([&] { import_tools(app); });
-  std::filesystem::remove(app.tools_import_file);
-  must_fail([&] { import_tools(app); });
+  cam::save_tools(import_file, imported);
+  must_fail([&] { import_tools(app, import_file); });
+  std::filesystem::remove(import_file);
+  must_fail([&] { import_tools(app, import_file); });
 
   imported.tools.pop_back();
   cam::save_tools(actual_file, imported);
-  app.has_plan = true;
   reload_tools(app);
-  check(app.tools.tools.size() == 2 && !app.has_plan,
-        "Reload must replace the in-memory library and invalidate planning");
+  check(app.tools.tools.size() == 2, "Reload must replace the in-memory library");
   cam::write_file(actual_file, "not JSON");
   must_fail([&] { reload_tools(app); });
   check(app.tools.tools.size() == 2, "Failed reload must retain the current tools");
   cam::save_tools(actual_file, {});
   reload_tools(app);
   check(app.tools.tools.empty(), "An explicitly empty library must remain empty");
-}
-
-void check_warning_wrapping() {
-  const std::vector<std::string> warnings{
-      "Stepdown reduced from 2 mm to 1.5875 mm: the selected tool's material "
-      "cutting data limits axial engagement to half its diameter, even though "
-      "its flute length is 25 mm. Edit the tool in Libraries to change this limit."};
-  for (int frame_index = 0; frame_index < 2; ++frame_index) {
-    ImGui::NewFrame();
-    ImGui::SetNextWindowSize(ImVec2(300, 500));
-    ImGui::Begin("Narrow warning panel");
-    show_warnings("test-warnings", warnings);
-    const ImRect text = GImGui->LastItemData.Rect;
-    check(text.GetHeight() > ImGui::GetTextLineHeight() * 2,
-          "Long warnings must wrap onto multiple lines");
-    check(text.Max.x <= ImGui::GetCurrentWindow()->WorkRect.Max.x + 1,
-          "Warning text must fit within a narrow panel");
-    ImGui::End();
-    ImGui::Render();
-  }
 }
 
 // The view cube, driven the way a hand drives it: a real press and release at a
@@ -361,6 +338,7 @@ int main() {
   ImGui::CreateContext();
   auto& io = ImGui::GetIO();
   io.IniFilename = nullptr;
+  io.ConfigDragClickToInputText = true;
   io.DisplaySize = ImVec2(1280, 1000);
   io.DeltaTime = 1.0f / 60.0f;
   unsigned char* pixels;
@@ -369,9 +347,8 @@ int main() {
   int result = EXIT_SUCCESS;
   try {
     run(directory);
-    check_warning_wrapping();
     check_view_cube();
-    std::cout << "Tool library, warning, and view cube GUI checks passed.\n";
+    std::cout << "Tool library and view cube GUI checks passed.\n";
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';
     result = EXIT_FAILURE;

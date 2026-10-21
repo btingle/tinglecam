@@ -16,12 +16,13 @@ namespace cam {
 std::filesystem::path config_directory();
 
 struct PanelLayout {
-  // Dimensions are stored in unscaled application pixels. The UI scale is
-  // applied when they are used by the renderer.
-  double left_width = 440.0;
-  double right_width = 480.0;
-  double left_program_fraction = 0.54;
-  double right_settings_fraction = 0.58;
+  // Screen pixels. The side panels keep their width whatever the UI scale, so
+  // the view in the middle is what grows and shrinks.
+  double left_width = 420.0;
+  double right_width = 440.0;
+  // Share of the left column given to the job setup above the operations.
+  double left_setup_fraction = 0.5;
+  double messages_height = 180.0;
 };
 
 PanelLayout default_panel_layout();
@@ -48,8 +49,17 @@ struct UserSettings {
   std::string custom_theme;
   std::vector<CustomUiTheme> custom_themes;
   PanelLayout panel_layout{};
-  std::array<Operation, 5> operation_defaults{};
+  // Debug readouts and planner overlays.
+  bool show_debug = false;
+  // What a new job starts with.
+  std::string default_machine;
+  std::string default_material;
+  // Most recent first.
+  std::vector<std::string> recent_jobs;
+  std::array<Operation, 6> operation_defaults{};
 };
+
+bool valid_panel_layout(const PanelLayout& layout);
 
 UserSettings default_user_settings();
 const Operation& operation_default(const UserSettings& settings,
@@ -76,11 +86,18 @@ void save_tools(const std::filesystem::path& path, const ToolLibrary& library);
 // Reads every *.json in a directory, so a profile is one file and adding one is
 // dropping it in.
 MachineLibrary load_machines(const std::filesystem::path& directory);
+// The shipped profiles: one JSON file per material in a directory.
 MaterialLibrary load_materials(const std::filesystem::path& directory);
+// The user's own library: one file, {"materials": [...]}.
+MaterialLibrary load_material_library(const std::filesystem::path& path);
+void save_material_library(const std::filesystem::path& path,
+                           const MaterialLibrary& library);
 void save_machine(const std::filesystem::path& path, const Machine& machine);
 void save_material(const std::filesystem::path& path, const Material& material);
 
-Job load_job(const std::filesystem::path& path);
+// `warnings`, when given, receives the fields the file has that the job does not.
+Job load_job(const std::filesystem::path& path,
+             std::vector<std::string>* warnings = nullptr);
 void save_job(const std::filesystem::path& path, const Job& job);
 
 // Round-trips through the same serialisation the files use, which is what the

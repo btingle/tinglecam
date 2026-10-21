@@ -1,0 +1,18 @@
+# The same square part, with the 4 mm opening passing through to the stock.
+v 0 0 10
+v 20 0 10
+v 20 20 10
+v 0 20 10
+v 8 8 10
+v 12 8 10
+v 12 12 10
+v 8 12 10
+v 0 0 0
+v 20 0 0
+v 20 20 0
+v 0 20 0
+f 1 2 6 5
+f 2 3 7 6
+f 3 4 8 7
+f 4 1 5 8
+f 9 12 11 10

@@ -6,6 +6,8 @@
 #include <stdexcept>
 
 #include "cam/parametric.h"
+#include "job_internal.h"
+#include "planning/routing.h"
 
 namespace cam {
 wave::Vec3d motion_point(const MotionPhase& phase, double t) {
@@ -85,7 +87,14 @@ wave::Heightmap initial_stock(const JobGeometry& geometry, const Job& job,
   for (const auto& op : job.operations) {
     if (op.mode == OperationMode::Pocket)
       for (const auto& p : op.pockets)
-        prisms.push_back({pocket_boundary(p), p.top_z - p.depth, p.top_z});
+        prisms.push_back({pocket_boundary(p, op.pocket_radial_margin),
+                          p.top_z - p.depth, p.top_z});
+    if(op.mode==OperationMode::Hole && op.holes.source_id.empty())
+      for(const auto& h:op.holes.systems) for(const auto& l:h.levels) {
+        const auto shape=Clipper2Lib::Ellipse(wave::Point64(wave::to_integer(h.center_x),wave::to_integer(h.center_y)),
+            wave::to_integer(l.radius),wave::to_integer(l.radius),96);
+        prisms.push_back({{shape},l.bottom_z,l.top_z});
+      }
     if (op.mode == OperationMode::PlaneClearing)
       for (const auto& a : op.plane.areas) {
         const auto x = wave::to_integer(a.center_x),
@@ -109,7 +118,183 @@ wave::Heightmap initial_stock(const JobGeometry& geometry, const Job& job,
   for (const auto& p : prisms) stock.fill(p.shape, p.bottom, p.top);
   return stock;
 }
+
+// The stock an operation starts from: the newest simulated stock before it, or
+// the blank.
+wave::Heightmap stock_before_operation(const JobGeometry& geometry, const Job& job,
+                                       const PriorOperations& prior, double pitch) {
+  for (auto i = prior.rbegin(); i != prior.rend(); ++i)
+    if (*i && (*i)->ok() && (*i)->stock_after) return *(*i)->stock_after;
+  return initial_stock(geometry, job, pitch);
+}
 }  // namespace
+
+namespace detail {
+bool link_layers(LevelPlan& previous, LevelPlan& level,
+                 const wave::Heightmap& stock, const wave::MillingCutter& cutter,
+                 double travel, double vertical_rate, double rapid_plane,
+                 double slack) {
+  auto& before = previous.feeds.motion;
+  auto& after = level.feeds.motion;
+  const auto last_cut = std::find_if(before.rbegin(), before.rend(),
+                                     [](const auto& p) { return !p.rapid; });
+  const auto first_cut = std::find_if(after.begin(), after.end(),
+                                      [](const auto& p) { return !p.rapid; });
+  if (last_cut == before.rend() || first_cut == after.end() ||
+      last_cut->to_z != previous.floor_z || first_cut->from_z != level.floor_z)
+    return false;
+  const auto from = last_cut->to, to = first_cut->from;
+  const double low = std::min(previous.floor_z, level.floor_z);
+  const double high = std::max(previous.floor_z, level.floor_z);
+  if (!(high < rapid_plane)) return false;
+  const auto at = [](const wave::Point64& p, double z) {
+    return wave::Vec3d{wave::to_world(p.x), wave::to_world(p.y), z};
+  };
+  const auto clear = [&](const wave::Point64& a, double za,
+                         const wave::Point64& b, double zb) {
+    return stock.clear(at(a, za), at(b, zb), cutter, 0.001, false);
+  };
+  // Lift first when moving up; descend last when moving down.
+  const auto lower_point = previous.floor_z < level.floor_z ? from : to;
+  if (!clear(lower_point, low, lower_point, high)) return false;
+  std::optional<wave::Path64> route = wave::Path64{from, to};
+  if (!clear(from, high, to, high)) {
+    const auto obstacles = stock.slice(high + 0.002);
+    if (obstacles.empty()) return false;
+    auto bounds = Clipper2Lib::GetBounds(obstacles);
+    bounds.left = std::min({bounds.left, from.x, to.x});
+    bounds.right = std::max({bounds.right, from.x, to.x});
+    bounds.top = std::min({bounds.top, from.y, to.y});
+    bounds.bottom = std::max({bounds.bottom, from.y, to.y});
+    const auto margin = wave::to_integer(cutter.radius * 4 + 10);
+    bounds.left -= margin; bounds.right += margin;
+    bounds.top -= margin; bounds.bottom += margin;
+    const wave::Paths64 world{{{bounds.left, bounds.top}, {bounds.right, bounds.top},
+                               {bounds.right, bounds.bottom}, {bounds.left, bounds.bottom}}};
+    const auto free = Clipper2Lib::Difference(
+        world, detail::offset_outward(obstacles, cutter.radius),
+        Clipper2Lib::FillRule::NonZero);
+    const wave::Router router(wave::routable_region(free, slack, {from, to}), slack);
+    route = router.route(from, to);
+    if (!route || route->empty()) return false;
+    for (std::size_t i = 1; i < route->size(); ++i)
+      if (!clear((*route)[i - 1], high, (*route)[i], high)) return false;
+  }
+  std::vector<MotionPhase> seam;
+  const double path_distance = first_cut->path_distance_begin;
+  const auto add = [&](const wave::Point64& a, const wave::Point64& b, double za,
+                       double zb) {
+    MotionPhase phase;
+    phase.from = a; phase.to = b; phase.from_z = za; phase.to_z = zb;
+    phase.path_distance_begin = phase.path_distance_end = path_distance;
+    phase.length = std::hypot(detail::distance_mm(a, b), zb - za);
+    phase.rapid = za != zb;
+    phase.rate = phase.rapid ? vertical_rate : travel;
+    phase.kind = wave::MoveKind::Link;
+    phase.inter_layer = true;
+    if (phase.length > 0) seam.push_back(phase);
+  };
+  add(from, from, previous.floor_z, high);
+  for (std::size_t i = 1; i < route->size(); ++i)
+    add((*route)[i - 1], (*route)[i], high, high);
+  add(to, to, high, level.floor_z);
+  const auto departure = last_cut.base();
+  double old_minutes = 0, new_minutes = 0;
+  for (auto i = departure; i != before.end(); ++i) old_minutes += i->length / i->rate;
+  for (auto i = after.begin(); i != first_cut; ++i) old_minutes += i->length / i->rate;
+  for (const auto& phase : seam) new_minutes += phase.length / phase.rate;
+  if (!(new_minutes < old_minutes)) return false;
+  before.erase(departure, before.end());
+  after.erase(after.begin(), first_cut);
+  if (!seam.empty()) seam.front().arrival = true;
+  after.insert(after.begin(), seam.begin(), seam.end());
+  previous.stays_down_after = previous.feeds.ends_at_depth = true;
+  level.feeds.begins_at_depth = true;
+  return true;
+}
+}  // namespace detail
+
+namespace {
+
+bool vertical_entry(const MotionPhase& phase) {
+  return !phase.arc && phase.from == phase.to && phase.to_z < phase.from_z &&
+         (phase.rapid || phase.kind == wave::MoveKind::Entry);
+}
+
+// Rebuilds everything derived from a level's commanded motion: distances,
+// travel and timing totals, and the 2D segments the pass view draws.
+void finish_level_motion(LevelPlan& level, const CuttingFeeds& feeds,
+                         double pitch) {
+  level.motion_distances.clear();
+  level.motion_distances.reserve(level.feeds.motion.size() + 1);
+  double total = 0;
+  for (const auto& phase : level.feeds.motion) {
+    level.motion_distances.push_back(total);
+    total += phase.length;
+  }
+  level.motion_distances.push_back(total);
+  for (auto& checkpoint : level.stock_checkpoints) {
+    checkpoint.phase = std::min(checkpoint.phase, level.feeds.motion.size());
+    checkpoint.motion_distance = std::min(checkpoint.motion_distance, total);
+  }
+  auto& stats = level.feeds.stats;
+  const double rpm = stats.spindle_rpm, engagement = stats.maximum_engagement;
+  stats = {};
+  stats.spindle_rpm = rpm;
+  stats.maximum_engagement = engagement;
+  for (const auto& phase : level.feeds.motion) {
+    if (phase.rapid) {
+      stats.rapid_distance += phase.length;
+      stats.rapid_minutes += phase.length / phase.rate;
+    } else {
+      stats.cutting_distance += phase.length;
+      stats.cutting_minutes += phase.length / phase.rate;
+      stats.minimum_feed = stats.minimum_feed ? std::min(stats.minimum_feed, phase.rate)
+                                              : phase.rate;
+      stats.maximum_feed = std::max(stats.maximum_feed, phase.rate);
+    }
+  }
+  // The 2D feed overlay must describe the same rates as the XYZ post.
+  level.feeds.segments.clear();
+  std::size_t move_index = 0;
+  double move_end = level.toolpath.moves.empty() ? 0 : level.toolpath.moves.front().length;
+  for (const auto& phase : level.feeds.motion) {
+    if (!(phase.path_distance_end > phase.path_distance_begin)) continue;
+    while (move_index + 1 < level.toolpath.moves.size() &&
+           move_end < phase.path_distance_begin - 1e-8)
+      move_end += level.toolpath.moves[++move_index].length;
+    const int pieces = phase.arc
+        ? std::max(32, int(std::ceil(phase.length / std::max(pitch, 0.1)))) : 1;
+    FeedLimit limit = FeedLimit::Engagement;
+    if (phase.rapid) limit = FeedLimit::Rapid;
+    else if (phase.kind == wave::MoveKind::Entry) limit = FeedLimit::Plunge;
+    else feeds.feed_at(phase.engagement, &limit);
+    for (int j = 0; j < pieces; ++j) {
+      const auto a = motion_point(phase, double(j) / pieces),
+                 b = motion_point(phase, double(j + 1) / pieces);
+      FeedSegment segment;
+      segment.from = {wave::to_integer(a.x), wave::to_integer(a.y)};
+      segment.to = {wave::to_integer(b.x), wave::to_integer(b.y)};
+      segment.move_index = move_index;
+      segment.kind = phase.kind;
+      segment.rapid = phase.rapid;
+      segment.length = (phase.path_distance_end - phase.path_distance_begin) / pieces;
+      segment.start_distance = phase.path_distance_begin + segment.length * j;
+      segment.rate = segment.feed = phase.rate;
+      segment.engagement = phase.engagement;
+      segment.limit = limit;
+      if (segment.length > 0) level.feeds.segments.push_back(segment);
+    }
+  }
+}
+}  // namespace
+
+wave::MillingCutter milling_cutter(const Tool& tool) {
+  return {tool.type == ToolType::BallEndMill ? wave::CutterShape::Ball :
+          tool.type == ToolType::Drill ? wave::CutterShape::Drill : wave::CutterShape::Flat,
+          tool.diameter / 2, tool.flute_length,tool.point_angle_degrees,tool.tip_flat_diameter/2};
+}
+
 void advance_stock_motion(wave::Heightmap& stock, const LevelPlan& level,
                           const wave::MillingCutter& tool, double from,
                           double to) {
@@ -172,99 +357,94 @@ wave::Heightmap stock_at_motion(const LevelPlan& level,
 }
 void simulate_operation_xyz(OperationPlan& plan, const JobGeometry& geometry,
                             const Job& job, const Operation& operation,
-                            const Tool& tool, const Machine& machine,
+                            const Tool& base_tool, const Machine& machine,
+                            const CuttingFeeds& base_feeds,
                             const PriorOperations& prior,
-                            const ProgressCallback& progress) {
+                            const ProgressCallback& progress,const ToolLibrary* tools) {
+  const Tool& tool=base_tool;const auto& feeds=base_feeds;
   try {
-    if (!std::isfinite(operation.simulation_pitch) ||
-        operation.simulation_pitch < 0.001)
-      throw std::runtime_error("Simulation pitch must be at least 0.001 mm");
-    std::shared_ptr<const wave::Heightmap> incoming;
-    for (auto i = prior.rbegin(); i != prior.rend(); ++i)
-      if (*i && (*i)->ok() && (*i)->stock_after) {
-        incoming = (*i)->stock_after;
-        break;
-      }
-    auto stock = incoming
-                     ? *incoming
-                     : initial_stock(geometry, job, operation.simulation_pitch);
+    if (!std::isfinite(job.simulation_pitch) || job.simulation_pitch < 0.001)
+      throw std::runtime_error("Stock grid pitch must be at least 0.001 mm");
+    if (!std::isfinite(job.plunge_clearance_height) || job.plunge_clearance_height < 0)
+      throw std::runtime_error("Plunge clearance must be finite and nonnegative");
+    if (tool.type != ToolType::FlatEndMill && tool.type != ToolType::BallEndMill && tool.type!=ToolType::Drill)
+      throw std::runtime_error("Stock simulation supports end mills and drills");
+    auto stock = stock_before_operation(geometry, job, prior, job.simulation_pitch);
     plan.stock_before = std::make_shared<const wave::Heightmap>(stock);
-    if (incoming && std::abs(stock.pitch() - operation.simulation_pitch) > 1e-8)
-      plan.warnings.push_back("Using the first operation's simulation pitch (" +
+    if (std::abs(stock.pitch() - job.simulation_pitch) > 1e-8)
+      plan.warnings.push_back("Earlier operations were simulated at " +
                               std::to_string(stock.pitch()) +
-                              " mm) to preserve stock history");
-    const wave::MillingCutter cutter{tool.type == ToolType::BallEndMill
-                                         ? wave::CutterShape::Ball
-                                         : wave::CutterShape::Flat,
-                                     tool.diameter / 2, tool.flute_length};
-    if (tool.type != ToolType::FlatEndMill &&
-        tool.type != ToolType::BallEndMill)
-      throw std::runtime_error(
-          "Heightmap simulation currently supports flat and ball end mills");
-    double slow = operation.full_engagement_feed,
-           fast = operation.no_engagement_feed;
-    if (!operation.manual_feed_range)
-      if (const auto* feeds = machine.feeds_for(operation.material_id)) {
-        slow = feeds->full_engagement;
-        fast = feeds->no_engagement;
-      }
-    if (!std::isfinite(slow) || !std::isfinite(fast) || slow <= 0 ||
-        fast < slow || !std::isfinite(operation.plunge_feed) ||
-        operation.plunge_feed <= 0)
-      throw std::runtime_error("Invalid cutting feed range or plunge feed");
-    plan.stats.cutting_distance = plan.stats.rapid_distance = 0;
-    plan.stats.cutting_minutes = plan.stats.rapid_minutes = 0;
+                              " mm; plan them again to use the new grid pitch");
+    const bool roughing = operation.mode == OperationMode::Roughing;
+    const double vertical_rate = std::max(rapid_feed_z(machine), 1.0);
+    // Keep even a zero-clearance approach above contact after the post rounds
+    // its coordinates, including inch output and an arbitrary work origin.
+    const double coordinate_step = (machine.output_inches ? 25.4 : 1.0) *
+                                   std::pow(10.0, -machine.decimals);
+    const double plunge_clearance = std::max(job.plunge_clearance_height, coordinate_step);
+    const double slack = detail::link_slack(operation.stepover_ratio * tool.diameter);
+    const double rapid_plane = job_rapid_plane(job, geometry);
+    plan.spindle_rpm = feeds.spindle_rpm;
     plan.stats.removed_volume = plan.stats.maximum_load = 0;
     plan.stats.levels = plan.levels.size();
     plan.stats.cut_levels = 0;
-    std::size_t conservative_descents = 0;
+    plan.stats.unsafe_plunges = 0;
+    std::size_t plunged_descents = 0;
+    LevelPlan* previous = nullptr;
     for (std::size_t l = 0; l < plan.levels.size(); ++l) {
       auto& level = plan.levels[l];
+      const Tool* selected=&base_tool;
+      if(!level.tool_id.empty() && level.tool_id!=base_tool.id) {
+        selected=tools?tools->find(level.tool_id):nullptr;
+        if(!selected) throw std::runtime_error("Unknown per-level tool");
+      }
+      const Tool& tool=*selected;
+      const auto feeds=selected==&base_tool?base_feeds:
+          resolve_cutting_feeds(tool,machine,job.material_id,operation.cutting);
+      const auto cutter=milling_cutter(tool);
+      const double travel=std::max(feeds.travel_feed(),1.0);
       if (progress &&
           !progress(double(l) / std::max(std::size_t{1}, plan.levels.size()),
-                    "Simulating XYZ stock"))
+                    "Simulating stock"))
         throw std::runtime_error("Cancelled");
+      if (roughing && previous && !level.nothing_to_cut && !level.feeds.motion.empty() &&
+          detail::link_layers(*previous, level, stock, cutter, travel, vertical_rate,
+                      rapid_plane, slack))
+        finish_level_motion(*previous, feeds, stock.pitch());
       level.stock_checkpoints.clear();
       level.stock_checkpoints.push_back(
           {0, std::make_shared<const wave::Heightmap>(stock)});
-      level.simulation.heightmap_before = level.stock_checkpoints.front().stock;
       level.feeds.authoritative_motion = true;
-      auto& stats = level.feeds.stats;
-      stats = {};
-      stats.spindle_rpm = plan.spindle_rpm;
-      double removed = 0, motion_distance = 0;
-      // Keep feed estimates local even when the planar feed pass previously
-      // merged a long straight contour into one commanded move.
+      level.feeds.stats = {};
+      level.feeds.stats.spindle_rpm = feeds.spindle_rpm;
+      double removed = 0, motion_distance = 0, maximum_engagement = 0;
+      // Keep feed estimates local even where a long straight contour was
+      // planned as one move.
       std::vector<MotionPhase> phases;
+      const auto pieces = [&](const MotionPhase& phase) {
+        return phase.rapid || phase.arc || vertical_entry(phase) ||
+                       operation.mode == OperationMode::SurfaceFinishing
+                   ? 1
+                   : std::max(1, int(std::ceil(phase.length /
+                                               std::max(0.05, operation.path_pitch))));
+      };
       std::size_t phase_count = 0;
-      for (const auto& phase : level.feeds.motion)
-        phase_count +=
-            phase.rapid || phase.arc ||
-                    operation.mode == OperationMode::SurfaceFinishing
-                ? 1
-                : std::max(
-                      std::size_t{1},
-                      std::size_t(std::ceil(
-                          phase.length / std::max(.05, operation.path_pitch))));
+      for (const auto& phase : level.feeds.motion) phase_count += pieces(phase);
+      if (phase_count > 50000000)
+        throw std::runtime_error("Simulation path has too many feed samples");
       phases.reserve(phase_count);
       for (const auto& phase : level.feeds.motion) {
-        const int n =
-            phase.rapid || phase.arc ||
-                    operation.mode == OperationMode::SurfaceFinishing
-                ? 1
-                : std::max(
-                      1, int(std::ceil(phase.length /
-                                       std::max(0.05, operation.path_pitch))));
-        if (n > 1000000)
-          throw std::runtime_error("Simulation path has too many feed samples");
+        const int n = pieces(phase);
         for (int i = 0; i < n; ++i) {
           auto p = phase;
           const double a = double(i) / n, b = double(i + 1) / n;
           const auto from = motion_point(phase, a), to = motion_point(phase, b);
-          p.from = {wave::to_integer(from.x), wave::to_integer(from.y)};
-          p.to = {wave::to_integer(to.x), wave::to_integer(to.y)};
-          p.from_z = from.z;
-          p.to_z = to.z;
+          if (n > 1) {
+            p.from = {wave::to_integer(from.x), wave::to_integer(from.y)};
+            p.to = {wave::to_integer(to.x), wave::to_integer(to.y)};
+            p.from_z = from.z;
+            p.to_z = to.z;
+          }
           p.length = phase.length / n;
           p.path_distance_begin =
               phase.path_distance_begin +
@@ -276,24 +456,22 @@ void simulate_operation_xyz(OperationPlan& plan, const JobGeometry& geometry,
         }
       }
       level.feeds.motion = std::move(phases);
-      level.motion_distances.clear();
-      level.motion_distances.reserve(level.feeds.motion.size() + 1);
-      double cumulative = 0;
-      for (const auto& phase : level.feeds.motion) {
-        level.motion_distances.push_back(cumulative);
-        cumulative += phase.length;
-      }
-      level.motion_distances.push_back(cumulative);
-      // Bounded checkpoints plus forward replay avoid retaining a new grid
-      // history every 64 tiny feed intervals on long, high-resolution jobs.
+      // A descent is split against the stock as it exists when that motion
+      // executes, after all earlier cuts in this level and earlier operations.
+      const std::size_t maximum_phases = level.feeds.motion.size() +
+          std::count_if(level.feeds.motion.begin(), level.feeds.motion.end(), vertical_entry);
+      if (maximum_phases > 50000000)
+        throw std::runtime_error("Simulation path has too many feed samples");
+      std::vector<MotionPhase> simulated;
+      simulated.reserve(maximum_phases);
+      // At most eight intermediate snapshots, even after splitting entries.
       const std::size_t checkpoint_stride =
-          std::max(std::size_t{64}, (level.feeds.motion.size() + 7) / 8);
-      for (std::size_t i = 0; i < level.feeds.motion.size(); ++i) {
-        auto& phase = level.feeds.motion[i];
+          std::max(std::size_t{64}, (maximum_phases + 7) / 8);
+      auto execute = [&](MotionPhase phase) {
         double volume = 0, depth = 0;
-        if (i % 64 == 0 && progress &&
+        if (simulated.size() % 64 == 0 && progress &&
             !progress(double(l) / std::max(std::size_t{1}, plan.levels.size()),
-                      "Simulating XYZ stock"))
+                      "Simulating stock"))
           throw std::runtime_error("Cancelled");
         const bool lift = phase.from == phase.to && phase.to_z >= phase.from_z;
         if (phase.rapid && !lift) {
@@ -302,15 +480,14 @@ void simulate_operation_xyz(OperationPlan& plan, const JobGeometry& geometry,
             clear &= stock.clear(a, b, cutter);
           });
           if (!clear) {
-            // A grid cannot prove a touching descent is in air. Execute it at
-            // plunge feed, rather than preserve an unproven G0 landing.
+            // A rapid descent that lands on stock comes down at plunge feed.
             if (phase.from != phase.to)
               throw std::runtime_error(
-                  "XYZ stock simulation found a rapid traverse through "
-                  "remaining stock");
+                  "A rapid traverse passes through remaining stock");
             phase.rapid = false;
             phase.kind = wave::MoveKind::Entry;
-            ++conservative_descents;
+            if (roughing) ++plan.stats.unsafe_plunges;
+            else ++plunged_descents;
           }
         }
         if (!phase.rapid)
@@ -322,111 +499,89 @@ void simulate_operation_xyz(OperationPlan& plan, const JobGeometry& geometry,
             volume += sample.volume;
             depth = std::max(depth, sample.maximum_depth);
           });
+        // Against the deeper of the pass's slab and what this move actually
+        // cut, so a near-empty slab cannot inflate the engagement.
         const double reference = tool.diameter *
-                                 std::max(level.axial_depth, 0.001) *
+                                 std::max({level.axial_depth, depth, 0.001}) *
                                  std::max(phase.length, 1e-9);
         const double load = volume / reference;
         phase.engagement = load;
         phase.removed_volume = volume;
         if (!phase.rapid)
-          phase.rate =
-              phase.kind == wave::MoveKind::Entry
-                  ? operation.plunge_feed
-                  : slow + (fast - slow) * (1 - std::clamp(load, 0.0, 1.0));
+          phase.rate = phase.kind == wave::MoveKind::Entry
+                           ? std::min(feeds.plunge_feed, feeds.maximum_feed)
+                           : feeds.feed_at(load);
         if (!(phase.rate > 0) || !std::isfinite(phase.rate))
           throw std::runtime_error("Invalid commanded motion feed");
-        if (phase.rapid) {
-          stats.rapid_distance += phase.length;
-          stats.rapid_minutes += phase.length / phase.rate;
-        } else {
-          stats.cutting_distance += phase.length;
-          stats.cutting_minutes += phase.length / phase.rate;
-          stats.minimum_feed = stats.minimum_feed
-                                   ? std::min(stats.minimum_feed, phase.rate)
-                                   : phase.rate;
-          stats.maximum_feed = std::max(stats.maximum_feed, phase.rate);
-        }
-        stats.maximum_engagement = std::max(stats.maximum_engagement, load);
+        // Plunges and other vertical moves are measured against a slot they
+        // are not cutting; only moves at one height say anything about load.
+        if (!phase.rapid && phase.kind != wave::MoveKind::Entry &&
+            phase.from_z == phase.to_z)
+          maximum_engagement = std::max(maximum_engagement, load);
         removed += volume;
         motion_distance += phase.length;
-        if ((i + 1) % checkpoint_stride == 0) {
+        simulated.push_back(std::move(phase));
+        if (simulated.size() % checkpoint_stride == 0) {
           stock.compact_history();
           level.stock_checkpoints.push_back(
-              {i + 1, std::make_shared<const wave::Heightmap>(stock),
+              {simulated.size(), std::make_shared<const wave::Heightmap>(stock),
                motion_distance});
         }
-      }
-      // The 2D feed overlay must describe the same rates as the XYZ post.
-      level.feeds.segments.clear();
-      std::size_t segment_count = 0;
-      for (const auto& phase : level.feeds.motion)
-        if (phase.path_distance_end > phase.path_distance_begin)
-          segment_count +=
-              phase.arc
-                  ? std::max(32, int(std::ceil(phase.length /
-                                               std::max(stock.pitch(), .1))))
-                  : 1;
-      level.feeds.segments.reserve(segment_count);
-      std::size_t move_index = 0;
-      double move_end = level.toolpath.moves.empty()
-                            ? 0
-                            : level.toolpath.moves.front().length;
-      for (const auto& phase : level.feeds.motion) {
-        while (move_index + 1 < level.toolpath.moves.size() &&
-               move_end < phase.path_distance_begin - 1e-8)
-          move_end += level.toolpath.moves[++move_index].length;
-        const int pieces =
-            phase.arc
-                ? std::max(32, int(std::ceil(phase.length /
-                                             std::max(stock.pitch(), 0.1))))
-                : 1;
-        for (int j = 0; j < pieces; ++j) {
-          const auto a = motion_point(phase, double(j) / pieces),
-                     b = motion_point(phase, double(j + 1) / pieces);
-          FeedSegment segment;
-          segment.from = {wave::to_integer(a.x), wave::to_integer(a.y)};
-          segment.to = {wave::to_integer(b.x), wave::to_integer(b.y)};
-          segment.move_index = move_index;
-          segment.kind = phase.kind;
-          segment.rapid = phase.rapid;
-          segment.safe_retract = phase.rapid;
-          segment.length =
-              (phase.path_distance_end - phase.path_distance_begin) / pieces;
-          segment.start_distance =
-              phase.path_distance_begin + segment.length * j;
-          segment.rate = segment.feed = phase.rate;
-          segment.engagement = phase.engagement;
-          segment.limit = phase.rapid ? FeedLimit::Rapid
-                                      : (phase.kind == wave::MoveKind::Entry
-                                             ? FeedLimit::Plunge
-                                             : FeedLimit::Engagement);
-          if (segment.length > 0) level.feeds.segments.push_back(segment);
+      };
+      for (const auto& candidate : level.feeds.motion) {
+        if (!vertical_entry(candidate)) {
+          execute(candidate);
+          continue;
         }
+        const auto from = motion_point(candidate, 0), to = motion_point(candidate, 1);
+        const double approach_z = stock.plunge_contact_z(from.x, from.y, cutter) + plunge_clearance;
+        if (candidate.rapid && approach_z > candidate.to_z &&
+            !stock.clear(from, to, cutter)) {
+          if (roughing) ++plan.stats.unsafe_plunges;
+          else ++plunged_descents;
+        }
+        auto approach = candidate;
+        approach.to_z = std::clamp(approach_z, candidate.to_z, candidate.from_z);
+        approach.length = approach.from_z - approach.to_z;
+        approach.rapid = true;
+        approach.kind = wave::MoveKind::Link;
+        approach.rate = vertical_rate;
+        if (approach.length > 1e-10) execute(approach);
+        auto plunge = candidate;
+        plunge.from_z = approach.to_z;
+        plunge.length = plunge.from_z - plunge.to_z;
+        plunge.rapid = false;
+        plunge.kind = wave::MoveKind::Entry;
+        if (approach.length > 1e-10) plunge.arrival = false;
+        if (plunge.length > 1e-10) execute(plunge);
       }
+      level.feeds.motion = std::move(simulated);
       stock.compact_history();
       level.stock_checkpoints.push_back(
           {level.feeds.motion.size(),
            std::make_shared<const wave::Heightmap>(stock), motion_distance});
-      level.simulation.heightmap_after = level.stock_checkpoints.back().stock;
-      // Routing has finished and the XYZ phases now own engagement. Retaining
-      // the preliminary planar samples duplicates the same path/load history.
-      std::vector<wave::SimulatedMove>().swap(level.simulation.moves);
-      std::vector<wave::SimulationCheckpoint>().swap(
-          level.simulation.checkpoints);
+      level.feeds.stats.maximum_engagement = maximum_engagement;
+      finish_level_motion(level, feeds, stock.pitch());
       if (removed > 0) ++plan.stats.cut_levels;
       plan.stats.removed_volume += removed;
-      plan.stats.maximum_load =
-          std::max(plan.stats.maximum_load, stats.maximum_engagement);
-      plan.stats.cutting_distance += stats.cutting_distance;
-      plan.stats.rapid_distance += stats.rapid_distance;
-      plan.stats.cutting_minutes += stats.cutting_minutes;
-      plan.stats.rapid_minutes += stats.rapid_minutes;
+      plan.stats.maximum_load = std::max(plan.stats.maximum_load, maximum_engagement);
+      if (!level.nothing_to_cut && !level.feeds.motion.empty()) previous = &level;
+    }
+    plan.stats.cutting_distance = plan.stats.rapid_distance = 0;
+    plan.stats.cutting_minutes = plan.stats.rapid_minutes = 0;
+    for (const auto& level : plan.levels) {
+      plan.stats.cutting_distance += level.feeds.stats.cutting_distance;
+      plan.stats.rapid_distance += level.feeds.stats.rapid_distance;
+      plan.stats.cutting_minutes += level.feeds.stats.cutting_minutes;
+      plan.stats.rapid_minutes += level.feeds.stats.rapid_minutes;
     }
     plan.stock_after = std::make_shared<const wave::Heightmap>(stock);
-    if (conservative_descents)
-      plan.warnings.push_back(std::to_string(conservative_descents) +
-                              " descents use plunge feed because grid "
-                              "clearance could not be established");
+    if (plan.stats.unsafe_plunges > 0)
+      plan.warnings.push_back(std::to_string(plan.stats.unsafe_plunges) +
+                              " roughing descent(s) land on stock and plunge");
+    if (plunged_descents)
+      plan.warnings.push_back(std::to_string(plunged_descents) +
+                              " descent(s) land on stock and use plunge feed");
   } catch (const std::exception& error) {
     plan.error = error.what();
     plan.stock_after.reset();

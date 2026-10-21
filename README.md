@@ -1,9 +1,9 @@
 # TingleCAM
 
 A desktop CAM application for wavefront roughing, contour finishing, pockets,
-plane clearing, and native STEP surface finishing. Load OBJ/STL/STEP part and stock models, configure operations,
+holes and counterbores, plane clearing, and native STEP surface finishing. Load OBJ/STL/STEP part and stock models, configure operations,
 preview toolpaths and material removal, and export G-code. Jobs save as JSON;
-pockets and planes can also be defined without a mesh.
+pockets, planes and manual holes can also be defined without a mesh.
 
 Requires CMake 3.20+, a C++20 compiler, the CUDA toolkit and a compatible NVIDIA
 GPU, SDL2 development files, OpenGL, and the Open CASCADE C++ SDK
@@ -18,9 +18,21 @@ cmake --build build --parallel
 ./build/tinglecam
 ```
 
-In the GUI, load models or a saved job, choose tools, machine, and material,
-add operations, plan, then generate and save G-code. Machine/material profiles
-and starter tools live in `data/`; local tools and settings live in `config/`.
+In the GUI, open a job or start one: choose the part model, the stock, the
+machine and the material in the setup panel, add operations, press **Plan**
+(F5), watch the result, then **Export G-code** (Ctrl+E). The Help menu lists the
+keyboard shortcuts.
+
+Feeds and speeds come from the tools. Each tool in the library (Tools > Tool
+library) carries cutting data per material: spindle speed, chip load and plunge
+feed. An operation uses its tool's data for the job material, and can override
+any of the three. The full-engagement feed is rpm x flutes x chip load; lighter
+radial cuts run faster to keep the same chip, up to the machine's maximum feed.
+Machines only set limits (spindle range, rapid rates) and post settings.
+
+Machine and material profiles and starter tools live in `data/`. Your own tools
+and settings live in `~/.config/tinglecam/` (`%APPDATA%\TingleCAM` on Windows);
+on first run the starter tools are copied there.
 
 Try the included example or generate G-code without opening a window:
 
@@ -30,6 +42,11 @@ Try the included example or generate G-code without opening a window:
 ./build/tinglecam --help
 ```
 
+The **Hole** mode supports independent circular-hole/counterbore identification,
+per-level drilling or milling strategies, and linked pre-drilling operations.
+See [holes and counterbores](docs/hole-mode.md) or open
+`data/examples/holes-and-counterbores.json`.
+
 For face selection, ball-nose compensation, the experimental heightmap stock
 simulator, SDK options and CLI examples, see
 [STEP finishing and heightmap simulation](docs/step-finishing-heightmap.md).
@@ -37,7 +54,7 @@ The 3D heightmap result is raycast directly at full resolution using OpenGL 3.2
 fragment shaders; this renderer does not require CUDA or CUDA/OpenGL interop.
 The existing mesh slicer still requires CUDA.
 Under WSL, startup automatically selects Mesa's D3D12 driver and the mesh GPU.
-The active renderer is shown under Settings and Playback / Display; explicit
+The active renderer is shown under Tools > Settings; explicit
 Mesa/driver environment overrides take precedence.
 Timing, memory measurements and the repeatable benchmark are documented in the
 [performance investigation](tools/benchmarks/heightmap_performance.md).

@@ -1,4 +1,5 @@
 #include "cam/config.h"
+#include "cam/hole_config.h"
 
 #include <nlohmann/json.hpp>
 
@@ -15,16 +16,10 @@ namespace {
 
 using nlohmann::json;
 
-std::optional<wave::SimulationMethod> simulation_method_from_name(const std::string& name) {
-  for (auto method : {wave::SimulationMethod::LocalArea, wave::SimulationMethod::Contact,
-                      wave::SimulationMethod::Compare, wave::SimulationMethod::ReferenceArea, wave::SimulationMethod::Heightmap})
-    if (name == wave::simulation_method_name(method)) return method;
-  return std::nullopt;
-}
-
 std::optional<OperationMode> operation_mode_from_name(const std::string& name) {
   if (name == "roughing") return OperationMode::Roughing;
   if (name == "contour_finishing") return OperationMode::ContourFinishing;
+  if (name == "hole") return OperationMode::Hole;
   if (name == "pocket") return OperationMode::Pocket;
   if (name == "plane_clearing") return OperationMode::PlaneClearing;
   if (name == "surface_finishing") return OperationMode::SurfaceFinishing;
@@ -46,18 +41,32 @@ std::size_t operation_default_index(OperationMode mode) {
     case OperationMode::Pocket: return 2;
     case OperationMode::PlaneClearing: return 3;
     case OperationMode::SurfaceFinishing: return 4;
+    case OperationMode::Hole: return 5;
   }
   return 0;
 }
 
-constexpr std::array<OperationMode, 5> kOperationModes{
+constexpr std::array<OperationMode, 6> kOperationModes{
     OperationMode::Roughing, OperationMode::ContourFinishing,
-    OperationMode::Pocket, OperationMode::PlaneClearing, OperationMode::SurfaceFinishing};
+    OperationMode::Pocket, OperationMode::PlaneClearing, OperationMode::SurfaceFinishing, OperationMode::Hole};
 
 template <typename T>
 void read(const json& node, const char* key, T& target) {
   if (!node.contains(key) || node.at(key).is_null()) return;
   target = node.at(key).get<T>();
+}
+
+// Names fields a reader does not know, so an old or mistyped file says what
+// it lost instead of loading quietly without it.
+void report_unknown(const json& node, std::initializer_list<const char*> known,
+                    const std::string& where, std::vector<std::string>* warnings) {
+  if (!warnings || !node.is_object()) return;
+  for (const auto& item : node.items()) {
+    const bool found = std::any_of(known.begin(), known.end(), [&](const char* key) {
+      return item.key() == key;
+    });
+    if (!found) warnings->push_back(where + ": unknown field \"" + item.key() + "\" ignored");
+  }
 }
 
 template <typename Enum>
@@ -69,9 +78,18 @@ void read_enum(const json& node, const char* key, Enum& target,
 }
 
 json to_json(const Tool& tool) {
+  json cutting = json::array();
+  for (const auto& data : tool.cutting)
+    cutting.push_back({{"material", data.material_id},
+                       {"spindle_rpm", data.spindle_rpm},
+                       {"chip_load", data.chip_load},
+                       {"plunge_feed", data.plunge_feed}});
   return json{{"id", tool.id}, {"name", tool.name},
               {"diameter", tool.diameter}, {"flute_length", tool.flute_length},
-              {"flutes", tool.flutes}, {"type", tool_type_name(tool.type)}};
+              {"flutes", tool.flutes}, {"type", tool_type_name(tool.type)},
+              {"cutting", std::move(cutting)},
+              {"point_angle_degrees", tool.point_angle_degrees},
+              {"tip_flat_diameter", tool.tip_flat_diameter}};
 }
 
 Tool tool_from(const json& node) {
@@ -81,35 +99,29 @@ Tool tool_from(const json& node) {
   read(node, "diameter", tool.diameter);
   read(node, "flute_length", tool.flute_length);
   read(node, "flutes", tool.flutes);
+  read(node, "point_angle_degrees", tool.point_angle_degrees);
+  read(node, "tip_flat_diameter", tool.tip_flat_diameter);
   if (node.contains("type")) {
     const auto type = tool_type_from_name(node.at("type").get<std::string>());
     if (!type) throw std::runtime_error("Unknown tool type");
     tool.type = *type;
-  } else if (tool.id.find("ball") != std::string::npos) {
-    // The previous stripped schema omitted type even for its ball starter.
-    tool.type = ToolType::BallEndMill;
   }
-  // Legacy cutting_data and other retired fields are deliberately ignored.
+  if (node.contains("cutting")) {
+    if (!node.at("cutting").is_array())
+      throw std::runtime_error("Expected a cutting data array");
+    for (const auto& entry : node.at("cutting")) {
+      CuttingData data;
+      read(entry, "material", data.material_id);
+      read(entry, "spindle_rpm", data.spindle_rpm);
+      read(entry, "chip_load", data.chip_load);
+      read(entry, "plunge_feed", data.plunge_feed);
+      tool.cutting.push_back(std::move(data));
+    }
+  }
   return tool;
 }
 
-json to_json(const MaterialFeedRange& range) {
-  return json{{"material", range.material_id},
-              {"full_engagement", range.full_engagement},
-              {"no_engagement", range.no_engagement}};
-}
-
-MaterialFeedRange feed_range_from(const json& node) {
-  MaterialFeedRange range;
-  read(node, "material", range.material_id);
-  read(node, "full_engagement", range.full_engagement);
-  read(node, "no_engagement", range.no_engagement);
-  return range;
-}
-
 json to_json(const Machine& machine) {
-  json ranges = json::array();
-  for (const auto& range : machine.feed_ranges) ranges.push_back(to_json(range));
   return json{{"id", machine.id},
               {"name", machine.name},
               {"specifications_unverified", machine.specifications_unverified},
@@ -120,7 +132,6 @@ json to_json(const Machine& machine) {
               {"max_rpm", machine.max_rpm},
               {"rpm_resolution", machine.rpm_resolution},
               {"spindle_spinup_seconds", machine.spindle_spinup_seconds},
-              {"feed_ranges", ranges},
               {"tool_change", tool_change_name(machine.tool_change)},
               {"tool_change_x", machine.tool_change_x},
               {"tool_change_y", machine.tool_change_y},
@@ -149,9 +160,6 @@ Machine machine_from(const json& node) {
   read(node, "max_rpm", machine.max_rpm);
   read(node, "rpm_resolution", machine.rpm_resolution);
   read(node, "spindle_spinup_seconds", machine.spindle_spinup_seconds);
-  if (node.contains("feed_ranges") && node.at("feed_ranges").is_array())
-    for (const auto& entry : node.at("feed_ranges"))
-      machine.feed_ranges.push_back(feed_range_from(entry));
   read_enum(node, "tool_change", machine.tool_change, tool_change_from_name);
   read(node, "tool_change_x", machine.tool_change_x);
   read(node, "tool_change_y", machine.tool_change_y);
@@ -198,12 +206,6 @@ json to_json(const Operation& operation) {
     areas.push_back({{"center_x", area.center_x}, {"center_y", area.center_y},
                      {"width", area.width}, {"height", area.height},
                      {"top_z", area.top_z}, {"depth", area.depth}});
-  const double plane_top = operation.plane.areas.empty()
-                               ? operation.plane.top_z
-                               : operation.plane.areas.front().top_z;
-  const double plane_depth = operation.plane.areas.empty()
-                                 ? operation.plane.depth
-                                 : operation.plane.areas.front().depth;
   json exclusions = json::array();
   for (const auto& exclusion : operation.pocket_auto.exclusions)
     exclusions.push_back({{"enabled", exclusion.enabled},
@@ -211,12 +213,17 @@ json to_json(const Operation& operation) {
                           {"center_y", exclusion.center_y},
                           {"width", exclusion.width},
                           {"height", exclusion.height}});
-  return json{{"name", operation.name},
+  json cutting = json::object();
+  if (operation.cutting.spindle_rpm)
+    cutting["spindle_rpm"] = *operation.cutting.spindle_rpm;
+  if (operation.cutting.chip_load)
+    cutting["chip_load"] = *operation.cutting.chip_load;
+  if (operation.cutting.plunge_feed)
+    cutting["plunge_feed"] = *operation.cutting.plunge_feed;
+  json result{{"name", operation.name},
               {"mode", operation_mode_name(operation.mode)},
               {"tool", operation.tool_id},
-              {"machine", operation.machine_id},
-              {"material", operation.material_id},
-              {"simulation_pitch", operation.simulation_pitch},
+              {"cutting", std::move(cutting)},
               {"surface", {{"faces", operation.surface.faces},
                            {"model_fingerprint", operation.surface.model_fingerprint},
                            {"stepover", operation.surface.stepover},
@@ -224,14 +231,13 @@ json to_json(const Operation& operation) {
                            {"allowance", operation.surface.allowance},
                            {"along_v", operation.surface.along_v},
                            {"bidirectional", operation.surface.bidirectional},
-                           {"flip_normals", operation.surface.flip_normals}}},
+                           {"flip_normals", operation.surface.flip_normals},
+                           {"manual_order", operation.surface.manual_order},
+                           {"order_signature", operation.surface.order_signature},
+                           {"order_roots", operation.surface.order_roots}}},
               {"stepover_ratio", operation.stepover_ratio},
               {"stepdown", operation.stepdown},
-              {"spindle_rpm", operation.spindle_rpm},
-              {"plunge_feed", operation.plunge_feed},
               {"coolant", operation.coolant},
-              {"tool_number", operation.tool_number},
-              {"length_offset", operation.length_offset},
               {"pockets", std::move(pockets)},
               {"auto_identify_pockets", operation.auto_identify_pockets},
               {"pocket_radial_margin", operation.pocket_radial_margin},
@@ -240,8 +246,7 @@ json to_json(const Operation& operation) {
                   {"helix_angle_degrees",
                    operation.pocket_auto.helix_angle_degrees},
                   {"exclusions", std::move(exclusions)}}},
-              {"plane", {{"top_z", plane_top},
-                         {"depth", plane_depth}, {"areas", areas}}},
+              {"plane", {{"areas", areas}}},
               {"finishing_subdivisions", operation.finishing_subdivisions},
               {"adaptive_cleanup_stepover", operation.adaptive_cleanup_stepover},
               {"cleanup_stepover_limit", operation.cleanup_stepover_limit},
@@ -253,7 +258,6 @@ json to_json(const Operation& operation) {
               {"lead_in", operation.lead_in},
               {"stock_deviation", operation.stock_deviation},
               {"path_pitch", operation.path_pitch},
-              {"simulation_method", wave::simulation_method_name(operation.simulation_method)},
               {"entry_front_match_tolerance",
                operation.entry_front_match_tolerance},
               {"tiny_split_area_factor", operation.tiny_split_area_factor},
@@ -262,12 +266,9 @@ json to_json(const Operation& operation) {
                contour_direction_name(operation.contour_direction)},
               {"rough_boundary_cleanup", operation.rough_boundary_cleanup},
               {"cleanup_tolerance", operation.cleanup_tolerance},
-              {"manual_feed_range", operation.manual_feed_range},
-              {"full_engagement_feed", operation.full_engagement_feed},
-              {"no_engagement_feed", operation.no_engagement_feed},
-              {"slice_grid", operation.slice_grid},
-              {"simulation_stock_inflation",
-               operation.simulation_stock_inflation}};
+              {"slice_grid", operation.slice_grid}};
+  if(operation.mode==OperationMode::Hole) result["holes"]=hole_parameters_json(operation.holes);
+  return result;
 }
 
 json to_json(const UserSettings& settings) {
@@ -287,21 +288,44 @@ json to_json(const UserSettings& settings) {
               {"custom_themes", std::move(themes)},
               {"panel_layout", {{"left_width", layout.left_width},
                                  {"right_width", layout.right_width},
-                                 {"left_program_fraction",
-                                  layout.left_program_fraction},
-                                 {"right_settings_fraction",
-                                  layout.right_settings_fraction}}},
+                                 {"left_setup_fraction", layout.left_setup_fraction},
+                                 {"messages_height", layout.messages_height}}},
+              {"show_debug", settings.show_debug},
+              {"default_machine", settings.default_machine},
+              {"default_material", settings.default_material},
+              {"recent_jobs", settings.recent_jobs},
               {"operation_defaults", std::move(defaults)}};
 }
 
-Operation operation_from(const json& node) {
+Operation operation_from(const json& node, std::vector<std::string>* warnings = nullptr,
+                         const std::string& where = {}) {
+  report_unknown(node,
+                 {"name", "mode", "tool", "cutting", "surface", "stepover_ratio",
+                  "stepdown", "coolant", "pockets", "holes", "auto_identify_pockets",
+                  "pocket_radial_margin", "pocket_auto", "plane",
+                  "finishing_subdivisions", "adaptive_cleanup_stepover",
+                  "cleanup_stepover_limit", "depth_breaks", "radial_stock_to_leave",
+                  "axial_stock_to_leave", "depth_from", "depth_to", "lead_in",
+                  "stock_deviation", "path_pitch", "entry_front_match_tolerance",
+                  "tiny_split_area_factor", "clip_contours_to_stock",
+                  "contour_direction", "rough_boundary_cleanup", "cleanup_tolerance",
+                  "slice_grid"},
+                 where, warnings);
   Operation operation;
   read(node, "name", operation.name);
   read_enum(node, "mode", operation.mode, operation_mode_from_name);
   read(node, "tool", operation.tool_id);
-  read(node, "machine", operation.machine_id);
-  read(node, "material", operation.material_id);
-  read(node, "simulation_pitch", operation.simulation_pitch);
+  if (node.contains("cutting")) {
+    const auto& cutting = node.at("cutting");
+    if (!cutting.is_object()) throw std::runtime_error("Expected cutting overrides object");
+    const auto optional = [&](const char* key, std::optional<double>& target) {
+      if (cutting.contains(key) && !cutting.at(key).is_null())
+        target = cutting.at(key).get<double>();
+    };
+    optional("spindle_rpm", operation.cutting.spindle_rpm);
+    optional("chip_load", operation.cutting.chip_load);
+    optional("plunge_feed", operation.cutting.plunge_feed);
+  }
   if (node.contains("surface")) {
     const auto& surface = node.at("surface");
     read(surface, "faces", operation.surface.faces);
@@ -312,14 +336,14 @@ Operation operation_from(const json& node) {
     read(surface, "along_v", operation.surface.along_v);
     read(surface, "bidirectional", operation.surface.bidirectional);
     read(surface, "flip_normals", operation.surface.flip_normals);
+    read(surface, "manual_order", operation.surface.manual_order);
+    read(surface, "order_signature", operation.surface.order_signature);
+    read(surface, "order_roots", operation.surface.order_roots);
   }
   read(node, "stepover_ratio", operation.stepover_ratio);
   read(node, "stepdown", operation.stepdown);
-  read(node, "spindle_rpm", operation.spindle_rpm);
-  read(node, "plunge_feed", operation.plunge_feed);
   read(node, "coolant", operation.coolant);
-  read(node, "tool_number", operation.tool_number);
-  read(node, "length_offset", operation.length_offset);
+  if (node.contains("holes")) operation.holes = hole_parameters_from_json(node.at("holes"));
   read(node, "auto_identify_pockets", operation.auto_identify_pockets);
   if (node.contains("pocket_auto")) {
     const auto& automatic = node.at("pocket_auto");
@@ -342,23 +366,15 @@ Operation operation_from(const json& node) {
       operation.pocket_auto.exclusions.clear();
       for (const auto& exclusion : exclusions)
         operation.pocket_auto.exclusions.push_back(read_exclusion(exclusion));
-    } else if (automatic.contains("exclusion")) {
-      // Read the single-area form written by the first auto-pocket version.
-      operation.pocket_auto.exclusions = {
-          read_exclusion(automatic.at("exclusion"))};
     }
   }
   if (node.contains("plane")) {
     const auto& plane = node.at("plane");
-    read(plane, "top_z", operation.plane.top_z);
-    read(plane, "depth", operation.plane.depth);
     if (plane.contains("areas")) {
       if (!plane.at("areas").is_array()) throw std::runtime_error("Expected plane areas array");
       operation.plane.areas.clear();
       for (const auto& entry : plane.at("areas")) {
         ClearingArea area;
-        area.top_z = operation.plane.top_z;
-        area.depth = operation.plane.depth;
         read(entry, "center_x", area.center_x);
         read(entry, "center_y", area.center_y);
         read(entry, "width", area.width);
@@ -367,27 +383,16 @@ Operation operation_from(const json& node) {
         read(entry, "depth", area.depth);
         operation.plane.areas.push_back(area);
       }
-    } else {
-      // Very old files could carry only the operation-wide plane range.
-      // Materialise it on the default area so the planner still sees the same
-      // cutting envelope after the per-area representation is loaded.
-      operation.plane.areas.front().top_z = operation.plane.top_z;
-      operation.plane.areas.front().depth = operation.plane.depth;
     }
   }
   const auto read_pocket = [](const json& pocket) {
     PocketParameters p;
-    bool circle = false;
-    bool rectangle = false;
     if (pocket.contains("shape")) {
       if (!pocket.at("shape").is_string())
         throw std::runtime_error("Pocket shape must be a string");
-      const std::string shape = pocket.at("shape").get<std::string>();
-      const auto parsed = pocket_shape_from_name(shape);
+      const auto parsed = pocket_shape_from_name(pocket.at("shape").get<std::string>());
       if (!parsed) throw std::runtime_error("Unknown pocket shape");
       p.shape = *parsed;
-      circle = shape == "circle";
-      rectangle = shape == "rectangle";
     }
     read(pocket, "center_x", p.center_x);
     read(pocket, "center_y", p.center_y);
@@ -397,10 +402,6 @@ Operation operation_from(const json& node) {
     read(pocket, "depth", p.depth);
     read(pocket, "radius", p.radius);
     read(pocket, "helix_angle_degrees", p.helix_angle_degrees);
-    // Old files represented circles by a radius and squares by a separate
-    // shape. Both are now rounded rectangles.
-    if (circle) p.width = p.height = 2.0 * p.radius;
-    if (rectangle) p.radius = 0.0;
     return p;
   };
   if (node.contains("pockets")) {
@@ -409,8 +410,6 @@ Operation operation_from(const json& node) {
     operation.pockets.clear();
     for (const auto& pocket : pockets)
       operation.pockets.push_back(read_pocket(pocket));
-  } else if (node.contains("pocket")) {
-    operation.pockets = {read_pocket(node.at("pocket"))};
   }
   read(node, "pocket_radial_margin", operation.pocket_radial_margin);
   read(node, "finishing_subdivisions", operation.finishing_subdivisions);
@@ -424,7 +423,6 @@ Operation operation_from(const json& node) {
   read(node, "lead_in", operation.lead_in);
   read(node, "stock_deviation", operation.stock_deviation);
   read(node, "path_pitch", operation.path_pitch);
-  read_enum(node, "simulation_method", operation.simulation_method, simulation_method_from_name);
   read(node, "entry_front_match_tolerance",
        operation.entry_front_match_tolerance);
   read(node, "tiny_split_area_factor", operation.tiny_split_area_factor);
@@ -433,12 +431,7 @@ Operation operation_from(const json& node) {
             contour_direction_from_name);
   read(node, "rough_boundary_cleanup", operation.rough_boundary_cleanup);
   read(node, "cleanup_tolerance", operation.cleanup_tolerance);
-  read(node, "manual_feed_range", operation.manual_feed_range);
-  read(node, "full_engagement_feed", operation.full_engagement_feed);
-  read(node, "no_engagement_feed", operation.no_engagement_feed);
   read(node, "slice_grid", operation.slice_grid);
-  read(node, "simulation_stock_inflation",
-       operation.simulation_stock_inflation);
   return operation;
 }
 
@@ -471,22 +464,15 @@ UserSettings settings_from(const json& node) {
       throw std::runtime_error("Expected panel_layout object");
     read(layout, "left_width", settings.panel_layout.left_width);
     read(layout, "right_width", settings.panel_layout.right_width);
-    read(layout, "left_program_fraction",
-         settings.panel_layout.left_program_fraction);
-    read(layout, "right_settings_fraction",
-         settings.panel_layout.right_settings_fraction);
+    read(layout, "left_setup_fraction", settings.panel_layout.left_setup_fraction);
+    read(layout, "messages_height", settings.panel_layout.messages_height);
   }
-  const PanelLayout& layout = settings.panel_layout;
-  if (!std::isfinite(layout.left_width) || layout.left_width < 260.0 ||
-      layout.left_width > 1200.0 || !std::isfinite(layout.right_width) ||
-      layout.right_width < 280.0 || layout.right_width > 1400.0 ||
-      !std::isfinite(layout.left_program_fraction) ||
-      layout.left_program_fraction < 0.2 ||
-      layout.left_program_fraction > 0.8 ||
-      !std::isfinite(layout.right_settings_fraction) ||
-      layout.right_settings_fraction < 0.2 ||
-      layout.right_settings_fraction > 0.8)
-    throw std::runtime_error("Panel layout values are outside their allowed ranges");
+  if (!valid_panel_layout(settings.panel_layout))
+    settings.panel_layout = default_panel_layout();
+  read(node, "show_debug", settings.show_debug);
+  read(node, "default_machine", settings.default_machine);
+  read(node, "default_material", settings.default_material);
+  read(node, "recent_jobs", settings.recent_jobs);
   if (node.contains("operation_defaults")) {
     const auto& defaults = node.at("operation_defaults");
     if (!defaults.is_object())
@@ -507,7 +493,16 @@ json to_json(const Job& job) {
   for (const auto& operation : job.operations)
     operations.push_back(to_json(operation));
   const BoxStockMargins& margins = job.box_stock_margins;
+  json tools = json::array();
+  for (const auto& entry : job.tools)
+    tools.push_back({{"tool", entry.tool_id},
+                     {"number", entry.number},
+                     {"length_offset", entry.length_offset}});
   return json{{"name", job.name},
+              {"machine", job.machine_id},
+              {"material", job.material_id},
+              {"simulation_pitch", job.simulation_pitch},
+              {"tools", std::move(tools)},
               {"box_stock", job.box_stock},
               {"box_stock_margins", {
                   {"minus_x", margins.minus_x},
@@ -522,15 +517,36 @@ json to_json(const Job& job) {
               {"origin_y", job.origin_y},
               {"origin_z", job.origin_z},
               {"rapid_clearance_height", job.rapid_clearance_height},
+              {"plunge_clearance_height", job.plunge_clearance_height},
               {"work_offset", job.work_offset},
               {"operations", operations}};
 }
 
-Job job_from(const json& node) {
+Job job_from(const json& node, std::vector<std::string>* warnings = nullptr) {
+  report_unknown(node,
+                 {"name", "machine", "material", "simulation_pitch", "tools",
+                  "part_mesh", "stock_mesh", "origin_x", "origin_y", "origin_z",
+                  "box_stock", "box_stock_margins", "rapid_clearance_height",
+                  "plunge_clearance_height",
+                  "work_offset", "operations"},
+                 "Job", warnings);
   Job job;
   std::string part;
   std::string stock;
   read(node, "name", job.name);
+  read(node, "machine", job.machine_id);
+  read(node, "material", job.material_id);
+  read(node, "simulation_pitch", job.simulation_pitch);
+  if (node.contains("tools")) {
+    if (!node.at("tools").is_array()) throw std::runtime_error("Expected a tools array");
+    for (const auto& entry : node.at("tools")) {
+      ToolAssignment assignment;
+      read(entry, "tool", assignment.tool_id);
+      read(entry, "number", assignment.number);
+      read(entry, "length_offset", assignment.length_offset);
+      job.tools.push_back(std::move(assignment));
+    }
+  }
   read(node, "part_mesh", part);
   read(node, "stock_mesh", stock);
   job.part_mesh = part;
@@ -549,19 +565,14 @@ Job job_from(const json& node) {
     read(margins, "plus_y", job.box_stock_margins.plus_y);
     read(margins, "minus_z", job.box_stock_margins.minus_z);
     read(margins, "plus_z", job.box_stock_margins.plus_z);
-  } else if (node.contains("box_stock_margin")) {
-    // Older jobs had one XY margin and no Z margin. Preserve that shape when
-    // loading them, then write the directional form on the next save.
-    read(node, "box_stock_margin", job.box_stock_margin);
-    job.box_stock_margins = {job.box_stock_margin, job.box_stock_margin,
-                             job.box_stock_margin, job.box_stock_margin, 0.0,
-                             0.0};
   }
   read(node, "rapid_clearance_height", job.rapid_clearance_height);
+  read(node, "plunge_clearance_height", job.plunge_clearance_height);
   read(node, "work_offset", job.work_offset);
   if (node.contains("operations") && node.at("operations").is_array())
     for (const auto& entry : node.at("operations"))
-      job.operations.push_back(operation_from(entry));
+      job.operations.push_back(operation_from(
+          entry, warnings, "Operation " + std::to_string(job.operations.size() + 1)));
   return job;
 }
 
@@ -589,6 +600,16 @@ std::filesystem::path config_directory() {
 }
 
 PanelLayout default_panel_layout() { return PanelLayout{}; }
+
+bool valid_panel_layout(const PanelLayout& layout) {
+  const auto within = [](double value, double low, double high) {
+    return std::isfinite(value) && value >= low && value <= high;
+  };
+  return within(layout.left_width, 200.0, 2000.0) &&
+         within(layout.right_width, 220.0, 2000.0) &&
+         within(layout.left_setup_fraction, 0.15, 0.85) &&
+         within(layout.messages_height, 60.0, 2000.0);
+}
 
 const char* ui_theme_name(UiTheme theme) {
   switch (theme) {
@@ -669,16 +690,7 @@ void save_user_settings(const std::filesystem::path& path,
   if (!(settings.ui_scale >= 0.5 && settings.ui_scale <= 3.0) ||
       !std::isfinite(settings.ui_scale))
     throw std::runtime_error("UI scale must be finite and between 0.5 and 3.0");
-  const PanelLayout& layout = settings.panel_layout;
-  if (!std::isfinite(layout.left_width) || layout.left_width < 260.0 ||
-      layout.left_width > 1200.0 || !std::isfinite(layout.right_width) ||
-      layout.right_width < 280.0 || layout.right_width > 1400.0 ||
-      !std::isfinite(layout.left_program_fraction) ||
-      layout.left_program_fraction < 0.2 ||
-      layout.left_program_fraction > 0.8 ||
-      !std::isfinite(layout.right_settings_fraction) ||
-      layout.right_settings_fraction < 0.2 ||
-      layout.right_settings_fraction > 0.8)
+  if (!valid_panel_layout(settings.panel_layout))
     throw std::runtime_error("Panel layout values are outside their allowed ranges");
   write_file(path, to_json(settings).dump(2) + "\n");
 }
@@ -787,6 +799,33 @@ MaterialLibrary load_materials(const std::filesystem::path& directory) {
   return library;
 }
 
+MaterialLibrary load_material_library(const std::filesystem::path& path) {
+  MaterialLibrary library;
+  const json node = parse(read_file(path), path);
+  try {
+    const json& list = node.at("materials");
+    if (!list.is_array()) throw std::runtime_error("Expected a materials array");
+    for (const auto& entry : list) {
+      Material material = material_from(entry);
+      const auto problems = validate(material);
+      if (!problems.empty()) throw std::runtime_error(problems.front());
+      if (library.find(material.id))
+        throw std::runtime_error("Duplicate material ID: " + material.id);
+      library.materials.push_back(std::move(material));
+    }
+  } catch (const std::exception& error) {
+    throw std::runtime_error(path.string() + ": " + error.what());
+  }
+  return library;
+}
+
+void save_material_library(const std::filesystem::path& path,
+                           const MaterialLibrary& library) {
+  json list = json::array();
+  for (const auto& material : library.materials) list.push_back(to_json(material));
+  write_file(path, json{{"materials", list}}.dump(2) + "\n");
+}
+
 void save_machine(const std::filesystem::path& path, const Machine& machine) {
   write_file(path, to_json(machine).dump(2) + "\n");
 }
@@ -794,8 +833,8 @@ void save_material(const std::filesystem::path& path,
                    const Material& material) {
   write_file(path, to_json(material).dump(2) + "\n");
 }
-Job load_job(const std::filesystem::path& path) {
-  return job_from(parse(read_file(path), path));
+Job load_job(const std::filesystem::path& path, std::vector<std::string>* warnings) {
+  return job_from(parse(read_file(path), path), warnings);
 }
 void save_job(const std::filesystem::path& path, const Job& job) {
   write_file(path, to_json(job).dump(2) + "\n");

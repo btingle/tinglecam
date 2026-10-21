@@ -29,12 +29,9 @@ wave::Path64 box(double x0, double y0, double x1, double y1);
 bool inside(const wave::Point64& at, const wave::Paths64& region);
 double area(const wave::Paths64& paths);
 
-struct SyntheticCut {
-  wave::Toolpath toolpath;
-  wave::SimulationResult simulation;
-};
-
-SyntheticCut straight_cut(const std::vector<double>& loads);
+cam::CuttingFeeds test_feeds();
+// A cut along X in `pieces` one-millimetre pieces.
+wave::Toolpath straight_cut(std::size_t pieces);
 wave::FrontLineage single_front_lineage(const wave::Path64& front,
                                         const wave::Path64& band);
 wave::FrontLineage railed_node(double band_inset);

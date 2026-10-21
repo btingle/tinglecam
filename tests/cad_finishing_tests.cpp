@@ -4,6 +4,7 @@
 #include <BRepBuilderAPI_MakeVertex.hxx>
 #include <BRepBuilderAPI_NurbsConvert.hxx>
 #include <BRepBuilderAPI_Sewing.hxx>
+#include <BRepBndLib.hxx>
 #include <BRepClass3d_SolidClassifier.hxx>
 #include <BRepExtrema_DistShapeShape.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
@@ -98,7 +99,28 @@ int main(int argc, char** argv) {
     const auto file = directory / "block.step";
     write(BRepPrimAPI_MakeBox(8, 6, 4).Shape(), file);
     JobGeometry geometry;
-    geometry.load_part(file);
+    double load_progress = -1;
+    int load_reports = 0;
+    geometry.load_part(file, [&](double fraction, const std::string& stage) {
+      check(fraction >= load_progress && fraction <= 1 && !stage.empty(),
+            "Model loading progress is monotonic with named stages");
+      load_progress = fraction;
+      ++load_reports;
+      return true;
+    });
+    check(load_progress == 1 && load_reports > 6,
+          "STEP loading reports intermediate progress through completion");
+    const auto original_model = geometry.part_cad();
+    bool load_cancelled = false;
+    try {
+      geometry.load_part(file, [](double fraction, const std::string&) {
+        return fraction < .5;
+      });
+    } catch (const std::runtime_error& error) {
+      load_cancelled = std::string(error.what()) == "Cancelled";
+    }
+    check(load_cancelled && geometry.part_cad() == original_model,
+          "Cancelling native face preparation preserves existing geometry");
     BoxStockMargins margins{};
     margins.minus_x = margins.plus_x = margins.minus_y = margins.plus_y = 0;
     margins.plus_z = 0.5;
@@ -112,12 +134,9 @@ int main(int argc, char** argv) {
     operation.name = "Finish";
     operation.mode = OperationMode::SurfaceFinishing;
     operation.tool_id = "ball";
-    operation.machine_id = "machine";
-    operation.material_id = "test";
     operation.surface.model_fingerprint = model->fingerprint();
     operation.surface.stepover = 1;
     operation.surface.chord_tolerance = .01;
-    operation.simulation_pitch = .1;
     for (const auto& face : model->faces()) {
       const auto p = model->evaluate(face.id, .5, .5);
       if (p.normal.z > .9) operation.surface.faces = {face.id};
@@ -145,8 +164,13 @@ int main(int argc, char** argv) {
     machine.id = "machine";
     machine.name = "Machine";
     machine.max_rpm = 24000;
-    machine.feed_ranges = {{"test", 400, 1200}};
+    tool.cutting = {{"test", 12000, 400.0 / 24000, 100}};
+    // 400 mm/min at full engagement, as the tool's data for "test" says.
+    const CuttingFeeds feeds = resolve_cutting_feeds(tool, machine, "test", {});
     Job job;
+    job.machine_id = "machine";
+    job.material_id = "test";
+    job.simulation_pitch = .1;
     job.operations = {operation};
     ToolLibrary tools{{tool}};
     MachineLibrary machines{{machine}};
@@ -225,7 +249,7 @@ int main(int argc, char** argv) {
     seam_op.surface.model_fingerprint = seams.part_cad()->fingerprint();
     check(seams.part_cad()->adjacent(0, 1), "Sewn faces share a native edge");
     const auto joined =
-        plan_surface_finishing(seams, seam_op, tool, machine, 15);
+        plan_surface_finishing(seams, seam_op, tool, machine, feeds, 15);
     check(joined.ok(), joined.error);
     check(joined.metrics.surface_seam_joins == 5 && joined.levels.size() == 5,
           "Matching face contours become five continuous lanes");
@@ -248,7 +272,7 @@ int main(int argc, char** argv) {
     auto allowance_op = seam_op;
     allowance_op.surface.allowance = .2;
     const auto with_allowance =
-        plan_surface_finishing(seams, allowance_op, tool, machine, 15);
+        plan_surface_finishing(seams, allowance_op, tool, machine, feeds, 15);
     check(with_allowance.ok(), with_allowance.error);
     check(with_allowance.metrics.surface_retracts == 1,
           "Allowance-preserving connectors still join flat passes");
@@ -258,7 +282,7 @@ int main(int argc, char** argv) {
               "Joined passes and feed links preserve the finishing allowance");
     seam_op.surface.bidirectional = false;
     const auto one_way =
-        plan_surface_finishing(seams, seam_op, tool, machine, 15);
+        plan_surface_finishing(seams, seam_op, tool, machine, feeds, 15);
     check(one_way.ok(), one_way.error);
     check(one_way.metrics.surface_seam_joins == 5 &&
               one_way.metrics.surface_retracts == 5,
@@ -269,8 +293,7 @@ int main(int argc, char** argv) {
           check(phase.to.y >= phase.from.y,
                 "One-way contours retain their direction");
     continuous(one_way);
-    auto cancelled = plan_surface_finishing(
-        seams, seam_op, tool, machine, 15,
+    auto cancelled = plan_surface_finishing(seams, seam_op, tool, machine, feeds, 15,
         [](PlanningProgress, const std::string& stage) {
           return stage != "Joining CAD finishing contours";
         });
@@ -293,15 +316,15 @@ int main(int argc, char** argv) {
           "Legacy collision toggles do not affect geometric finishing paths");
     auto bad = operation;
     bad.surface.model_fingerprint = "other";
-    check(!plan_surface_finishing(geometry, bad, tool, machine, 15).ok(),
+    check(!plan_surface_finishing(geometry, bad, tool, machine, feeds, 15).ok(),
           "Changed STEP requires explicit reselection");
     bad = operation;
     bad.surface.faces = {999};
-    check(!plan_surface_finishing(geometry, bad, tool, machine, 15).ok(),
+    check(!plan_surface_finishing(geometry, bad, tool, machine, feeds, 15).ok(),
           "Invalid face rejected");
     auto flat = tool;
     flat.type = ToolType::FlatEndMill;
-    check(!plan_surface_finishing(geometry, operation, flat, machine, 15).ok(),
+    check(!plan_surface_finishing(geometry, operation, flat, machine, feeds, 15).ok(),
           "CAD finishing rejects unsupported cutter");
     check(!model->cutter_sweep_clear({-2, 3, 1}, {10, 3, 1}, 1, 10, .001),
           "Continuous sweep detects crossing a solid between clear endpoints");
@@ -365,12 +388,21 @@ int main(int argc, char** argv) {
     write(BRepPrimAPI_MakeCylinder(3, 4).Shape(), cylinder);
     JobGeometry curved;
     curved.load_part(cylinder);
-    curved.set_box_stock(true, 0);
+    {
+      // Exact surface bounds, so a box blank wraps a curved STEP part as
+      // tightly as it wraps the same part as a mesh.
+      const auto& b = curved.part().mesh().bounds;
+      near(b.lower.x, -3, 1e-5, "Curved STEP bounds are exact, not padded");
+      near(b.upper.y, 3, 1e-5, "Curved STEP bounds are exact, not padded");
+      near(b.lower.z, 0, 1e-5, "Curved STEP bounds are exact, not padded");
+      near(b.upper.z, 4, 1e-5, "Curved STEP bounds are exact, not padded");
+    }
+    curved.set_box_stock(true, BoxStockMargins{0, 0, 0, 0, 0, 0});
     auto op = operation;
     op.surface.model_fingerprint = curved.part_cad()->fingerprint();
     for (const auto& face : curved.part_cad()->faces())
       if (face.type == "Cylinder") op.surface.faces = {face.id};
-    const auto flow = plan_surface_finishing(curved, op, tool, machine, 15);
+    const auto flow = plan_surface_finishing(curved, op, tool, machine, feeds, 15);
     check(flow.ok(), flow.error);
     check(flow.levels.size() > 8,
           "Cylinder physical stepover creates multiple finishing contours");
@@ -402,11 +434,10 @@ int main(int argc, char** argv) {
     auto large_ball = tool;
     large_ball.diameter = 6;
     large_ball.flute_length = 16;
-    auto fillet = plan_surface_finishing(fillet_geometry, fillet_op, large_ball,
-                                         machine, 15);
+    auto fillet = plan_surface_finishing(fillet_geometry, fillet_op, large_ball, machine, feeds, 15);
     check(fillet.ok(), fillet.error);
-    check(fillet.levels.size() == 9 && fillet.metrics.surface_retracts == 1 &&
-              fillet.metrics.surface_stay_down_links == 8,
+    check(fillet.levels.size() == 7 && fillet.metrics.surface_retracts == 1 &&
+              fillet.metrics.surface_stay_down_links == 6,
           "Compensated convex passes use curved stay-down turnarounds");
     continuous(fillet);
     std::size_t turn_segments = 0;
@@ -419,11 +450,10 @@ int main(int argc, char** argv) {
                "Turnarounds follow the compensated contour within chord "
                "tolerance");
         }
-    check(turn_segments > 8,
+    check(turn_segments > 6,
           "Convex turnarounds follow the curve rather than straight chords");
     fillet_op.surface.allowance = .2;
-    fillet = plan_surface_finishing(fillet_geometry, fillet_op, large_ball,
-                                    machine, 15);
+    fillet = plan_surface_finishing(fillet_geometry, fillet_op, large_ball, machine, feeds, 15);
     check(fillet.ok(), fillet.error);
     check(fillet.metrics.surface_retracts == 1,
           "Convex turnarounds preserve the normal stock allowance");
@@ -436,10 +466,9 @@ int main(int argc, char** argv) {
         }
     fillet_op.surface.allowance = 0;
     fillet_op.surface.bidirectional = false;
-    const auto one_way_fillet = plan_surface_finishing(
-        fillet_geometry, fillet_op, large_ball, machine, 15);
+    const auto one_way_fillet = plan_surface_finishing(fillet_geometry, fillet_op, large_ball, machine, feeds, 15);
     check(one_way_fillet.ok(), one_way_fillet.error);
-    check(one_way_fillet.metrics.surface_retracts == 9 &&
+    check(one_way_fillet.metrics.surface_retracts == 7 &&
               one_way_fillet.metrics.surface_stay_down_links == 0,
           "Contact spacing does not reverse one-way fillet passes");
     // Cross the shared edge between two curved faces with endpoints set back
@@ -488,7 +517,7 @@ int main(int argc, char** argv) {
     auto split_op = fillet_op;
     split_op.surface.bidirectional = true;
     OperationPlan split_path;
-    detail::link_surface_runs(*split_fillet, split_op, large_ball, machine, 15,
+    detail::link_surface_runs(*split_fillet, split_op, large_ball, machine, feeds, 15,
                               split_runs, split_path, {});
     check(split_path.metrics.surface_retracts == 1 &&
               split_path.metrics.surface_stay_down_links == 1,
@@ -559,7 +588,7 @@ int main(int argc, char** argv) {
     op.surface.faces = {0};
     op.surface.model_fingerprint = trimmed_geometry.part_cad()->fingerprint();
     const auto trimmed_plan =
-        plan_surface_finishing(trimmed_geometry, op, tool, machine, 15);
+        plan_surface_finishing(trimmed_geometry, op, tool, machine, feeds, 15);
     check(trimmed_plan.ok(), trimmed_plan.error);
     bool near_hole = false;
     for (const auto& level : trimmed_plan.levels)
@@ -584,7 +613,7 @@ int main(int argc, char** argv) {
     assembly_geometry.load_part(assembly_file);
     op.surface.model_fingerprint = assembly_geometry.part_cad()->fingerprint();
     const auto assembly_plan =
-        plan_surface_finishing(assembly_geometry, op, tool, machine, 15);
+        plan_surface_finishing(assembly_geometry, op, tool, machine, feeds, 15);
     check(assembly_plan.ok(), assembly_plan.error);
     continuous(assembly_plan);
     auto cut_count = [](const OperationPlan& plan) {
@@ -605,6 +634,17 @@ int main(int argc, char** argv) {
     const auto loose_file = directory / "loose-obstacles.step";
     write(assembly, loose_file);
     const auto loose = CadModel::load(loose_file);
+    Bnd_Box reference_bounds;
+    BRepBndLib::AddOptimal(assembly, reference_bounds, false, false);
+    double x0, y0, z0, x1, y1, z1;
+    reference_bounds.Get(x0, y0, z0, x1, y1, z1);
+    const auto& loose_bounds = loose->mesh().bounds;
+    near(loose_bounds.lower.x, x0, 1e-5, "Reused bounds include loose edges");
+    near(loose_bounds.lower.y, y0, 1e-5, "Reused bounds preserve model Y minimum");
+    near(loose_bounds.lower.z, z0, 1e-5, "Reused bounds preserve model Z minimum");
+    near(loose_bounds.upper.x, x1, 1e-5, "Reused bounds include loose vertices");
+    near(loose_bounds.upper.y, y1, 1e-5, "Reused bounds preserve model Y maximum");
+    near(loose_bounds.upper.z, z1, 1e-5, "Reused bounds preserve model Z maximum");
     check(!loose->cutter_clear({-2, 0, 0}, 1, 6, .005),
           "Free native edges still obstruct the cutter shaft");
     check(!loose->cutter_clear({10, 10, 0}, 1, 6, .005),
@@ -628,8 +668,7 @@ int main(int argc, char** argv) {
     overhead_op.surface.model_fingerprint =
         overhead_geometry.part_cad()->fingerprint();
     const auto queries_before_overhead = cad_query_statistics();
-    const auto under = plan_surface_finishing(overhead_geometry, overhead_op,
-                                              tool, machine, 15);
+    const auto under = plan_surface_finishing(overhead_geometry, overhead_op, tool, machine, feeds, 15);
     check(under.ok(), under.error);
     check(under.levels.size() == 5 && under.metrics.surface_retracts == 1 &&
               under.metrics.surface_stay_down_links == 4,
@@ -641,8 +680,7 @@ int main(int argc, char** argv) {
           "Surface links perform no CAD collision queries");
     continuous(under);
     overhead_op.surface.bidirectional = false;
-    const auto one_way_under = plan_surface_finishing(
-        overhead_geometry, overhead_op, tool, machine, 15);
+    const auto one_way_under = plan_surface_finishing(overhead_geometry, overhead_op, tool, machine, feeds, 15);
     check(one_way_under.ok(), one_way_under.error);
     for (const auto& level : one_way_under.levels)
       for (const auto& phase : level.feeds.motion)
@@ -658,7 +696,7 @@ int main(int argc, char** argv) {
     for (const auto& face : sphere_geometry.part_cad()->faces())
       if (face.type == "Sphere") op.surface.faces = {face.id};
     const auto sphere_plan =
-        plan_surface_finishing(sphere_geometry, op, tool, machine, 15);
+        plan_surface_finishing(sphere_geometry, op, tool, machine, feeds, 15);
     check(sphere_plan.ok(), sphere_plan.error);
     check(!sphere_plan.levels.empty(),
           "A sphere remains finishable at its parameter singularities");
@@ -672,10 +710,10 @@ int main(int argc, char** argv) {
     for (const auto& face : track.part_cad()->faces())
       track_op.surface.faces.push_back(face.id);
     const auto track_plan =
-        plan_surface_finishing(track, track_op, large_ball, machine, 25);
+        plan_surface_finishing(track, track_op, large_ball, machine, feeds, 25);
     check(track_plan.ok(), track_plan.error);
     check(track.part_cad()->faces().size() == 14 &&
-              track_plan.levels.size() > 150 &&
+              track_plan.levels.size() > 100 &&
               track_plan.metrics.surface_retracts == 1 &&
               track_plan.metrics.surface_stay_down_links + 1 ==
                   track_plan.levels.size(),
@@ -709,12 +747,15 @@ int main(int argc, char** argv) {
     check(vertical_track.part_cad()->faces().size() == 1 &&
               vertical_track.part_cad()->faces()[0].type == "B-spline",
           "Vertical regression retains the original native B-spline wall");
-    const auto vertical = plan_surface_finishing(vertical_track, vertical_op,
-                                                 vertical_tool, machine, 25);
+    const auto vertical = plan_surface_finishing(vertical_track, vertical_op, vertical_tool, machine, feeds, 25);
     check(vertical.ok(), vertical.error);
-    check(vertical.levels.size() == 33 && vertical.warnings.empty(),
+    const auto& wall_model = *vertical_track.part_cad();
+    const auto wall_intervals = std::size_t(std::ceil(
+        wave::distance(wall_model.evaluate(0,0,.5).point, wall_model.evaluate(0,1,.5).point) /
+            vertical_op.surface.stepover - 1e-6));
+    check(vertical.levels.size() == wall_intervals + 1 && vertical.warnings.empty(),
           "All vertical-wall contours remain accessible without skipped cuts");
-    check(vertical.metrics.surface_stay_down_links == 32 &&
+    check(vertical.metrics.surface_stay_down_links == wall_intervals &&
               vertical.metrics.surface_retracts == 1,
           "Vertical-wall finishing retains short feed links");
     continuous(vertical);

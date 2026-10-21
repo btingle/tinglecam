@@ -1,6 +1,7 @@
-#include "cam/stock.h"
 #include "cam/parametric.h"
 #include "cam/auto_pockets.h"
+#include "cam/holes.h"
+#include "job_internal.h"
 
 #include <clipper2/clipper.h>
 
@@ -74,6 +75,7 @@ struct PathBuilder {
   LevelPlan& level;
   const Operation& operation;
   const Machine& machine;
+  const CuttingFeeds& feeds;
   Point64 position;
   double z;
   double distance = 0;
@@ -91,7 +93,7 @@ struct PathBuilder {
     phase.length = std::hypot(xy, to_z-z);
     phase.kind = kind; phase.rapid = rapid;
     phase.rate = rapid ? (to_z != z ? rapid_feed_z(machine) : rapid_feed(machine))
-                       : operation.plunge_feed;
+                       : feeds.plunge_feed;
     if (phase.length > 0 || level.feeds.motion.empty())
       level.feeds.motion.push_back(phase);
     if (xy > 0) {
@@ -163,7 +165,7 @@ struct PathBuilder {
     phase.path_distance_end = distance + planar;
     phase.length = std::hypot(2 * pi * radius, to_z - z);
     phase.kind = kind;
-    phase.rate = operation.plunge_feed;
+    phase.rate = feeds.plunge_feed;
     phase.arc = true;
     phase.arc_center = center;
     level.feeds.motion.push_back(phase);
@@ -180,45 +182,17 @@ struct PathBuilder {
   }
 };
 
-void finish_level(LevelPlan& level, const Operation& operation, const Tool& tool,
-                  const Machine& machine, double slow, double fast,
-                  double rapid_plane) {
-  // The protected frame describes everything outside the requested opening.
-  // It also supplies the nonempty final subject required by the 2D simulator.
-  const auto protected_frame = Difference(InflatePaths(level.stock_slice,
-      wave::to_integer(tool.diameter), JoinType::Round, EndType::Polygon),
-      level.stock_slice, FillRule::NonZero);
+// Provisional rates and totals; the stock simulation measures engagement and
+// assigns the final feeds.
+void finish_level(LevelPlan& level, const CuttingFeeds& feeds, double radius) {
   level.part_slice = level.stock_slice;
-  level.simulation = wave::simulate_material(level.incoming_stock, protected_frame,
-                                             level.toolpath, tool.diameter/2,0,wave::SimulationMethod::Heightmap,{},false);
-  // The 2D simulator cannot evaluate changing Z. The explicit entry is already
-  // resolved here; material at the floor is subtracted by its final flat turn.
-  level.simulation.stats.unresolved_entries = 0;
-  level.simulation.stats.unsafe_plunges = 0;
-  for (auto& move : level.simulation.moves) {
-    move.entry_unresolved = false;
-    move.plunge_collision.clear();
-    move.plunge_collision_area = 0;
-  }
-  level.toolpath.cleared = level.simulation.removed_material;
-  auto motion = std::move(level.feeds.motion);
-  level.feeds = plan_feeds(level.toolpath, level.simulation, machine, slow, fast,
-                           operation.spindle_rpm, operation.plunge_feed,
-                           level.floor_z, rapid_plane);
-  level.feeds.motion = std::move(motion);
-  level.feeds.stats = {};
-  level.feeds.stats.spindle_rpm = commandable_rpm(machine, operation.spindle_rpm);
-  std::size_t segment = 0;
+  level.swept = detail::swept_footprint(level, radius);
+  auto& stats = level.feeds.stats;
+  stats = {};
+  stats.spindle_rpm = feeds.spindle_rpm;
   for (auto& phase : level.feeds.motion) {
-    if (!phase.rapid && phase.kind != wave::MoveKind::Entry) {
-      const double middle = (phase.path_distance_begin + phase.path_distance_end)/2;
-      while (segment + 1 < level.feeds.segments.size() &&
-             level.feeds.segments[segment].start_distance +
-                 level.feeds.segments[segment].length < middle - 1e-8) ++segment;
-      phase.rate = segment < level.feeds.segments.size()
-                       ? level.feeds.segments[segment].rate : slow;
-    }
-    auto& stats = level.feeds.stats;
+    if (!phase.rapid && phase.kind != wave::MoveKind::Entry)
+      phase.rate = feeds.full_feed();
     if (phase.rapid) {
       stats.rapid_distance += phase.length;
       stats.rapid_minutes += phase.length/phase.rate;
@@ -230,12 +204,11 @@ void finish_level(LevelPlan& level, const Operation& operation, const Tool& tool
       stats.maximum_feed = std::max(stats.maximum_feed, phase.rate);
     }
   }
-  level.feeds.stats.maximum_engagement = level.simulation.stats.maximum_load;
 }
 }  // namespace
 
 bool is_parametric(OperationMode mode) {
-  return mode == OperationMode::Pocket || mode == OperationMode::PlaneClearing;
+  return mode == OperationMode::Pocket || mode == OperationMode::PlaneClearing || mode == OperationMode::Hole;
 }
 const char* pocket_shape_name(PocketShape shape) {
   switch (shape) {
@@ -244,11 +217,7 @@ const char* pocket_shape_name(PocketShape shape) {
   return "unknown";
 }
 std::optional<PocketShape> pocket_shape_from_name(const std::string& name) {
-  // The old names remain readable so existing job files still load. They are
-  // normalized to the one shape now exposed by the UI.
-  if (name == "circle" || name == "rectangle" ||
-      name == "rounded_rectangle")
-    return PocketShape::RoundedRectangle;
+  if (name == "rounded_rectangle") return PocketShape::RoundedRectangle;
   return std::nullopt;
 }
 
@@ -287,13 +256,16 @@ wave::Paths64 pocket_margin_boundary(const wave::Paths64& boundary,
 
 OperationPlan plan_parametric_operation(
     const Operation& operation, const Tool& tool, const Machine& machine,
-    double rapid_plane, const PriorOperations& prior_operations,
+    const CuttingFeeds& feeds, double rapid_plane,
+    const PriorOperations& prior_operations,
     const ProgressCallback& progress, double progress_from, double progress_to,
     const JobGeometry* geometry) {
+  if(operation.mode==OperationMode::Hole)
+    return plan_hole_operation(operation,tool,machine,feeds,rapid_plane,prior_operations,
+                               progress,progress_from,progress_to,geometry);
   const auto started = std::chrono::steady_clock::now();
   OperationPlan result;
   result.operation_name = operation.name; result.tool_id = tool.id;
-  result.machine_id = machine.id; result.material_id = operation.material_id;
   try {
     require(is_parametric(operation.mode), "Expected pocket or plane clearing operation");
     const auto problems = validate(tool);
@@ -302,19 +274,8 @@ OperationPlan plan_parametric_operation(
             "Pocket and plane clearing require a flat end mill for a flat floor");
     require(positive(operation.stepdown) && positive(operation.stepover_ratio) &&
                 operation.stepover_ratio <= 1, "Stepdown must be positive; stepover must be in (0, 1]");
-    require(positive(operation.spindle_rpm) && positive(operation.plunge_feed),
-            "Spindle speed and plunge feed must be positive and finite");
     require(positive(operation.path_pitch) && operation.path_pitch >= 0.001,
             "Path pitch must be finite and at least 0.001 mm");
-    require(operation.tool_number >= 0 && operation.length_offset >= 0,
-            "Tool number and length offset cannot be negative");
-    const auto* feed_range = machine.feeds_for(operation.material_id);
-    require(operation.manual_feed_range || feed_range,
-            "Select a machine/material feed range or enter operation feeds manually");
-    const double slow = operation.manual_feed_range ? operation.full_engagement_feed : feed_range->full_engagement;
-    const double fast = operation.manual_feed_range ? operation.no_engagement_feed : feed_range->no_engagement;
-    require(positive(slow) && positive(fast) && fast >= slow,
-            "Feed range must be positive, with maximum feed at least the full-engagement feed");
     const bool pocket = operation.mode == OperationMode::Pocket;
     const double radius = tool.diameter/2;
     // Pocket walls only. Plane clearing faces a surface; there is no wall for
@@ -447,7 +408,6 @@ OperationPlan plan_parametric_operation(
     double highest_top = 0.0;
     bool first_region = true;
     std::size_t total_levels = 0;
-    std::vector<double> boundaries;
     for (Region& region : regions) {
       require(std::isfinite(region.top) && region.top > -1e7,
               "Top Z must be finite and within the geometry range");
@@ -461,9 +421,6 @@ OperationPlan plan_parametric_operation(
       require(region.layers > 0 && total_levels + static_cast<std::size_t>(region.layers) <= 20000,
               "Too many area/depth passes; increase stepdown");
       total_levels += static_cast<std::size_t>(region.layers);
-      for (int layer = 0; layer <= region.layers; ++layer)
-        boundaries.push_back(region.top -
-                             std::min(region.depth, layer * operation.stepdown));
     }
     struct Task {
       std::size_t region_index;
@@ -494,12 +451,7 @@ OperationPlan plan_parametric_operation(
     require(tasks.size() == total_levels, "Internal parametric level count mismatch");
     require(std::isfinite(rapid_plane) && rapid_plane > highest_top,
             "Rapid clearance must be above every parametric top surface");
-    result.composed_stock = geometry && geometry->has_stock();
-    auto incoming_stack = result.composed_stock
-        ? active_stock(*geometry, prior_operations, operation.slice_grid, boundaries)
-        : std::vector<StockSlab>{};
-    result.preview_context = incoming_stack;
-    std::vector<StockSlab> preview_areas;
+    const bool modelled_stock = geometry && geometry->has_stock();
     std::optional<Point64> previous;
     std::optional<double> previous_z;
     std::optional<std::size_t> previous_region;
@@ -540,25 +492,17 @@ OperationPlan plan_parametric_operation(
           tasks[task_index + 1].layer == layer + 1;
       level.stay_down_preferred = next_is_same_pocket_layer;
       level.stock_slice = region.boundary;
-      if (result.composed_stock) {
-        level.local_stock = stock_inside(incoming_stack, region.boundary, floor, upper);
-        // Partition the initial blank once. Earlier areas own overlaps; each
-        // disjoint pocket keeps separate geometry so its live cut does not
-        // force retriangulation of every other pocket at the same height.
-        auto initial = stock_inside(result.preview_context, region.boundary, floor, upper);
-        preview_areas.insert(preview_areas.end(), initial.begin(), initial.end());
-        result.preview_context = stock_outside(result.preview_context,
-                                               region.boundary, floor, upper);
-        // Local stock measures this cut's engagement and volume. Preview uses
-        // the complete initial stack and applies cuts in execution order.
-        for (const auto& slab : level.local_stock)
-          level.incoming_stock.insert(level.incoming_stock.end(), slab.region->begin(), slab.region->end());
-        level.incoming_stock = Union(level.incoming_stock, FillRule::NonZero);
-      } else {
-        const double sample_z = (upper+floor)/2;
-        level.incoming_stock = stock_after_operations_at_z(region.boundary, sample_z, prior_operations);
-        level.incoming_stock = stock_after_planned_operation_at_z(level.incoming_stock, sample_z, result);
-      }
+      // What earlier operations and earlier areas of this one left. Without a
+      // modelled blank the area itself is the material to remove.
+      const double sample_z = (upper+floor)/2;
+      level.incoming_stock = stock_after_operations_at_z(
+          modelled_stock ? Intersect(region.boundary,
+                                     geometry->stock_outline(sample_z, operation.slice_grid),
+                                     FillRule::NonZero)
+                         : region.boundary,
+          sample_z, prior_operations);
+      level.incoming_stock =
+          detail::stock_after_operation_at_z(level.incoming_stock, sample_z, result);
       if (level.incoming_stock.empty()) {
         level.nothing_to_cut = true;
         ++result.stats.levels;
@@ -577,7 +521,7 @@ OperationPlan plan_parametric_operation(
           previous && previous_z && previous_region && previous_layer &&
           *previous_region == region_index && *previous_layer + 1 == layer &&
           *previous_z != rapid_plane;
-      PathBuilder path{level, operation, machine, previous.value_or(entry),
+      PathBuilder path{level, operation, machine, feeds, previous.value_or(entry),
                        previous_z.value_or(rapid_plane)};
       if (!continuing_pocket && path.z != rapid_plane) {
         path.line(path.position, rapid_plane, wave::MoveKind::Retract, true);
@@ -652,7 +596,7 @@ OperationPlan plan_parametric_operation(
       previous_z = level.stays_down_after ? floor : rapid_plane;
       previous_region = region_index;
       previous_layer = layer;
-      finish_level(level, operation, tool, machine, slow, fast, rapid_plane);
+      finish_level(level, feeds, radius);
       level.feeds.ends_at_depth = level.stays_down_after;
       const auto& stats = level.feeds.stats;
       ++result.stats.levels; ++result.stats.cut_levels;
@@ -660,28 +604,174 @@ OperationPlan plan_parametric_operation(
       result.stats.rapid_distance += stats.rapid_distance;
       result.stats.cutting_minutes += stats.cutting_minutes;
       result.stats.rapid_minutes += stats.rapid_minutes;
-      if (result.composed_stock) {
-        for (const auto& slab : level.local_stock) {
-          const auto removed = Intersect(*slab.region, level.simulation.removed_material, FillRule::NonZero);
-          result.stats.removed_volume += std::abs(Area(removed)) /
-              (double(wave::to_integer(1))*wave::to_integer(1)) * (slab.top-slab.bottom);
-        }
-        incoming_stack = stock_outside(incoming_stack, level.simulation.removed_material, floor, upper);
-      } else result.stats.removed_volume += level.simulation.stats.removed_area*level.axial_depth;
-      result.stats.maximum_load = std::max(result.stats.maximum_load, level.simulation.stats.maximum_load);
-      result.stats.excess_area += level.simulation.stats.excess_area;
       result.metrics.toolpath_moves += level.toolpath.moves.size();
-      result.metrics.simulation_intervals += level.simulation.stats.cutting_steps;
       result.levels.push_back(std::move(level));
       ++completed_levels;
     }
-    result.preview_context.insert(result.preview_context.end(),
-                                   preview_areas.begin(), preview_areas.end());
-    result.spindle_rpm = commandable_rpm(machine, operation.spindle_rpm);
+    result.spindle_rpm = feeds.spindle_rpm;
   } catch (const std::exception& error) {
     result.error = error.what();
   }
   result.metrics.total_milliseconds = std::chrono::duration<double,std::milli>(
+      std::chrono::steady_clock::now()-started).count();
+  return result;
+}
+
+OperationPlan plan_hole_operation(const Operation& operation,const Tool& tool,
+    const Machine& machine,const CuttingFeeds& feeds,double rapid_plane,
+    const PriorOperations& prior,const ProgressCallback& progress,double from,double to,
+    const JobGeometry* geometry,const ToolLibrary* tools,const std::string& material_id) {
+  OperationPlan result;result.operation_name=operation.name;result.tool_id=tool.id;
+  const auto started=std::chrono::steady_clock::now();
+  try {
+    const auto& p=operation.holes;
+    if(p.automatic) {
+      require(geometry && geometry->has_part(),"Load a part to use identified holes");
+      require(!p.detection_signature.empty() &&
+          p.detection_signature==hole_detection_signature(*geometry,p),
+          "Identify holes again: the source geometry or inspection settings changed");
+    }
+    require(positive(operation.stepdown),"Hole stepdown must be positive");
+    require(positive(operation.path_pitch) && operation.path_pitch>=.001,"Path pitch must be at least 0.001 mm");
+    require(positive(p.helix_angle_degrees) && p.helix_angle_degrees<=10,"Helix angle must be in (0, 10] degrees");
+    require(std::isfinite(p.adaptive_radius) && p.adaptive_radius>0,"Adaptive cutoff radius must be positive");
+    require(std::isfinite(p.radial_margin),"Hole radial margin must be finite");
+    require(std::isfinite(p.drilling.peck_depth) && p.drilling.peck_depth>=0 &&
+        std::isfinite(p.drilling.peck_clearance) && p.drilling.peck_clearance>=0 &&
+        std::isfinite(p.drilling.breakthrough) && p.drilling.breakthrough>=0 &&
+        std::isfinite(p.drilling.depth_adjustment),
+        "Drilling depths and clearances must be finite and nonnegative");
+    std::optional<Point64> previous;double previous_z=rapid_plane;
+    for(auto op=prior.rbegin();op!=prior.rend() && !previous;++op)
+      if(*op && (*op)->ok()) for(auto l=(*op)->levels.rbegin();l!=(*op)->levels.rend();++l)
+        if(!l->feeds.motion.empty()) {previous=l->feeds.motion.back().to;previous_z=l->feeds.motion.back().to_z;break;}
+    struct Task {
+      const HoleSystem* system;
+      const HoleLevel* level;
+      std::size_t previous;
+      bool complete=false;
+    };
+    std::vector<Task> tasks;
+    const auto none=std::numeric_limits<std::size_t>::max();
+    for(const auto& h:p.systems) if(h.selected) {
+      auto predecessor=none;
+      for(const auto& l:h.levels) if(l.selected) {
+        tasks.push_back({&h,&l,predecessor});predecessor=tasks.size()-1;
+      }
+    }
+    const auto selected=tasks.size();std::size_t done=0;
+    require(selected>0,"Select at least one hole level to cut");
+    require(selected<=20000,"Too many selected hole levels");
+    std::string current_tool=tool.id;
+    while(done<selected) {
+      std::size_t next=none;
+      // Prefer ready levels using the same tool. Each system's shallow levels
+      // remain predecessors of its deeper levels; across systems this batches
+      // drilling/milling instead of changing tools once per hole.
+      for(int pass=0;pass<2 && next==none;++pass)
+        for(std::size_t i=0;i<tasks.size();++i) {
+          const auto& task=tasks[i];
+          if(task.complete || (task.previous!=none && !tasks[task.previous].complete)) continue;
+          const auto& id=task.level->tool_id.empty()?tool.id:task.level->tool_id;
+          if(pass==0 && id!=current_tool) continue;
+          next=i;break;
+        }
+      require(next!=none,"Hole level ordering contains a dependency cycle");
+      auto& task=tasks[next];const auto& h=*task.system;const auto& l=*task.level;
+      const auto center=point(h.center_x,h.center_y);
+      if(progress && !progress(from+(to-from)*double(done)/selected,"Planning hole/counterbore levels"))
+        throw std::runtime_error("Cancelled");
+      ++done;
+      require(positive(l.radius) && std::isfinite(l.top_z) && std::isfinite(l.bottom_z) && l.top_z>l.bottom_z,
+              "Hole levels need a positive radius and top Z above bottom Z");
+      require(rapid_plane>l.top_z,"Rapid plane must be above every hole");
+      const Tool* chosen=&tool;
+      if(!l.tool_id.empty() && l.tool_id!=tool.id) {
+        chosen=tools?tools->find(l.tool_id):nullptr;
+        require(chosen,"Choose a valid tool for this hole level");
+      }
+      const auto errors=validate(*chosen);require(errors.empty(),errors.empty()?"":errors.front().c_str());
+      const auto rates=chosen==&tool?feeds:resolve_cutting_feeds(*chosen,machine,material_id,operation.cutting);
+      const auto strategy=effective_hole_strategy(p,l);
+      if(strategy==HoleStrategy::Pocket) {
+        Operation pocket=operation;pocket.mode=OperationMode::Pocket;pocket.auto_identify_pockets=false;
+        pocket.pocket_radial_margin=p.radial_margin;pocket.pockets.clear();
+        PocketParameters area;area.center_x=h.center_x;area.center_y=h.center_y;
+        area.radius=l.radius;area.width=area.height=2*l.radius;
+        area.top_z=l.top_z;area.depth=l.top_z-l.bottom_z;area.helix_angle_degrees=p.helix_angle_degrees;
+        pocket.pockets.push_back(area);pocket.tool_id=chosen->id;
+        auto earlier=prior;earlier.push_back(&result);
+        auto planned=plan_parametric_operation(pocket,*chosen,machine,rates,rapid_plane,earlier,
+            progress,from+(to-from)*double(done-1)/selected,
+            from+(to-from)*double(done)/selected,geometry);
+        require(planned.ok(),planned.error.c_str());
+        require(result.levels.size()+planned.levels.size()<=20000,"Too many hole/depth passes");
+        for(auto& level:planned.levels) {level.tool_id=chosen->id;result.levels.push_back(std::move(level));}
+      } else {
+        require(result.levels.size()<20000,"Too many hole/depth passes");
+        LevelPlan level;level.tool_id=chosen->id;level.explicit_motion=true;
+        level.stock_slice={Clipper2Lib::Ellipse(center,wave::to_integer(l.radius),wave::to_integer(l.radius),96)};
+        level.incoming_stock=level.stock_slice;
+        level.floor_z=l.bottom_z;level.axial_depth=l.top_z-l.bottom_z;
+        const Point64 entry=strategy==HoleStrategy::Drill?center:
+            point(h.center_x+l.radius-p.radial_margin-chosen->diameter/2,h.center_y);
+        PathBuilder path{level,operation,machine,rates,previous.value_or(entry),previous_z};
+        if(path.z!=rapid_plane) path.line(path.position,rapid_plane,wave::MoveKind::Retract,true);
+        path.line(entry,rapid_plane,wave::MoveKind::Retract,true);
+        path.line(entry,l.top_z,wave::MoveKind::Entry,true);
+        if(strategy==HoleStrategy::Drill) {
+          require(chosen->type==ToolType::Drill,"A drilling level requires a drill tool");
+          if(!p.source_id.empty()) require(chosen->diameter/2<=l.radius+std::max(.005,p.circle_tolerance),
+              "The pilot drill must fit inside the selected bore");
+          if(p.source_id.empty()) require(std::abs(chosen->diameter/2-l.radius)<=std::max(.005,p.circle_tolerance),
+              "Choose a drill matching the hole radius, or insert a pre-drilling operation");
+          const double tip=drill_tip_height(*chosen);
+          const double bottom=l.bottom_z-p.drilling.depth_adjustment-(l.through?p.drilling.breakthrough:0)-
+              (p.drilling.depth_reference==DrillDepth::FullDiameter?tip:0);
+          require(bottom<l.top_z,"Adjusted drilling depth must be below the hole top");
+          require(l.top_z-bottom<=chosen->flute_length,"Drilling depth exceeds the tool's flute length");
+          level.floor_z=bottom;level.axial_depth=l.top_z-bottom;
+          const double peck=p.drilling.peck_depth>0?p.drilling.peck_depth:l.top_z-bottom;
+          const double n=std::ceil((l.top_z-bottom)/peck);
+          require(n<=20000,"Too many drilling pecks");
+          for(int i=1;i<=int(n);++i) {
+            const double floor=std::max(bottom,l.top_z-peck*i);
+            path.line(center,floor,wave::MoveKind::Entry);
+            if(i<int(n)) {
+              path.line(center,std::min(rapid_plane,l.top_z+p.drilling.peck_clearance),wave::MoveKind::Retract,true);
+              path.line(center,std::min(l.top_z,floor+.1),wave::MoveKind::Entry,true);
+            }
+          }
+        } else {
+          require(chosen->type==ToolType::FlatEndMill || chosen->type==ToolType::BallEndMill,
+                  "Helical finishing requires an end mill");
+          const double orbit=l.radius-p.radial_margin-chosen->diameter/2;
+          require(orbit>=.002,"The cutter must fit inside the requested hole");
+          require(l.top_z-l.bottom_z<=chosen->flute_length,"Hole depth exceeds flute length");
+          const double pitch=std::min(operation.stepdown,2*pi*orbit*std::tan(p.helix_angle_degrees*pi/180));
+          const double turns=std::ceil((l.top_z-l.bottom_z)/pitch);
+          require((turns+1)*circle_segments(orbit)<=max_phases,
+                  "Helix requires too many samples; increase angle or stepdown");
+          // Intentionally no central-core/stock-clearing restriction: the
+          // operator chooses whether this wall-finishing path is appropriate.
+          for(int i=1;i<=int(turns);++i)
+            path.helix_turn(center,orbit,l.top_z+(l.bottom_z-l.top_z)*i/turns,wave::MoveKind::Cut);
+          path.helix_turn(center,orbit,l.bottom_z,wave::MoveKind::Cut);
+        }
+        path.line(path.position,rapid_plane,wave::MoveKind::Retract,true);
+        finish_level(level,rates,chosen->diameter/2);
+        result.levels.push_back(std::move(level));
+      }
+      if(!result.levels.empty() && !result.levels.back().feeds.motion.empty()) {
+        previous=result.levels.back().feeds.motion.back().to;
+        previous_z=result.levels.back().feeds.motion.back().to_z;
+      }
+      task.complete=true;current_tool=chosen->id;
+    }
+    for(std::size_t i=0;i<result.levels.size();++i) result.levels[i].subdivision_level=i;
+    result.spindle_rpm=feeds.spindle_rpm;
+  } catch(const std::exception& e) {result.error=e.what();}
+  result.metrics.total_milliseconds=std::chrono::duration<double,std::milli>(
       std::chrono::steady_clock::now()-started).count();
   return result;
 }

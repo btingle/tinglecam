@@ -1,19 +1,20 @@
 #pragma once
 
 #include <array>
+#include <map>
 
-#include "cam/job.h"
+#include "cam/surface_finishing.h"
 
 namespace cam::detail {
-struct SurfaceRun {
-  std::vector<wave::Vec3d> points;
-  wave::Vec3d first_contact, last_contact;
-  std::array<double, 2> first_uv{}, last_uv{};
-  std::size_t first_face = 0, last_face = 0;
-  bool first_boundary = false, last_boundary = false;
-};
+using SurfaceRun = SurfaceContour;
+std::map<std::size_t, std::vector<double>> surface_lanes(
+    const CadModel&, const Operation&, PlanningMetrics&, const ProgressCallback&);
+void build_surface_adjacency(const CadModel&, const Operation&,
+                             SurfaceContourPreview&, const ProgressCallback&);
 void link_surface_runs(const CadModel&, const Operation&, const Tool&,
-                       const Machine&, double rapid_plane,
+                       const Machine&, const CuttingFeeds&, double rapid_plane,
                        std::vector<SurfaceRun>&, OperationPlan&,
-                       const ProgressCallback&);
+                       const ProgressCallback&,
+                       std::vector<SurfaceRun>* joined = nullptr,
+                       bool fixed_order = false);
 }  // namespace cam::detail

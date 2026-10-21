@@ -21,8 +21,6 @@ void angles_from_direction(const Vec3& direction, float current_yaw,
                                            : std::atan2(unit.y, unit.x);
 }
 
-#include "prism_view.h"
-PrismView prism_view;
 std::unique_ptr<wave::heightfield::Renderer> heightmap_view;
 
 // A convex piece to paint, as a run of points in a shared pool. A frame builds
@@ -212,159 +210,6 @@ void append_mesh(std::vector<Facet>& facets, std::vector<ImVec2>& pool,
   }
 }
 
-// One entry front, as a vertical ribbon along the curve it actually occupies.
-// A front is a stretch of wall the wave starts from, not a volume: giving it
-// thickness put faces inside the stock for the depth sort to fight over, and
-// said something about the material that is not what a front is.
-//
-// A ribbon has no inside, so both faces are lit and neither is culled. Where a
-// lead-in stands the front off the stock, the ribbon stands off with it, which
-// is where the pass view draws the same curve.
-void append_ribbon(std::vector<Facet>& facets, std::vector<ImVec2>& pool,
-                   const wave::Path64& path, bool closed, double bottom, double top,
-                   const Projection& projection, const Vec3& light,
-                   const float colour[3], int alpha) {
-  if (path.size() < 2) return;
-  const std::size_t segments = closed ? path.size() : path.size() - 1;
-  for (std::size_t i = 0; i < segments; ++i) {
-    const Point64& a = path[i];
-    const Point64& b = path[(i + 1) % path.size()];
-    const float dx = static_cast<float>(wave::to_world(b.x - a.x));
-    const float dy = static_cast<float>(wave::to_world(b.y - a.y));
-    const float length = std::sqrt(dx * dx + dy * dy);
-    if (length < 1e-6f) continue;
-    const float nx = dy / length;
-    const float ny = -dx / length;
-    const float lambert = std::abs(nx * light.x + ny * light.y);
-
-    const Vec3 a_top{static_cast<float>(wave::to_world(a.x)),
-                     static_cast<float>(wave::to_world(a.y)),
-                     static_cast<float>(top)};
-    const Vec3 b_top{static_cast<float>(wave::to_world(b.x)),
-                     static_cast<float>(wave::to_world(b.y)),
-                     static_cast<float>(top)};
-    const Vec3 a_bottom{a_top.x, a_top.y, static_cast<float>(bottom)};
-    const Vec3 b_bottom{b_top.x, b_top.y, static_cast<float>(bottom)};
-
-    Facet facet;
-    facet.first = static_cast<std::uint32_t>(pool.size());
-    facet.count = 4;
-    float depth = 0.0f;
-    for (const Vec3& corner : {a_top, b_top, b_bottom, a_bottom}) {
-      pool.push_back(projection.point(corner));
-      depth += projection.depth(corner);
-    }
-    // Biased towards the eye so a front lying flat on the stock wall, which is
-    // what one with no lead-in does, is drawn over it rather than into it.
-    facet.depth = depth * 0.25f + 0.05f;
-    facet.fill = shaded_alpha(colour, lambert, alpha);
-    facet.edge = 0;
-    facets.push_back(facet);
-  }
-}
-
-// The active cutter in the stacked result. It is intentionally translucent:
-// the point of this view is to see both where the tool is and the stock it is
-// passing through. Side quads, a top cap, and the two silhouette rails make it
-// read as a cylinder under the same orthographic projection as the slabs.
-void append_cutter(std::vector<Facet>& facets, std::vector<ImVec2>& pool,
-                   const Vec3& centre, float radius, float bottom, float top,
-                   const Projection& projection, const Vec3& light, bool ball) {
-  constexpr std::size_t kSides = 40;
-  constexpr float kPi = 3.14159265358979323846f;
-  const float colour[3] = {0.48f, 0.86f, 1.0f};
-
-  if (ball) {
-    wave::Mesh nose;
-    constexpr int bands=10;
-    const float tip=bottom;
-    const auto vertex=[&](int ring,int side) {
-      const float phi=-kPi/2+(kPi/2)*ring/bands;
-      const float theta=2*kPi*side/kSides;
-      return wave::Vec3f{centre.x+radius*std::cos(phi)*std::cos(theta),
-                         centre.y+radius*std::cos(phi)*std::sin(theta),
-                         tip+radius+radius*std::sin(phi)};
-    };
-    for(int ring=0;ring<bands;++ring) for(int side=0;side<int(kSides);++side) {
-      const auto a=vertex(ring,side),b=vertex(ring,side+1),c=vertex(ring+1,side+1),d=vertex(ring+1,side);
-      nose.triangles.push_back({a,b,c});nose.triangles.push_back({a,c,d});
-    }
-    append_mesh(facets,pool,nose,projection,light,colour,70,false);
-    bottom+=radius;
-  }
-
-  const auto point = [&](std::size_t side, float z) {
-    const float angle = 2.0f * kPi * static_cast<float>(side) /
-                        static_cast<float>(kSides);
-    return Vec3{centre.x + radius * std::cos(angle),
-                centre.y + radius * std::sin(angle), z};
-  };
-  const auto emit = [&](std::initializer_list<Vec3> corners, float depth_bias,
-                        ImU32 fill, ImU32 edge) {
-    Facet facet;
-    facet.first = static_cast<std::uint32_t>(pool.size());
-    facet.count = static_cast<std::uint32_t>(corners.size());
-    float depth = 0.0f;
-    for (const Vec3& corner : corners) {
-      pool.push_back(projection.point(corner));
-      depth += projection.depth(corner);
-    }
-    facet.depth = depth / static_cast<float>(corners.size()) + depth_bias;
-    facet.fill = fill;
-    facet.edge = edge;
-    facets.push_back(facet);
-  };
-
-  for (std::size_t side = 0; side < kSides; ++side) {
-    const std::size_t next = (side + 1) % kSides;
-    const float angle = 2.0f * kPi *
-                        (static_cast<float>(side) + 0.5f) /
-                        static_cast<float>(kSides);
-    const Vec3 normal{std::cos(angle), std::sin(angle), 0.0f};
-    const float facing = normal.x * projection.toward.x +
-                         normal.y * projection.toward.y;
-    const int alpha = facing > 0.0f ? 54 : 18;
-    emit({point(side, top), point(next, top), point(next, bottom),
-          point(side, bottom)},
-         0.0f,
-         shaded_alpha(colour,
-                      normal.x * light.x + normal.y * light.y,
-                      alpha),
-         0);
-
-    // The visible top is a triangle fan. Separate triangles do not overlap, so
-    // their alpha remains uniform while still fitting the convex-facet renderer.
-    emit({Vec3{centre.x, centre.y, top}, point(side, top), point(next, top)},
-         0.003f, shaded_alpha(colour, light.z, 42), 0);
-  }
-
-  const ImU32 outline = IM_COL32(165, 226, 250, 175);
-  for (const float z : {bottom, top}) {
-    Facet ring;
-    ring.first = static_cast<std::uint32_t>(pool.size());
-    ring.count = kSides;
-    float depth = 0.0f;
-    for (std::size_t side = 0; side < kSides; ++side) {
-      const Vec3 at = point(side, z);
-      pool.push_back(projection.point(at));
-      depth += projection.depth(at);
-    }
-    ring.depth = depth / static_cast<float>(kSides) + 0.006f;
-    ring.edge = outline;
-    facets.push_back(ring);
-  }
-
-  const float view_angle =
-      std::atan2(projection.toward.y, projection.toward.x);
-  for (const float angle : {view_angle - kPi * 0.5f,
-                            view_angle + kPi * 0.5f}) {
-    const Vec3 lower{centre.x + radius * std::cos(angle),
-                     centre.y + radius * std::sin(angle), bottom};
-    const Vec3 upper{lower.x, lower.y, top};
-    emit({lower, upper}, 0.007f, 0, outline);
-  }
-}
-
 // The parts of an orbited stack view that say nothing about what is being
 // drawn: the canvas, the mouse, the projection, the light, and the painter's
 // sort. Three views share them and differ only in the slabs they contribute.
@@ -425,42 +270,22 @@ bool begin_scene(App& app, OrbitScene& scene, const char* id) {
   scene.list = ImGui::GetWindowDrawList();
   const ImVec2 bottom_right{scene.top_left.x + scene.size.x,
                             scene.top_left.y + scene.size.y};
-  scene.list->AddRectFilled(scene.top_left, bottom_right, IM_COL32(14, 17, 22, 255));
+  scene.list->AddRectFilled(scene.top_left, bottom_right, canvas_colours(app).background);
   scene.list->PushClipRect(scene.top_left, bottom_right, true);
   orbit_controls(app, scene.hovered && !app.orbit.cube_pressed);
   return true;
 }
 
-void scene_message(OrbitScene& scene, const char* message) {
+void scene_message(const App& app, OrbitScene& scene, const char* message) {
   const ImVec2 extent = ImGui::CalcTextSize(message);
   scene.list->AddText({scene.top_left.x + (scene.size.x - extent.x) * 0.5f,
                        scene.top_left.y + (scene.size.y - extent.y) * 0.5f},
-                      IM_COL32(120, 130, 145, 255), message);
+                      canvas_colours(app).message, message);
 }
 
 void end_scene(OrbitScene& scene) {
   scene.list->PopClipRect();
   ImGui::EndChild();
-}
-
-// A control in the corner of a view, declared after the canvas so it takes the
-// mouse where the two overlap and orbiting does not start under the pointer.
-// Returns true when it was pressed.
-bool scene_button(OrbitScene& scene, const char* label, float from_right,
-                  float from_top) {
-  const ImVec2 saved = ImGui::GetCursorScreenPos();
-  const float width = ImGui::CalcTextSize(label).x +
-                      ImGui::GetStyle().FramePadding.x * 2.0f;
-  ImGui::SetCursorScreenPos({scene.top_left.x + scene.size.x - width - from_right,
-                             scene.top_left.y + from_top});
-  const bool pressed = ImGui::Button(label);
-  if (ImGui::IsItemHovered()) scene.hovered = false;
-  // Back inside the canvas rather than to where the canvas left it: that was
-  // one item's spacing past the bottom, and putting the cursor there grows the
-  // parent, which ImGui rightly complains about.
-  (void)saved;
-  ImGui::SetCursorScreenPos(scene.top_left);
-  return pressed;
 }
 
 // Frames the view on a fixed world box. Nothing that moves may contribute to
@@ -571,12 +396,12 @@ void draw_origin_gizmo(const App& app, const OrbitScene& scene) {
     const ImVec2 end = projection.point(tip);
     // Outlined, because an axis crossing the part it is drawn over is otherwise
     // the same brightness as what it crosses.
-    scene.list->AddLine(centre, end, IM_COL32(12, 14, 18, 200), 3.5f);
+    scene.list->AddLine(centre, end, canvas_colours(app).outline, 3.5f);
     scene.list->AddLine(centre, end, kColours[axis], 1.7f);
     scene.list->AddText({end.x + 3.0f, end.y - 6.0f}, kColours[axis],
                         kNames[axis]);
   }
-  scene.list->AddCircleFilled(centre, 3.5f, IM_COL32(12, 14, 18, 220));
+  scene.list->AddCircleFilled(centre, 3.5f, canvas_colours(app).outline);
   scene.list->AddCircleFilled(centre, 2.0f, IM_COL32(238, 240, 245, 255));
 }
 

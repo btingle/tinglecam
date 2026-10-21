@@ -13,8 +13,12 @@ void check_user_settings() {
   settings.custom_themes = {{"Workshop", cam::UiFont::Mono, "style-bytes"}};
   settings.panel_layout.left_width = 512.0;
   settings.panel_layout.right_width = 604.0;
-  settings.panel_layout.left_program_fraction = 0.61;
-  settings.panel_layout.right_settings_fraction = 0.43;
+  settings.panel_layout.left_setup_fraction = 0.61;
+  settings.panel_layout.messages_height = 243.0;
+  settings.show_debug = true;
+  settings.default_machine = "makera-z1";
+  settings.default_material = "hdpe";
+  settings.recent_jobs = {"/tmp/a.json", "/tmp/b.json"};
   cam::operation_default(settings, cam::OperationMode::Pocket)
       .pockets.front().width = 47.0;
   cam::operation_default(settings, cam::OperationMode::PlaneClearing)
@@ -46,10 +50,14 @@ void check_user_settings() {
                "left panel width survives settings persistence");
   require_near(loaded.panel_layout.right_width, 604.0, 1e-12,
                "right panel width survives settings persistence");
-  require_near(loaded.panel_layout.left_program_fraction, 0.61, 1e-12,
+  require_near(loaded.panel_layout.left_setup_fraction, 0.61, 1e-12,
                "left panel split survives settings persistence");
-  require_near(loaded.panel_layout.right_settings_fraction, 0.43, 1e-12,
-               "right panel split survives settings persistence");
+  require_near(loaded.panel_layout.messages_height, 243.0, 1e-12,
+               "message drawer height survives settings persistence");
+  require(loaded.show_debug && loaded.default_machine == "makera-z1" &&
+              loaded.default_material == "hdpe" &&
+              loaded.recent_jobs == settings.recent_jobs,
+          "job defaults and recent jobs survive settings persistence");
   require_near(
       cam::operation_default(loaded, cam::OperationMode::Pocket)
           .pockets.front().width,
@@ -116,28 +124,18 @@ void check_schedule_timing() {
   cut.path = {point(10.0), point(20.0)};
   cut.length = 10.0;
   toolpath.moves.push_back(cut);
-  wave::SimulationResult simulation;
-  simulation.moves.resize(2);
-  wave::MaterialStep step;
-  step.from = point(10.0);
-  step.to = point(20.0);
-  step.move_distance_end = 10.0;
-  step.load = 1.0;
-  simulation.moves[1].steps.push_back(step);
-  const auto schedule = cam::plan_feeds(
-      toolpath, simulation, test_machine(), 500.0, 2000.0, 12000.0, 120.0);
+  const auto schedule = cam::plan_feeds(toolpath, test_machine(), test_feeds());
   require(schedule.segments.size() == 2, "rapid and cutting movement are scheduled");
   const double rapid_seconds = 10.0 / 6000.0 * 60.0;
-  const double cut_seconds = 10.0 / 500.0 * 60.0;
+  // Provisional rates: the stock simulation assigns the measured ones.
+  const double cut_seconds = 10.0 / 2000.0 * 60.0;
   require_near(cam::feed_schedule_seconds(schedule),
                rapid_seconds + cut_seconds, 1e-9,
                "machine time uses the final scheduled rates");
   require_near(cam::feed_seconds_to(schedule, 10.0), rapid_seconds, 1e-9,
                "distance converts to time across a rapid");
 
-  const auto vertical = cam::plan_feeds(
-      toolpath, simulation, test_machine(), 500.0, 2000.0, 12000.0,
-      120.0, -2.0, 10.0);
+  const auto vertical = cam::plan_feeds(toolpath, test_machine(), test_feeds(), -2.0, 10.0);
   const double descent_seconds = 12.0 / 6000.0 * 60.0;
   const double lift_seconds = 12.0 / 6000.0 * 60.0;
   require(vertical.motion.size() == 4,
@@ -168,7 +166,7 @@ void check_schedule_timing() {
   require_near(halfway_down.motion_distance, 16.0, 1e-9,
                "the XYZ counter includes rapid and vertical travel");
   require(halfway_down.rapid,
-          "a simulation-cleared retract landing returns to depth at rapid");
+          "a retract landing is offered as a rapid descent for the stock simulation to check");
   require_near(halfway_down.rate, 6000.0, 1e-9,
                "the playback cursor exposes the commanded rapid rate");
 
@@ -181,18 +179,11 @@ void check_schedule_timing() {
                "planar simulation distance pauses during a retract");
 
   wave::Toolpath between_paths;
-  wave::SimulationResult between_simulation;
-  between_simulation.moves.resize(3);
   wave::ToolpathMove first_cut;
   first_cut.kind = wave::MoveKind::Cut;
   first_cut.path = {point(0.0), point(1.0)};
   first_cut.length = 1.0;
   between_paths.moves.push_back(first_cut);
-  wave::MaterialStep first_step;
-  first_step.from = point(0.0);
-  first_step.to = point(1.0);
-  first_step.move_distance_end = 1.0;
-  between_simulation.moves[0].steps.push_back(first_step);
   wave::ToolpathMove lift_and_cross;
   lift_and_cross.kind = wave::MoveKind::Retract;
   lift_and_cross.path = {point(1.0), point(3.0)};
@@ -201,13 +192,7 @@ void check_schedule_timing() {
   wave::ToolpathMove second_cut = first_cut;
   second_cut.path = {point(3.0), point(4.0)};
   between_paths.moves.push_back(second_cut);
-  wave::MaterialStep second_step = first_step;
-  second_step.from = point(3.0);
-  second_step.to = point(4.0);
-  between_simulation.moves[2].steps.push_back(second_step);
-  const auto transition = cam::plan_feeds(
-      between_paths, between_simulation, test_machine(), 500.0, 2000.0,
-      12000.0, 120.0, -2.0, 10.0);
+  const auto transition = cam::plan_feeds(between_paths, test_machine(), test_feeds(), -2.0, 10.0);
   require(transition.motion.size() == 7,
           "a disconnected transition has plunge, cut, lift, traverse, "
           "plunge, cut, and final lift phases");
@@ -232,8 +217,7 @@ void check_schedule_timing() {
   {
     cam::Machine slow_z = test_machine();
     slow_z.rapid_feed_z = 1500.0;
-    const auto slowed = cam::plan_feeds(between_paths, between_simulation,
-                                        slow_z, 500.0, 2000.0, 12000.0, 120.0,
+    const auto slowed = cam::plan_feeds(between_paths, slow_z, test_feeds(),
                                         -2.0, 10.0);
     require(slowed.motion.size() == transition.motion.size(),
             "a slower Z axis changes the timing, not the moves");
@@ -268,8 +252,7 @@ void check_schedule_timing() {
   {
     cam::Machine unstated = test_machine();
     unstated.rapid_feed_z = 0.0;
-    const auto same = cam::plan_feeds(between_paths, between_simulation,
-                                      unstated, 500.0, 2000.0, 12000.0, 120.0,
+    const auto same = cam::plan_feeds(between_paths, unstated, test_feeds(),
                                       -2.0, 10.0);
     require_near(cam::feed_schedule_seconds(same),
                  cam::feed_schedule_seconds(transition), 1e-9,
@@ -278,9 +261,7 @@ void check_schedule_timing() {
 
   // The next pass down starts wherever its own geometry does, which is not
   // where the previous one left the cutter. That leg is the plan's to own.
-  const auto arrived = cam::plan_feeds(
-      between_paths, between_simulation, test_machine(), 500.0, 2000.0,
-      12000.0, 120.0, -2.0, 10.0, cam::PassLink{point(0.0, 5.0), 10.0, false});
+  const auto arrived = cam::plan_feeds(between_paths, test_machine(), test_feeds(), -2.0, 10.0, cam::PassLink{point(0.0, 5.0), 10.0, false});
   require(arrived.motion.size() == transition.motion.size() + 1,
           "arriving from a previous pass adds one phase");
   if (!arrived.motion.empty()) {
@@ -305,10 +286,8 @@ void check_schedule_timing() {
   require(cam::feed_motion_at_seconds(arrived, 0.0).position == point(0.0, 5.0),
           "playback starts the pass where the previous one finished");
 
-  const SyntheticCut unresolved = straight_cut({1.0});
   const auto unresolved_schedule = cam::plan_feeds(
-      unresolved.toolpath, unresolved.simulation, test_machine(), 500.0,
-      2000.0, 12000.0, 120.0, -2.0, 10.0);
+      straight_cut(1), test_machine(), test_feeds(), -2.0, 10.0);
   require(!unresolved_schedule.motion.empty() &&
               !unresolved_schedule.motion.front().rapid,
           "a cut without a verified cleared retract still uses a plunge");

@@ -1,0 +1,24 @@
+# A 20 mm square part with a 4 mm square blind pocket.  The top is a ring,
+# leaving a single convex hole in the downward envelope at z=9.
+v 0 0 10
+v 20 0 10
+v 20 20 10
+v 0 20 10
+v 8 8 10
+v 12 8 10
+v 12 12 10
+v 8 12 10
+v 0 0 0
+v 20 0 0
+v 20 20 0
+v 0 20 0
+v 8 8 3
+v 12 8 3
+v 12 12 3
+v 8 12 3
+f 1 2 6 5
+f 2 3 7 6
+f 3 4 8 7
+f 4 1 5 8
+f 9 12 11 10
+f 13 14 15 16

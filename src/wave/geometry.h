@@ -146,6 +146,8 @@ WaveResult build_wavefront_from_seeds(
 bool paths_equal_canonical(const Paths64& lhs, const Paths64& rhs);
 double to_world(std::int64_t value);
 std::int64_t to_integer(double value);
+// Non-zero area in mm^2. Input is unioned first so overlaps count once.
+double material_area(const Paths64& paths);
 const char* stop_reason_name(StopReason reason);
 
 }  // namespace wave

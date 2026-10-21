@@ -42,21 +42,6 @@ Paths64 drawable_region(const Paths64& region, double spacing) {
   return Clipper2Lib::Union(thinned(region, spacing), Clipper2Lib::FillRule::NonZero);
 }
 
-// A difference between two independently sampled versions of a nominally
-// coincident curve can still contain a few integer-grid crumbs. They are far
-// below the detail this view retains, but a mixture of tiny outer and hole
-// rings can make the triangulator reject the whole otherwise-empty surface.
-Paths64 drawable_surface(const Paths64& region, double spacing) {
-  const double integer_scale2 = wave::kIntegerScale * wave::kIntegerScale;
-  const double minimum_area = spacing * spacing * 0.25 * integer_scale2;
-  Paths64 visible;
-  visible.reserve(region.size());
-  for (const auto& ring : region)
-    if (std::abs(Clipper2Lib::Area(ring)) >= minimum_area)
-      visible.push_back(ring);
-  return drawable_region(visible, spacing);
-}
-
 // The same region cut into triangles by Clipper2's constrained Delaunay.
 //
 // Every filled thing in this program goes through here, for two reasons. Holes
@@ -107,21 +92,23 @@ ImU32 blend(ImU32 low, ImU32 high, float t) {
       ImVec4(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t, 1.0f));
 }
 
-ImU32 engagement_colour(const wave::MaterialStep& step, int display) {
-  double value = step.load;
-  if (display == 1) value = step.area_load;
-  if (display == 2) value = step.contact_load;
-  if (display == 3)
-    value = 10*std::abs(std::clamp(step.contact_load,0.0,1.0)-
-                       std::clamp(step.area_load,0.0,1.0));
-  return blend(IM_COL32(70,150,255,255),IM_COL32(255,80,70,255),static_cast<float>(value));
+ImU32 engagement_colour(double engagement) {
+  return blend(IM_COL32(70, 150, 255, 255), IM_COL32(255, 80, 70, 255),
+               static_cast<float>(engagement));
+}
+
+ImU32 feed_colour(double feed, double lowest, double highest) {
+  const double span = std::max(highest - lowest, 1e-6);
+  return blend(IM_COL32(60, 110, 230, 255), IM_COL32(120, 235, 140, 255),
+               static_cast<float>((feed - lowest) / span));
 }
 
 ImU32 limit_colour(cam::FeedLimit limit) {
   switch (limit) {
     case cam::FeedLimit::Engagement: return IM_COL32(90, 200, 140, 255);
-    case cam::FeedLimit::Rapid: return IM_COL32(80, 95, 115, 255);
+    case cam::FeedLimit::Rapid: return IM_COL32(110, 125, 150, 255);
     case cam::FeedLimit::Plunge: return IM_COL32(255, 170, 60, 255);
+    case cam::FeedLimit::Machine: return IM_COL32(200, 120, 255, 255);
   }
   return IM_COL32(200, 200, 200, 255);
 }
@@ -131,7 +118,7 @@ ImU32 move_colour(wave::MoveKind kind) {
     case wave::MoveKind::Cut: return IM_COL32(120, 220, 160, 255);
     case wave::MoveKind::Step: return IM_COL32(255, 190, 90, 255);
     case wave::MoveKind::Link: return IM_COL32(110, 180, 255, 255);
-    case wave::MoveKind::Retract: return IM_COL32(90, 105, 130, 255);
+    case wave::MoveKind::Retract: return IM_COL32(110, 125, 150, 255);
     case wave::MoveKind::Entry: return IM_COL32(255, 100, 100, 255);
   }
   return IM_COL32(200, 200, 200, 255);
@@ -177,11 +164,10 @@ void sync_playback_time(App& app) {
 }
 
 // The remaining stock for the pass being watched. Recomputed only when the
-// playback has actually moved, since each call redoes the current move's
-// booleans and there is no sense doing that for a still frame.
+// playback has actually moved.
 void refresh_material(App& app) {
   const cam::LevelPlan* level = current_level(app);
-  if (!level || level->nothing_to_cut) {
+  if (!level || level->nothing_to_cut || level->stock_checkpoints.empty()) {
     app.material.clear();
     app.material_heightmap.reset();
     app.material_distance = -1.0;
@@ -192,52 +178,34 @@ void refresh_material(App& app) {
       std::abs(app.material_distance - app.playback.distance) < 1e-9 &&
       std::abs(app.material_motion_seconds - app.playback.motion_seconds) < 1e-9)
     return;
+  const cam::Tool* tool =
+      app.tools.find(level->tool_id.empty()?app.plan.operations[app.selected_plan_operation].tool_id:level->tool_id);
+  if (!tool) return;
   try {
-    const cam::Tool* tool = app.tools.find(app.plan.operations[app.selected_plan_operation].tool_id);
-    if (!level->stock_checkpoints.empty() && tool) {
-      const wave::MillingCutter cutter{tool->type == cam::ToolType::BallEndMill ? wave::CutterShape::Ball : wave::CutterShape::Flat,
-                                      tool->diameter/2, tool->flute_length};
-      const auto cursor = cam::feed_motion_at_seconds(level->feeds, app.playback.motion_seconds);
-      if(app.material_heightmap&&app.material_operation==app.selected_plan_operation&&app.material_level==app.selected_level&&
-         app.material_motion_seconds>=0&&cursor.motion_distance>=app.material_motion_distance) {
-        auto stock=*app.material_heightmap;
-        cam::advance_stock_motion(stock,*level,cutter,app.material_motion_distance,cursor.motion_distance);
-        if(stock.volume()!=app.material_heightmap->volume())app.material_heightmap=std::make_shared<const wave::Heightmap>(std::move(stock));
-      } else app.material_heightmap=std::make_shared<const wave::Heightmap>(cam::stock_at_motion(*level,cutter,cursor.motion_distance));
-      app.material_motion_distance=cursor.motion_distance;app.material_section_dirty=true;
+    const wave::MillingCutter cutter = cam::milling_cutter(*tool);
+    const auto cursor = cam::feed_motion_at_seconds(level->feeds, app.playback.motion_seconds);
+    if (app.material_heightmap && app.material_operation == app.selected_plan_operation &&
+        app.material_level == app.selected_level && app.material_motion_seconds >= 0 &&
+        cursor.motion_distance >= app.material_motion_distance) {
+      auto stock = *app.material_heightmap;
+      cam::advance_stock_motion(stock, *level, cutter, app.material_motion_distance,
+                                cursor.motion_distance);
+      if (stock.volume() != app.material_heightmap->volume())
+        app.material_heightmap = std::make_shared<const wave::Heightmap>(std::move(stock));
     } else {
-    app.material_heightmap.reset();
-    const bool advancing =
-        app.material_operation == app.selected_plan_operation &&
-        app.material_level == app.selected_level &&
-        app.material_distance >= 0.0 &&
-        app.playback.distance > app.material_distance;
-    app.material = advancing
-        ? wave::advance_simulation_stock(level->simulation, level->toolpath,
-                                         app.material, app.material_distance,
-                                         app.playback.distance)
-        : wave::simulation_stock_at(level->simulation, level->toolpath,
-                                    app.playback.distance);
+      app.material_heightmap = std::make_shared<const wave::Heightmap>(
+          cam::stock_at_motion(*level, cutter, cursor.motion_distance));
     }
-  } catch (const std::exception&) {
-    app.material = level->simulation.remaining_stock;
+    app.material_motion_distance = cursor.motion_distance;
+    app.material_section_dirty = true;
+  } catch (const std::exception& error) {
+    log_message(app, LogSeverity::Warning, "Playback", error.what());
+    app.material_heightmap.reset();
   }
   app.material_motion_seconds = app.playback.motion_seconds;
   app.material_distance = app.playback.distance;
   app.material_level = app.selected_level;
   app.material_operation = app.selected_plan_operation;
-}
-
-// The segment covering a distance along the pass, or the end of the schedule.
-// Segments are laid down in path order, so the search is a bisection on where
-// each one starts.
-std::size_t segment_at(const std::vector<cam::FeedSegment>& segments, double distance) {
-  auto it = std::upper_bound(segments.begin(), segments.end(), distance,
-                             [](double value, const cam::FeedSegment& segment) {
-                               return value < segment.start_distance;
-                             });
-  if (it == segments.begin()) return 0;
-  return static_cast<std::size_t>(std::distance(segments.begin(), it) - 1);
 }
 
 // m:ss for anything over a minute, seconds with a decimal below it. A pass is
@@ -382,6 +350,7 @@ void fit_view(App& app, ImVec2 canvas) {
 // two axes rather than three, since the third points at the reader.
 void draw_origin_marker(const App& app, ImDrawList* list,
                         const Transform& to_screen) {
+  const ImU32 outline = canvas_colours(app).outline;
   const ImVec2 centre = to_screen(Point64(
       wave::to_integer(-app.job.origin_x), wave::to_integer(-app.job.origin_y)));
   static const ImVec2 kSteps[2] = {{46.0f, 0.0f}, {0.0f, -46.0f}};
@@ -390,13 +359,96 @@ void draw_origin_marker(const App& app, ImDrawList* list,
   static const char* const kNames[2] = {"X", "Y"};
   for (int axis = 0; axis < 2; ++axis) {
     const ImVec2 end{centre.x + kSteps[axis].x, centre.y + kSteps[axis].y};
-    list->AddLine(centre, end, IM_COL32(12, 14, 18, 200), 3.5f);
+    list->AddLine(centre, end, outline, 3.5f);
     list->AddLine(centre, end, kColours[axis], 1.7f);
     list->AddText({end.x + 3.0f, end.y - 6.0f}, kColours[axis], kNames[axis]);
   }
-  list->AddCircleFilled(centre, 3.5f, IM_COL32(12, 14, 18, 220));
+  list->AddCircleFilled(centre, 3.5f, outline);
   list->AddCircleFilled(centre, 2.0f, IM_COL32(238, 240, 245, 255));
 }
+
+namespace {
+
+ImU32 segment_colour(const App& app, const cam::FeedSegment& segment, double lowest,
+                     double highest) {
+  if (segment.rapid) return move_colour(wave::MoveKind::Retract);
+  switch (app.colouring) {
+    case Colouring::Feed: return feed_colour(segment.feed, lowest, highest);
+    case Colouring::Limit: return limit_colour(segment.limit);
+    case Colouring::Load: return engagement_colour(segment.engagement);
+    case Colouring::Move: return move_colour(segment.kind);
+  }
+  return IM_COL32(150, 150, 150, 255);
+}
+
+void draw_segments(const App& app, ImDrawList* list, const Transform& to_screen,
+                   const cam::LevelPlan& level, double travelled, bool fade,
+                   double lowest, double highest) {
+  for (const auto& segment : level.feeds.segments) {
+    if (segment.rapid ? !app.show_rapid_travel : !app.show_cutting_paths) continue;
+    ImU32 colour = segment_colour(app, segment, lowest, highest);
+    if (fade && segment.start_distance >= travelled) {
+      ImVec4 faded = ImGui::ColorConvertU32ToFloat4(colour);
+      faded.w = 0.22f;
+      colour = ImGui::ColorConvertFloat4ToU32(faded);
+    }
+    list->AddLine(to_screen(segment.from), to_screen(segment.to), colour,
+                  segment.rapid ? 1.0f : 1.7f);
+  }
+}
+
+void debug_overlays(App& app, ImDrawList* list, const Transform& to_screen,
+                    const cam::LevelPlan* level) {
+  const auto& operation = app.plan.operations[app.selected_plan_operation];
+  const std::size_t layer_index = static_cast<std::size_t>(app.selected_level);
+  if (layer_index >= operation.inter_layer.layers.size()) return;
+  const wave::LayerTopology& topology = operation.inter_layer.layers[layer_index];
+  const ImU32 background = canvas_colours(app).background;
+  if (app.node_debug_colouring != NodeDebugColouring::None &&
+      layer_index < operation.inter_layer.node_chain_ids.size()) {
+    const auto& ids = operation.inter_layer.node_chain_ids[layer_index];
+    for (std::size_t node = 0; node < topology.nodes.size() && node < ids.size(); ++node) {
+      const bool joined = ids[node] != wave::kNoTopologyId;
+      const ImU32 edge = app.node_debug_colouring == NodeDebugColouring::Node
+                             ? chain_colour(node, 0, 1, 245)
+                             : (joined ? chain_colour(ids[node], layer_index,
+                                                      operation.levels.size(), 245)
+                                       : IM_COL32(145, 150, 165, 150));
+      fill_paths(list, topology.nodes[node].footprint, to_screen,
+                 blend(background, edge, 0.18f), &app.fill_failures);
+      draw_paths(list, topology.nodes[node].footprint, to_screen, edge, 2.2f);
+    }
+  }
+  if (app.show_entry_front_chains &&
+      layer_index < operation.inter_layer.entry_front_chain_ids.size()) {
+    const auto& ids = operation.inter_layer.entry_front_chain_ids[layer_index];
+    for (std::size_t entry = 0; entry < topology.entry_fronts.size() && entry < ids.size();
+         ++entry) {
+      const std::size_t id = topology.entry_fronts[entry];
+      if (id >= level->lineage.entry_fronts.size()) continue;
+      const auto& path = level->lineage.entry_fronts[id].path;
+      std::vector<ImVec2> points;
+      for (const Point64& point : path) points.push_back(to_screen(point));
+      if (points.size() >= 2)
+        list->AddPolyline(points.data(), static_cast<int>(points.size()),
+                          ids[entry] == wave::kNoTopologyId
+                              ? IM_COL32(145, 150, 165, 150)
+                              : chain_colour(ids[entry], layer_index,
+                                             operation.levels.size(), 255),
+                          ImDrawFlags_None, 4.0f);
+    }
+  }
+  if (app.show_boundary_contacts)
+    for (const auto& generation : level->lineage.generations)
+      for (const auto& front : generation.fronts)
+        if (!front.closed)
+          for (const auto& contact : front.boundary_contacts)
+            if (contact.valid)
+              list->AddCircleFilled(to_screen(contact.point), 3.5f,
+                                    IM_COL32(255, 110, 210, 245));
+}
+
+}  // namespace
 
 void draw_canvas(App& app) {
   ImGui::BeginChild("canvas", ImVec2(0, 0), ImGuiChildFlags_Borders,
@@ -405,240 +457,99 @@ void draw_canvas(App& app) {
   ImVec2 size = ImGui::GetContentRegionAvail();
   size.x = std::max(size.x, 50.0f);
   size.y = std::max(size.y, 50.0f);
+  ImGui::SetNextItemAllowOverlap();
   ImGui::InvisibleButton("plot", size,
                          ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight);
   const bool hovered = ImGui::IsItemHovered();
   ImDrawList* list = ImGui::GetWindowDrawList();
   const ImVec2 bottom_right{top_left.x + size.x, top_left.y + size.y};
-  list->AddRectFilled(top_left, bottom_right, IM_COL32(16, 19, 25, 255));
+  const CanvasColours colours = canvas_colours(app);
+  list->AddRectFilled(top_left, bottom_right, colours.background);
   list->PushClipRect(top_left, bottom_right, true);
 
   if (app.view.needs_fit) fit_view(app, size);
-
-  if (hovered && ImGui::IsMouseDragging(ImGuiMouseButton_Right)) {
+  if (hovered && (ImGui::IsMouseDragging(ImGuiMouseButton_Right) ||
+                  ImGui::IsMouseDragging(ImGuiMouseButton_Left))) {
     app.view.pan.x += ImGui::GetIO().MouseDelta.x;
     app.view.pan.y += ImGui::GetIO().MouseDelta.y;
   }
   if (hovered && ImGui::GetIO().MouseWheel != 0.0f) {
+    // Zoom about the pointer.
     const float factor = std::pow(1.12f, ImGui::GetIO().MouseWheel);
+    const ImVec2 centre{top_left.x + size.x * 0.5f, top_left.y + size.y * 0.5f};
+    const ImVec2 mouse = ImGui::GetIO().MousePos;
+    const float before = app.view.zoom;
     app.view.zoom = std::clamp(app.view.zoom * factor, 0.02f, 4000.0f);
-    app.view.pan.x *= factor;
-    app.view.pan.y *= factor;
+    const float applied = app.view.zoom / before;
+    app.view.pan.x = (app.view.pan.x - (mouse.x - centre.x)) * applied + (mouse.x - centre.x);
+    app.view.pan.y = (app.view.pan.y - (mouse.y - centre.y)) * applied + (mouse.y - centre.y);
   }
 
-  const Transform to_screen{
-      {top_left.x + size.x * 0.5f + app.view.pan.x,
-       top_left.y + size.y * 0.5f + app.view.pan.y},
-      app.view.zoom};
-
+  const Transform to_screen{{top_left.x + size.x * 0.5f + app.view.pan.x,
+                             top_left.y + size.y * 0.5f + app.view.pan.y},
+                            app.view.zoom};
   app.fill_failures = 0;
 
   const cam::LevelPlan* level = current_level(app);
-  if(app.material_section_dirty&&app.material_heightmap&&level) {
-    app.material=app.material_heightmap->slice(level->floor_z);app.material_section_dirty=false;
+  if (app.material_section_dirty && app.material_heightmap && level) {
+    app.material = app.material_heightmap->slice(level->floor_z);
+    app.material_section_dirty = false;
   }
   if (level) {
-    // What is left of the stock, drawn as the solid it is rather than as an
-    // outline. This is the whole point of simulating: the outline of a pocket
-    // and the outline of an island look the same until one of them is filled.
     if (app.show_material && !app.material.empty())
-      fill_paths(list, app.material, to_screen, IM_COL32(52, 78, 104, 255),
-                 &app.fill_failures);
+      fill_paths(list, app.material, to_screen, IM_COL32(52, 78, 104, 255), &app.fill_failures);
     if (app.show_stock)
       draw_paths(list, level->stock_slice, to_screen, IM_COL32(70, 130, 165, 200), 1.6f);
     if (app.show_part)
       draw_paths(list, level->part_slice, to_screen, IM_COL32(235, 200, 90, 220), 2.0f);
+    if (app.settings.show_debug) debug_overlays(app, list, to_screen, level);
 
-    const auto& operation = app.plan.operations[app.selected_plan_operation];
-    const std::size_t layer_index = static_cast<std::size_t>(app.selected_level);
-    if (layer_index < operation.inter_layer.layers.size()) {
-      const wave::LayerTopology& topology =
-          operation.inter_layer.layers[layer_index];
-      if (app.node_debug_colouring != NodeDebugColouring::None &&
-          layer_index < operation.inter_layer.node_chain_ids.size()) {
-        const auto& ids = operation.inter_layer.node_chain_ids[layer_index];
-        for (std::size_t node = 0; node < topology.nodes.size() && node < ids.size();
-             ++node) {
-          const bool joined = ids[node] != wave::kNoTopologyId;
-          const ImU32 edge = app.node_debug_colouring ==
-                                     NodeDebugColouring::Node
-                                 ? chain_colour(node, 0, 1, 245)
-                                 : (joined
-                                        ? chain_colour(ids[node], layer_index,
-                                                       operation.levels.size(), 245)
-                                        : IM_COL32(145, 150, 165, 150));
-          // Use the same fill path as simulated stock. Pre-blending into an
-          // opaque dark colour avoids alpha accumulating on shared triangle
-          // edges while leaving the toolpath legible above the node area.
-          const ImU32 fill = blend(IM_COL32(16, 19, 25, 255), edge, 0.18f);
-          fill_paths(list, topology.nodes[node].footprint, to_screen, fill,
-                     &app.fill_failures);
-          draw_paths(list, topology.nodes[node].footprint, to_screen, edge, 2.2f);
-        }
-      }
-      if (app.show_entry_front_chains &&
-          layer_index < operation.inter_layer.entry_front_chain_ids.size()) {
-        const auto& ids = operation.inter_layer.entry_front_chain_ids[layer_index];
-        for (std::size_t entry = 0;
-             entry < topology.entry_fronts.size() && entry < ids.size(); ++entry) {
-          const std::size_t id = topology.entry_fronts[entry];
-          if (id >= level->lineage.entry_fronts.size()) continue;
-          const auto& path = level->lineage.entry_fronts[id].path;
-          std::vector<ImVec2> points;
-          points.reserve(path.size());
-          for (const Point64& point : path) points.push_back(to_screen(point));
-          if (points.size() >= 2)
-            list->AddPolyline(points.data(), static_cast<int>(points.size()),
-                              ids[entry] == wave::kNoTopologyId
-                                  ? IM_COL32(145, 150, 165, 150)
-                                  : chain_colour(ids[entry], layer_index,
-                                                 operation.levels.size(), 255),
-                              ImDrawFlags_None, 4.0f);
-        }
-      }
-      if (app.show_boundary_contacts) {
-        for (const auto& generation : level->lineage.generations)
-          for (const auto& front : generation.fronts)
-            if (!front.closed)
-              for (const auto& contact : front.boundary_contacts)
-                if (contact.valid)
-                  list->AddCircleFilled(to_screen(contact.point), 3.5f,
-                                        IM_COL32(255, 110, 210, 245));
-      }
+    double lowest = 0.0, highest = 0.0;
+    feed_range(app, lowest, highest);
+    if (app.show_all_passes) {
+      for (const auto& other : app.plan.operations[app.selected_plan_operation].levels)
+        if (!other.nothing_to_cut)
+          draw_segments(app, list, to_screen, other, 0.0, false, lowest, highest);
+    } else {
+      draw_segments(app, list, to_screen, *level, app.playback.distance, true, lowest,
+                    highest);
     }
 
-    double lowest = 0.0;
-    double highest = 0.0;
-    for (const auto& segment : level->feeds.segments) {
-      if (segment.rapid) continue;
-      highest = std::max(highest, segment.feed);
-      lowest = lowest > 0.0 ? std::min(lowest, segment.feed) : segment.feed;
-    }
-    const double span = std::max(highest - lowest, 1e-6);
-
-    // Where the cutter has got to, in the same units the segments carry.
-    const double travelled = app.playback.distance;
-
-    // The rapid in from the previous pass. It covers no path distance, so it
-    // cannot be placed by `travelled` like the rest; whether it has happened is
-    // a question about elapsed time.
-    if (app.show_rapid_travel)
-      for (const auto& phase : level->feeds.motion) {
-        if (!phase.arrival) continue;
-        const double duration = phase.length / (std::max(phase.rate, 1.0) / 60.0);
-        const ImU32 colour = app.playback.motion_seconds >= duration
-                                 ? IM_COL32(70, 82, 100, 255)
-                                 : IM_COL32(70, 82, 100, 56);
-        list->AddLine(to_screen(phase.from), to_screen(phase.to), colour, 1.0f);
-      }
-
-    double walked = 0.0;
-    for (const auto& segment : level->feeds.segments) {
-      const double segment_start = segment.start_distance;
-      walked += segment.length;
-      if (segment.rapid ? !app.show_rapid_travel : !app.show_cutting_paths)
-        continue;
-      if (app.colouring == Colouring::Load && !level->explicit_motion && level->stock_checkpoints.empty() &&
-          !segment.rapid && segment.kind != wave::MoveKind::Entry) continue;
-      // Anything still ahead of the cutter is drawn faintly, so the part of the
-      // pass that has happened reads apart from the part that has not.
-      const bool done = segment_start < travelled;
-      ImU32 colour = IM_COL32(150, 150, 150, 255);
-      float width = 1.7f;
-      switch (app.colouring) {
-        case Colouring::Feed:
-          colour = segment.rapid
-                       ? IM_COL32(70, 82, 100, 255)
-                       : blend(IM_COL32(60, 110, 230, 255), IM_COL32(120, 235, 140, 255),
-                               static_cast<float>((segment.feed - lowest) / span));
-          break;
-        case Colouring::Limit:
-          colour = limit_colour(segment.limit);
-          break;
-        case Colouring::Load:
-          colour = segment.rapid
-                       ? IM_COL32(70, 82, 100, 255)
-                       : blend(IM_COL32(70, 150, 255, 255), IM_COL32(255, 80, 70, 255),
-                               static_cast<float>(segment.engagement));
-          break;
-        case Colouring::Move:
-          colour = move_colour(segment.kind);
-          break;
-      }
-      if (segment.rapid) width = 1.0f;
-      if (!done) {
-        ImVec4 faded = ImGui::ColorConvertU32ToFloat4(colour);
-        faded.w = 0.22f;
-        colour = ImGui::ColorConvertFloat4ToU32(faded);
-      }
-      list->AddLine(to_screen(segment.from), to_screen(segment.to), colour, width);
-    }
-
-    if (app.colouring == Colouring::Load && !level->explicit_motion && level->stock_checkpoints.empty() && app.show_cutting_paths) {
-      const bool comparison = level->simulation.method == wave::SimulationMethod::Compare ||
-                              level->simulation.method == wave::SimulationMethod::Contact;
-      double move_start = 0;
-      for (std::size_t i=0; i<level->simulation.moves.size(); ++i) {
-        for (const auto& step : level->simulation.moves[i].steps) {
-          ImU32 colour = engagement_colour(step, comparison ? app.engagement_display : 0);
-          if (move_start+step.move_distance_begin >= travelled) {
-            auto faded = ImGui::ColorConvertU32ToFloat4(colour); faded.w = 0.22f;
-            colour = ImGui::ColorConvertFloat4ToU32(faded);
-          }
-          list->AddLine(to_screen(step.from),to_screen(step.to),colour,1.7f);
-        }
-        move_start += level->toolpath.moves[i].length;
-      }
-    }
-
-    // The cutter itself, at its true diameter, so an engagement that looks
-    // reasonable as a line can be seen for what it is.
-    const cam::Tool* tool = nullptr;
-    for (const auto& operation : app.job.operations)
-      if (operation.name ==
-          app.plan.operations[app.selected_plan_operation].operation_name)
-        tool = app.tools.find(operation.tool_id);
-    // The cutter is the playback cursor rather than part of either path, so it
-    // survives hiding one of them and goes only when both are off.
-    if (tool && (app.show_cutting_paths || app.show_rapid_travel)) {
-      const wave::Point64 position = level->feeds.motion.empty()
-                                         ? wave::toolpath_at(
-                                               level->toolpath,
-                                               app.playback.distance)
-                                               .position
-                                         : cam::feed_motion_at_seconds(
-                                               level->feeds,
-                                               app.playback.motion_seconds)
-                                               .position;
+    const cam::Tool* tool =
+        app.tools.find(level->tool_id.empty()?app.plan.operations[app.selected_plan_operation].tool_id:level->tool_id);
+    if (tool && !level->feeds.motion.empty()) {
+      const wave::Point64 position =
+          cam::feed_motion_at_seconds(level->feeds, app.playback.motion_seconds).position;
       const ImVec2 centre = to_screen(position);
-      const float radius =
-          static_cast<float>(tool->diameter * 0.5) * app.view.zoom;
-      list->AddCircleFilled(centre, std::max(radius, 2.0f),
-                            IM_COL32(255, 255, 255, 40));
-      list->AddCircle(centre, std::max(radius, 2.0f), IM_COL32(255, 255, 255, 210), 0,
-                      1.6f);
-      list->AddCircleFilled(centre, 2.5f, IM_COL32(255, 255, 255, 235));
+      const float radius = std::max(static_cast<float>(tool->diameter * 0.5) * app.view.zoom, 2.0f);
+      const ImU32 ring = light_theme(app) ? IM_COL32(20, 24, 30, 220) : IM_COL32(255, 255, 255, 210);
+      list->AddCircleFilled(centre, radius, (ring & 0x00ffffff) | 0x28000000);
+      list->AddCircle(centre, radius, ring, 0, 1.6f);
+      list->AddCircleFilled(centre, 2.5f, ring);
     }
+    char caption[160];
+    std::snprintf(caption, sizeof caption, "Floor Z %.3f mm   Drag: pan   Wheel: zoom",
+                  level->floor_z + app.job.origin_z);
+    view_caption(app, list, top_left, size, 0, colours.caption, caption);
   } else {
-    const char* text = app.has_plan ? "This level has nothing to cut"
-                                    : "Load a part and a stock model, then plan";
+    const char* text = app.has_plan ? "This operation has no passes to show"
+                                    : "Plan the job to see its passes";
     const ImVec2 extent = ImGui::CalcTextSize(text);
     list->AddText({top_left.x + (size.x - extent.x) * 0.5f,
                    top_left.y + (size.y - extent.y) * 0.5f},
-                  IM_COL32(120, 130, 145, 255), text);
+                  colours.message, text);
   }
 
   draw_origin_marker(app, list, to_screen);
-
   if (app.fill_failures > 0) {
     char note[128];
-    std::snprintf(note, sizeof note, "%zu region%s could not be triangulated",
-                  app.fill_failures, app.fill_failures == 1 ? "" : "s");
-    list->AddText({top_left.x + 12.0f, top_left.y + 10.0f}, IM_COL32(232, 156, 92, 255),
-                  note);
+    std::snprintf(note, sizeof note, "%zu region%s could not be filled", app.fill_failures,
+                  app.fill_failures == 1 ? "" : "s");
+    view_caption(app, list, top_left, size, 1,
+                 ImGui::GetColorU32(severity_colour(app, LogSeverity::Warning)), note);
   }
-
   list->PopClipRect();
+  view_overlay(app, ViewKind::Pass, top_left, size);
   ImGui::EndChild();
 }
 }  // namespace tinglecam_gui

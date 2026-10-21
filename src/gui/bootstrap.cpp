@@ -29,8 +29,8 @@ void bootstrap(App& app) {
   const std::filesystem::path data = cam::data_directory();
   const std::filesystem::path config = cam::config_directory();
   app.tools_file = config / "tools.json";
+  app.materials_file = config / "materials.json";
   app.settings_file = config / "settings.json";
-  app.tools_import_file = (data / "starter-tools.json").string();
 
   try {
     if (std::filesystem::exists(app.settings_file))
@@ -43,7 +43,18 @@ void bootstrap(App& app) {
 
   try {
     app.machines = cam::load_machines(data / "machines");
-    app.materials = cam::load_materials(data / "materials");
+  } catch (const std::exception& error) {
+    say(app, error.what(), true);
+  }
+  try {
+    if (std::filesystem::exists(app.materials_file)) {
+      app.materials = cam::load_material_library(app.materials_file);
+    } else {
+      // First run: the shipped materials become the user's own library.
+      app.materials = cam::load_materials(data / "materials");
+      if (!app.materials.materials.empty())
+        cam::save_material_library(app.materials_file, app.materials);
+    }
   } catch (const std::exception& error) {
     say(app, error.what(), true);
   }
@@ -62,8 +73,8 @@ void bootstrap(App& app) {
   } catch (const std::exception& error) {
     say(app, error.what(), true);
   }
-  std::snprintf(app.save_path.data(), app.save_path.size(), "%s",
-                (std::filesystem::current_path() / "tinglecam.nc").string().c_str());
+  adopt_default_setup(app);
+  mark_job_saved(app);
 }
 
 void load_ui_fonts(App& app) {
@@ -91,6 +102,8 @@ void load_ui_fonts(App& app) {
 
 void apply_ui_theme(App& app) {
   if (!ImGui::GetCurrentContext()) return;
+  // A click on a number types into it; dragging still scrubs.
+  ImGui::GetIO().ConfigDragClickToInputText = true;
 
   load_ui_fonts(app);
   ImGuiStyle& style = ImGui::GetStyle();
@@ -222,6 +235,6 @@ void apply_ui_scale(App& app) {
                                  0.5f, 3.0f);
   ImGui::GetStyle() = app.unscaled_style;
   ImGui::GetStyle().ScaleAllSizes(scale);
-  ImGui::GetIO().FontGlobalScale = scale;
+  ImGui::GetStyle().FontScaleMain = scale;
 }
 }  // namespace tinglecam_gui

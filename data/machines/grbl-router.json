@@ -8,14 +8,6 @@
   "max_rpm": 30000.0,
   "rpm_resolution": 1000.0,
   "spindle_spinup_seconds": 4.0,
-  "feed_ranges": [
-    { "material": "aluminium-6082", "full_engagement": 400.0, "no_engagement": 1800.0 },
-    { "material": "brass-cz121", "full_engagement": 500.0, "no_engagement": 2000.0 },
-    { "material": "hdpe", "full_engagement": 500.0, "no_engagement": 2000.0 },
-    { "material": "mdf", "full_engagement": 700.0, "no_engagement": 2500.0 },
-    { "material": "steel-1018", "full_engagement": 150.0, "no_engagement": 600.0 },
-    { "material": "stainless-304", "full_engagement": 100.0, "no_engagement": 400.0 }
-  ],
   "tool_change": "manual",
   "tool_change_x": 0.0,
   "tool_change_y": 0.0,

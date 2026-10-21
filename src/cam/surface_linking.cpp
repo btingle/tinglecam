@@ -60,9 +60,11 @@ void reverse_run(SurfaceRun& run) {
 
 void link_surface_runs(const CadModel& model, const Operation& operation,
                        const Tool& tool, const Machine& machine,
+                       const CuttingFeeds& feeds,
                        double rapid_plane, std::vector<SurfaceRun>& runs,
                        OperationPlan& result,
-                       const ProgressCallback& progress) {
+                       const ProgressCallback& progress,
+                       std::vector<SurfaceRun>* joined, bool fixed_order) {
   const auto started = PlanningClock::now();
   const auto& settings = operation.surface;
   auto report = [&] {
@@ -178,117 +180,127 @@ void link_surface_runs(const CadModel& model, const Operation& operation,
     result.metrics.surface_sampling_milliseconds += elapsed_milliseconds(began);
     return path;
   };
-  // Match compatible boundary endpoints before ordering passes. This
-  // interleaves faces into continuous lanes rather than finishing an entire
-  // face first.
-  const double seam_reach =
-      std::max(2 * settings.chord_tolerance, .75 * settings.stepover);
-  Bins seams;
-  for (std::size_t i = 0; i < runs.size(); ++i)
-    for (int end = 0; end < 2; ++end)
-      if (end ? runs[i].last_boundary : runs[i].first_boundary)
-        seams[cell(endpoint(runs[i], end), seam_reach)].push_back(2 * i + end);
-  struct Match {
-    double distance;
-    std::size_t a, b;
-  };
-  std::vector<Match> matches;
-  for (const auto& [key, ports] : seams) {
-    (void)key;
-    for (auto a : ports) {
-      const auto& ra = runs[a / 2];
-      const auto p = endpoint(ra, a % 2);
-      nearby(seams, p, seam_reach, [&](std::size_t b) {
-        if (b <= a || b / 2 == a / 2) return;
-        if (!settings.bidirectional && a % 2 == b % 2) return;
-        const auto& rb = runs[b / 2];
-        if (!model.adjacent(ra.first_face, rb.first_face)) return;
-        const double d = wave::distance(p, endpoint(rb, b % 2));
-        if (d > seam_reach) return;
-        // Outward endpoint tangents must face one another. Avoid joining two
-        // parallel lanes sideways merely because their faces share some edge.
-        const auto inner = [](const SurfaceRun& r, bool end) {
-          return end ? r.points[r.points.size() - 2] : r.points[1];
-        };
-        const auto ia = inner(ra, a % 2), ib = inner(rb, b % 2);
-        const auto q = endpoint(rb, b % 2);
-        const double dot = (p.x - ia.x) * (q.x - ib.x) +
-                           (p.y - ia.y) * (q.y - ib.y) +
-                           (p.z - ia.z) * (q.z - ib.z);
-        if (dot > -.5 * wave::distance(p, ia) * wave::distance(q, ib)) return;
-        matches.push_back({d, a, b});
-      });
-    }
-  }
-  std::sort(matches.begin(), matches.end(), [](const Match& a, const Match& b) {
-    return std::tie(a.distance, a.a, a.b) < std::tie(b.distance, b.a, b.b);
-  });
-  const std::size_t none = std::size_t(-1);
-  std::vector<std::size_t> partner(runs.size() * 2, none);
-  std::vector<Path> bridges(runs.size() * 2);
-  std::vector<std::size_t> parent(runs.size());
-  std::iota(parent.begin(), parent.end(), 0);
-  auto root = [&](std::size_t n) {
-    while (parent[n] != n) {
-      parent[n] = parent[parent[n]];
-      n = parent[n];
-    }
-    return n;
-  };
-  for (const auto& match : matches) {
-    report();
-    if (partner[match.a] != none || partner[match.b] != none ||
-        root(match.a / 2) == root(match.b / 2))
-      continue;
-    auto bridge = connect(surface_end(runs[match.a / 2], match.a % 2),
-                          surface_end(runs[match.b / 2], match.b % 2));
-    if (!bridge) continue;
-    bridges[match.a] = *bridge;
-    std::reverse(bridge->begin(), bridge->end());
-    bridges[match.b] = std::move(*bridge);
-    partner[match.a] = match.b;
-    partner[match.b] = match.a;
-    parent[root(match.a / 2)] = root(match.b / 2);
-    ++result.metrics.surface_seam_joins;
-  }
   std::vector<SurfaceRun> chains;
-  std::vector<bool> used(runs.size(), false);
-  for (std::size_t i = 0; i < runs.size(); ++i) {
-    if (used[i]) continue;
-    // Find the free start of this connected component, retaining the chosen
-    // cutting direction when bidirectional machining is disabled.
-    std::size_t start = 2 * i;
-    while (partner[start] != none) start = partner[start] ^ 1;
-    SurfaceRun chain;
-    auto port = start;
-    while (true) {
-      auto& run = runs[port / 2];
-      used[port / 2] = true;
-      if (port % 2) reverse_run(run);
-      if (chain.points.empty()) {
-        chain.first_face = run.first_face;
-        chain.first_contact = run.first_contact;
-        chain.first_uv = run.first_uv;
-        chain.first_boundary = run.first_boundary;
+  if (!fixed_order) {
+    // Match compatible boundary endpoints before ordering passes. This
+    // interleaves faces into continuous lanes rather than finishing an entire
+    // face first.
+    const double seam_reach =
+        std::max(2 * settings.chord_tolerance, .75 * settings.stepover);
+    Bins seams;
+    for (std::size_t i = 0; i < runs.size(); ++i)
+      for (int end = 0; end < 2; ++end)
+        if (end ? runs[i].last_boundary : runs[i].first_boundary)
+          seams[cell(endpoint(runs[i], end), seam_reach)].push_back(2 * i + end);
+    struct Match {
+      double distance;
+      std::size_t a, b;
+    };
+    std::vector<Match> matches;
+    for (const auto& [key, ports] : seams) {
+      (void)key;
+      for (auto a : ports) {
+        const auto& ra = runs[a / 2];
+        const auto p = endpoint(ra, a % 2);
+        nearby(seams, p, seam_reach, [&](std::size_t b) {
+          if (b <= a || b / 2 == a / 2) return;
+          if (!settings.bidirectional && a % 2 == b % 2) return;
+          const auto& rb = runs[b / 2];
+          if (!model.adjacent(ra.first_face, rb.first_face)) return;
+          const double d = wave::distance(p, endpoint(rb, b % 2));
+          if (d > seam_reach) return;
+          // Outward endpoint tangents must face one another. Avoid joining two
+          // parallel lanes sideways merely because their faces share some edge.
+          const auto inner = [](const SurfaceRun& r, bool end) {
+            return end ? r.points[r.points.size() - 2] : r.points[1];
+          };
+          const auto ia = inner(ra, a % 2), ib = inner(rb, b % 2);
+          const auto q = endpoint(rb, b % 2);
+          const double dot = (p.x - ia.x) * (q.x - ib.x) +
+                             (p.y - ia.y) * (q.y - ib.y) +
+                             (p.z - ia.z) * (q.z - ib.z);
+          if (dot > -.5 * wave::distance(p, ia) * wave::distance(q, ib)) return;
+          matches.push_back({d, a, b});
+        });
       }
-      if (chain.points.empty())
-        chain.points = std::move(run.points);
-      else {
-        chain.points.insert(chain.points.end(), run.points.begin(),
-                            run.points.end());
-        std::vector<wave::Vec3d>().swap(run.points);
-      }
-      chain.last_face = run.last_face;
-      chain.last_contact = run.last_contact;
-      chain.last_uv = run.last_uv;
-      chain.last_boundary = run.last_boundary;
-      const auto next = partner[port ^ 1];
-      if (next == none) break;
-      const auto& bridge = bridges[port ^ 1];
-      chain.points.insert(chain.points.end(), bridge.begin() + 1, bridge.end());
-      port = next;
     }
-    chains.push_back(std::move(chain));
+    std::sort(matches.begin(), matches.end(), [](const Match& a, const Match& b) {
+      return std::tie(a.distance, a.a, a.b) < std::tie(b.distance, b.a, b.b);
+    });
+    const std::size_t none = std::size_t(-1);
+    std::vector<std::size_t> partner(runs.size() * 2, none);
+    std::vector<Path> bridges(runs.size() * 2);
+    std::vector<std::size_t> parent(runs.size());
+    std::iota(parent.begin(), parent.end(), 0);
+    auto root = [&](std::size_t n) {
+      while (parent[n] != n) {
+        parent[n] = parent[parent[n]];
+        n = parent[n];
+      }
+      return n;
+    };
+    for (const auto& match : matches) {
+      report();
+      if (partner[match.a] != none || partner[match.b] != none ||
+          root(match.a / 2) == root(match.b / 2))
+        continue;
+      auto bridge = connect(surface_end(runs[match.a / 2], match.a % 2),
+                            surface_end(runs[match.b / 2], match.b % 2));
+      if (!bridge) continue;
+      bridges[match.a] = *bridge;
+      std::reverse(bridge->begin(), bridge->end());
+      bridges[match.b] = std::move(*bridge);
+      partner[match.a] = match.b;
+      partner[match.b] = match.a;
+      parent[root(match.a / 2)] = root(match.b / 2);
+      ++result.metrics.surface_seam_joins;
+    }
+    std::vector<bool> used(runs.size(), false);
+    for (std::size_t i = 0; i < runs.size(); ++i) {
+      if (used[i]) continue;
+      // Find the free start of this connected component, retaining the chosen
+      // cutting direction when bidirectional machining is disabled.
+      std::size_t start = 2 * i;
+      while (partner[start] != none) start = partner[start] ^ 1;
+      SurfaceRun chain;
+      auto port = start;
+      while (true) {
+        auto& run = runs[port / 2];
+        used[port / 2] = true;
+        if (port % 2) reverse_run(run);
+        if (chain.points.empty()) {
+          chain.first_face = run.first_face;
+          chain.first_contact = run.first_contact;
+          chain.first_uv = run.first_uv;
+          chain.first_boundary = run.first_boundary;
+        }
+        if (chain.points.empty())
+          chain.points = std::move(run.points);
+        else {
+          chain.points.insert(chain.points.end(), run.points.begin(),
+                              run.points.end());
+          std::vector<wave::Vec3d>().swap(run.points);
+        }
+        for (auto& span : run.spans) chain.spans.push_back(std::move(span));
+        chain.last_face = run.last_face;
+        chain.last_contact = run.last_contact;
+        chain.last_uv = run.last_uv;
+        chain.last_boundary = run.last_boundary;
+        const auto next = partner[port ^ 1];
+        if (next == none) break;
+        const auto& bridge = bridges[port ^ 1];
+        chain.points.insert(chain.points.end(), bridge.begin() + 1, bridge.end());
+        port = next;
+      }
+      chains.push_back(std::move(chain));
+    }
+  } else {
+    chains = std::move(runs);
+  }
+  if (joined) {
+    *joined = std::move(chains);
+    result.metrics.surface_linking_milliseconds += elapsed_milliseconds(started);
+    return;
   }
   // Short stay-down moves are feeds: remaining stock can still be present.
   // Connections follow native surfaces. Disconnected selections retain the
@@ -306,7 +318,7 @@ void link_surface_runs(const CadModel& model, const Operation& operation,
       contacts[cell(contact(chains[i], true), link_reach)].push_back(2 * i + 1);
     }
   }
-  used.assign(chains.size(), false);
+  std::vector<bool> used(chains.size(), false);
   std::optional<wave::Vec3d> previous;
   std::vector<wave::Vec3d> feed_link;
   bool stay_down = false;
@@ -343,9 +355,8 @@ void link_surface_runs(const CadModel& model, const Operation& operation,
       phase.length = wave::distance(a, b);
       phase.rate =
           rapid ? (a.z == b.z ? rapid_feed(machine) : rapid_feed_z(machine))
-                : (kind == wave::MoveKind::Entry
-                       ? operation.plunge_feed
-                       : operation.full_engagement_feed);
+                : (kind == wave::MoveKind::Entry ? feeds.plunge_feed
+                                                 : feeds.full_feed());
       phase.path_distance_begin = path_distance;
       const double xy = std::hypot(b.x - a.x, b.y - a.y);
       path_distance += xy;
@@ -395,6 +406,9 @@ void link_surface_runs(const CadModel& model, const Operation& operation,
     stay_down = false;
     for (auto [d, port] : options) {
       (void)d;
+      // A manual sequence is authoritative. A short link may orient the next
+      // contour, but must never skip ahead to a closer, later contour.
+      if (fixed_order && port / 2 != completed) continue;
       auto path = connect(surface_end(chain, true),
                           surface_end(chains[port / 2], port % 2));
       if (!path) continue;

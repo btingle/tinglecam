@@ -7,7 +7,7 @@
 #include "cam/material.h"
 #include "cam/tooling.h"
 #include "planning/toolpath.h"
-#include "simulation/simulation.h"
+#include "simulation/heightmap.h"
 #include "wave/analysis.h"
 #include "wave/geometry.h"
 #include "wave/mesh_slicer.h"
@@ -31,6 +31,7 @@ enum class OperationMode {
   Pocket,
   PlaneClearing,
   SurfaceFinishing,
+  Hole,
 };
 
 // A rounded rectangle covers the former circle and square cases as well:
@@ -64,10 +65,6 @@ struct PocketParameters {
 };
 
 struct PlaneParameters {
-  // Retained as a compatibility fallback for older job files. New files and
-  // the planner use each area's own Z range.
-  double top_z = 0.0;
-  double depth = 1.0;
   std::vector<ClearingArea> areas{{}};
 };
 
@@ -89,6 +86,52 @@ struct PocketAutoParameters {
 
 // A native CAD face selection is bound to its source file, since face numbers
 // can change after a model is edited or re-exported.
+enum class HoleStrategy { Drill, Helical, Pocket, Adaptive };
+const char* hole_strategy_name(HoleStrategy);
+std::optional<HoleStrategy> hole_strategy_from_name(const std::string&);
+enum class DrillDepth { Tip, FullDiameter };
+const char* drill_depth_name(DrillDepth);
+std::optional<DrillDepth> drill_depth_from_name(const std::string&);
+struct DrillParameters {
+  DrillDepth depth_reference = DrillDepth::Tip;
+  double peck_depth = 0.0; // Zero drills in one feed move.
+  double peck_clearance = 1.0;
+  double breakthrough = 0.2; // Applied only to through holes.
+  double depth_adjustment = 0.0; // Positive extends below the nominal hole floor.
+};
+struct HoleLevel {
+  double radius = 3.0;
+  double top_z = 0.0;
+  double bottom_z = -5.0;
+  bool through = false;
+  bool selected = true;
+  std::optional<HoleStrategy> strategy;
+  std::string tool_id; // Empty inherits the operation tool.
+  double fit_error = 0.0;
+};
+struct HoleSystem {
+  double center_x = 0.0, center_y = 0.0;
+  bool selected = true;
+  std::vector<HoleLevel> levels{{}}; // Shallowest/widest first.
+};
+struct HoleParameters {
+  bool automatic = false;
+  double inspection_depth = 0.0; // Down from part top; zero inspects just inside it.
+  double circle_tolerance = 0.03; // Maximum radial boundary deviation, mm.
+  bool counterbores = true;
+  double probe_inset = 0.05;
+  double slice_epsilon = 0.01;
+  HoleStrategy strategy = HoleStrategy::Helical;
+  double adaptive_radius = 3.0;
+  double helix_angle_degrees = 3.0;
+  double radial_margin = 0.0;
+  DrillParameters drilling;
+  std::vector<HoleSystem> systems{{}};
+  std::string detection_signature;
+  std::string id; // Stable identity for a linked pre-drilling operation.
+  std::string source_id; // Read selected milling holes from this Hole operation.
+};
+
 struct SurfaceParameters {
   std::vector<std::size_t> faces;
   std::string model_fingerprint;
@@ -98,28 +141,29 @@ struct SurfaceParameters {
   bool along_v = true;
   bool bidirectional = true;
   bool flip_normals = false;
+  bool manual_order = false;
+  // Indices refer to the joined contour preview identified by this signature.
+  // Changed geometry/settings require explicit reselection rather than silently
+  // transferring a root to a different contour.
+  std::string order_signature;
+  std::vector<std::size_t> order_roots;
 };
 
 struct Operation {
   std::string name = "Rough";
   std::string tool_id;
-  std::string machine_id;
-  std::string material_id;
   OperationMode mode = OperationMode::Roughing;
 
   // Strategies belong to operations, never to the tool library.
   double stepover_ratio = 0.4;
   double stepdown = 1.0;
-  double spindle_rpm = 12000.0;
-  double plunge_feed = 100.0;
+  // Feeds and speeds come from the tool's cutting data for the job material.
+  CuttingOverrides cutting;
   bool coolant = false;
-  // Zero selects the tool's library position (1-based), or the tool number
-  // for H. Explicit machine assignments belong to this operation.
-  int tool_number = 0;
-  int length_offset = 0;
   std::vector<PocketParameters> pockets{{}};
   bool auto_identify_pockets = false;
   PocketAutoParameters pocket_auto;
+  HoleParameters holes;
   // Pocket mode only, and applied to identified pockets as well as entered
   // ones. Walls finish this far inside the requested outline, which leaves
   // that much for a finishing pass; a negative margin cuts that far past them,
@@ -127,7 +171,6 @@ struct Operation {
   double pocket_radial_margin = 0.0;
   PlaneParameters plane;
   SurfaceParameters surface;
-  double simulation_pitch = 0.1;
   // Descend through all coarse floors, then clean each terrace upward,
   // deepest first. N divides each actual coarse interval into N equal parts.
   int finishing_subdivisions = 1;
@@ -180,13 +223,7 @@ struct Operation {
   // outside remaining stock a later subdivision's cleanup centreline may run.
   // Planning clamps the effective distance to zero at the cutter radius.
   double cleanup_tolerance = 0.15;
-  // When false, use the selected machine's range for this material.
-  bool manual_feed_range = false;
-  double full_engagement_feed = 500.0;
-  double no_engagement_feed = 2000.0;
   int slice_grid = 32;
-  double simulation_stock_inflation = 0.0;
-  wave::SimulationMethod simulation_method = wave::SimulationMethod::Heightmap;
 };
 
 struct BoxStockMargins {
@@ -198,10 +235,26 @@ struct BoxStockMargins {
   double plus_z = 0.0;
 };
 
+// A tool's place in the machine for this job. Length offset 0 means the same
+// number as the tool.
+struct ToolAssignment {
+  std::string tool_id;
+  int number = 0;
+  int length_offset = 0;
+};
+
 struct Job {
   std::string name = "Untitled";
   std::filesystem::path part_mesh;
   std::filesystem::path stock_mesh;
+  // One machine runs the program and one material is on it.
+  std::string machine_id;
+  std::string material_id;
+  // XY spacing of the stock simulation grid, mm.
+  double simulation_pitch = 0.02;
+  // Every tool the operations use, with its pocket number. Tools missing from
+  // the table are numbered after it in order of first use.
+  std::vector<ToolAssignment> tools;
   // Where the program's origin sits relative to the mesh coordinates. Added to
   // every posted coordinate.
   double origin_x = 0.0;
@@ -211,22 +264,21 @@ struct Job {
   // directional margins.
   bool box_stock = false;
   BoxStockMargins box_stock_margins;
-  // Kept as a source-compatibility field for callers built against the old
-  // uniform-margin API. New job files use box_stock_margins instead.
-  double box_stock_margin = 5.0;
   // Every disconnected move retracts to Z0 plus this height. Keeping a single
   // safe plane avoids pretending a 2D slice can prove a lower traverse safe.
   double rapid_clearance_height = 10.0;
+  // Vertical entries rapid through air, then use plunge feed this far above
+  // first contact with the current remaining stock under the whole cutter.
+  double plunge_clearance_height = 1.0;
   std::string work_offset = "G54";
   std::vector<Operation> operations;
 };
 
-// One depth of cut: everything the engine produced for it, kept so the UI can
-// draw any level and the post can walk them in order.
-struct StockSlab {
-  double bottom = 0, top = 0;
-  std::shared_ptr<const wave::Paths64> region;
-};
+// The job's tool table with every tool the operations use, missing entries
+// numbered after the highest number already taken, in order of first use.
+std::vector<ToolAssignment> resolved_tool_table(const Job& job);
+const ToolAssignment* find_tool_assignment(const std::vector<ToolAssignment>& table,
+                                           const std::string& tool_id);
 
 struct StockCheckpoint {
   std::size_t phase = 0;
@@ -234,13 +286,15 @@ struct StockCheckpoint {
   double motion_distance = 0.0;
 };
 
+// One depth of cut: everything the engine produced for it, kept so the UI can
+// draw any level and the post can walk them in order.
 struct LevelPlan {
   std::vector<StockCheckpoint> stock_checkpoints;
   std::vector<double> motion_distances;
-  std::vector<StockSlab> local_stock;
   // Parametric operations carry their actual XYZ path in feeds.motion. The
   // planar projection remains available for stock simulation and 2D views.
   bool explicit_motion = false;
+  std::string tool_id; // Optional tool override for a hole/counterbore level.
   double floor_z = 0.0;    // the depth this pass cuts down to
   // Axial slab height; cleanup uses the remaining coarse terrace as its bound.
   double axial_depth = 0.0;
@@ -269,11 +323,13 @@ struct LevelPlan {
   std::size_t analysis_trials = 0;
   std::size_t accepted_analysis_trials = 0;
   wave::Toolpath toolpath;
-  wave::SimulationResult simulation;
+  // Everywhere the cutter's footprint passes over at this floor. The passes
+  // of an operation still being planned hand stock to each other through it.
+  wave::Paths64 swept;
   FeedSchedule feeds;
   bool nothing_to_cut = false;
-  // This pass leaves the cutter at its floor. Roughing's next motion schedule
-  // carries the validated XYZ link; legacy planar linking uses `transition`.
+  // This pass leaves the cutter at its floor. A roughing pass links to the next
+  // through the stock simulation; within one depth, `transition` carries it.
   bool stays_down_after = false;
   // Pocket layers share a known opening, so prefer that stay-down connection
   // whenever the router can prove it is safe.
@@ -298,9 +354,10 @@ struct PlanStats {
   double tool_change_minutes = 0.0;
   double maximum_load = 0.0;
   double removed_volume = 0.0;  // mm^3
+  // Swept cutter area reaching into the part slice, roughing and contours.
   double gouge_area = 0.0;
+  // Roughing descents that land on stock and have to plunge.
   std::size_t unsafe_plunges = 0;
-  std::size_t unresolved_entries = 0;
   std::size_t skipped_entries = 0;
   // Rapids the planner had to route over the part because the free space
   // around it is disconnected. A slice says nothing about how far the part
@@ -309,10 +366,6 @@ struct PlanStats {
   // Fronts the sequencer never reached. The material they bound is still
   // there when the operation finishes.
   std::size_t unreachable_fronts = 0;
-  // Stock still standing that is not part of the finished shape. Roughing
-  // always leaves some -- the radial allowance is exactly this -- so it is
-  // reported rather than warned about.
-  double excess_area = 0.0;
 };
 
 // Timing measurements and scale counters for one planning run. These are
@@ -338,7 +391,6 @@ struct PlanningMetrics {
   double cleanup_milliseconds = 0.0;
   double stitching_milliseconds = 0.0;
   double resampling_milliseconds = 0.0;
-  double simulation_milliseconds = 0.0;
   double xyz_simulation_milliseconds = 0.0;
   double feeds_milliseconds = 0.0;
   // Phase times sum elapsed work across concurrently planned cleanup passes.
@@ -353,9 +405,6 @@ struct PlanningMetrics {
   std::size_t analysis_trials = 0;
   std::size_t accepted_analysis_trials = 0;
   std::size_t toolpath_moves = 0;
-  std::size_t simulation_intervals = 0;
-  std::size_t empty_simulation_intervals = 0;
-  std::size_t gouge_bounds_rejections = 0;
 };
 
 struct OperationPlan {
@@ -364,15 +413,9 @@ struct OperationPlan {
   // error says so, so every reader that already skips a failed operation skips
   // this one too; the flag is what tells a failure apart from a gap.
   bool planned = false;
-  bool composed_stock = false;
   std::shared_ptr<const wave::Heightmap> stock_before, stock_after;
-  // Complete incoming stock, including previous operations' cuts. Playback
-  // applies this operation's sweeps in order, without rebuilding area ownership.
-  std::vector<StockSlab> preview_context;
   std::string operation_name;
   std::string tool_id;
-  std::string machine_id;
-  std::string material_id;
   struct IdentifiedPocket {
     wave::Paths64 boundary;
     double center_x = 0.0;
@@ -456,16 +499,14 @@ class JobGeometry {
     return *this;
   }
 
-  void load_part(const std::filesystem::path& file);
-  void load_stock(const std::filesystem::path& file);
+  void load_part(const std::filesystem::path& file, const ModelLoadProgress& = {});
+  void load_stock(const std::filesystem::path& file, const ModelLoadProgress& = {});
   // Stand a rectangular blank in for a stock model: the part's bounding box
   // grown by directional margins. A loaded stock model always wins.
   // Drops a loaded stock model, so a blank named and then unnamed does not go
   // on winning over the box that replaced it.
   void clear_stock();
   void set_box_stock(bool enabled, const BoxStockMargins& margins);
-  // Compatibility overload for callers using the former uniform XY margin.
-  void set_box_stock(bool enabled, double margin);
   bool box_stock() const { return box_stock_ && stock_.empty(); }
   bool has_part() const { return !part_.empty(); }
   bool has_stock() const { return !stock_.empty() || (box_stock_ && !part_.empty()); }
@@ -543,7 +584,7 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
                               const Operation& operation,
                               const Tool& tool,
                               const Machine& machine,
-                              const Material& material,
+                              const CuttingFeeds& feeds,
                               const ProgressCallback& progress,
                               double progress_from = 0.0,
                               double progress_to = 1.0,
@@ -587,7 +628,7 @@ void plan_toolpaths(OperationPlan& plan,
                     const Operation& operation,
                     const Tool& tool,
                     const Machine& machine,
-                    const Material& material,
+                    const CuttingFeeds& feeds,
                     const ProgressCallback& progress,
                     double progress_from = 0.0,
                     double progress_to = 1.0,
@@ -601,7 +642,7 @@ OperationPlan plan_operation(const JobGeometry& geometry,
                              const Operation& operation,
                              const Tool& tool,
                              const Machine& machine,
-                             const Material& material,
+                             const CuttingFeeds& feeds,
                              const ProgressCallback& progress,
                              double progress_from = 0.0,
                              double progress_to = 1.0,
@@ -610,16 +651,11 @@ OperationPlan plan_operation(const JobGeometry& geometry,
                              const OperationPlan* prior_subdivisions = nullptr,
                              bool defer_links = false);
 
-// Resolves the material present at one Z plane after a sequence of operations.
-// A level removes material only through the axial slab it represents. This is
-// deliberately public: pocketing and stock-aware contour clipping can consume
-// the same authoritative handoff as simulation instead of rebuilding a second
-// stock model later.
+// The material at one Z plane after a sequence of operations: the nominal
+// stock clipped to the newest simulated stock among them.
 wave::Paths64 stock_after_operations_at_z(
     const wave::Paths64& nominal_stock, double z,
     const PriorOperations& operations);
-wave::Paths64 stock_after_planned_operation_at_z(
-    const wave::Paths64& nominal_stock, double z, const OperationPlan& operation);
 
 // What one re-planning run produced. `operations` covers job operations
 // [first, first + operations.size()) and nothing else; the caller splices them

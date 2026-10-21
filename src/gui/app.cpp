@@ -2,11 +2,6 @@
 
 namespace tinglecam_gui {
 
-#include "prism_view.h"
-
-void release_prism_view() {
-  heightmap_view.reset();
-  prism_view.release();
-}
+void release_render_resources() { heightmap_view.reset(); }
 
 }  // namespace tinglecam_gui

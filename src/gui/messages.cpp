@@ -12,77 +12,89 @@ const char* severity_name(LogSeverity severity) {
   return "";
 }
 
-ImVec4 severity_colour(LogSeverity severity) {
-  switch (severity) {
-    case LogSeverity::Info: return ImVec4(0.65f, 0.78f, 0.9f, 1.0f);
-    case LogSeverity::Warning: return ImVec4(1.0f, 0.72f, 0.35f, 1.0f);
-    case LogSeverity::Error: return ImVec4(1.0f, 0.4f, 0.4f, 1.0f);
-  }
-  return ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
-}
-
 bool visible(LogSeverity severity, int filter) {
   return filter == 0 || static_cast<int>(severity) == filter - 1;
 }
 
 }  // namespace
 
-void messages_panel(App& app) {
-  std::size_t infos = 0;
-  std::size_t warnings = 0;
-  std::size_t errors = 0;
-  for (const LogMessage& message : app.messages) {
-    switch (message.severity) {
-      case LogSeverity::Info: ++infos; break;
-      case LogSeverity::Warning: ++warnings; break;
-      case LogSeverity::Error: ++errors; break;
-    }
-  }
-
-  ImGui::SeparatorText("Build messages");
-  ImGui::Text("%zu total", app.messages.size());
-  ImGui::SameLine();
-  ImGui::TextColored(severity_colour(LogSeverity::Info), "%zu info", infos);
-  ImGui::SameLine();
-  ImGui::TextColored(severity_colour(LogSeverity::Warning), "%zu warnings", warnings);
-  ImGui::SameLine();
-  ImGui::TextColored(severity_colour(LogSeverity::Error), "%zu errors", errors);
-
+void messages_drawer(App& app) {
   const char* filters[] = {"All", "Info", "Warnings", "Errors"};
   for (int filter = 0; filter < 4; ++filter) {
     if (filter != 0) ImGui::SameLine();
     if (ImGui::RadioButton(filters[filter], app.message_filter == filter))
       app.message_filter = filter;
   }
-  if (ImGui::SmallButton("Copy visible messages")) {
+  ImGui::SameLine();
+  if (ImGui::SmallButton("Copy")) {
     std::string copied;
     for (const LogMessage& message : app.messages) {
       if (!visible(message.severity, app.message_filter)) continue;
-      copied += '[';
-      copied += severity_name(message.severity);
-      copied += "] ";
-      copied += message.source;
-      copied += ": ";
-      copied += message.text;
-      copied += '\n';
+      copied += std::string("[") + severity_name(message.severity) + "] " +
+                message.source + ": " + message.text + '\n';
     }
     ImGui::SetClipboardText(copied.c_str());
   }
   ImGui::SameLine();
   if (ImGui::SmallButton("Clear")) app.messages.clear();
+  ImGui::SameLine();
+  if (ImGui::SmallButton("Close")) app.show_messages = false;
 
-  ImGui::BeginChild("message-list", ImVec2(0, 0), ImGuiChildFlags_Borders);
+  ImGui::BeginChild("message-list", ImVec2(0, 0));
   for (const LogMessage& message : app.messages) {
     if (!visible(message.severity, app.message_filter)) continue;
-    ImGui::PushStyleColor(ImGuiCol_Text, severity_colour(message.severity));
-    ImGui::Text("[%s] %s", severity_name(message.severity),
-                message.source.c_str());
+    ImGui::PushStyleColor(ImGuiCol_Text, severity_colour(app, message.severity));
+    ImGui::TextUnformatted(message.source.c_str());
     ImGui::PopStyleColor();
     ImGui::SameLine();
     ImGui::TextWrapped("%s", message.text.c_str());
   }
   if (app.messages.empty()) ImGui::TextDisabled("No messages.");
+  if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 1.0f) ImGui::SetScrollHereY(1.0f);
   ImGui::EndChild();
+}
+
+void status_bar(App& app) {
+  std::size_t warnings = 0, errors = 0;
+  for (const LogMessage& message : app.messages) {
+    if (message.severity == LogSeverity::Warning) ++warnings;
+    if (message.severity == LogSeverity::Error) ++errors;
+  }
+  char right[160];
+  int length = 0;
+  if (app.has_plan)
+    length += std::snprintf(right, sizeof right, "Job %.1f min    ",
+                            app.plan.stats.cutting_minutes + app.plan.stats.rapid_minutes +
+                                app.plan.stats.tool_change_minutes);
+  std::snprintf(right + length, sizeof right - length, "%zu warning%s  %zu error%s",
+                warnings, warnings == 1 ? "" : "s", errors, errors == 1 ? "" : "s");
+  const float right_width = ImGui::CalcTextSize(right).x;
+
+  const ImVec2 start = ImGui::GetCursorScreenPos();
+  const float width = ImGui::GetContentRegionAvail().x;
+  const ImVec2 size(width, ImGui::GetFrameHeight());
+  if (ImGui::InvisibleButton("status", size)) app.show_messages = !app.show_messages;
+  ImGui::SetItemTooltip(app.show_messages ? "Hide messages" : "Show messages");
+  ImDrawList* list = ImGui::GetWindowDrawList();
+  list->AddRectFilled(start, ImVec2(start.x + size.x, start.y + size.y),
+                      ImGui::GetColorU32(ImGuiCol_MenuBarBg));
+  const float text_y = start.y + (size.y - ImGui::GetFontSize()) * 0.5f;
+  const float padding = ImGui::GetStyle().FramePadding.x;
+  if (!app.messages.empty()) {
+    const LogMessage& last = app.messages.back();
+    const std::string text = last.source + ": " + last.text;
+    const std::string line = text.substr(0, text.find('\n'));
+    list->PushClipRect(start, ImVec2(start.x + width - right_width - padding * 3.0f,
+                                     start.y + size.y), true);
+    list->AddText(ImVec2(start.x + padding, text_y),
+                  ImGui::GetColorU32(severity_colour(app, last.severity)), line.c_str());
+    list->PopClipRect();
+  }
+  const ImU32 summary = ImGui::GetColorU32(
+      errors ? severity_colour(app, LogSeverity::Error)
+             : warnings ? severity_colour(app, LogSeverity::Warning)
+                        : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+  list->AddText(ImVec2(start.x + width - right_width - padding, text_y), summary, right);
 }
 
 }  // namespace tinglecam_gui

@@ -350,6 +350,12 @@ std::int64_t to_integer(double value) {
   return static_cast<std::int64_t>(std::llround(value * kIntegerScale));
 }
 
+double material_area(const Paths64& paths) {
+  return std::abs(Clipper2Lib::Area(
+             Clipper2Lib::Union(paths, Clipper2Lib::FillRule::NonZero))) /
+         (kIntegerScale * kIntegerScale);
+}
+
 SvgGeometry load_svg_closed_paths(const std::filesystem::path& filename) {
   std::ifstream stream(filename);
   if (!stream) throw std::runtime_error("Unable to open SVG: " + filename.string());

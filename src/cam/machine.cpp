@@ -41,12 +41,6 @@ constexpr std::pair<LengthOffsetMode, const char*> kOffsetModes[]{
 
 }  // namespace
 
-const MaterialFeedRange* Machine::feeds_for(const std::string& material_id) const {
-  for (const auto& range : feed_ranges)
-    if (range.material_id == material_id) return &range;
-  return nullptr;
-}
-
 const char* controller_name(Controller value) { return name_of(value, kControllers); }
 const char* tool_change_name(ToolChange value) { return name_of(value, kToolChanges); }
 const char* length_offset_mode_name(LengthOffsetMode value) {
@@ -93,21 +87,6 @@ std::vector<std::string> validate(const Machine& machine) {
   require(machine.min_rpm >= 0.0, "Minimum spindle speed cannot be negative");
   require(machine.decimals >= 1 && machine.decimals <= 6,
           "Output precision must be between 1 and 6 decimals");
-  std::vector<std::string> seen_materials;
-  for (const auto& range : machine.feed_ranges) {
-    const std::string where = " for " + range.material_id;
-    require(!range.material_id.empty(), "A feed range is missing its material");
-    require(range.full_engagement > 0.0 &&
-                std::isfinite(range.full_engagement),
-            "Full-engagement feed must be positive" + where);
-    require(range.no_engagement >= range.full_engagement &&
-                std::isfinite(range.no_engagement),
-            "No-engagement feed must not be slower than full engagement" + where);
-    require(std::find(seen_materials.begin(), seen_materials.end(),
-                      range.material_id) == seen_materials.end(),
-            "Two feed ranges name " + range.material_id);
-    seen_materials.push_back(range.material_id);
-  }
   return problems;
 }
 

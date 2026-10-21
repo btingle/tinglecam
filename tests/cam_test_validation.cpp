@@ -10,19 +10,29 @@ void check_validation() {
   bad.flutes = 0;
   require(!cam::validate(bad).empty(), "zero flute count is rejected");
   require(cam::validate(test_machine()).empty(), "the test machine validates");
+  bad = test_tool();
+  bad.cutting.front().chip_load = 0.0;
+  require(!cam::validate(bad).empty(), "a zero chip load is rejected");
+  bad = test_tool();
+  bad.cutting.push_back(bad.cutting.front());
+  require(!cam::validate(bad).empty(), "two cutting entries for one material are rejected");
 }
 
 void check_planning_error_details() {
   std::cout << "planning error details\n";
   cam::Job job;
+  job.machine_id = test_machine().id;
+  job.material_id = "plastic";
   cam::Operation broken;
   broken.name = "Broken roughing";
   broken.tool_id = "missing-tool";
   job.operations.push_back(broken);
+  cam::MaterialLibrary materials;
+  materials.materials.push_back({"plastic", "Plastic"});
 
   const cam::JobPlan plan = cam::plan_job(
-      cam::JobGeometry{}, job, cam::ToolLibrary{}, cam::MachineLibrary{},
-      cam::MaterialLibrary{}, {});
+      cam::JobGeometry{}, job, cam::ToolLibrary{}, cam::MachineLibrary{{test_machine()}},
+      materials, {});
   require(!plan.ok(), "an operation with an unknown tool must fail planning");
   require(plan.error.find("No operation could be planned") != std::string::npos,
           "the job-level planning failure keeps its summary");
@@ -46,25 +56,17 @@ void check_shipped_data(const std::filesystem::path& data) {
   for (const auto& machine : machines.machines) {
     for (const auto& problem : cam::validate(machine))
       require(false, machine.id + ": " + problem);
-    for (const auto& range : machine.feed_ranges)
-      require(materials.find(range.material_id) != nullptr,
-              machine.id + " names an unknown material feed range");
   }
+  require(machines.find("makera-z1") != nullptr, "the Makera profile is present");
   for (const auto& tool : tools.tools) {
     for (const auto& problem : cam::validate(tool))
       require(false, tool.id + ": " + problem);
-  }
-  const cam::Machine* makera = machines.find("makera-z1");
-  require(makera != nullptr, "the Makera profile is present");
-  if (makera) {
-    const cam::MaterialFeedRange* plastic = makera->feeds_for("hdpe");
-    require(plastic != nullptr, "the Makera has a plastic feed range");
-    if (plastic) {
-      require_near(plastic->full_engagement, 500.0, 1e-9,
-                   "Makera plastic full-engagement feed");
-      require_near(plastic->no_engagement, 2000.0, 1e-9,
-                   "Makera plastic no-engagement feed");
-    }
+    for (const auto& material : materials.materials)
+      require(tool.cutting_for(material.id) != nullptr,
+              tool.id + " has starter cutting data for " + material.id);
+    for (const auto& data : tool.cutting)
+      require(materials.find(data.material_id) != nullptr,
+              tool.id + " names an unknown material");
   }
 }
 
@@ -77,23 +79,20 @@ void check_post_output() {
   cam::Machine machine = test_machine();
   machines.upsert(machine);
   cam::Job job;
+  job.machine_id = machine.id;
+  job.material_id = "plastic";
+  job.tools = {{tool.id, 3, 0}};
   cam::Operation operation;
   operation.name = "Rough";
-  operation.tool_number = 3;
-  operation.plunge_feed = 120.0;
   operation.tool_id = tool.id;
-  operation.machine_id = machine.id;
-  operation.material_id = "plastic";
   job.operations.push_back(operation);
 
-  const SyntheticCut cut = straight_cut({0.5, 0.5});
   cam::LevelPlan level;
   level.floor_z = -1.5;
   level.axial_depth = 1.5;
-  level.toolpath = cut.toolpath;
-  level.simulation = cut.simulation;
-  level.feeds = cam::plan_feeds(
-      cut.toolpath, cut.simulation, machine, 500.0, 2000.0, 12000.0, 120.0);
+  level.toolpath = straight_cut(2);
+  level.feeds = cam::plan_feeds(level.toolpath, machine, test_feeds(), level.floor_z,
+                                job.rapid_clearance_height);
   cam::OperationPlan planned_operation;
   planned_operation.operation_name = "Rough";
   planned_operation.planned = true;
@@ -107,8 +106,10 @@ void check_post_output() {
   require(result.ok(), "the post succeeds: " + result.error);
   require(result.text.find("M3 S12000") != std::string::npos,
           "the configured spindle speed is posted");
-  require(result.text.find("F1250") != std::string::npos,
-          "the engagement-derived feed is posted");
+  require(result.text.find("F2000") != std::string::npos,
+          "the scheduled feed is posted");
+  require(result.text.find("Tool 3") != std::string::npos,
+          "the job's tool table numbers the tool");
   require(result.text.find("F120") != std::string::npos,
           "a cut without a cleared landing is posted at plunge feed");
   require(result.text.find("M30") != std::string::npos,
@@ -147,25 +148,15 @@ void check_post_output() {
   safe_cut.path = {point(0.0), point(1.0)};
   safe_cut.length = 1.0;
   safe_path.moves.push_back(safe_cut);
-  wave::SimulationResult safe_simulation;
-  safe_simulation.moves.resize(2);
-  wave::MaterialStep safe_step;
-  safe_step.from = point(0.0);
-  safe_step.to = point(1.0);
-  safe_step.move_distance_end = 1.0;
-  safe_step.load = 1.0;
-  safe_simulation.moves[1].steps.push_back(safe_step);
   level.toolpath = safe_path;
-  level.simulation = safe_simulation;
-  level.feeds = cam::plan_feeds(
-      safe_path, safe_simulation, machine, 500.0, 2000.0, 12000.0,
-      120.0, level.floor_z, job.rapid_clearance_height);
+  level.feeds = cam::plan_feeds(safe_path, machine, test_feeds(), level.floor_z,
+                                job.rapid_clearance_height);
   plan.operations.front().levels.front() = level;
   const cam::PostResult rapid_entry =
       cam::post_job(plan, job, tools, machines);
   require(rapid_entry.ok(), "the safe-entry post succeeds: " + rapid_entry.error);
   require(rapid_entry.text.find("F120") == std::string::npos,
-          "a simulation-cleared retract landing returns to depth with G0");
+          "a retract landing returns to depth with G0");
 }
 
 }  // namespace cam_test

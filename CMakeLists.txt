@@ -116,7 +116,6 @@ target_compile_options(wave_planning PRIVATE
 )
 
 add_library(wave_simulation
-  src/simulation/simulation.cpp
   src/simulation/heightmap.cpp
 )
 target_link_libraries(wave_simulation PUBLIC wave_planning)
@@ -126,16 +125,8 @@ target_compile_options(wave_simulation PRIVATE
   $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/W4>
 )
 
-add_library(wave_rendering
-  src/rendering/prism_renderer.cu
-)
-target_link_libraries(wave_rendering PUBLIC wave_geometry PRIVATE cuBQL_cuda_float3_static)
-target_include_directories(wave_rendering PUBLIC src)
-target_compile_definitions(wave_rendering PUBLIC WAVE_HAVE_CUDA=1)
-set_target_properties(wave_rendering PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
-
-# Native heightfield rendering uses portable OpenGL fragment shaders. CUDA
-# remains confined to the existing mesh slicer and legacy prism renderer.
+# Native heightfield rendering uses portable OpenGL fragment shaders. CUDA is
+# confined to the mesh slicer.
 add_library(heightmap_rendering src/rendering/heightmap_renderer.cpp)
 target_link_libraries(heightmap_rendering PUBLIC wave_simulation PRIVATE SDL2::SDL2 OpenGL::GL)
 target_include_directories(heightmap_rendering PUBLIC src)
@@ -166,9 +157,13 @@ add_library(tinglecam_core
   src/cam/cad.cpp
   src/cam/surface_finishing.cpp
   src/cam/surface_linking.cpp
+  src/cam/surface_ordering.cpp
+  src/cam/surface_sampling.cpp
   src/cam/heightmap_simulation.cpp
   src/cam/contours.cpp
   src/cam/config.cpp
+  src/cam/holes.cpp
+  src/cam/hole_config.cpp
   src/cam/auto_pockets.cpp
   src/cam/feeds.cpp
   src/cam/job_geometry.cpp
@@ -177,7 +172,6 @@ add_library(tinglecam_core
   src/cam/job_support.cpp
   src/cam/machine.cpp
   src/cam/material.cpp
-  src/cam/stock.cpp
   src/cam/parametric.cpp
   src/cam/post.cpp
   src/cam/tooling.cpp
@@ -213,7 +207,7 @@ endif()
 
 add_custom_command(TARGET clipper2_wave_demo POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
-          ${CMAKE_CURRENT_SOURCE_DIR}/wavetest.svg
+          ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/wavetest.svg
           $<TARGET_FILE_DIR:clipper2_wave_demo>/wavetest.svg
 )
 
@@ -226,21 +220,25 @@ target_include_directories(tinglecam_gui PRIVATE ${imgui_SOURCE_DIR})
 add_library(tinglecam_app_ui STATIC
   src/gui/app.cpp
   src/gui/bootstrap.cpp
+  src/gui/dialogs.cpp
   src/gui/drawing.cpp
   src/gui/job_panels.cpp
   src/gui/layout.cpp
   src/gui/messages.cpp
+  src/gui/holes.cpp
+  src/gui/model_loading.cpp
   src/gui/operation_panels.cpp
-  src/gui/output_panels.cpp
   src/gui/result_view.cpp
   src/gui/setup_result.cpp
-  src/gui/sidebar.cpp
+  src/gui/surface_contours.cpp
   src/gui/settings.cpp
   src/gui/theme.cpp
   src/gui/tool_builder.cpp
+  src/gui/view_controls.cpp
+  src/gui/widgets.cpp
 )
 target_link_libraries(tinglecam_app_ui PUBLIC tinglecam_core tinglecam_gui imgui_sdl_opengl)
-target_link_libraries(tinglecam_app_ui PUBLIC wave_rendering heightmap_rendering graphics_startup)
+target_link_libraries(tinglecam_app_ui PUBLIC heightmap_rendering graphics_startup)
 target_include_directories(tinglecam_app_ui PUBLIC src)
 
 add_executable(tinglecam src/apps/tinglecam_main.cpp)
@@ -253,7 +251,7 @@ enable_testing()
 add_executable(wave_geometry_tests tests/geometry_tests.cpp)
 target_link_libraries(wave_geometry_tests PRIVATE wave_planning)
 add_test(NAME wave_geometry_tests
-         COMMAND wave_geometry_tests ${CMAKE_CURRENT_SOURCE_DIR}/wavetest.svg
+         COMMAND wave_geometry_tests ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/wavetest.svg
                  ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/meshes/LsJig1.obj)
 
 add_executable(routing_tests tests/routing_tests.cpp)
@@ -263,11 +261,6 @@ add_test(NAME routing_tests COMMAND routing_tests)
 add_executable(mesh_slicer_tests tests/mesh_slicer_tests.cpp)
 target_link_libraries(mesh_slicer_tests PRIVATE wave_geometry)
 add_test(NAME mesh_slicer_tests COMMAND mesh_slicer_tests)
-
-add_executable(simulation_tests tests/simulation_tests.cpp)
-target_link_libraries(simulation_tests PRIVATE wave_simulation)
-add_test(NAME simulation_tests
-         COMMAND simulation_tests ${CMAKE_CURRENT_SOURCE_DIR}/wavetest.svg)
 
 add_executable(cam_tests
   tests/cam_tests.cpp
@@ -287,6 +280,11 @@ add_executable(tool_library_tests tests/tool_library_tests.cpp)
 target_link_libraries(tool_library_tests PRIVATE tinglecam_app_ui)
 add_test(NAME tool_library_tests COMMAND tool_library_tests)
 
+add_executable(model_loading_tests tests/model_loading_tests.cpp)
+target_link_libraries(model_loading_tests PRIVATE tinglecam_app_ui)
+add_test(NAME model_loading_tests COMMAND model_loading_tests)
+set_tests_properties(model_loading_tests PROPERTIES TIMEOUT 15)
+
 add_executable(graphics_startup_tests tests/graphics_startup_tests.cpp)
 target_link_libraries(graphics_startup_tests PRIVATE graphics_startup SDL2::SDL2)
 add_test(NAME graphics_startup_tests COMMAND graphics_startup_tests)
@@ -297,16 +295,8 @@ add_test(NAME parametric_tests COMMAND parametric_tests)
 
 add_test(NAME demo_help COMMAND clipper2_wave_demo --help)
 add_test(NAME demo_analysis_dump
-         COMMAND clipper2_wave_demo ${CMAKE_CURRENT_SOURCE_DIR}/wavetest.svg
+         COMMAND clipper2_wave_demo ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/wavetest.svg
                  --mitered-waves --dump-analysis)
-
-add_executable(stock_tests tests/stock_tests.cpp)
-target_link_libraries(stock_tests PRIVATE tinglecam_core)
-add_test(NAME stock_tests COMMAND stock_tests)
-
-add_executable(prism_renderer_tests tests/prism_renderer_tests.cpp)
-target_link_libraries(prism_renderer_tests PRIVATE wave_rendering)
-add_test(NAME prism_renderer_tests COMMAND prism_renderer_tests)
 
 add_executable(heightmap_renderer_tests tests/heightmap_renderer_tests.cpp)
 target_link_libraries(heightmap_renderer_tests PRIVATE heightmap_rendering SDL2::SDL2 OpenGL::GL)
@@ -321,6 +311,11 @@ endif()
 add_executable(heightmap_tests tests/heightmap_tests.cpp)
 target_link_libraries(heightmap_tests PRIVATE wave_simulation)
 add_test(NAME heightmap_tests COMMAND heightmap_tests)
+
+add_executable(plunge_approach_tests tests/plunge_approach_tests.cpp)
+target_link_libraries(plunge_approach_tests PRIVATE tinglecam_core)
+add_test(NAME plunge_approach_tests COMMAND plunge_approach_tests)
+
 if(TINGLECAM_WITH_OCCT)
   add_executable(cad_finishing_tests tests/cad_finishing_tests.cpp)
   target_link_libraries(cad_finishing_tests PRIVATE tinglecam_core)
@@ -328,4 +323,18 @@ if(TINGLECAM_WITH_OCCT)
            ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/cad/vertical_track_wall.step
            ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/cad/track_finish_faces.step)
   set_tests_properties(cad_finishing_tests PROPERTIES TIMEOUT 30)
+  add_executable(surface_ordering_tests tests/surface_ordering_tests.cpp)
+  target_link_libraries(surface_ordering_tests PRIVATE tinglecam_app_ui)
+  add_test(NAME surface_ordering_tests COMMAND surface_ordering_tests)
+  set_tests_properties(surface_ordering_tests PROPERTIES TIMEOUT 30)
+
 endif()
+
+add_executable(hole_tests tests/hole_tests.cpp)
+target_link_libraries(hole_tests PRIVATE tinglecam_core)
+add_test(NAME hole_tests COMMAND hole_tests)
+
+add_executable(hole_ui_tests tests/hole_ui_tests.cpp)
+target_link_libraries(hole_ui_tests PRIVATE tinglecam_app_ui)
+add_test(NAME hole_ui_tests COMMAND hole_ui_tests)
+set_tests_properties(hole_ui_tests PROPERTIES TIMEOUT 15)

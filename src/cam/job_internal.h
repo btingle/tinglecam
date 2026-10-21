@@ -178,8 +178,9 @@ wave::Paths64 open_space(const wave::Paths64& stock_slice,
                          const wave::Paths64& keep_out);
 
 struct OperationSetup {
-  double full_engagement_feed = 0.0;
-  double no_engagement_feed = 0.0;
+  CuttingFeeds feeds;
+  // Feed through cleared material, for links and transitions.
+  double travel_feed = 0.0;
   double radius = 0.0;
   double stepover = 0.0;
   double first_bite_allowance = 0.0;
@@ -187,9 +188,8 @@ struct OperationSetup {
 };
 
 bool resolve_setup(const Operation& operation, const Tool& tool,
-                   const Machine& machine, const Material& material,
-                   std::string& error, std::vector<std::string>* warnings,
-                   OperationSetup& setup);
+                   const CuttingFeeds& feeds, std::string& error,
+                   std::vector<std::string>* warnings, OperationSetup& setup);
 bool resolve_floors(const Operation& operation, const OperationSetup& setup,
                     double work_top, std::string& error,
                     std::vector<double>& floors);
@@ -202,10 +202,17 @@ void append_inter_layer(wave::InterLayerTopology& into,
                         std::size_t layer_offset);
 void stitch_passes(OperationPlan& plan, const OperationSetup& setup,
                    const Machine& machine, double rapid_plane);
-void link_roughing_levels(OperationPlan& plan, const JobGeometry& geometry,
-    const Operation& operation, const OperationSetup& setup,
-    const Machine& machine, double rapid_plane, const ProgressCallback& progress,
-    double progress_from, double progress_to);
+// The union of the cutter's footprint over a level's cutting moves.
+wave::Paths64 swept_footprint(const LevelPlan& level, double radius);
+// Swept cutter area at the level's floor that reaches into its part slice.
+double level_gouge_area(const LevelPlan& level, double radius);
+// Joins two roughing layers at depth: from the last cut of `previous` to the
+// first of `level`, at the higher of their floors, when the simulated stock
+// shows the way clear and staying down is quicker than lifting. Returns true
+// when it replaced the lift.
+bool link_layers(LevelPlan& previous, LevelPlan& level, const wave::Heightmap& stock,
+                 const wave::MillingCutter& cutter, double travel, double vertical_rate,
+                 double rapid_plane, double slack);
 
 }  // namespace cam::detail
 
@@ -213,7 +220,7 @@ namespace cam {
 
 OperationPlan plan_subdivided_operation(
     const JobGeometry& geometry, const Operation& operation,
-    const Tool& tool, const Machine& machine, const Material& material,
+    const Tool& tool, const Machine& machine, const CuttingFeeds& feeds,
     const ProgressCallback& progress, double progress_from,
     double progress_to, double rapid_plane,
     const PriorOperations& prior_operations);

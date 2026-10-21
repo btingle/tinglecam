@@ -28,12 +28,6 @@ enum class LengthOffsetMode {
   G43Dynamic,
 };
 
-struct MaterialFeedRange {
-  std::string material_id;
-  double full_engagement = 500.0;
-  double no_engagement = 2000.0;
-};
-
 struct Machine {
   std::string id;
   std::string name;
@@ -52,7 +46,6 @@ struct Machine {
   double max_rpm = 0.0;
   double rpm_resolution = 1.0;
   double spindle_spinup_seconds = 2.0;
-  std::vector<MaterialFeedRange> feed_ranges;
 
   ToolChange tool_change = ToolChange::Manual;
   double tool_change_x = 0.0;
@@ -68,8 +61,6 @@ struct Machine {
   std::string program_header;
   std::string program_footer;
   std::string path_blending;
-
-  const MaterialFeedRange* feeds_for(const std::string& material_id) const;
 };
 
 double commandable_rpm(const Machine& machine, double requested);

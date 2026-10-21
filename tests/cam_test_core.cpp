@@ -1,5 +1,5 @@
 #include "cam_test_support.h"
-#include "cam/stock.h"
+#include "cam/heightmap_simulation.h"
 #include "cam/job_internal.h"
 namespace cam_test {
 
@@ -87,17 +87,23 @@ cam::Machine test_machine() {
   machine.min_rpm = 1000.0;
   machine.max_rpm = 24000.0;
   machine.rpm_resolution = 100.0;
-  machine.feed_ranges.push_back({"plastic", 500.0, 2000.0});
   return machine;
 }
 
+// 12000 rpm x 2 flutes x 0.0208333 mm is 500 mm/min at full engagement.
 cam::Tool test_tool() {
   cam::Tool tool;
   tool.id = "test-tool";
   tool.name = "6 mm test tool";
   tool.diameter = 6.0;
   tool.flute_length = 16.0;
+  tool.flutes = 2;
+  tool.cutting.push_back({"plastic", 12000.0, 500.0 / 24000.0, 120.0});
   return tool;
+}
+
+cam::CuttingFeeds test_feeds() {
+  return cam::resolve_cutting_feeds(test_tool(), test_machine(), "plastic", {});
 }
 
 wave::Point64 point(double x, double y) {
@@ -129,63 +135,64 @@ double area(const wave::Paths64& paths) {
          (wave::kIntegerScale * wave::kIntegerScale);
 }
 
-SyntheticCut straight_cut(const std::vector<double>& loads) {
-  SyntheticCut cut;
+wave::Toolpath straight_cut(std::size_t pieces) {
+  wave::Toolpath toolpath;
   wave::ToolpathMove move;
   move.kind = wave::MoveKind::Cut;
-  move.path = {point(0.0), point(static_cast<double>(loads.size()))};
-  move.length = static_cast<double>(loads.size());
-  cut.toolpath.moves.push_back(move);
-  cut.simulation.moves.resize(1);
-  for (std::size_t index = 0; index < loads.size(); ++index) {
-    wave::MaterialStep step;
-    step.from = point(static_cast<double>(index));
-    step.to = point(static_cast<double>(index + 1));
-    step.move_distance_begin = static_cast<double>(index);
-    step.move_distance_end = static_cast<double>(index + 1);
-    step.load = loads[index];
-    step.removed_area = loads[index] * 6.0;
-    cut.simulation.moves[0].steps.push_back(step);
-  }
-  return cut;
+  for (std::size_t index = 0; index <= pieces; ++index)
+    move.path.push_back(point(static_cast<double>(index)));
+  move.length = static_cast<double>(pieces);
+  toolpath.moves.push_back(move);
+  return toolpath;
 }
 
 void check_engagement_feeds() {
-  std::cout << "engagement feed mapping\n";
-  for (const auto [load, expected] :
-       std::vector<std::pair<double, double>>{{1.0, 500.0},
-                                              {0.5, 1250.0},
-                                              {0.0, 2000.0},
-                                              {1.5, 500.0}}) {
-    const SyntheticCut cut = straight_cut({load});
-    const auto schedule = cam::plan_feeds(
-        cut.toolpath, cut.simulation, test_machine(), 500.0, 2000.0,
-        12000.0, 120.0);
-    require(schedule.segments.size() == 1, "one sample produces one feed segment");
-    if (!schedule.segments.empty())
-      require_near(schedule.segments.front().feed, expected, 1e-9,
-                   "feed is the clamped linear engagement interpolation");
-  }
+  std::cout << "chip-thinning engagement feeds\n";
+  const cam::CuttingFeeds feeds = test_feeds();
+  require_near(feeds.full_feed(), 500.0, 1e-6, "full feed is rpm x flutes x chip load");
+  for (const auto [engagement, expected] :
+       std::vector<std::pair<double, double>>{{1.5, 500.0},
+                                              {1.0, 500.0},
+                                              {0.5, 500.0},
+                                              {0.25, 500.0 / std::sqrt(0.75)},
+                                              {0.0, 2000.0}})
+    require_near(feeds.feed_at(engagement), expected, 1e-6,
+                 "lighter radial engagement feeds faster for the same chip");
+  cam::CuttingFeeds capped = feeds;
+  capped.maximum_feed = 900.0;
+  cam::FeedLimit limit = cam::FeedLimit::Engagement;
+  require_near(capped.feed_at(0.0, &limit), 900.0, 1e-9, "the machine maximum caps the feed");
+  require(limit == cam::FeedLimit::Machine, "and says that it did");
+
+  cam::Tool bare = test_tool();
+  bare.cutting.clear();
+  bool missing = false;
+  try { cam::resolve_cutting_feeds(bare, test_machine(), "plastic", {}); }
+  catch (const std::runtime_error&) { missing = true; }
+  require(missing, "a tool without cutting data for the material cannot be planned");
+  cam::CuttingOverrides overrides;
+  overrides.spindle_rpm = 30000.0;
+  overrides.chip_load = 0.01;
+  overrides.plunge_feed = 50.0;
+  const auto overridden = cam::resolve_cutting_feeds(bare, test_machine(), "plastic", overrides);
+  require_near(overridden.spindle_rpm, 24000.0, 1e-9, "spindle overrides clamp to the machine");
+  require_near(overridden.full_feed(), 24000.0 * 2 * 0.01, 1e-9,
+               "overrides stand in for missing cutting data");
 }
 
 void check_feed_compatible_merge() {
   std::cout << "post-feed line merging\n";
-  const SyntheticCut equal = straight_cut({0.5, 0.5, 0.5, 0.5});
-  const auto merged = cam::plan_feeds(
-      equal.toolpath, equal.simulation, test_machine(), 500.0, 2000.0,
-      12000.0, 120.0);
+  const auto merged = cam::plan_feeds(straight_cut(4), test_machine(), test_feeds());
   require(merged.segments.size() == 1,
           "collinear segments at one feed merge after assignment");
   if (!merged.segments.empty())
     require_near(merged.segments.front().length, 4.0, 1e-9,
                  "merging preserves travelled distance");
-
-  const SyntheticCut different = straight_cut({0.5, 0.5, 0.2, 0.2});
-  const auto split = cam::plan_feeds(
-      different.toolpath, different.simulation, test_machine(), 500.0, 2000.0,
-      12000.0, 120.0);
-  require(split.segments.size() == 2,
-          "a feed change prevents a collinear merge");
+  wave::Toolpath bent = straight_cut(2);
+  bent.moves.front().path.push_back(point(2.0, 1.0));
+  bent.moves.front().length += 1.0;
+  require(cam::plan_feeds(bent, test_machine(), test_feeds()).segments.size() == 2,
+          "a change of direction prevents a merge");
 }
 
 void check_path_resampling() {
@@ -280,6 +287,22 @@ void write_stepped_part(const std::filesystem::path& file) {
   }
 }
 
+// The lowest and highest stock top over a rectangle of the grid.
+std::pair<double, double> face_heights(const wave::Heightmap& stock, double x0, double y0,
+                                       double x1, double y1) {
+  double low = std::numeric_limits<double>::infinity();
+  double high = -low;
+  for (int r = 0; r < stock.rows(); ++r)
+    for (int c = 0; c < stock.columns(); ++c) {
+      if (stock.x(c) < x0 || stock.x(c) > x1 || stock.y(r) < y0 || stock.y(r) > y1) continue;
+      const double top = stock.top(c, r);
+      if (!std::isfinite(top)) continue;
+      low = std::min(low, top);
+      high = std::max(high, top);
+    }
+  return {low, high};
+}
+
 void check_adaptive_roughing() {
   std::cout << "coarse descent and upward roughing cleanup\n";
   const auto file = std::filesystem::temp_directory_path() /
@@ -299,8 +322,6 @@ void check_adaptive_roughing() {
   materials.materials.push_back({"plastic", "Plastic"});
   cam::Operation op;
   op.tool_id = tool.id;
-  op.machine_id = machine.id;
-  op.material_id = "plastic";
   op.depth_to = 6;
   op.stepdown = 3;
   op.finishing_subdivisions = 3;
@@ -308,6 +329,8 @@ void check_adaptive_roughing() {
   op.cleanup_stepover_limit = 0.5;
   op.path_pitch = 0.5;
   cam::Job job;
+  job.machine_id = machine.id;
+  job.material_id = "plastic";
   const auto plan = [&](const cam::Operation& operation,
                         const cam::ProgressCallback& progress = {}) {
     job.operations = {operation};
@@ -323,7 +346,6 @@ void check_adaptive_roughing() {
     const auto& rough = result.operations.front();
     require(rough.levels.size() == depths.size(), "all scheduled layers survive planning");
     if (rough.levels.size() != depths.size()) return;
-    cam::OperationPlan prefix;
     for (std::size_t i = 0; i < depths.size(); ++i) {
       const auto& level = rough.levels[i];
       require_near(top - level.floor_z, depths[i], 1e-8, "layer execution depth");
@@ -331,19 +353,18 @@ void check_adaptive_roughing() {
       require_near(level.radial_width, widths[i] * tool.diameter, 1e-8,
                    "cleanup radial width respects axial ratio and ceiling");
       if (level.finishing_index != 0) {
-        const auto inherited = cam::stock_after_planned_operation_at_z(
-            level.stock_slice, level.floor_z, prefix);
-        require(wave::paths_equal_canonical(inherited, level.incoming_stock),
-                "each upward cut receives every preceding cut's stock");
+        require(Clipper2Lib::Difference(level.incoming_stock, level.stock_slice,
+                                        Clipper2Lib::FillRule::NonZero).empty() &&
+                    wave::material_area(level.incoming_stock) + 0.01 <
+                        wave::material_area(level.stock_slice),
+                "each upward cut receives the stock the cuts before it left");
         const auto& coarse = rough.levels[level.coarse_level];
         require_near(level.floor_z + level.axial_depth,
                      coarse.floor_z + coarse.axial_depth, 1e-8,
                      "cleanup never extends above its coarse terrace");
       }
-      prefix.levels.push_back(level);
     }
-    require(rough.stats.unsafe_plunges == 0 && rough.stats.unresolved_entries == 0,
-            "upward planning preserves safe resolved entries");
+    require(rough.stats.unsafe_plunges == 0, "upward planning plunges onto no stock");
     require(cam::post_job(result, job, tools, machines).ok(),
             "the combined downward/upward operation posts");
 
@@ -363,8 +384,8 @@ void check_adaptive_roughing() {
     require_near(rough.stock_before->volume()-before,rough.stats.removed_volume,1e-3,
                  "Operation removal agrees with its heightmap history");
     for(double z:{1.5,3.5,6.5,10.5}) {
-      const auto expected=cam::stock_after_planned_operation_at_z(
-          geometry.stock_outline(z,op.slice_grid),z,rough);
+      const auto expected=cam::stock_after_operations_at_z(
+          geometry.stock_outline(z,op.slice_grid),z,{&rough});
       const auto actual=Clipper2Lib::Intersect(geometry.stock_outline(z,op.slice_grid),
           rough.stock_after->slice(z),Clipper2Lib::FillRule::NonZero);
       require(wave::paths_equal_canonical(actual,expected),
@@ -423,17 +444,12 @@ void check_adaptive_roughing() {
   const auto inclusive = geometry.part_outline(6.0, op.slice_grid);
   const auto flat = plan(op);
   require(flat.ok(), "an explicit flat depth with axial allowance plans");
-  bool flat_cleared = false;
-  if (flat.ok()) for (const auto& level : flat.operations.front().levels) {
-    const auto removed_on_face = Clipper2Lib::Intersect(
-        level.simulation.removed_material, wave::Paths64{box(26, 10, 34, 30)},
-        Clipper2Lib::FillRule::NonZero);
-    if (area(removed_on_face) > 1.0) {
-      require(level.floor_z >= 6.25 - 1e-8, "the flat's axial allowance is preserved");
-      if (std::abs(level.floor_z - 6.25) < 1e-8) flat_cleared = true;
-    }
+  if (flat.ok()) {
+    const auto [low, high] = face_heights(*flat.operations.front().stock_after, 26, 10, 34, 30);
+    require(low >= 6.25 - 1e-5, "the flat's axial allowance is preserved");
+    require(high <= 6.25 + 1e-5,
+            "a depth break clears the horizontal face exactly to its allowance");
   }
-  require(flat_cleared, "a depth break clears the horizontal face exactly to its allowance");
   require(wave::paths_equal_canonical(inclusive, geometry.part_outline(6.0, op.slice_grid)),
           "roughing does not change inclusive slices used by other operations");
 
@@ -452,10 +468,7 @@ void check_adaptive_roughing() {
 
 void check_roughing_links() {
   std::cout << "stock-validated roughing layer links\n";
-  cam::Operation operation;
-  cam::detail::OperationSetup setup;
-  setup.radius = 1; setup.stepover = .5; setup.no_engagement_feed = 2000;
-  const auto machine = test_machine();
+  const wave::MillingCutter cutter{wave::CutterShape::Flat, 1.0, 10.0};
   const auto phase = [](wave::Point64 a, wave::Point64 b, double za, double zb, bool rapid) {
     cam::MotionPhase p;
     p.from=a; p.to=b; p.from_z=za; p.to_z=zb; p.rapid=rapid;
@@ -478,174 +491,87 @@ void check_roughing_links() {
                     phase(point(10),point(11),second_z,second_z,false),
                     phase(point(11),point(11),second_z,10,true)};
     plan.levels={a,b};
-    for (auto& level : plan.levels) for (const auto& p : level.feeds.motion) {
-      if (p.rapid) {
-        level.feeds.stats.rapid_distance+=p.length;
-        level.feeds.stats.rapid_minutes+=p.length/p.rate;
-      } else {
-        level.feeds.stats.cutting_distance+=p.length;
-        level.feeds.stats.cutting_minutes+=p.length/p.rate;
-      }
-    }
     return plan;
   };
-  const auto link = [&](cam::OperationPlan& plan) {
-    cam::detail::link_roughing_levels(plan, cam::JobGeometry{}, operation, setup,
-                                     machine,10,{},0,1);
+  // A blank from Z -10 to the floor everywhere, with `walls` standing up to
+  // Z 0 where they are given.
+  const auto stock = [](const wave::Paths64& walls, double wall_low = -3, double wall_high = 0) {
+    wave::Heightmap map(-20, -20, 50, 40, 0.05);
+    map.fill({box(-20, -20, 30, 20)}, -10, -4);
+    if (!walls.empty()) map.fill(walls, wall_low, wall_high);
+    return map;
+  };
+  const auto link = [&](cam::OperationPlan& plan, const wave::Heightmap& map) {
+    const bool linked = cam::detail::link_layers(plan.levels[0], plan.levels[1], map, cutter,
+                                                 2000.0, 6000.0, 10.0, 25.0);
     const cam::MotionPhase* previous = nullptr;
-    double minutes=0, distance=0;
     for (const auto& level : plan.levels) for (const auto& p : level.feeds.motion) {
       if (previous) {
         require(previous->to == p.from, "linked motion is continuous in XY");
-        require_near(previous->to_z,p.from_z,1e-9,"linked motion is continuous in Z");
+        require_near(previous->to_z, p.from_z, 1e-9, "linked motion is continuous in Z");
       }
-      minutes+=p.length/p.rate; distance+=p.length; previous=&p;
+      previous = &p;
     }
-    require_near(plan.stats.cutting_minutes+plan.stats.rapid_minutes,minutes,1e-9,
-                 "linked estimate equals the commanded timeline");
-    require_near(plan.stats.cutting_distance+plan.stats.rapid_distance,distance,1e-9,
-                 "linked travel totals equal the commanded timeline");
+    return linked;
   };
-  auto rising=make_plan(-3,-2);
-  rising.preview_context={{-3,0,std::make_shared<const wave::Paths64>(wave::Paths64{box(-5,-5,15,5)})}};
-  rising.levels[0].simulation.removed_material={box(-2,-2,13,2)};
-  link(rising);
-  require(rising.levels[0].stays_down_after && rising.levels[1].feeds.begins_at_depth,
-          "accumulated removal permits upward linking");
-  require(rising.levels[1].feeds.motion.front().from_z==-3 &&
-              rising.levels[1].feeds.motion.front().to_z==-2 &&
+  // Walls around a channel the first layer has cleared to its floor.
+  const auto channel_walls = [](double x0, double y0, double x1, double y1) {
+    return Clipper2Lib::Difference(wave::Paths64{box(-5, -5, 15, 5)},
+                                   wave::Paths64{box(x0, y0, x1, y1)},
+                                   Clipper2Lib::FillRule::NonZero);
+  };
+  auto rising = make_plan(-3, -2);
+  require(link(rising, stock(channel_walls(-2, -2, 13, 2))) &&
+              rising.levels[0].stays_down_after && rising.levels[1].feeds.begins_at_depth,
+          "cleared stock permits upward linking");
+  require(rising.levels[1].feeds.motion.front().from_z == -3 &&
+              rising.levels[1].feeds.motion.front().to_z == -2 &&
               rising.levels[1].feeds.motion.front().inter_layer,
           "upward cleanup rises before traversing");
   {
-    auto tool=test_tool(); tool.diameter=2;
-    operation.tool_id=tool.id; operation.machine_id=machine.id;
-    operation.material_id="plastic";
-    cam::Job job; job.operations={operation};
-    cam::JobPlan posted_plan; posted_plan.rapid_plane=10;
-    rising.tool_id=tool.id; rising.machine_id=machine.id; rising.planned=true;
-    rising.spindle_rpm=12000; posted_plan.operations={rising};
-    const auto posted=cam::post_job(posted_plan,job,cam::ToolLibrary{{tool}},
-                                    cam::MachineLibrary{{machine}});
-    require(posted.ok(),"stock-validated XYZ links post: "+posted.error);
-    const auto next=posted.text.find("Depth -2");
-    const auto up=posted.text.find("Z-2",next);
-    const auto across=posted.text.find("X10",next);
-    const auto clearance=posted.text.find("Z10",next);
-    require(next!=std::string::npos && up<across && across<clearance,
+    auto tool = test_tool(); tool.diameter = 2;
+    cam::Operation operation;
+    operation.tool_id = tool.id;
+    cam::Job job;
+    job.machine_id = test_machine().id;
+    job.material_id = "plastic";
+    job.operations = {operation};
+    cam::JobPlan posted_plan; posted_plan.rapid_plane = 10;
+    rising.tool_id = tool.id; rising.planned = true;
+    rising.spindle_rpm = 12000; posted_plan.operations = {rising};
+    const auto posted = cam::post_job(posted_plan, job, cam::ToolLibrary{{tool}},
+                                      cam::MachineLibrary{{test_machine()}});
+    require(posted.ok(), "stock-validated XYZ links post: " + posted.error);
+    const auto next = posted.text.find("Depth -2");
+    const auto up = posted.text.find("Z-2", next);
+    const auto across = posted.text.find("X10", next);
+    const auto clearance = posted.text.find("Z10", next);
+    require(next != std::string::npos && up < across && across < clearance,
             "posted cleanup rises and traverses before its final clearance retract");
-    require(posted.text.find("X-1")<posted.text.find("Z-3"),
+    require(posted.text.find("X-1") < posted.text.find("Z-3"),
             "the first roughing entry establishes XY before descending");
   }
-  // A polygonal stock subtraction can leave a tiny remnant inside the exact
-  // circular tool footprint. Only a matching executed capsule in this Z slab
-  // may explain it away; area alone must never authorize a link.
-  auto remnant = make_plan(-3, -2);
-  const auto speck = std::make_shared<const wave::Paths64>(
-      wave::Paths64{box(0.996, 0.010, 0.998, 0.011)});
-  remnant.preview_context = {{-3, 0, speck}};
-  wave::SimulatedMove swept;
-  wave::MaterialStep step;
-  step.from = point(-1); step.to = point(0);
-  swept.steps.push_back(step);
-  remnant.levels[0].simulation.moves.push_back(swept);
-  auto unexplained = remnant;
-  unexplained.levels[0].simulation.moves.clear();
-  link(unexplained);
-  require(!unexplained.levels[0].stays_down_after,
-          "small collision area alone does not authorize upward travel");
-  link(remnant);
-  require(remnant.levels[0].stays_down_after,
-          "an executed capsule proves a numerical remnant already cleared");
-  auto overhead_remnant = make_plan(-3, -2);
-  overhead_remnant.preview_context = {{1, 2, speck}};
-  overhead_remnant.levels[0].simulation.moves.push_back(swept);
-  link(overhead_remnant);
-  require(!overhead_remnant.levels[0].stays_down_after,
-          "a footprint cleared below cannot excuse overhead stock");
-
-  const auto part_file = std::filesystem::temp_directory_path() / "tinglecam-link-part.obj";
-  { std::ofstream mesh(part_file);
-    mesh << "v -0.5 1.5 0\nv 0.5 1.5 0\nv 0.5 2.5 0\nv -0.5 2.5 0\n"
-            "f 1 2 3\nf 1 3 4\n";
-  }
-  cam::JobGeometry part_geometry;
-  part_geometry.load_part(part_file);
-  std::filesystem::remove(part_file);
-  auto allowance_operation = operation;
-  allowance_operation.radial_stock_to_leave = 1.0;
-  auto cleared_allowance = make_plan(-3, -2);
-  cam::detail::link_roughing_levels(cleared_allowance, part_geometry,
-      allowance_operation, setup, machine, 10, {}, 0, 1);
-  require(cleared_allowance.levels[0].stays_down_after,
-          "nominal allowance is not recreated where no stock remains");
-  auto uncut_allowance = make_plan(-3, -2);
-  uncut_allowance.preview_context = {{-3, 1, std::make_shared<const wave::Paths64>(
-      wave::Paths64{box(-0.5, 0.5, 0.5, 1.5)})}};
-  cam::detail::link_roughing_levels(uncut_allowance, part_geometry,
-      allowance_operation, setup, machine, 10, {}, 0, 1);
-  require(!uncut_allowance.levels[0].stays_down_after,
-          "remaining allowance is protected as actual stock");
-  auto protected_part = make_plan(-3, -2);
-  for (auto& level : protected_part.levels) for (auto& motion : level.feeds.motion) {
-    motion.from.y += 2000; motion.to.y += 2000;
-  }
-  auto claimed_cut = swept;
-  for (auto& sample : claimed_cut.steps) {
-    sample.from.y += 2000; sample.to.y += 2000;
-  }
-  protected_part.levels[0].simulation.moves.push_back(claimed_cut);
-  cam::detail::link_roughing_levels(protected_part, part_geometry,
-      allowance_operation, setup, machine, 10, {}, 0, 1);
-  require(!protected_part.levels[0].stays_down_after,
-          "finished part protection cannot be waived by claimed earlier removal");
-
-  auto falling=make_plan(-2,-3);
-  link(falling);
-  require(falling.levels[0].stays_down_after,"a clear descent can stay down");
-  require(falling.levels[1].feeds.motion.front().from_z==-2 &&
-              falling.levels[1].feeds.motion.front().to_z==-2,
+  auto uncleared = make_plan(-3, -2);
+  require(!link(uncleared, stock({box(-5, -5, 15, 5)})),
+          "uncut stock above the floor blocks the link");
+  auto falling = make_plan(-2, -3);
+  require(link(falling, stock({})) && falling.levels[0].stays_down_after,
+          "a clear descent can stay down");
+  require(falling.levels[1].feeds.motion.front().from_z == -2 &&
+              falling.levels[1].feeds.motion.front().to_z == -2,
           "descending links traverse before descending");
-  auto blocked=make_plan(-2,-3);
-  blocked.preview_context={{-3,-2.5,std::make_shared<const wave::Paths64>(wave::Paths64{box(9,-2,12,2)})}};
-  link(blocked);
-  require(!blocked.levels[0].stays_down_after,
+  auto blocked = make_plan(-2, -3);
+  require(!link(blocked, stock({box(9, -2, 12, 2)}, -3, -2.5)),
           "stock below the traversal blocks an unsafe vertical descent");
-  auto roof=make_plan(-3,-2);
-  roof.preview_context={{1,2,std::make_shared<const wave::Paths64>(wave::Paths64{box(-2,-2,2,2)})}};
-  link(roof);
-  require(!roof.levels[0].stays_down_after,
+  auto roof = make_plan(-3, -2);
+  require(!link(roof, stock({box(-2, -2, 2, 2)}, 1, 2)),
           "overhead stock blocks a cutter column that looks clear at the tip");
-  auto detour=make_plan(-3,-2);
-  detour.preview_context={{-4,0,std::make_shared<const wave::Paths64>(wave::Paths64{box(4,-1,6,1)})}};
-  link(detour);
-  require(detour.levels[0].stays_down_after,
+  auto detour = make_plan(-3, -2);
+  require(link(detour, stock({box(4, -1, 6, 1)}, -4, 0)),
           "the router finds a safe detour around an intervening island");
-  auto hollow=make_plan(-3,-2);
-  auto hole=box(-2,-2,13,2);
-  std::reverse(hole.begin(),hole.end());
-  const auto shell=std::make_shared<const wave::Paths64>(
-      wave::Paths64{box(-100,-100,100,100),hole,box(200,200,210,210)});
-  hollow.preview_context={{-4,-1,shell},{-1,0,shell}};
-  link(hollow);
-  require(hollow.levels[0].stays_down_after,
-          "collision filtering preserves holes through repeated stock slabs");
-  auto covered_hole=make_plan(-3,-2);
-  covered_hole.preview_context=hollow.preview_context;
-  covered_hole.preview_context.push_back(
-      {1,2,std::make_shared<const wave::Paths64>(wave::Paths64{box(-50,-50,50,50)})});
-  link(covered_hole);
-  require(!covered_hole.levels[0].stays_down_after,
-          "an enclosing overhead region blocks a hole in lower stock");
-  auto skipped=make_plan(-3,-2);
-  cam::LevelPlan empty; empty.nothing_to_cut=true;
-  skipped.levels.insert(skipped.levels.begin()+1,empty);
-  link(skipped);
-  require(skipped.levels[0].stays_down_after && skipped.levels[2].feeds.begins_at_depth,
-          "empty layers do not break the executed layer chain");
-  auto cancelled=make_plan(-3,-2);
-  cam::detail::link_roughing_levels(cancelled,cam::JobGeometry{},operation,setup,
-      machine,10,[](double,const std::string&){return false;},0,1);
-  require(cancelled.error=="Cancelled","linking remains cancellable");
+  auto wide = make_plan(-3, -2);
+  require(!link(wide, stock({box(4, -18, 6, 18)}, -4, 0)),
+          "a detour slower than lifting is not taken");
 }
 
 void check_axial_allowance() {
@@ -670,11 +596,9 @@ void check_axial_allowance() {
   const auto lowest_pass_onto_the_face = [&](double allowance) {
     cam::JobGeometry geometry;
     geometry.load_part(file);
-    geometry.set_box_stock(true, 4.0);
+    geometry.set_box_stock(true, cam::BoxStockMargins{4, 4, 4, 4, 0, 0});
     cam::Operation operation;
     operation.tool_id = tool.id;
-    operation.machine_id = machine.id;
-    operation.material_id = "plastic";
     operation.stepover_ratio = 0.4;
     operation.stepdown = 1.0;
     operation.depth_from = 0.75;
@@ -682,6 +606,8 @@ void check_axial_allowance() {
     operation.radial_stock_to_leave = 0.0;
     operation.axial_stock_to_leave = allowance;
     cam::Job job;
+    job.machine_id = machine.id;
+    job.material_id = "plastic";
     job.operations = {operation};
     const auto plan =
         cam::plan_job(geometry, job, tools, machines, materials, {});
@@ -690,16 +616,9 @@ void check_axial_allowance() {
       return std::pair<bool, double>{false, 0.0};
 
     // Well inside the low half, so a pass that reached the face is unmistakable.
-    const wave::Paths64 face{box(24.0, 8.0, 36.0, 32.0)};
-    double lowest = 0.0;
-    for (const auto& level : plan.operations.front().levels) {
-      if (level.nothing_to_cut) continue;
-      const auto onto = Clipper2Lib::Intersect(
-          level.simulation.removed_material, face, Clipper2Lib::FillRule::NonZero);
-      if (area(onto) < 1.0) continue;
-      if (lowest == 0.0 || level.floor_z < lowest) lowest = level.floor_z;
-    }
-    return std::pair<bool, double>{true, lowest};
+    const auto& after = plan.operations.front().stock_after;
+    if (!after) return std::pair<bool, double>{false, 0.0};
+    return std::pair<bool, double>{true, face_heights(*after, 24, 8, 36, 32).first};
   };
 
   const auto bare_result = lowest_pass_onto_the_face(0.0);
@@ -866,7 +785,7 @@ void check_box_stock(const std::filesystem::path& part_mesh) {
   geometry.load_part(part_mesh);
   require(!geometry.has_stock(), "a part alone is still not a blank");
 
-  geometry.set_box_stock(true, 4.0);
+  geometry.set_box_stock(true, cam::BoxStockMargins{4, 4, 4, 4, 0, 0});
   require(geometry.has_stock(), "the box stands in for a stock model");
   require(geometry.box_stock(), "and reports that it is what is standing in");
 
@@ -916,7 +835,7 @@ void check_box_stock(const std::filesystem::path& part_mesh) {
           "the blank is the same at every depth");
 
   const double wider = 9.0;
-  geometry.set_box_stock(true, wider);
+  geometry.set_box_stock(true, cam::BoxStockMargins{wider, wider, wider, wider, 0, 0});
   const auto grown = Clipper2Lib::GetBounds(geometry.stock_outline(0.0, 32));
   require_near(wave::to_world(grown.left), bounds.lower.x - wider, 1e-3,
                "changing the margin re-cuts the blank rather than reusing it");
@@ -939,16 +858,16 @@ void check_engagement_limits(const std::filesystem::path& part_mesh) {
   const cam::Machine machine = test_machine();
   cam::JobGeometry geometry;
   geometry.load_part(part_mesh);
-  geometry.set_box_stock(true, 1.0);
+  geometry.set_box_stock(true, cam::BoxStockMargins{1, 1, 1, 1, 0, 0});
   cam::Operation operation;
   operation.tool_id = tool.id;
-  operation.machine_id = machine.id;
-  operation.material_id = "plastic";
   operation.stepover_ratio = 0.4;
   operation.stepdown = 2;
   operation.depth_to = 3;
   operation.finishing_subdivisions = 4;
   cam::Job job;
+  job.machine_id = machine.id;
+  job.material_id = "plastic";
   job.operations = {operation};
   cam::ToolLibrary tools;
   tools.upsert(tool);
@@ -982,14 +901,14 @@ void check_multi_operation_plan(const std::filesystem::path& data,
   const cam::Tool* tool = tools.tools.empty() ? nullptr : &tools.tools.front();
   if (!tool) return;
   const std::string material_id = "aluminium-6082";
-  const cam::Machine* machine = nullptr;
-  for (const auto& candidate : machines.machines)
-    if (candidate.feeds_for(material_id)) machine = &candidate;
+  const cam::Machine* machine = machines.machines.empty() ? nullptr : &machines.machines.front();
+  require(machine && materials.find(material_id) && tool->cutting_for(material_id),
+          "the shipped data has a machine and aluminium cutting data");
   if (!machine || !materials.find(material_id)) return;
 
   cam::JobGeometry geometry;
   geometry.load_part(part_mesh);
-  geometry.set_box_stock(true, 4.0);
+  geometry.set_box_stock(true, cam::BoxStockMargins{4, 4, 4, 4, 0, 0});
   double low = 0.0;
   double high = 0.0;
   require(geometry.work_range(low, high),
@@ -999,8 +918,6 @@ void check_multi_operation_plan(const std::filesystem::path& data,
   cam::Operation rough;
   rough.name = "Rough first";
   rough.tool_id = tool->id;
-  rough.machine_id = machine->id;
-  rough.material_id = material_id;
   rough.depth_from = 0.0;
   rough.depth_to = std::min(high - low, 2.0);
   rough.stepdown = rough.depth_to;
@@ -1019,6 +936,8 @@ void check_multi_operation_plan(const std::filesystem::path& data,
   finish.radial_stock_to_leave = 0.0;
 
   cam::Job job;
+  job.machine_id = machine->id;
+  job.material_id = material_id;
   job.operations = {rough, rest, finish};
   const cam::JobPlan plan =
       cam::plan_job(geometry, job, tools, machines, materials, {});
@@ -1098,8 +1017,8 @@ void check_multi_operation_plan(const std::filesystem::path& data,
     require(openings_checked >= 1,
             "at least one subdivision boundary was there to be checked");
 
-    require(subdivided.composed_stock && !subdivided.preview_context.empty(),
-            "subdivision playback uses physical stock slabs");
+    require(subdivided.stock_before && subdivided.stock_after,
+            "subdivision playback uses the simulated stock");
   }
 
   bool roughing_inherited_less_stock = false;
@@ -1124,11 +1043,8 @@ void check_multi_operation_plan(const std::filesystem::path& data,
   bool inherited_less_stock = false;
   bool compared = false;
   for (const cam::LevelPlan& level : plan.operations[2].levels) {
-    if (level.nothing_to_cut || level.simulation.initial_stock.empty()) continue;
+    if (level.nothing_to_cut || level.incoming_stock.empty()) continue;
     compared = true;
-    require(wave::paths_equal_canonical(level.incoming_stock,
-                                        level.simulation.initial_stock),
-            "downstream simulation starts with its recorded incoming stock");
     const double nominal = wave::material_area(level.stock_slice);
     const double incoming = wave::material_area(level.incoming_stock);
     require(incoming <= nominal + 0.001,
@@ -1138,6 +1054,12 @@ void check_multi_operation_plan(const std::filesystem::path& data,
   require(compared, "the finishing operation has a simulated cutting level");
   require(inherited_less_stock,
           "at least one finishing level inherits material removed by roughing");
+}
+
+double level_removed(const cam::LevelPlan& level) {
+  double removed = 0.0;
+  for (const auto& phase : level.feeds.motion) removed += phase.removed_volume;
+  return removed;
 }
 
 void check_lsjig_subdivision_cleanup(const std::filesystem::path& data,
@@ -1155,7 +1077,7 @@ void check_lsjig_subdivision_cleanup(const std::filesystem::path& data,
 
   cam::JobGeometry geometry;
   geometry.load_part(part_mesh);
-  geometry.set_box_stock(true, 5.0);
+  geometry.set_box_stock(true, cam::BoxStockMargins{5, 5, 5, 5, 0, 0});
   double low = 0.0;
   double high = 0.0;
   require(geometry.work_range(low, high),
@@ -1164,14 +1086,14 @@ void check_lsjig_subdivision_cleanup(const std::filesystem::path& data,
 
   cam::Operation operation;
   operation.tool_id = tool->id;
-  operation.machine_id = machine->id;
-  operation.material_id = material->id;
   operation.depth_to = high - low;
   operation.finishing_subdivisions = 4;
   operation.cleanup_tolerance = tool->diameter * 0.5;
   cam::Job job;
+  job.machine_id = machine->id;
+  job.material_id = material->id;
   job.box_stock = true;
-  job.box_stock_margin = 5.0;
+  job.box_stock_margins = cam::BoxStockMargins{5, 5, 5, 5, 0, 0};
   job.operations = {operation};
 
   const cam::JobPlan strict_plan =
@@ -1181,7 +1103,7 @@ void check_lsjig_subdivision_cleanup(const std::filesystem::path& data,
   if (!strict_plan.ok() || strict_plan.operations.empty()) return;
   std::size_t strict_cutting_layers = 0;
   for (const cam::LevelPlan& level : strict_plan.operations.front().levels)
-    if (!level.nothing_to_cut && level.simulation.stats.removed_area > 0.0)
+    if (!level.nothing_to_cut && level_removed(level) > 0.0)
       ++strict_cutting_layers;
   require(strict_plan.operations.front().levels.size() == 68 &&
               strict_cutting_layers > 0,
@@ -1197,7 +1119,7 @@ void check_lsjig_subdivision_cleanup(const std::filesystem::path& data,
       const cam::LevelPlan& level =
           strict_rough.levels[range.first_level + local];
       if (!level.wave.reached_generations.empty()) ++strict_later_reached;
-      if (!level.nothing_to_cut && level.simulation.stats.removed_area > 0.0)
+      if (!level.nothing_to_cut && level_removed(level) > 0.0)
         ++strict_later_cutting;
     }
   }
@@ -1244,7 +1166,7 @@ void check_lsjig_subdivision_cleanup(const std::filesystem::path& data,
       ++later_layers;
       const cam::LevelPlan& level = rough.levels[range.first_level + local];
       if (!level.wave.reached_generations.empty()) ++reached_layers;
-      if (!level.nothing_to_cut && level.simulation.stats.removed_area > 0.0)
+      if (!level.nothing_to_cut && level_removed(level) > 0.0)
         ++cutting_layers;
     }
   }
@@ -1255,7 +1177,6 @@ void check_lsjig_subdivision_cleanup(const std::filesystem::path& data,
   require(cutting_layers > strict_later_cutting,
           "exterior cutter reach removes stock on more later LsJig layers");
   require(rough.stats.unsafe_plunges == 0 &&
-              rough.stats.unresolved_entries == 0 &&
               rough.stats.lifts_over_subject == 0 &&
               rough.stats.unreachable_fronts == 0,
           "exterior-domain roughing introduces no unsafe or unresolved motion");

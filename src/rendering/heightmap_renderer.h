@@ -11,6 +11,7 @@ namespace wave::heightfield {
 struct Camera {
   Vec3f centre, right, up, toward, light;
   float scale = 1, reach = 100, pan_x = 0, pan_y = 0;
+  std::array<float, 4> background{14.f / 255, 17.f / 255, 22.f / 255, 1};
 };
 struct MeshDraw {
   const Mesh* mesh = nullptr;
@@ -22,13 +23,17 @@ struct Cutter {
   Vec3f tip{};
   float radius = 0, length = 0;
   bool ball = false;
+  float point_height = 0, tip_flat_radius = 0;
 };
 struct Stats {
   std::size_t changed_tiles = 0, uploaded_bytes = 0, resident_bytes = 0;
   std::size_t tiles = 0, hierarchy_nodes = 0;
+  bool reused_frame = false;
 };
 // OpenGL 3.2 / GLSL 1.50; no CUDA or compute-shader dependency. Construct,
 // render, read back, and destroy on the thread owning the current GL context.
+// Display caps interpolate the stored samples with discontinuity-aware
+// bilinear patches; simulation geometry is never modified by reconstruction.
 class Renderer {
  public:
   Renderer();

@@ -193,30 +193,13 @@ PostResult post_job(const JobPlan& plan,
     return result;
   }
 
-  // Every operation must agree on the machine: one program goes to one control.
-  const Machine* machine = nullptr;
-  for (std::size_t operation_index = 0;
-       operation_index < plan.operations.size(); ++operation_index) {
-    const OperationPlan& operation = plan.operations[operation_index];
-    if (!operation.ok()) continue;
-    const std::string machine_id =
-        !operation.machine_id.empty()
-            ? operation.machine_id
-            : (operation_index < job.operations.size()
-                   ? job.operations[operation_index].machine_id
-                   : std::string());
-    const Machine* found = machines.find(machine_id);
-    if (!found) continue;
-    if (machine && machine->id != found->id) {
-      result.error = "The job's operations are for different machines";
-      return result;
-    }
-    machine = found;
-  }
+  const Machine* machine = machines.find(job.machine_id);
   if (!machine) {
-    result.error = "No machine could be resolved for this job";
+    result.error = job.machine_id.empty() ? "The job has no machine"
+                                          : "Unknown machine: " + job.machine_id;
     return result;
   }
+  const std::vector<ToolAssignment> tool_table = resolved_tool_table(job);
 
   // The one rapid plane has to be above everything in the way. A 2D slice
   // cannot certify a lower traverse, so disconnected moves always use it. It is
@@ -246,6 +229,7 @@ PostResult post_job(const JobPlan& plan,
   std::string active_tool;
   bool spindle_running = false;
   bool coolant_running = false;
+  double active_rpm=-1;
 
   for (std::size_t operation_index = 0;
        operation_index < plan.operations.size(); ++operation_index) {
@@ -260,77 +244,75 @@ PostResult post_job(const JobPlan& plan,
     const Operation* source = operation_index < job.operations.size()
                                   ? &job.operations[operation_index]
                                   : nullptr;
-    const Tool* tool = tools.find(operation.tool_id);
-    if (!tool || !source) continue;
+    if(!source) continue;
+    writer.blank();writer.comment("Operation: "+operation.operation_name);
+    const auto activate_tool=[&](const Tool* tool,double rpm) {
+      const ToolAssignment* assignment = find_tool_assignment(tool_table, tool->id);
+      const int tool_number = assignment ? assignment->number : 1;
+      const int length_offset = assignment ? assignment->length_offset : tool_number;
+      const std::string tool_assignment = tool->id + ":" + std::to_string(tool_number) +
+                                          ":" + std::to_string(length_offset);
 
-    const int tool_number = source->tool_number > 0 ? source->tool_number :
-        static_cast<int>(tool - tools.tools.data()) + 1;
-    const int length_offset = source->length_offset > 0 ? source->length_offset : tool_number;
-    const std::string tool_assignment = tool->id + ":" + std::to_string(tool_number) +
-                                        ":" + std::to_string(length_offset);
-    writer.blank();
-    writer.comment("Operation: " + operation.operation_name);
-    writer.comment("Tool " + std::to_string(tool_number) + " - " + tool->name);
-    writer.comment("Cutter " + writer.coordinate(tool->diameter) + " mm");
-
-    if (active_tool != tool_assignment) {
-      writer.line("G0 Z" + writer.coordinate(rapid_plane));
-      if (spindle_running) {
-        writer.line("M5");
-        spindle_running = false;
+      const bool changed=active_tool!=tool_assignment;
+      if(changed) {
+        writer.comment("Tool " + std::to_string(tool_number) + " - " + tool->name);
+        writer.comment("Cutter " + writer.coordinate(tool->diameter) + " mm");
+        if(coolant_running) {writer.line("M9");coolant_running=false;}
+        writer.line("G0 Z" + writer.coordinate(rapid_plane));
+        if (spindle_running) {
+          writer.line("M5");
+          spindle_running = false;
+        }
+        switch (machine->tool_change) {
+          case ToolChange::Automatic:
+            writer.line("T" + std::to_string(tool_number) + " M6");
+            break;
+          case ToolChange::SemiAutomatic:
+            writer.line("T" + std::to_string(tool_number));
+            writer.line("M6");
+            break;
+          case ToolChange::Manual:
+            writer.comment("Fit tool " + std::to_string(tool_number) + ": " +
+                           tool->name);
+            writer.line("M0");
+            break;
+        }
+        if (machine->length_offset_mode == LengthOffsetMode::G43WithH)
+          writer.line("G43 H" + std::to_string(length_offset));
+        writer.reset_modal();
+        active_tool = tool_assignment;
       }
-      switch (machine->tool_change) {
-        case ToolChange::Automatic:
-          writer.line("T" + std::to_string(tool_number) + " M6");
-          break;
-        case ToolChange::SemiAutomatic:
-          writer.line("T" + std::to_string(tool_number));
-          writer.line("M6");
-          break;
-        case ToolChange::Manual:
-          writer.comment("Fit tool " + std::to_string(tool_number) + ": " +
-                         tool->name);
-          writer.line("M0");
-          break;
+
+      if(changed || !spindle_running || active_rpm!=rpm) {
+        writer.line(spindle_word(*machine,rpm));
+        spindle_running=true;active_rpm=rpm;
+        if(machine->spindle_spinup_seconds>0) {
+          char buffer[48];std::snprintf(buffer,sizeof buffer,"G4 P%.1f",machine->spindle_spinup_seconds);
+          writer.line(buffer);
+        }
       }
-      if (machine->length_offset_mode == LengthOffsetMode::G43WithH)
-        writer.line("G43 H" + std::to_string(length_offset));
-      writer.reset_modal();
-      active_tool = tool_assignment;
-    }
 
-    writer.line(spindle_word(*machine, operation.spindle_rpm));
-    spindle_running = true;
-    if (machine->spindle_spinup_seconds > 0.0) {
-      char buffer[48];
-      std::snprintf(buffer, sizeof buffer, "G4 P%.1f", machine->spindle_spinup_seconds);
-      writer.line(buffer);
-    }
+      if (!source->coolant && coolant_running) {
+        writer.line("M9");
+        coolant_running = false;
+      }
+      if (source->coolant && !coolant_running) {
+        if (machine->coolant_flood) { writer.line("M8"); coolant_running = true; }
+        else if (machine->coolant_mist) { writer.line("M7"); coolant_running = true; }
+        else result.warnings.push_back(operation.operation_name +
+            ": coolant requested but unavailable on this machine");
+      }
 
-    if (!source->coolant && coolant_running) {
-      writer.line("M9");
-      coolant_running = false;
-    }
-    if (source->coolant && !coolant_running) {
-      if (machine->coolant_flood) { writer.line("M8"); coolant_running = true; }
-      else if (machine->coolant_mist) { writer.line("M7"); coolant_running = true; }
-      else result.warnings.push_back(operation.operation_name +
-          ": coolant requested but unavailable on this machine");
-    }
+      return changed;
+    };
 
-    // Carried across the passes rather than reset at each one, because a pass
-    // can now be reached without lifting: the pass above ends over this one's
-    // first point, at its own floor, and the only move between them is the
-    // descent. Where that has not happened these stay exactly as they were --
-    // false at the top of every pass -- and the tool crosses at the plane.
-    bool at_depth = false;
-    bool rapid_descent = false;
     bool motion_positioned = false;
-    double depth_z = 0.0;
-    const double plunge_rate = std::max(source->plunge_feed, 1.0);
     for (const LevelPlan& level : operation.levels) {
-      if (level.nothing_to_cut ||
-          (level.feeds.segments.empty() && level.feeds.motion.empty())) continue;
+      if (level.nothing_to_cut || level.feeds.motion.empty()) continue;
+      const auto* tool=tools.find(level.tool_id.empty()?operation.tool_id:level.tool_id);
+      if(!tool) {result.error="Unknown tool in planned hole level";return result;}
+      if(activate_tool(tool,level.feeds.stats.spindle_rpm>0?level.feeds.stats.spindle_rpm:operation.spindle_rpm))
+        motion_positioned=false;
       const double cut_z = level.floor_z + job.origin_z;
       writer.blank();
       // The posted depth, not the model's. Every other number in this file is
@@ -339,104 +321,25 @@ PostResult post_job(const JobPlan& plan,
       writer.comment("Depth " + writer.coordinate(cut_z) + " mm, cutting " +
                      writer.coordinate(level.axial_depth) + " mm");
 
-      if (level.explicit_motion || level.feeds.authoritative_motion) {
-        if (level.feeds.authoritative_motion && !motion_positioned &&
-            !level.feeds.motion.empty()) {
-          // The first schedule starts above its entry point. Establish that
-          // XY at clearance before executing its vertical descent.
-          const auto& first = level.feeds.motion.front();
-          writer.rapid(wave::to_world(first.from.x) + job.origin_x,
-                       wave::to_world(first.from.y) + job.origin_y, rapid_plane);
-          motion_positioned = true;
-        }
-        // XYZ phases are authoritative for helices: flattening these back to
-        // FeedSegment would turn the entry into a vertical plunge.
-        for (const MotionPhase& phase : level.feeds.motion) {
-          const double x = wave::to_world(phase.to.x) + job.origin_x;
-          const double y = wave::to_world(phase.to.y) + job.origin_y;
-          const double z = phase.to_z + job.origin_z;
-          if (phase.rapid) writer.rapid(x, y, z);
-          else if (phase.arc)
-            writer.arc(x, y, z,
-                       wave::to_world(phase.arc_center.x - phase.from.x),
-                       wave::to_world(phase.arc_center.y - phase.from.y),
-                       phase.clockwise, phase.rate);
-          else writer.feed(x, y, z, phase.rate);
-        }
-        at_depth = false;
-        continue;
+      if (!motion_positioned) {
+        // The first schedule starts above its entry point. Establish that XY
+        // at clearance before executing its vertical descent.
+        const auto& first = level.feeds.motion.front();
+        writer.rapid(wave::to_world(first.from.x) + job.origin_x,
+                     wave::to_world(first.from.y) + job.origin_y, rapid_plane);
+        motion_positioned = true;
       }
-
-      // The opening retract of a pass reached at depth is the one thing that
-      // must not be written out: it exists to prove the descent after it lands
-      // in cleared air, and writing it would lift the tool back to the plane
-      // that staying down was the whole point of avoiding. What it proves is
-      // still taken from it.
-      bool opening_retract = level.feeds.begins_at_depth && at_depth;
-      for (const FeedSegment& segment : level.feeds.segments) {
-        const double from_x = wave::to_world(segment.from.x) + job.origin_x;
-        const double from_y = wave::to_world(segment.from.y) + job.origin_y;
-        const double to_x = wave::to_world(segment.to.x) + job.origin_x;
-        const double to_y = wave::to_world(segment.to.y) + job.origin_y;
-
-        if (segment.kind == wave::MoveKind::Retract) {
-          if (opening_retract) {
-            rapid_descent = segment.safe_retract;
-            continue;
-          }
-          if (at_depth) {
-            // Straight up where it stands, then across. Lifting and traversing
-            // together would drag the cutter through the wall it is leaving.
-            writer.rapid(from_x, from_y, depth_z);
-            writer.rapid(from_x, from_y, rapid_plane);
-            at_depth = false;
-          }
-          writer.rapid(to_x, to_y, rapid_plane);
-          rapid_descent = segment.safe_retract;
-          continue;
-        }
-        opening_retract = false;
-
-        if (at_depth && depth_z != cut_z) {
-          // Reached without lifting: the cutter already stands over this pass's
-          // first point, one pass depth above it.
-          if (rapid_descent) writer.rapid(from_x, from_y, cut_z);
-          else writer.feed(from_x, from_y, cut_z, plunge_rate);
-          depth_z = cut_z;
-          rapid_descent = false;
-        } else if (!at_depth) {
-          // Across at height first, then straight down. Combining the two into
-          // one diagonal rapid would take the tool through whatever stands
-          // between where it was and where it is going.
-          writer.rapid(from_x, from_y, rapid_plane);
-          if (rapid_descent && segment.kind != wave::MoveKind::Entry) {
-            // Retract landings are checked against the simulated remaining
-            // stock. Where that footprint is clear, returning to depth is a
-            // positioning move rather than a cutting plunge.
-            writer.rapid(from_x, from_y, cut_z);
-          } else {
-            writer.feed(from_x, from_y, cut_z, plunge_rate);
-          }
-          at_depth = true;
-          depth_z = cut_z;
-          rapid_descent = false;
-        }
-
-        // The rate is the schedule's own: a disengaged piece at depth is a
-        // feed at the machine's cutting maximum rather than a rapid, and it is
-        // timed at that same figure, so the estimate cannot drift from what
-        // this writes.
-        writer.feed(to_x, to_y, cut_z, segment.rate);
-      }
-
-      if (at_depth && !level.feeds.ends_at_depth) {
-        // Leave the pass by lifting where it finished rather than dragging out.
-        const double last_x =
-            wave::to_world(level.feeds.segments.back().to.x) + job.origin_x;
-        const double last_y =
-            wave::to_world(level.feeds.segments.back().to.y) + job.origin_y;
-        writer.rapid(last_x, last_y, rapid_plane);
-        at_depth = false;
+      for (const MotionPhase& phase : level.feeds.motion) {
+        const double x = wave::to_world(phase.to.x) + job.origin_x;
+        const double y = wave::to_world(phase.to.y) + job.origin_y;
+        const double z = phase.to_z + job.origin_z;
+        if (phase.rapid) writer.rapid(x, y, z);
+        else if (phase.arc)
+          writer.arc(x, y, z,
+                     wave::to_world(phase.arc_center.x - phase.from.x),
+                     wave::to_world(phase.arc_center.y - phase.from.y),
+                     phase.clockwise, phase.rate);
+        else writer.feed(x, y, z, phase.rate);
       }
     }
 
@@ -492,6 +395,8 @@ PostResult post_operations(const JobPlan& plan,
   JobPlan selected_plan;
   selected_plan.rapid_plane = plan.rapid_plane;
   Job selected_job = job;
+  // Numbered as the whole job numbers them.
+  selected_job.tools = resolved_tool_table(job);
   selected_job.operations.clear();
   std::vector<std::size_t> sorted_indices = operation_indices;
   std::sort(sorted_indices.begin(), sorted_indices.end());

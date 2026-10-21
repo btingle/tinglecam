@@ -1,0 +1,39 @@
+{
+  "name": "Holes and nested counterbores",
+  "machine": "grbl-router",
+  "material": "aluminium-6082",
+  "simulation_pitch": 0.02,
+  "rapid_clearance_height": 10,
+  "operations": [
+    {
+      "name": "Adaptive holes",
+      "mode": "hole",
+      "tool": "3mm-2f-alu",
+      "stepover_ratio": 0.4,
+      "stepdown": 1,
+      "holes": {
+        "strategy": "adaptive",
+        "adaptive_radius": 3,
+        "helix_angle_degrees": 5,
+        "systems": [
+          {
+            "center_x": -10,
+            "center_y": 0,
+            "levels": [
+              {"radius": 6, "top_z": 0, "bottom_z": -2},
+              {"radius": 4, "top_z": -2, "bottom_z": -4},
+              {"radius": 2, "top_z": -4, "bottom_z": -6, "through": true}
+            ]
+          },
+          {
+            "center_x": 10,
+            "center_y": 0,
+            "levels": [
+              {"radius": 2.5, "top_z": 0, "bottom_z": -4}
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

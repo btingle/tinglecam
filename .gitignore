@@ -1,8 +1,13 @@
 /build/
+/models/
+/saves/
 /imgui.ini
 /tinglecam.nc
 /objs/
 *.obj
+!/tests/fixtures/meshes/**/*.obj
 *.mtl
 __pycache__/
 /.venv-tracks/
+/pyenv/
+/tools/gcode1/
