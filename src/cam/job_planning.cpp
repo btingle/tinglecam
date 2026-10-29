@@ -1,4 +1,5 @@
 #include "job_internal.h"
+#include <unordered_map>
 namespace cam {
 using namespace detail;
 OperationPlan plan_wavefronts(const JobGeometry& geometry,
@@ -144,8 +145,37 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
 
   const double lead_in =
       operation.lead_in ? radius + first_bite_allowance : 0.0;
+  // Wave analysis takes only XY geometry and operation-wide settings. Equal
+  // protected/incoming regions at different depths therefore have the same
+  // result. Compute each exact input once, then copy its mutable per-level
+  // buffers before inter-layer topology and tool motion can modify them.
+  std::vector<std::size_t> representatives(floors.size()), unique_wave_levels;
+  std::unordered_map<std::uint64_t,std::vector<std::size_t>> regions;
+  for (const auto index : wave_levels) {
+    std::uint64_t hash = 1469598103934665603ull;
+    const auto mix = [&](std::uint64_t value) { hash ^= value; hash *= 1099511628211ull; };
+    for (const auto* paths : {&keep_outs[index], &plan.levels[index].incoming_stock}) {
+      mix(paths->size());
+      for (const auto& path : *paths) {
+        mix(path.size());
+        for (const auto& point : path) { mix(point.x); mix(point.y); }
+      }
+    }
+    auto& candidates = regions[hash];
+    auto found = std::find_if(candidates.begin(), candidates.end(), [&](std::size_t other) {
+      return keep_outs[index] == keep_outs[other] &&
+             plan.levels[index].incoming_stock == plan.levels[other].incoming_stock;
+    });
+    if (found == candidates.end()) {
+      representatives[index] = index;
+      candidates.push_back(index);
+      unique_wave_levels.push_back(index);
+    } else representatives[index] = *found;
+  }
+  if (std::getenv("TINGLECAM_PROFILE_WORKERS") && wave_levels.size()>1)
+    std::fprintf(stderr,"\nwavefront_reuse levels=%zu unique=%zu\n",wave_levels.size(),unique_wave_levels.size());
   const auto wavefront_start = PlanningClock::now();
-  if (!parallel_for_levels(wave_levels, [&](std::size_t index, const LevelProgress&) {
+  if (!parallel_for_levels(unique_wave_levels, [&](std::size_t index, const LevelProgress&) {
     LevelPlan& level = plan.levels[index];
     try {
       wave::WavefrontAnalysis analysis = wave::analyze_wavefront(
@@ -170,6 +200,20 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
      operation.name + ": wavefronts")) {
     plan.error = "Cancelled";
     return plan;
+  }
+  for (const auto index : wave_levels) {
+    const auto representative = representatives[index];
+    if (index == representative) continue;
+    wave_errors[index] = wave_errors[representative];
+    if (wave_errors[index]) continue;
+    auto& target = plan.levels[index];
+    const auto& source = plan.levels[representative];
+    target.wave_stages = source.wave_stages;
+    target.wave = source.wave;
+    target.lineage = source.lineage;
+    target.topology = source.topology;
+    target.analysis_trials = source.analysis_trials;
+    target.accepted_analysis_trials = source.accepted_analysis_trials;
   }
   plan.metrics.wavefront_milliseconds +=
       elapsed_milliseconds(wavefront_start);

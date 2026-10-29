@@ -138,9 +138,41 @@ void compare_backends() {
   }
 }
 
+void check_overlapping_surfaces() {
+  wave::Mesh mesh;
+  constexpr int count=2048;
+  for (int i=0;i<count;++i) {
+    const float z=float(i)/count;
+    mesh.triangles.push_back({{0,0,z},{1,0,1-z},{0,1,z}});
+  }
+  mesh.bounds={{0,0,0},{1,1,1},true};
+  for (const auto backend : {wave::MeshSlicerBackend::CPU,wave::MeshSlicerBackend::CUDA}) {
+    if (backend==wave::MeshSlicerBackend::CUDA && !wave::cuda_slicer_available()) continue;
+    wave::MeshSlicer slicer(backend);
+    slicer.set_mesh(mesh);
+    const auto slice=slicer.slice(.5f);
+    require(std::abs(Clipper2Lib::Area(slice.polygons)-500000)<1,
+            "Bounded pruning must preserve the full projected surface envelope");
+    std::vector<wave::Vec3f> origins;
+    for (float x : {.1f,.25f,.5f,.75f}) origins.push_back({x,.1f,2});
+    double ms;
+    const auto hits=slicer.vertical_raycast(origins,-1,ms);
+    for (std::size_t i=0;i<origins.size();++i) {
+      float expected=-1;
+      for (int j=0;j<count;++j) {
+        const float z=float(j)/count;
+        expected=std::max(expected,z+origins[i].x*(1-2*z));
+      }
+      require(std::isfinite(hits[i]) && std::abs(hits[i]-expected)<1e-5,
+              "Bounded pruning must preserve top-envelope ray heights");
+    }
+  }
+}
+
 int main(int argc, char** argv) {
   try {
     const bool expect_cpu = argc == 2 && std::string(argv[1]) == "--expect-cpu";
+    check_overlapping_surfaces();
     check_backend(wave::MeshSlicerBackend::CPU);
     check_backend(wave::MeshSlicerBackend::Default, expect_cpu);
     if (wave::cuda_slicer_available()) {

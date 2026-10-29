@@ -6,6 +6,7 @@
 #include <cmath>
 #include <limits>
 #include <queue>
+#include <numeric>
 #include <utility>
 
 namespace wave {
@@ -38,20 +39,6 @@ bool crosses(const Point64& a, const Point64& b, const Point64& c,
   const std::int64_t d3 = side(c, d, a);
   const std::int64_t d4 = side(c, d, b);
   return d1 * d2 < 0 && d3 * d4 < 0;
-}
-
-// Non-zero containment across a whole set of rings, so a point sitting in a
-// hole reads as outside rather than as inside the ring that bounds it.
-bool inside(const Paths64& paths, const Point64& point) {
-  int winding = 0;
-  for (const Path64& ring : paths) {
-    if (ring.size() < 3) continue;
-    const PointInPolygonResult result = PointInPolygon(point, ring);
-    if (result == PointInPolygonResult::IsOn) return true;
-    if (result == PointInPolygonResult::IsInside)
-      winding += Area(ring) >= 0.0 ? 1 : -1;
-  }
-  return winding != 0;
 }
 
 Point64 along(const Point64& a, const Point64& b, double t) {
@@ -152,6 +139,10 @@ Router::Router(const Paths64& region, double slack)
     return;
   }
   probe_ = InflatePaths(padded_, pad, JoinType::Miter, EndType::Polygon);
+  for (const auto& ring : probe_) {
+    probe_bounds_.push_back(GetBounds(ring));
+    probe_winding_.push_back(Area(ring) >= 0 ? 1 : -1);
+  }
 
   // The graph is built on a simplified outline, and this is not an economy: it
   // is what makes the graph mean anything. An offset boundary zigzags by a unit
@@ -177,6 +168,15 @@ Router::Router(const Paths64& region, double slack)
       edge_to_.push_back(ring[(i + 1) % ring.size()]);
     }
   }
+
+  edge_bounds_.reserve(edge_from_.size());
+  for (std::size_t i = 0; i < edge_from_.size(); ++i) {
+    const auto a = edge_from_[i], b = edge_to_[i];
+    edge_bounds_.push_back({std::min(a.x,b.x),std::min(a.y,b.y),
+                             std::max(a.x,b.x),std::max(a.y,b.y)});
+    edge_order_.push_back(i);
+  }
+  if (!edge_order_.empty()) build_edge_index(0, edge_order_.size());
 
   // Every vertex of the outline is a corner the graph may turn at, and the
   // temptation to keep only the ones a shortest path can actually turn at --
@@ -204,9 +204,8 @@ Router::Router(const Paths64& region, double slack)
   outline_ = outline;
 
   const std::size_t count = corners_.size();
-  corner_visible_.assign(count * count, 2);
-  for (std::size_t i = 0; i < count; ++i)
-    corner_visible_[i * count + i] = 1;
+  if (count <= 2048) corner_visible_.assign(count * count, 2);
+  for (std::size_t i = 0; i < count; ++i) set_visibility(i,i,1);
 
   // Two vertices with a boundary edge between them are joined whatever the
   // visibility test makes of it, because that edge is a legal route by
@@ -223,16 +222,68 @@ Router::Router(const Paths64& region, double slack)
     for (std::size_t i = 0; i < size; ++i) {
       const std::size_t a = begin + i;
       const std::size_t b = begin + (i + 1) % size;
-      corner_visible_[a * count + b] = 1;
-      corner_visible_[b * count + a] = 1;
+      set_visibility(a,b,1);
     }
+  }
+}
+
+int Router::build_edge_index(std::size_t begin, std::size_t end) {
+  auto bounds = edge_bounds_[edge_order_[begin]];
+  for (std::size_t i=begin+1;i<end;++i) {
+    const auto& b = edge_bounds_[edge_order_[i]];
+    bounds.left=std::min(bounds.left,b.left); bounds.right=std::max(bounds.right,b.right);
+    bounds.top=std::min(bounds.top,b.top); bounds.bottom=std::max(bounds.bottom,b.bottom);
+  }
+  const int node = int(edge_index_.size());
+  edge_index_.push_back({bounds,begin,end,-1,-1});
+  if (end-begin > 8) {
+    const auto middle = begin+(end-begin)/2;
+    const bool x = bounds.Width() >= bounds.Height();
+    std::nth_element(edge_order_.begin()+begin, edge_order_.begin()+middle,
+        edge_order_.begin()+end, [&](std::size_t a, std::size_t b) {
+      const auto& p=edge_bounds_[a];const auto& q=edge_bounds_[b];
+      const auto pc=x?std::midpoint(p.left,p.right):std::midpoint(p.top,p.bottom);
+      const auto qc=x?std::midpoint(q.left,q.right):std::midpoint(q.top,q.bottom);
+      return pc!=qc ? pc<qc : a<b;
+    });
+    const int left=build_edge_index(begin,middle),right=build_edge_index(middle,end);
+    edge_index_[node].left=left; edge_index_[node].right=right;
+  }
+  return node;
+}
+bool Router::crosses_edges(int node, const Rect64& query,
+                           const Point64& a, const Point64& b) const {
+  const auto& n=edge_index_[node];
+  if (query.right<n.bounds.left || query.left>n.bounds.right ||
+      query.bottom<n.bounds.top || query.top>n.bounds.bottom) return false;
+  if (n.left>=0)
+    return crosses_edges(n.left,query,a,b) || crosses_edges(n.right,query,a,b);
+  for (std::size_t i=n.begin;i<n.end;++i) {
+    const auto id=edge_order_[i];
+    if (crosses(a,b,edge_from_[id],edge_to_[id])) return true;
+  }
+  return false;
+}
+std::uint8_t Router::visibility(std::size_t a, std::size_t b) const {
+  if (!corner_visible_.empty()) return corner_visible_[a*corners_.size()+b];
+  if (a>b) std::swap(a,b);
+  const auto it=sparse_visible_.find(a*corners_.size()+b);
+  return it==sparse_visible_.end()?2:it->second;
+}
+void Router::set_visibility(std::size_t a, std::size_t b, std::uint8_t value) const {
+  if (!corner_visible_.empty()) {
+    corner_visible_[a*corners_.size()+b]=corner_visible_[b*corners_.size()+a]=value;
+  } else {
+    if (a>b) std::swap(a,b);
+    sparse_visible_[a*corners_.size()+b]=value;
   }
 }
 
 bool Router::visible(const Point64& a, const Point64& b) const {
   if (a == b) return true;
-  for (std::size_t i = 0; i < edge_from_.size(); ++i)
-    if (crosses(a, b, edge_from_[i], edge_to_[i])) return false;
+  const Rect64 query{std::min(a.x,b.x),std::min(a.y,b.y),
+                       std::max(a.x,b.x),std::max(a.y,b.y)};
+  if (!edge_index_.empty() && crosses_edges(0,query,a,b)) return false;
   // Crossing nothing leaves two cases apart: a segment inside the region and
   // one wholly outside it, in a hole or beyond the boundary. A point on it
   // tells them apart, and having crossed no edge the whole segment is on that
@@ -261,7 +312,18 @@ bool Router::visible(const Point64& a, const Point64& b) const {
   for (std::size_t i = 0; i < samples; ++i) {
     const double t = (static_cast<double>(i) + 0.5) /
                      static_cast<double>(samples);
-    if (!inside(probe_, along(a, b, t))) return false;
+    const auto point = along(a,b,t);
+    int winding=0;
+    bool boundary=false;
+    for (std::size_t ring=0;ring<probe_.size();++ring) {
+      const auto& bounds=probe_bounds_[ring];
+      if (point.x<bounds.left || point.x>bounds.right ||
+          point.y<bounds.top || point.y>bounds.bottom || probe_[ring].size()<3) continue;
+      const auto result=PointInPolygon(point,probe_[ring]);
+      if (result==PointInPolygonResult::IsOn) {boundary=true;break;}
+      if (result==PointInPolygonResult::IsInside) winding+=probe_winding_[ring];
+    }
+    if (!boundary && winding==0) return false;
   }
   return true;
 }
@@ -316,10 +378,10 @@ std::optional<Path64> Router::route(const Point64& from,
       if (settled[next]) continue;
       const double candidate = cost + length_of(corners_[node], corners_[next]);
       if (candidate >= best[next]) continue;
-      std::uint8_t& edge = corner_visible_[node * count + next];
+      std::uint8_t edge = visibility(node,next);
       if (edge == 2) {
         edge = visible(corners_[node], corners_[next]) ? 1 : 0;
-        corner_visible_[next * count + node] = edge;
+        set_visibility(node,next,edge);
       }
       if (!edge) continue;
       best[next] = candidate;

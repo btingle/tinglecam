@@ -126,7 +126,8 @@ struct CadModel::Impl {
   };
   struct CollisionFace {
     Bnd_Box bounds;
-    std::vector<std::unique_ptr<Patch>> patches;
+    mutable std::vector<std::unique_ptr<Patch>> patches;
+    std::unique_ptr<std::once_flag> patches_once = std::make_unique<std::once_flag>();
   };
   // Shared once-initialized refinements are bounded per model. After this
   // budget, queries use temporary refinements with identical geometry/tests.
@@ -135,6 +136,7 @@ struct CadModel::Impl {
   static constexpr std::size_t kCachedPatchPoles = 131072;
   mutable std::atomic<std::size_t> cached_patch_poles{0};
   std::vector<CollisionFace> collision_faces;
+  void prepare_collision_face(std::size_t index) const;
   bool boundary_clear(const TopoDS_Shape& query, double clearance) const;
 #endif
 };
@@ -343,7 +345,9 @@ std::shared_ptr<CadModel> CadModel::load(const std::filesystem::path& path,
       const auto face = TopoDS::Face(faces(index));
       BRepAdaptor_Surface surface(face, true);
       GProp_GProps properties;
-      BRepGProp::SurfaceProperties(face, properties);
+      // Area is display metadata. Reuse the tessellation rather than
+      // integrating every native spline just to populate the face list.
+      BRepGProp::SurfaceProperties(face, properties, false, true);
       data.native_faces.push_back(face);
       std::array<double, 4> bounds;
       BRepTools::UVBounds(face, bounds[0], bounds[1], bounds[2], bounds[3]);
@@ -353,30 +357,17 @@ std::shared_ptr<CadModel> CadModel::load(const std::filesystem::path& path,
         throw std::runtime_error("STEP face has an unbounded parameter domain");
       data.domains.push_back(bounds);
       Impl::CollisionFace collision;
-      BRepBndLib::AddOptimal(face, collision.bounds, false, false);
-      box.Add(collision.bounds);
-      // Knot-span Bezier patches describe the exact underlying B-spline, not
-      // its display mesh. Their control hulls bound every surface point. The
-      // untrimmed patches are a superset of the face: they can prove clearance;
-      // a suspected collision still falls back to the original trimmed face.
-      if (surface.GetType() == GeomAbs_BSplineSurface) {
-        try {
-          GeomConvert_BSplineSurfaceToBezierSurface converter(
-              surface.BSpline(), bounds[0], bounds[1], bounds[2], bounds[3],
-              1e-10);
-          if (converter.NbUPatches() * converter.NbVPatches() <= 4096) {
-            for (int u = 1; u <= converter.NbUPatches(); ++u)
-              for (int v = 1; v <= converter.NbVPatches(); ++v) {
-                auto piece = std::make_unique<Impl::Patch>();
-                piece->initialize(converter.Patch(u, v));
-                collision.patches.push_back(std::move(piece));
-              }
-          }
-        } catch (const Standard_Failure&) {
-          collision.patches.clear();
-        } catch (const std::runtime_error&) {
-          collision.patches.clear();
-        }
+      if (surface.GetType() == GeomAbs_BSplineSurface ||
+          surface.GetType() == GeomAbs_BezierSurface) {
+        // Native spline extrema can dominate import (seconds per face).
+        // Control-hull bounds conservatively cover the native collision
+        // geometry; mesher bounds include deflection and keep stock close to
+        // the displayed surface without a global extrema search.
+        BRepBndLib::Add(face, collision.bounds, false);
+        BRepBndLib::Add(face, box, true);
+      } else {
+        BRepBndLib::AddOptimal(face, collision.bounds, false, false);
+        box.Add(collision.bounds);
       }
       data.collision_faces.push_back(std::move(collision));
       const auto type = static_cast<std::size_t>(surface.GetType());
@@ -438,9 +429,8 @@ std::shared_ptr<CadModel> CadModel::load(const std::filesystem::path& path,
     }
     if (data.mesh.triangles.empty())
       throw std::runtime_error("STEP contains no triangulatable faces");
-    // Reuse the exact face/loose-geometry bounds above. Recomputing optimal
-    // bounds for the complete shape repeats expensive B-spline extrema work.
-    // Mesh bounds would add triangulation deflection to the box blank.
+    // Analytic faces retain exact bounds. Spline bounds are conservative,
+    // including tessellation deflection, so a box blank always covers them.
     double x0, y0, z0, x1, y1, z1;
     box.Get(x0, y0, z0, x1, y1, z1);
     data.mesh.bounds = {{float(x0), float(y0), float(z0)},
@@ -611,6 +601,34 @@ bool finite_point(wave::Vec3d p) {
 }  // namespace
 #endif
 #ifdef TINGLECAM_HAVE_OCCT
+void CadModel::Impl::prepare_collision_face(std::size_t index) const {
+  const auto& collision = collision_faces[index];
+  std::call_once(*collision.patches_once, [&] {
+    BRepAdaptor_Surface surface(native_faces[index], true);
+    if (surface.GetType() != GeomAbs_BSplineSurface) return;
+    const auto spline = surface.BSpline();
+    // Check the budget before conversion: its constructor materializes every
+    // knot span, so checking Nb*Patches afterwards is already too late.
+    if (std::int64_t(spline->NbUKnots()-1)*(spline->NbVKnots()-1) > 4096) return;
+    const auto& bounds = domains[index];
+    try {
+      GeomConvert_BSplineSurfaceToBezierSurface converter(
+          spline, bounds[0], bounds[1], bounds[2], bounds[3], 1e-10);
+      if (std::int64_t(converter.NbUPatches())*converter.NbVPatches() > 4096) return;
+      for (int u = 1; u <= converter.NbUPatches(); ++u)
+        for (int v = 1; v <= converter.NbVPatches(); ++v) {
+          auto piece = std::make_unique<Patch>();
+          piece->initialize(converter.Patch(u,v));
+          collision.patches.push_back(std::move(piece));
+        }
+    } catch (const Standard_Failure&) {
+      collision.patches.clear();
+    } catch (const std::runtime_error&) {
+      collision.patches.clear();
+    }
+  });
+}
+
 bool CadModel::Impl::boundary_clear(const TopoDS_Shape& query,
                                     double clearance) const {
   Bnd_Box bounds;
@@ -764,6 +782,7 @@ bool CadModel::Impl::boundary_clear(const TopoDS_Shape& query,
   for (std::size_t i = 0; i < collision_faces.size(); ++i) {
     const auto& face = collision_faces[i];
     if (bounds.Distance(face.bounds) >= clearance) continue;
+    prepare_collision_face(i);
     bool proved = !face.patches.empty();
     for (const auto& patch : face.patches) {
       if (!patch_clear(*patch, 0)) {

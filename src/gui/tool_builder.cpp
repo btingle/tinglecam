@@ -8,6 +8,7 @@ namespace {
 void commit_tools(App& app, cam::ToolLibrary library) {
   cam::save_tools(app.tools_file, library);
   app.tools = std::move(library);
+  app.result_preview = {};
 }
 
 bool tool_in_use(const App& app, const std::string& id) {

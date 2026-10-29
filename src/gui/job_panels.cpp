@@ -472,6 +472,7 @@ cam::OperationPlan unplanned(const cam::Operation& operation) {
 // was planned from are three lists in step. Every structural edit goes here.
 void insert_operation(App& app, int index, cam::Operation operation) {
   index = std::clamp(index, 0, static_cast<int>(app.job.operations.size()));
+  app.result_preview = {};
   app.plan.operations.insert(app.plan.operations.begin() + index, unplanned(operation));
   app.planned.insert(app.planned.begin() + index, PlannedRecord{});
   app.operation_selection.insert(app.operation_selection.begin() + index, false);
@@ -481,6 +482,7 @@ void insert_operation(App& app, int index, cam::Operation operation) {
 void erase_operation(App& app, int index) {
   if (index < 0 || index >= static_cast<int>(app.job.operations.size())) return;
   app.job.operations.erase(app.job.operations.begin() + index);
+  app.result_preview = {};
   app.plan.operations.erase(app.plan.operations.begin() + index);
   app.planned.erase(app.planned.begin() + index);
   if (index < static_cast<int>(app.operation_selection.size()))
@@ -509,6 +511,7 @@ void align_plan(App& app) {
   const std::size_t count = app.job.operations.size();
   app.operation_selection.resize(count, false);
   if (app.plan.operations.size() == count && app.planned.size() == count) return;
+  app.result_preview = {};
   app.plan.operations.clear();
   for (const cam::Operation& operation : app.job.operations)
     app.plan.operations.push_back(unplanned(operation));
@@ -581,6 +584,7 @@ void invalidate_plan(App& app) {
   app.planner.stop();
   app.has_plan = false;
   app.plan = {};
+  app.result_preview = {};
   for (const cam::Operation& operation : app.job.operations)
     app.plan.operations.push_back(unplanned(operation));
   app.planned.assign(app.job.operations.size(), PlannedRecord{});

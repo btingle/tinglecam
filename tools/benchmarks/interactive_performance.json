@@ -1,0 +1,100 @@
+{
+  "date": "2026-10-29",
+  "configuration": "Release, cuBQL CPU backend, Open CASCADE enabled; renderer tested with Mesa llvmpipe OpenGL 3.2",
+  "checkpoint": "fce2318",
+  "native_step_import": {
+    "model": "local test.step (not distributed)",
+    "bytes": 15123143,
+    "sha256": "bfd4f2ed770860e20e022bf85b954a1b01621043c499c08d385ed744690e7282",
+    "faces": 168,
+    "triangles": 330502,
+    "before_seconds": 51.6776,
+    "after_seconds": 10.6022,
+    "permanent_benchmark_after_ms": 10757.6,
+    "after_index_ms": 363.941,
+    "retained_triangles": 297646
+  },
+  "roughing": {
+    "fixture": "tests/fixtures/meshes/LsJig1.obj",
+    "arguments": "--box-stock 5 --mode rough --tool 3.175mm-square --machine makera-z1 --material hdpe --stepdown 3 --stepover .2 --finishing-subdivisions 4 --path-pitch .2 --simulation-pitch .1",
+    "before_wall_seconds": 26.73,
+    "after_wall_seconds": 24.22,
+    "before_plan_ms": 26395.587,
+    "after_plan_ms": 23922.97,
+    "coarse_wavefront_levels": 6,
+    "unique_coarse_wavefronts": 5,
+    "before_and_after_gcode_sha256": "42c5849c25f04450089487eb798fc3b292b54c9bbd77f6f787b4239c818223c6"
+  },
+  "timeline": {
+    "phases": 100000,
+    "queries": 2000,
+    "linear_ms": 1355.43,
+    "indexed_ms": 1.15621,
+    "matching_checksum": true
+  },
+  "overlapping_mesh": {
+    "triangles": 16000,
+    "after_index_ms": 40.7581
+  },
+  "routing": {
+    "runs": [
+      {
+        "corners": 148,
+        "build_ms": 0.330771,
+        "routes_32_ms": 46.1994,
+        "route_points": 138,
+        "checksum": 1662182261815744923
+      },
+      {
+        "corners": 148,
+        "build_ms": 0.363909,
+        "routes_32_ms": 29.5785,
+        "route_points": 138,
+        "checksum": 1662182261815744923
+      },
+      {
+        "corners": 148,
+        "build_ms": 0.412416,
+        "routes_32_ms": 40.1045,
+        "route_points": 138,
+        "checksum": 1662182261815744923
+      },
+      {
+        "corners": 148,
+        "build_ms": 0.370396,
+        "routes_32_ms": 37.1563,
+        "route_points": 138,
+        "checksum": 1662182261815744923
+      },
+      {
+        "corners": 148,
+        "build_ms": 0.945802,
+        "routes_32_ms": 49.3472,
+        "route_points": 138,
+        "checksum": 1662182261815744923
+      },
+      {
+        "corners": 148,
+        "build_ms": 0.296263,
+        "routes_32_ms": 24.8649,
+        "route_points": 138,
+        "checksum": 1662182261815744923
+      }
+    ],
+    "before_median_ms": 46.1994,
+    "after_median_ms": 29.5785,
+    "matching_routes": true
+  },
+  "renderer": {
+    "segments": 100000,
+    "initial_line_upload_bytes": 5600000,
+    "camera_change_line_upload_bytes": 0,
+    "idle_reuses_frame": true
+  },
+  "validation": {
+    "ctest_passed": 23,
+    "ctest_total": 23,
+    "result_view_screenshot_checked": true,
+    "cuda": "unavailable"
+  }
+}

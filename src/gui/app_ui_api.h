@@ -6,6 +6,7 @@
 #include "cam/surface_finishing.h"
 #include "cam/holes.h"
 #include "gui_types.h"
+#include "rendering/heightmap_renderer.h"
 
 #include <clipper2/clipper.h>
 #include <imgui.h>

@@ -40,10 +40,17 @@ void extend(Bounds3f& bounds, Vec3f p) {
 }
 
 void append_triangle(Mesh& mesh, Triangle3f triangle) {
-  const double area_xy =
-      static_cast<double>(triangle.b.x - triangle.a.x) * (triangle.c.y - triangle.a.y) -
-      static_cast<double>(triangle.b.y - triangle.a.y) * (triangle.c.x - triangle.a.x);
-  if (std::abs(area_xy) <= 1e-12) return;
+  for (const auto p : {triangle.a, triangle.b, triangle.c})
+    if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z))
+      throw std::runtime_error("Mesh contains a non-finite vertex");
+  const double ux = double(triangle.b.x) - triangle.a.x,
+               uy = double(triangle.b.y) - triangle.a.y,
+               uz = double(triangle.b.z) - triangle.a.z;
+  const double vx = double(triangle.c.x) - triangle.a.x,
+               vy = double(triangle.c.y) - triangle.a.y,
+               vz = double(triangle.c.z) - triangle.a.z;
+  const double nx = uy*vz - uz*vy, ny = uz*vx - ux*vz, nz = ux*vy - uy*vx;
+  if (nx == 0 && ny == 0 && nz == 0) return;
   mesh.triangles.push_back(triangle);
   extend(mesh.bounds, triangle.a);
   extend(mesh.bounds, triangle.b);
@@ -54,12 +61,85 @@ std::int32_t obj_index(std::string_view token, std::size_t vertex_count) {
   const auto slash = token.find('/');
   if (slash != std::string_view::npos) token = token.substr(0, slash);
   if (token.empty()) throw std::runtime_error("OBJ face has an empty vertex index");
-  const int parsed = std::stoi(std::string(token));
+  std::size_t used = 0;
+  const int parsed = std::stoi(std::string(token), &used);
+  if (used != token.size() || parsed == 0)
+    throw std::runtime_error("Invalid OBJ vertex index");
   const std::int64_t index = parsed > 0 ? parsed - 1
                                        : static_cast<std::int64_t>(vertex_count) + parsed;
   if (index < 0 || index >= static_cast<std::int64_t>(vertex_count))
     throw std::runtime_error("OBJ face vertex index is out of range");
   return static_cast<std::int32_t>(index);
+}
+
+// Project onto the face's dominant plane. Convex faces use a linear fan;
+// concave faces use ears, preserving the original 3D coordinates and winding.
+void append_face(Mesh& mesh, const std::vector<Vec3f>& vertices,
+                 std::vector<std::int32_t> face) {
+  face.erase(std::unique(face.begin(), face.end()), face.end());
+  if (face.size() > 1 && face.front() == face.back()) face.pop_back();
+  if (face.size() < 3) throw std::runtime_error("OBJ face has fewer than three vertices");
+  if (face.size() == 3) {
+    append_triangle(mesh, {vertices[face[0]], vertices[face[1]], vertices[face[2]]});
+    return;
+  }
+  double normal[3]{};
+  const auto origin = vertices[face[0]];
+  for (std::size_t i = 1; i + 1 < face.size(); ++i) {
+    const auto b = vertices[face[i]], c = vertices[face[i+1]];
+    const double u[]{double(b.x)-origin.x, double(b.y)-origin.y, double(b.z)-origin.z};
+    const double v[]{double(c.x)-origin.x, double(c.y)-origin.y, double(c.z)-origin.z};
+    for (int a = 0; a < 3; ++a)
+      normal[a] += u[(a+1)%3]*v[(a+2)%3] - u[(a+2)%3]*v[(a+1)%3];
+  }
+  const int axis = int(std::max_element(normal, normal+3,
+      [](double a, double b) { return std::abs(a) < std::abs(b); }) - normal);
+  if (normal[axis] == 0) throw std::runtime_error("OBJ face has no well-defined plane");
+  const double winding = normal[axis] > 0 ? 1 : -1;
+  const auto xy = [&](std::int32_t id) {
+    const auto p = vertices[id];
+    if (axis == 0) return std::array<double,2>{p.y, p.z};
+    if (axis == 1) return std::array<double,2>{p.z, p.x};
+    return std::array<double,2>{p.x, p.y};
+  };
+  const auto turn = [&](std::int32_t a, std::int32_t b, std::int32_t c) {
+    const auto p = xy(a), q = xy(b), r = xy(c);
+    return winding*((q[0]-p[0])*(r[1]-p[1]) - (q[1]-p[1])*(r[0]-p[0]));
+  };
+  bool convex = true;
+  for (std::size_t i = 0; i < face.size(); ++i)
+    if (turn(face[i], face[(i+1)%face.size()], face[(i+2)%face.size()]) < 0)
+      convex = false;
+  if (convex) {
+    for (std::size_t i = 1; i+1 < face.size(); ++i)
+      append_triangle(mesh, {vertices[face[0]], vertices[face[i]], vertices[face[i+1]]});
+    return;
+  }
+  while (face.size() > 3) {
+    bool clipped = false;
+    for (std::size_t i = 0; i < face.size(); ++i) {
+      const auto a = face[(i+face.size()-1)%face.size()], b = face[i],
+                 c = face[(i+1)%face.size()];
+      const double area = turn(a,b,c);
+      if (area < 0) continue;
+      bool occupied = false;
+      if (area > 0)
+        for (auto p : face) {
+          if (p == a || p == b || p == c) continue;
+          if (turn(a,b,p) >= 0 && turn(b,c,p) >= 0 && turn(c,a,p) >= 0) {
+            occupied = true;
+            break;
+          }
+        }
+      if (occupied) continue;
+      if (area > 0) append_triangle(mesh, {vertices[a], vertices[b], vertices[c]});
+      face.erase(face.begin() + i);
+      clipped = true;
+      break;
+    }
+    if (!clipped) throw std::runtime_error("Cannot triangulate OBJ face (check for self intersections)");
+  }
+  append_triangle(mesh, {vertices[face[0]], vertices[face[1]], vertices[face[2]]});
 }
 
 Mesh load_obj(const std::filesystem::path& filename) {
@@ -81,10 +161,11 @@ Mesh load_obj(const std::filesystem::path& filename) {
     } else if (kind == "f") {
       std::vector<std::int32_t> face;
       std::string token;
-      while (fields >> token) face.push_back(obj_index(token, vertices.size()));
-      if (face.size() < 3) throw std::runtime_error("OBJ face has fewer than three vertices");
-      for (std::size_t i = 1; i + 1 < face.size(); ++i)
-        append_triangle(result, {vertices[face[0]], vertices[face[i]], vertices[face[i + 1]]});
+      while (fields >> token) {
+        if (token.front() == '#') break;
+        face.push_back(obj_index(token, vertices.size()));
+      }
+      append_face(result, vertices, std::move(face));
     }
   }
   return result;
@@ -224,7 +305,7 @@ Mesh load_triangle_mesh(const std::filesystem::path& filename) {
   else
     throw std::runtime_error("Unsupported mesh format '" + extension + "' (use OBJ or STL)");
   if (result.triangles.empty())
-    throw std::runtime_error("Mesh has no triangles with non-degenerate XY projections");
+    throw std::runtime_error("Mesh has no non-degenerate triangles");
   return result;
 }
 

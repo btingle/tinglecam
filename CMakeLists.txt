@@ -367,3 +367,21 @@ add_executable(hole_ui_tests tests/hole_ui_tests.cpp)
 target_link_libraries(hole_ui_tests PRIVATE tinglecam_app_ui)
 add_test(NAME hole_ui_tests COMMAND hole_ui_tests)
 set_tests_properties(hole_ui_tests PROPERTIES TIMEOUT 15)
+
+add_executable(mesh_loading_tests tests/mesh_loading_tests.cpp)
+target_link_libraries(mesh_loading_tests PRIVATE wave_geometry)
+add_test(NAME mesh_loading_tests COMMAND mesh_loading_tests)
+
+add_executable(motion_index_tests tests/motion_index_tests.cpp)
+target_link_libraries(motion_index_tests PRIVATE tinglecam_core)
+add_test(NAME motion_index_tests COMMAND motion_index_tests)
+
+add_executable(interactive_performance EXCLUDE_FROM_ALL tools/benchmarks/interactive_performance.cpp)
+target_link_libraries(interactive_performance PRIVATE tinglecam_core)
+
+add_executable(routing_benchmark EXCLUDE_FROM_ALL tools/benchmarks/routing.cpp)
+target_link_libraries(routing_benchmark PRIVATE wave_planning)
+
+add_executable(wave_reuse_tests tests/wave_reuse_tests.cpp)
+target_link_libraries(wave_reuse_tests PRIVATE tinglecam_core)
+add_test(NAME wave_reuse_tests COMMAND wave_reuse_tests)

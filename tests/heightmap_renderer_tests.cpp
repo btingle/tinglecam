@@ -252,6 +252,31 @@ void benchmark(int width = 640, int height = 480) {
               << " resident_bytes=" << renderer.stats().resident_bytes
               << " unchanged_upload_bytes=" << renderer.stats().uploaded_bytes
               << '\n';
+    if (pitch == .1) {
+      auto lines=std::make_shared<Lines>();
+      for (int i=0;i<100000;++i) {
+        const float x=(i%1000)*.04f, y=(i/1000)*.4f;
+        lines->vertices.push_back({{x,y,2},{.2f,.8f,1,1}});
+        lines->vertices.push_back({{x+.035f,y+.02f,2},{.2f,.8f,1,1}});
+      }
+      renderer.render(stock,camera,width,height,{}, {},lines);
+      glFinish();
+      const auto uploaded=renderer.stats().line_upload_bytes;
+      const auto moving=Clock::now();
+      for (int i=0;i<8;++i) {
+        camera.pan_x+=.1f;
+        renderer.render(stock,camera,width,height,{}, {},lines);
+        glFinish();
+        check(renderer.stats().line_upload_bytes==0,"Moving paths must retain their GPU buffer");
+      }
+      const double moving_ms=std::chrono::duration<double,std::milli>(Clock::now()-moving).count()/8;
+      const auto idle=Clock::now();
+      for (int i=0;i<64;++i) renderer.render(stock,camera,width,height,{}, {},lines);
+      std::cout<<"path_segments=100000 first_upload_bytes="<<uploaded
+               <<" moving_frame_ms="<<moving_ms
+               <<" idle_ms="<<std::chrono::duration<double,std::milli>(Clock::now()-idle).count()/64
+               <<" repeated_upload_bytes="<<renderer.stats().line_upload_bytes<<'\n';
+    }
   }
 }
 int main(int argc, char** argv) {
@@ -396,6 +421,38 @@ int main(int argc, char** argv) {
                 renderer.read_depth()==plain_depth,
             "Lighting changes invalidate the cached image without changing geometry");
       renderer.render(block,c,43,37);
+      auto lines = std::make_shared<Lines>();
+      lines->vertices = {{{-1,0,0},{1,0,1,1}},{{1,0,0},{1,0,1,1}}};
+      renderer.render(block,c,43,37,{}, {}, lines);
+      const auto lined = renderer.read_colour();
+      check(lined != plain && renderer.read_depth() == plain_depth,
+            "Toolpath lines overlay stock without changing its depth");
+      check(renderer.stats().line_upload_bytes == 2*sizeof(LineVertex),
+            "New toolpaths upload their immutable geometry once");
+      renderer.render(block,c,43,37,{}, {}, lines);
+      check(renderer.stats().reused_frame && renderer.stats().line_upload_bytes == 0 &&
+                renderer.read_colour() == lined,
+            "Idle toolpath frames reuse their image without uploads");
+      auto panned = c;
+      panned.pan_y += 4;
+      renderer.render(block,panned,43,37,{}, {}, lines);
+      check(renderer.stats().line_upload_bytes == 0 && renderer.read_colour() != lined,
+            "Camera motion retains the toolpath GPU buffer");
+      const auto moved = renderer.read_colour();
+      const auto line_row = [](const std::vector<std::uint8_t>& pixels) {
+        double sum=0;int count=0;
+        for (int y=0;y<37;++y) for (int x=0;x<43;++x) {
+          const auto i=(y*43+x)*4;
+          if (pixels[i]>240 && pixels[i+1]<10 && pixels[i+2]>240) {sum+=y;++count;}
+        }
+        check(count>0,"Line shader must produce the requested vertex colour");
+        return sum/count;
+      };
+      near(line_row(lined)-line_row(moved),4,1e-6,
+           "Toolpath projection uses the same top-left pan convention as meshes");
+      renderer.render(block,c,43,37);
+      check(renderer.read_colour() == plain,
+            "Hiding paths invalidates the frame and removes old geometry");
       Mesh triangle;
       triangle.triangles.push_back({{-1, -1, 2}, {1, -1, 2}, {0, 1, 2}});
       renderer.render(block, c, 43, 37, {{&triangle, {}, {1, 0, 0, 1}, false}});

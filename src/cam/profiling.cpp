@@ -52,7 +52,8 @@ void report_plan_memory(const JobPlan& plan) {
         maps.push_back(checkpoint.stock.get());
       checkpoints += level.stock_checkpoints.size();
       motion += level.feeds.motion.capacity() * sizeof(MotionPhase) +
-                level.feeds.segments.capacity() * sizeof(FeedSegment);
+                level.feeds.segments.capacity() * sizeof(FeedSegment) +
+                (level.feeds.motion_seconds.capacity()+level.feeds.motion_lengths.capacity()) * sizeof(double);
       geometry += wave_bytes(level.wave) + lineage_bytes(level.lineage);
       for (const auto& stage : level.wave_stages)
         geometry += wave_bytes(stage.wave) + lineage_bytes(stage.lineage);

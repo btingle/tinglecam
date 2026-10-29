@@ -362,24 +362,65 @@ ImU32 phase_colour(const App& app, const cam::MotionPhase& phase, double lowest,
   return IM_COL32(150, 150, 150, 255);
 }
 
-void draw_motion(const App& app, ImDrawList* list, const Projection& projection,
-                 const cam::LevelPlan& level, double lowest, double highest,
-                 double maximum_feed) {
-  for (const cam::MotionPhase& phase : level.feeds.motion) {
-    if (phase.rapid ? !app.show_rapid_travel : !app.show_cutting_paths) continue;
-    const ImU32 colour = phase_colour(app, phase, lowest, highest, maximum_feed);
-    const int pieces = phase.arc ? 64 : 1;
-    auto previous = cam::motion_point(phase, 0);
-    const auto screen = [&](wave::Vec3d p) {
-      return projection.point({float(p.x), float(p.y), float(p.z)});
-    };
-    for (int j = 1; j <= pieces; ++j) {
-      const auto next = cam::motion_point(phase, double(j) / pieces);
-      list->AddLine(screen(previous), screen(next), colour,
-                    phase.kind == wave::MoveKind::Entry ? 1.8f : 1.0f);
-      previous = next;
+void prepare_result_preview(App& app, const cam::OperationPlan& operation,
+                            const cam::Tool* tool, double maximum_feed) {
+  auto& cached = app.result_preview;
+  const int level = app.show_all_passes ? -1 :
+      std::clamp(app.selected_level, 0, int(operation.levels.size())-1);
+  if (cached.lines && cached.serial == app.plan_serial &&
+      cached.operation == app.selected_plan_operation && cached.level == level &&
+      cached.colouring == app.colouring && cached.cutting == app.show_cutting_paths &&
+      cached.rapids == app.show_rapid_travel && cached.maximum_feed == maximum_feed)
+    return;
+  cached = {};
+  cached.serial = app.plan_serial;
+  cached.operation = app.selected_plan_operation;
+  cached.level = level;
+  cached.colouring = app.colouring;
+  cached.cutting = app.show_cutting_paths;
+  cached.rapids = app.show_rapid_travel;
+  cached.maximum_feed = maximum_feed;
+  double lowest = 0, highest = 0;
+  feed_range(app, lowest, highest);
+  auto lines = std::make_shared<wave::heightfield::Lines>();
+  const auto include = [&](wave::Vec3d p, double radius, double flute) {
+    auto& b = cached.motion_bounds;
+    if (!b.valid) {
+      b.lower = {float(p.x-radius),float(p.y-radius),float(p.z)};
+      b.upper = {float(p.x+radius),float(p.y+radius),float(p.z+flute)};
+      b.valid = true;
+    } else {
+      b.lower = {std::min(b.lower.x,float(p.x-radius)),std::min(b.lower.y,float(p.y-radius)),std::min(b.lower.z,float(p.z))};
+      b.upper = {std::max(b.upper.x,float(p.x+radius)),std::max(b.upper.y,float(p.y+radius)),std::max(b.upper.z,float(p.z+flute))};
+    }
+  };
+  for (std::size_t i = 0; i < operation.levels.size(); ++i) {
+    const auto& pass = operation.levels[i];
+    const auto* cutter = pass.tool_id.empty() ? tool : app.tools.find(pass.tool_id);
+    for (const auto& phase : pass.feeds.motion) {
+      const double radius = cutter ? cutter->diameter/2 : 0;
+      const double flute = cutter ? cutter->flute_length : 0;
+      // Include arc samples in the frame too: endpoints alone miss a full circle.
+      const int pieces = phase.arc ? 64 : 1;
+      const bool show = (level < 0 || int(i) == level) &&
+          (phase.rapid ? app.show_rapid_travel : app.show_cutting_paths);
+      const auto colour = ImGui::ColorConvertU32ToFloat4(
+          phase_colour(app, phase, lowest, highest, maximum_feed));
+      auto previous = cam::motion_point(phase, 0);
+      include(previous, radius, flute);
+      for (int j = 1; j <= pieces; ++j) {
+        const auto next = cam::motion_point(phase, double(j)/pieces);
+        include(next, radius, flute);
+        if (show) {
+          for (auto p : {previous, next})
+            lines->vertices.push_back({{float(p.x),float(p.y),float(p.z)},
+                                       {colour.x,colour.y,colour.z,colour.w}});
+        }
+        previous = next;
+      }
     }
   }
+  cached.lines = std::move(lines);
 }
 
 }  // namespace
@@ -444,20 +485,17 @@ void draw_result(App& app) {
       wave::to_integer(map.lower_y() + map.rows() * map.pitch())};
   double lowest = map.lowest(), highest = map.highest();
   const double material_lowest = lowest, material_highest = highest;
-  if (active_tool) {
-    const std::int64_t radius = wave::to_integer(active_tool->diameter * 0.5);
-    for (const auto& level : levels)
-      for (const cam::MotionPhase& phase : level.feeds.motion) {
-        for (const Point64& point : {phase.from, phase.to}) {
-          extent_2d.left = std::min(extent_2d.left, point.x - radius);
-          extent_2d.right = std::max(extent_2d.right, point.x + radius);
-          extent_2d.top = std::min(extent_2d.top, point.y - radius);
-          extent_2d.bottom = std::max(extent_2d.bottom, point.y + radius);
-        }
-        lowest = std::min({lowest, phase.from_z, phase.to_z});
-        highest = std::max({highest, std::max(phase.from_z, phase.to_z) +
-                                         active_tool->flute_length});
-      }
+  const cam::Machine* machine = app.machines.find(app.job.machine_id);
+  const double maximum_feed = machine ? cam::rapid_feed(*machine) : 1e12;
+  prepare_result_preview(app, planned_operation, app.tools.find(planned_operation.tool_id), maximum_feed);
+  const auto& motion_bounds = app.result_preview.motion_bounds;
+  if (motion_bounds.valid) {
+    extent_2d.left = std::min(extent_2d.left, wave::to_integer(motion_bounds.lower.x));
+    extent_2d.right = std::max(extent_2d.right, wave::to_integer(motion_bounds.upper.x));
+    extent_2d.top = std::min(extent_2d.top, wave::to_integer(motion_bounds.lower.y));
+    extent_2d.bottom = std::max(extent_2d.bottom, wave::to_integer(motion_bounds.upper.y));
+    lowest = std::min(lowest, double(motion_bounds.lower.z));
+    highest = std::max(highest, double(motion_bounds.upper.z));
   }
   const double width = wave::to_world(extent_2d.right - extent_2d.left);
   const double height = wave::to_world(extent_2d.bottom - extent_2d.top);
@@ -531,7 +569,7 @@ void draw_result(App& app) {
     const auto texture = heightmap_view->render(*shown, camera,
                                                 int(std::ceil(size.x * pixel_scale)),
                                                 int(std::ceil(size.y * pixel_scale)), models,
-                                                cutter);
+                                                cutter, app.result_preview.lines);
     list->AddImage(static_cast<ImTextureID>(texture), top_left,
                    ImVec2(top_left.x + size.x, top_left.y + size.y), ImVec2(0, 1),
                    ImVec2(1, 0));
@@ -539,17 +577,6 @@ void draw_result(App& app) {
     heightmap_view.reset();
     list->AddText(top_left, ImGui::GetColorU32(severity_colour(app, LogSeverity::Error)),
                   error.what());
-  }
-
-  double feed_low = 0.0, feed_high = 0.0;
-  feed_range(app, feed_low, feed_high);
-  const cam::Machine* machine = app.machines.find(app.job.machine_id);
-  const double maximum_feed = machine ? cam::rapid_feed(*machine) : 1e12;
-  if (app.show_all_passes) {
-    for (const auto& level : levels)
-      draw_motion(app, list, projection, level, feed_low, feed_high, maximum_feed);
-  } else {
-    draw_motion(app, list, projection, active, feed_low, feed_high, maximum_feed);
   }
 
   OrbitScene overlay;

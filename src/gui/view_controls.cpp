@@ -190,6 +190,13 @@ void feed_range(const App& app, double& lowest, double& highest) {
     return;
   const auto& levels = app.plan.operations[app.selected_plan_operation].levels;
   const auto include = [&](const cam::LevelPlan& level) {
+    if (level.feeds.authoritative_motion) {
+      const auto& stats = level.feeds.stats;
+      highest = std::max(highest,stats.maximum_feed);
+      if (stats.minimum_feed > 0)
+        lowest = lowest > 0 ? std::min(lowest,stats.minimum_feed) : stats.minimum_feed;
+      return;
+    }
     for (const auto& phase : level.feeds.motion) {
       if (phase.rapid) continue;
       highest = std::max(highest, phase.rate);
@@ -287,18 +294,11 @@ void motion_readout(const App& app, const cam::LevelPlan* level) {
     ImGui::EndTooltip();
   }
 
-  // Mean over moves that removed material, so air cuts do not dilute it.
-  double engaged = 0.0, weighted = 0.0;
-  for (const cam::MotionPhase& phase : level->feeds.motion) {
-    if (phase.rapid || phase.from_z != phase.to_z || !(phase.removed_volume > 0.0)) continue;
-    engaged += phase.length;
-    weighted += phase.engagement * phase.length;
-  }
   const cam::FeedStats& stats = level->feeds.stats;
   ImGui::TextDisabled("Feed %.0f-%.0f mm/min", stats.minimum_feed, stats.maximum_feed);
   ImGui::SameLine(0.0f, gap);
   ImGui::TextDisabled("Engagement mean %.1f%%, peak %.1f%%",
-                      engaged > 0.0 ? weighted / engaged * 100.0 : 0.0,
+                      stats.mean_engagement * 100.0,
                       stats.maximum_engagement * 100.0);
   ImGui::SetItemTooltip("The mean is over moves that removed material");
 }

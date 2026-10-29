@@ -225,6 +225,7 @@ bool vertical_entry(const MotionPhase& phase) {
 // travel and timing totals, and the 2D segments the pass view draws.
 void finish_level_motion(LevelPlan& level, const CuttingFeeds& feeds,
                          double pitch) {
+  index_feed_motion(level.feeds);
   level.motion_distances.clear();
   level.motion_distances.reserve(level.feeds.motion.size() + 1);
   double total = 0;
@@ -242,6 +243,7 @@ void finish_level_motion(LevelPlan& level, const CuttingFeeds& feeds,
   stats = {};
   stats.spindle_rpm = rpm;
   stats.maximum_engagement = engagement;
+  double engaged = 0, weighted = 0;
   for (const auto& phase : level.feeds.motion) {
     if (phase.rapid) {
       stats.rapid_distance += phase.length;
@@ -252,8 +254,13 @@ void finish_level_motion(LevelPlan& level, const CuttingFeeds& feeds,
       stats.minimum_feed = stats.minimum_feed ? std::min(stats.minimum_feed, phase.rate)
                                               : phase.rate;
       stats.maximum_feed = std::max(stats.maximum_feed, phase.rate);
+      if (phase.from_z == phase.to_z && phase.removed_volume > 0) {
+        engaged += phase.length;
+        weighted += phase.engagement*phase.length;
+      }
     }
   }
+  stats.mean_engagement = engaged > 0 ? weighted/engaged : 0;
   // The 2D feed overlay must describe the same rates as the XYZ post.
   level.feeds.segments.clear();
   std::size_t move_index = 0;

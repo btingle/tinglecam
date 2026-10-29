@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -390,10 +391,35 @@ FeedSchedule plan_feeds(const wave::Toolpath& toolpath,
     schedule.stats.rapid_distance += phase.length;
     schedule.stats.rapid_minutes += phase.length / std::max(phase.rate, 1.0);
   }
+  index_feed_motion(schedule);
   return schedule;
 }
 
+void index_feed_motion(FeedSchedule& schedule) {
+  schedule.motion_seconds.assign(1, 0);
+  schedule.motion_lengths.assign(1, 0);
+  schedule.motion_seconds.reserve(schedule.motion.size()+1);
+  schedule.motion_lengths.reserve(schedule.motion.size()+1);
+  bool ordered = true;
+  double previous_end = -std::numeric_limits<double>::infinity();
+  for (const auto& phase : schedule.motion) {
+    ordered &= phase.path_distance_begin >= previous_end &&
+               phase.path_distance_end >= phase.path_distance_begin;
+    previous_end = phase.path_distance_end;
+    schedule.motion_seconds.push_back(schedule.motion_seconds.back() + phase_seconds(phase));
+    schedule.motion_lengths.push_back(schedule.motion_lengths.back() + phase.length);
+  }
+  // Custom schedules may use overlapping/reset path coordinates. Keep their
+  // existing linear semantics rather than indexing an unordered path axis.
+  if (!ordered) {
+    schedule.motion_seconds.clear();
+    schedule.motion_lengths.clear();
+  }
+}
+
 double feed_schedule_seconds(const FeedSchedule& schedule) {
+  if (!schedule.motion.empty() && schedule.motion_seconds.size() == schedule.motion.size()+1)
+    return schedule.motion_seconds.back();
   double total = 0.0;
   if (!schedule.motion.empty()) {
     for (const MotionPhase& phase : schedule.motion)
@@ -406,6 +432,8 @@ double feed_schedule_seconds(const FeedSchedule& schedule) {
 }
 
 double feed_motion_length(const FeedSchedule& schedule) {
+  if (!schedule.motion.empty() && schedule.motion_lengths.size() == schedule.motion.size()+1)
+    return schedule.motion_lengths.back();
   double total = 0.0;
   for (const MotionPhase& phase : schedule.motion) total += phase.length;
   if (!schedule.motion.empty()) return total;
@@ -416,6 +444,16 @@ double feed_motion_length(const FeedSchedule& schedule) {
 double feed_seconds_to(const FeedSchedule& schedule, double distance) {
   if (!(distance > 0.0)) return 0.0;
   double total = 0.0;
+  if (!schedule.motion.empty() && schedule.motion_seconds.size() == schedule.motion.size()+1) {
+    const auto it = std::upper_bound(schedule.motion.begin(), schedule.motion.end(), distance,
+        [](double d, const MotionPhase& p) { return d < p.path_distance_end; });
+    total = schedule.motion_seconds[std::size_t(it-schedule.motion.begin())];
+    if (it != schedule.motion.end() && it->path_distance_begin < distance &&
+        it->path_distance_end > it->path_distance_begin)
+      total += phase_seconds(*it) * std::clamp(
+          (distance-it->path_distance_begin)/(it->path_distance_end-it->path_distance_begin),0.0,1.0);
+    return total;
+  }
   if (!schedule.motion.empty()) {
     for (const MotionPhase& phase : schedule.motion) {
       if (phase.path_distance_begin == phase.path_distance_end) {
@@ -462,7 +500,18 @@ MotionCursor feed_motion_at_seconds(const FeedSchedule& schedule,
 
   double elapsed = 0.0;
   double travelled = 0.0;
-  for (const MotionPhase& phase : schedule.motion) {
+  std::size_t first = 0;
+  if (schedule.motion_seconds.size() == schedule.motion.size()+1 &&
+      schedule.motion_lengths.size() == schedule.motion.size()+1) {
+    const auto it = std::lower_bound(schedule.motion_seconds.begin()+1,
+                                    schedule.motion_seconds.end(), seconds);
+    first = std::min(std::size_t(it - schedule.motion_seconds.begin()-1),
+                     schedule.motion.size()-1);
+    elapsed = schedule.motion_seconds[first];
+    travelled = schedule.motion_lengths[first];
+  }
+  for (std::size_t i = first; i < schedule.motion.size(); ++i) {
+    const auto& phase = schedule.motion[i];
     const double duration = phase_seconds(phase);
     if (seconds <= elapsed + duration) {
       const double t = duration > 0.0

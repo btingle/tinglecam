@@ -76,6 +76,7 @@ struct FeedStats {
   double minimum_feed = 0.0;
   double maximum_feed = 0.0;
   double maximum_engagement = 0.0;
+  double mean_engagement = 0.0;
 };
 
 // A commanded machine motion.  Unlike FeedSegment, this also represents the
@@ -128,6 +129,9 @@ struct FeedSchedule {
   std::vector<FeedSegment> segments;
   std::vector<MotionPhase> motion;
   FeedStats stats;
+  // Prefix indexes rebuilt after commanded motion is finalized. Unindexed
+  // schedules remain supported for callers constructing motion directly.
+  std::vector<double> motion_seconds, motion_lengths;
   // Inter-layer XYZ links cannot be reconstructed from planar feed segments.
   bool authoritative_motion = false;
   // This pass finishes with the cutter still at its own floor. The pass after
@@ -171,6 +175,8 @@ double feed_schedule_seconds(const FeedSchedule& schedule);
 double feed_motion_length(const FeedSchedule& schedule);
 double feed_seconds_to(const FeedSchedule& schedule, double distance);
 double feed_distance_at_seconds(const FeedSchedule& schedule, double seconds);
+void index_feed_motion(FeedSchedule& schedule);
+
 MotionCursor feed_motion_at_seconds(const FeedSchedule& schedule,
                                     double seconds);
 double feed_distance_after(const FeedSchedule& schedule, double distance,

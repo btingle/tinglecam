@@ -28,6 +28,7 @@ float cross_xy(Vec3f a, Vec3f b, Vec3f p) {
   return (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
 }
 bool point_in_xy(const Triangle3f& triangle, Vec3f p) {
+  if (std::abs(cross_xy(triangle.a, triangle.b, triangle.c)) <= 1e-12f) return false;
   const float a = cross_xy(triangle.a, triangle.b, p);
   const float b = cross_xy(triangle.b, triangle.c, p);
   const float c = cross_xy(triangle.c, triangle.a, p);
@@ -80,6 +81,7 @@ struct Handle {
   Bounds3f bounds;
   std::vector<box3f> boxes;
   cuBQL::bvh3f bvh;
+  bool has_primitives = true;
   Handle(const std::vector<Triangle3f>& input, Bounds3f bounds)
       : triangles(input), bounds(bounds) {}
   ~Handle() { cuBQL::cpu::freeBVH(bvh); }
@@ -97,10 +99,18 @@ Handle* create(const std::vector<Triangle3f>& triangles, const Bounds3f& bounds,
                     static_cast<std::uint32_t>(triangles.size()), cuBQL::BuildConfig(4));
   std::vector<std::uint8_t> pruned(triangles.size());
   parallel_for(triangles.size(), [&](std::size_t id) {
+    if (std::abs(cross_xy(triangles[id].a, triangles[id].b, triangles[id].c)) <= 1e-12f) {
+      pruned[id] = 1; // Keep vertical faces in the display mesh, outside the height BVH.
+      return;
+    }
     const auto& box = handle->boxes[id];
-    const box3f search{{box.lower.x, box.lower.y, bounds.lower.z},
+    const box3f search{{box.lower.x, box.lower.y, box.lower.z},
                        {box.upper.x, box.upper.y, bounds.upper.z}};
+    // Pruning is optional: a bounded search retains unresolved prisms. Dense
+    // overlapping surfaces must not turn model loading into quadratic work.
+    unsigned visited = 0;
     cuBQL::fixedBoxQuery::forEachPrim([&](std::uint32_t other) {
+      if (++visited > 256) return CUBQL_TERMINATE_TRAVERSAL;
       if (other != id && contained(triangles[id], triangles[other]) &&
           (!contained(triangles[other], triangles[id]) || other < id)) {
         pruned[id] = 1;
@@ -111,11 +121,14 @@ Handle* create(const std::vector<Triangle3f>& triangles, const Bounds3f& bounds,
   });
   for (std::size_t id = 0; id < triangles.size(); ++id)
     if (pruned[id]) handle->boxes[id] = box3f();
-  cuBQL::cpu::freeBVH(handle->bvh);
-  cuBQL::cpuBuilder(handle->bvh, handle->boxes.data(),
-                    static_cast<std::uint32_t>(triangles.size()), cuBQL::BuildConfig(4));
   stats.pruned_triangles = std::count(pruned.begin(), pruned.end(), 1);
   stats.retained_triangles = triangles.size() - stats.pruned_triangles;
+  handle->has_primitives = stats.retained_triangles != 0;
+  if (handle->has_primitives) {
+    cuBQL::cpu::freeBVH(handle->bvh);
+    cuBQL::cpuBuilder(handle->bvh, handle->boxes.data(),
+                      static_cast<std::uint32_t>(triangles.size()), cuBQL::BuildConfig(4));
+  }
   stats.gpu_accelerated = false;
   stats.build_milliseconds = elapsed(start);
   return handle.release();
@@ -127,7 +140,7 @@ std::vector<std::uint32_t> query(const Handle* handle, float z,
                                  double& milliseconds) {
   const auto start = Clock::now();
   std::vector<std::uint32_t> result;
-  if (z <= handle->bounds.upper.z) {
+  if (handle->has_primitives && z <= handle->bounds.upper.z) {
     const box3f search{{handle->bounds.lower.x, handle->bounds.lower.y, z},
                        packed(handle->bounds.upper)};
     cuBQL::fixedBoxQuery::forEachPrim([&](std::uint32_t id) {
@@ -147,7 +160,7 @@ std::vector<float> vertical_raycast(const Handle* handle,
   std::vector<float> result(origins.size(), std::numeric_limits<float>::quiet_NaN());
   parallel_for(origins.size(), [&](std::size_t i) {
     const auto origin = origins[i];
-    if (origin.z <= lower_z) return;
+    if (!handle->has_primitives || origin.z <= lower_z) return;
     cuBQL::ray3f ray(packed(origin), {0, 0, -1}, 1e-5f, origin.z - lower_z);
     float nearest = ray.tMax;
     cuBQL::shrinkingRayQuery::forEachPrim([&](std::uint32_t id) {

@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <optional>
 #include <vector>
+#include <unordered_map>
 
 namespace wave {
 
@@ -53,6 +54,16 @@ class Router {
   // Visibility within the graph: no proper crossing of the simplified outline,
   // and a point on the segment inside the padded region.
   bool visible(const Point64& a, const Point64& b) const;
+  struct EdgeNode {
+    Clipper2Lib::Rect64 bounds;
+    std::size_t begin = 0, end = 0;
+    int left = -1, right = -1;
+  };
+  int build_edge_index(std::size_t begin, std::size_t end);
+  bool crosses_edges(int node, const Clipper2Lib::Rect64& query,
+                     const Point64& a, const Point64& b) const;
+  std::uint8_t visibility(std::size_t a, std::size_t b) const;
+  void set_visibility(std::size_t a, std::size_t b, std::uint8_t value) const;
 
   Paths64 region_;
   Paths64 padded_;
@@ -64,13 +75,18 @@ class Router {
   // one rather than against the outline they sit on: a probe on a boundary is
   // a coin toss, and a probe well inside one is not.
   Paths64 probe_;
+  std::vector<Clipper2Lib::Rect64> probe_bounds_, edge_bounds_;
+  std::vector<int> probe_winding_;
+  std::vector<std::size_t> edge_order_;
+  std::vector<EdgeNode> edge_index_;
   double slack_ = 0.0;
   std::vector<Point64> corners_;
-  // Lower triangle stored whole for a plain index; corners_.size() is small.
+  // Dense for small graphs; sparse above 2048 corners to bound initial memory.
   // 0 = blocked, 1 = visible, 2 = not tested yet. One router may answer more
   // than one query, so visibility discovered by an earlier search remains
   // available to the next one without eagerly constructing the dense graph.
   mutable std::vector<std::uint8_t> corner_visible_;
+  mutable std::unordered_map<std::size_t, std::uint8_t> sparse_visible_;
   // Every edge of `padded_`, flattened, so a visibility test is one pass.
   std::vector<Point64> edge_from_;
   std::vector<Point64> edge_to_;

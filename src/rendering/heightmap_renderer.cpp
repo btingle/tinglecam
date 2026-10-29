@@ -285,11 +285,34 @@ Mesh cutter_mesh(const Cutter& cutter) {
 }
 }  // namespace
 
+namespace {
+constexpr const char* line_vertex = R"GLSL(#version 150
+in vec3 position;
+in vec4 normal;
+uniform vec3 centre, right, up;
+uniform vec2 viewport, pan;
+uniform float scale;
+out vec4 line_colour;
+void main() {
+  vec3 p = position-centre;
+  vec2 pixel = pan + scale*vec2(dot(p,right),-dot(p,up));
+  gl_Position = vec4(2.0*pixel.x/viewport.x-1.0,1.0-2.0*pixel.y/viewport.y,0.0,1.0);
+  line_colour = normal;
+})GLSL";
+constexpr const char* line_fragment = R"GLSL(#version 150
+in vec4 line_colour;
+out vec4 colour;
+void main() { colour = line_colour; }
+)GLSL";
+}
+
 struct Renderer::Impl {
   Gl gl;
   Buffer bounds{GL_RGBA32F, sizeof(F4)}, tree{GL_RGBA32I, sizeof(I4)},
       descriptors{GL_RGBA32I, sizeof(I4)}, samples{GL_R32F, sizeof(float)};
   GLuint program = 0, mesh_program = 0, vao = 0, mesh_vao = 0, mesh_vbo = 0;
+  GLuint line_program = 0, line_vao = 0, line_vbo = 0;
+  std::shared_ptr<const Lines> line_source;
   GLuint fbo = 0, image = 0, depth = 0;
   int width = 0, height = 0, columns = 0, rows = 0, tile_columns = 0;
   std::size_t texture_limit = 0;
@@ -319,6 +342,9 @@ struct Renderer::Impl {
     samples.release(gl);
     gl.DeleteProgram(program);
     gl.DeleteProgram(mesh_program);
+    gl.DeleteProgram(line_program);
+    gl.DeleteVertexArrays(1, &line_vao);
+    gl.DeleteBuffers(1, &line_vbo);
     gl.DeleteVertexArrays(1, &vao);
     gl.DeleteVertexArrays(1, &mesh_vao);
     gl.DeleteBuffers(1, &mesh_vbo);
@@ -378,6 +404,16 @@ struct Renderer::Impl {
                    (std::string(heightmap_fragment) + surface_lighting).c_str());
     mesh_program = link(mesh_vertex,
                         (std::string(mesh_fragment) + surface_lighting).c_str());
+    line_program = link(line_vertex, line_fragment);
+    gl.GenVertexArrays(1, &line_vao);
+    gl.GenBuffers(1, &line_vbo);
+    gl.BindVertexArray(line_vao);
+    gl.BindBuffer(GL_ARRAY_BUFFER, line_vbo);
+    gl.EnableVertexAttribArray(0);
+    gl.EnableVertexAttribArray(1);
+    gl.VertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(LineVertex), nullptr);
+    gl.VertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, sizeof(LineVertex),
+                           reinterpret_cast<void*>(offsetof(LineVertex, colour)));
     gl.GenVertexArrays(1, &vao);
     gl.GenVertexArrays(1, &mesh_vao);
     gl.GenBuffers(1, &mesh_vbo);
@@ -716,6 +752,25 @@ struct Renderer::Impl {
     gl.Uniform1f(gl.GetUniformLocation(p, "scale"), c.scale);
     gl.Uniform1f(gl.GetUniformLocation(p, "reach"), c.reach);
   }
+  void lines(const std::shared_ptr<const Lines>& source, const Camera& c) {
+    gl.BindVertexArray(line_vao);
+    gl.BindBuffer(GL_ARRAY_BUFFER, line_vbo);
+    if (line_source != source) {
+      const std::size_t bytes = source ? source->vertices.size()*sizeof(LineVertex) : 0;
+      gl.BufferData(GL_ARRAY_BUFFER, bytes, bytes ? source->vertices.data() : nullptr, GL_STATIC_DRAW);
+      counters.line_upload_bytes = bytes;
+      line_source = source;
+    }
+    if (!source || source->vertices.empty()) return;
+    gl.UseProgram(line_program);
+    camera(line_program, c);
+    // Paths are an overlay, matching the existing preview's visibility.
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_CULL_FACE);
+    glDepthMask(GL_FALSE);
+    glDrawArrays(GL_LINES, 0, source->vertices.size());
+  }
   void mesh(const MeshDraw& draw, const Camera& c) {
     if (!draw.mesh || draw.mesh->triangles.empty()) return;
     auto vertices = mesh_vertices(*draw.mesh);
@@ -750,12 +805,14 @@ Renderer::~Renderer() = default;
 unsigned Renderer::render(const Heightmap& stock, const Camera& camera,
                           int width, int height,
                           const std::vector<MeshDraw>& meshes,
-                          const Cutter& cutter) {
+                          const Cutter& cutter,
+                          const std::shared_ptr<const Lines>& lines) {
   if (width <= 0 || height <= 0 || !std::isfinite(camera.scale) ||
       camera.scale <= 0 || !std::isfinite(camera.reach) || camera.reach <= 0)
     throw std::invalid_argument("Invalid heightmap viewport or camera");
   auto& r = *impl_;
-  if (r.frame_valid && r.width == width && r.height == height && meshes.empty() &&
+  r.counters.line_upload_bytes = 0;
+  if (r.frame_valid && r.width == width && r.height == height && meshes.empty() && r.line_source == lines &&
       same_camera(r.drawn_camera,camera) && same_cutter(r.drawn_cutter,cutter) &&
       r.same_stock(stock)) {
     r.counters.changed_tiles = r.counters.uploaded_bytes = 0;
@@ -769,7 +826,7 @@ unsigned Renderer::render(const Heightmap& stock, const Camera& camera,
   // Mutable mesh pointers have no revision identifier, so frames with mesh
   // overlays always redraw. Stock pages and the cutter/camera inputs have
   // complete change detection and can safely reuse the rendered texture.
-  if (r.frame_valid && meshes.empty() && r.counters.changed_tiles == 0 &&
+  if (r.frame_valid && meshes.empty() && r.line_source == lines && r.counters.changed_tiles == 0 &&
       same_camera(r.drawn_camera,camera) && same_cutter(r.drawn_cutter,cutter)) {
     r.counters.reused_frame = true;
     return r.image;
@@ -810,6 +867,7 @@ unsigned Renderer::render(const Heightmap& stock, const Camera& camera,
     auto shape = cutter_mesh(cutter);
     r.mesh({&shape, cutter.tip, {.48f, .86f, 1.f, .38f}, false}, camera);
   }
+  r.lines(lines, camera);
   if (auto error = glGetError(); error != GL_NO_ERROR)
     throw std::runtime_error("OpenGL heightmap rendering failed (" +
                              std::to_string(error) + ")");

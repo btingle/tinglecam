@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdint>
 #include <mutex>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -37,6 +38,7 @@ __device__ float cross_xy(vec3f a, vec3f b, vec3f p) {
 }
 
 __device__ bool point_in_xy(const GpuTriangle& triangle, vec3f point) {
+  if (fabsf(cross_xy(triangle.a, triangle.b, triangle.c)) <= 1e-12f) return false;
   const float c0 = cross_xy(triangle.a, triangle.b, point);
   const float c1 = cross_xy(triangle.b, triangle.c, point);
   const float c2 = cross_xy(triangle.c, triangle.a, point);
@@ -75,16 +77,21 @@ __global__ void make_bounds(box3f* boxes, const GpuTriangle* triangles,
 __global__ void prune_contained(std::uint32_t* pruned,
                                 const GpuTriangle* triangles,
                                 const box3f* boxes, std::uint32_t count,
-                                bvh3f bvh, float global_lower_z,
-                                float global_upper_z) {
+                                bvh3f bvh, float global_upper_z) {
   const std::uint32_t id = blockIdx.x * blockDim.x + threadIdx.x;
   if (id >= count) return;
+  const GpuTriangle inner = triangles[id];
+  if (fabsf(cross_xy(inner.a, inner.b, inner.c)) <= 1e-12f) {
+    pruned[id] = 1;
+    return;
+  }
   const box3f primitive_bounds = boxes[id];
   const box3f query_box{
-      vec3f(primitive_bounds.lower.x, primitive_bounds.lower.y, global_lower_z),
+      vec3f(primitive_bounds.lower.x, primitive_bounds.lower.y, primitive_bounds.lower.z),
       vec3f(primitive_bounds.upper.x, primitive_bounds.upper.y, global_upper_z)};
-  const GpuTriangle inner = triangles[id];
+  unsigned visited = 0;
   auto candidate = [&](std::uint32_t other) -> int {
+    if (++visited > 256) return CUBQL_TERMINATE_TRAVERSAL;
     if (other == id || !contained(inner, triangles[other]))
       return CUBQL_CONTINUE_TRAVERSAL;
     // Equal prisms are deterministically represented by their lowest ID.
@@ -189,6 +196,7 @@ struct Handle {
   std::uint32_t* output = nullptr;
   std::uint32_t* output_count = nullptr;
   std::uint32_t triangle_count = 0;
+  bool has_primitives = true;
   Vec3f lower;
   Vec3f upper;
 
@@ -269,7 +277,7 @@ Handle* create(const std::vector<Triangle3f>& triangles, const Bounds3f& bounds,
                     cuBQL::BuildConfig(4));
   prune_contained<<<blocks, block_size>>>(
       handle->pruned, handle->triangles, handle->boxes, handle->triangle_count,
-      handle->bvh, bounds.lower.z, bounds.upper.z);
+      handle->bvh, bounds.upper.z);
   check(cudaGetLastError(), "launch prism containment kernel");
   std::uint32_t* device_pruned_count = nullptr;
   check(cudaMalloc(&device_pruned_count, sizeof(std::uint32_t)), "allocate prune count");
@@ -287,9 +295,12 @@ Handle* create(const std::vector<Triangle3f>& triangles, const Bounds3f& bounds,
   invalidate_pruned<<<blocks, block_size>>>(handle->boxes, handle->pruned,
                                              handle->triangle_count);
   check(cudaGetLastError(), "launch pruned-bound invalidation kernel");
-  cuBQL::cuda::free(handle->bvh);
-  cuBQL::gpuBuilder(handle->bvh, handle->boxes, handle->triangle_count,
-                    cuBQL::BuildConfig(4));
+  handle->has_primitives = pruned_count != count;
+  if (handle->has_primitives) {
+    cuBQL::cuda::free(handle->bvh);
+    cuBQL::gpuBuilder(handle->bvh, handle->boxes, handle->triangle_count,
+                      cuBQL::BuildConfig(4));
+  }
 
   stats.pruned_triangles = pruned_count;
   stats.retained_triangles = count - pruned_count;
@@ -307,7 +318,7 @@ std::vector<std::uint32_t> query(Handle* handle, float z, int grid_resolution,
                                  double& milliseconds) {
   if (!handle) throw std::runtime_error("Mesh slicer is not initialized");
   grid_resolution = std::clamp(grid_resolution, 1, 256);
-  if (z > handle->upper.z) {
+  if (!handle->has_primitives || z > handle->upper.z) {
     milliseconds = 0.0;
     return {};
   }
@@ -354,6 +365,10 @@ std::vector<float> vertical_raycast(Handle* handle,
   if (origins.empty()) {
     milliseconds = 0.0;
     return {};
+  }
+  if (!handle->has_primitives) {
+    milliseconds = 0;
+    return std::vector<float>(origins.size(), std::numeric_limits<float>::quiet_NaN());
   }
   const std::size_t origin_bytes = origins.size() * sizeof(vec3f);
   const std::size_t result_bytes = origins.size() * sizeof(float);

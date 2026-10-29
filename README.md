@@ -64,6 +64,8 @@ The active renderer is shown under Tools > Settings; explicit
 Mesa/driver environment overrides take precedence.
 Timing, memory measurements and the repeatable benchmark are documented in the
 [performance investigation](tools/benchmarks/heightmap_performance.md).
+For STEP import, mesh triangulation, retained toolpath previews and routing,
+see [geometry and interactive performance](docs/performance.md).
 
 Run the tests with `ctest --test-dir build --output-on-failure`.
 

@@ -27,7 +27,7 @@ struct SurfacePoint {
 struct CadFace {
   std::size_t id = 0;
   std::string type;
-  double area = 0;
+  double area = 0; // Approximate display area from the face tessellation.
 };
 // Immutable native geometry plus a face-tagged display/roughing triangulation.
 // All coordinates are converted by the STEP reader to millimetres.

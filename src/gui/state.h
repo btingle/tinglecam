@@ -248,6 +248,16 @@ struct LoadedModels {
   std::string error;
 };
 
+struct ResultPreview {
+  std::uint64_t serial = 0;
+  int operation = -1, level = -2;
+  Colouring colouring = Colouring::Feed;
+  bool cutting = true, rapids = true;
+  double maximum_feed = 0;
+  std::shared_ptr<const wave::heightfield::Lines> lines;
+  wave::Bounds3f motion_bounds;
+};
+
 struct App {
   cam::ToolLibrary tools;
   cam::MachineLibrary machines;
@@ -332,6 +342,7 @@ struct App {
   View view;
   Orbit orbit;
   Playback playback;
+  ResultPreview result_preview;
   // Remaining stock for the pass being watched, recomputed only when the
   // playback position actually moves.
   std::shared_ptr<const wave::Heightmap> material_heightmap;

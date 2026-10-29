@@ -546,6 +546,7 @@ void take_plan_result(App& app, cam::PartialPlan produced, bool screenshot) {
   // Each planned operation takes its own entry. The signature recorded is the
   // one taken when the run was asked for, so an edit made meanwhile shows.
   const std::uint64_t serial = ++app.plan_serial;
+  app.result_preview = {};
   std::size_t planned_count = 0;
   for (std::size_t i = 0; i < produced.operations.size(); ++i) {
     const std::size_t at = produced.first + i;

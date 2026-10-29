@@ -50,7 +50,8 @@ struct MeshSlice {
   double polygon_milliseconds = 0.0;
 };
 
-// Loads triangulated OBJ, binary STL, or ASCII STL geometry.
+// Loads polygonal OBJ, binary STL, or ASCII STL geometry, preserving all
+// non-degenerate 3D faces for display. Height queries ignore vertical faces.
 Mesh load_triangle_mesh(const std::filesystem::path& filename);
 
 enum class MeshSlicerBackend { Default, CPU, CUDA };

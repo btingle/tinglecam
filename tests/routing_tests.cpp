@@ -258,8 +258,19 @@ void check_empty_region() {
 
 }  // namespace
 
+void check_large_outline() {
+  // Enough well-resolved corners to exercise sparse visibility storage. The
+  // straight query should not allocate a quadratic dense graph on construction.
+  const auto circle=Clipper2Lib::Ellipse(Point64(0,0),100000000.,100000000.,8192);
+  wave::Router router({circle},kSlack);
+  require(router.corner_count()>2048,"Large outline must exercise sparse visibility");
+  const auto route=router.route(Point64(0,0),Point64(10000,20000));
+  require(route && route->size()==2,"Large convex outline must preserve direct routes");
+}
+
 int main() {
   try {
+    check_large_outline();
     check_geodesic();
     check_clear_line_is_left_alone();
     check_separated_rooms();
