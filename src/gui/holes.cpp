@@ -132,7 +132,15 @@ bool holes_section(App& app,cam::Operation& operation) {
     prop_double("Depth adjustment",p.drilling.depth_adjustment,.05f,"%.3f mm",
                 "Positive drills deeper; negative stops above the nominal hole floor.");
     prop_double("Peck depth",p.drilling.peck_depth,.1f,"%.3f mm","Zero drills in one feed move.",0);
-    prop_double("Peck retract clearance",p.drilling.peck_clearance,.1f,"%.3f mm",nullptr,0);
+    if(p.drilling.peck_depth>0) {
+      prop_check("Partial peck retract",p.drilling.partial_peck_retract);
+      if(p.drilling.partial_peck_retract)
+        prop_double("Peck retract distance",p.drilling.peck_retract_distance,.05f,"%.3f mm",
+                    "Lift this far above each peck floor, up to the hole top.",.001);
+      else
+        prop_double("Peck retract clearance",p.drilling.peck_clearance,.1f,"%.3f mm",
+                    "Retract above the hole top between pecks.",0);
+    }
     prop_double("Through breakthrough",p.drilling.breakthrough,.05f,"%.3f mm",nullptr,0);
     end_properties();
   }
@@ -153,8 +161,9 @@ bool holes_section(App& app,cam::Operation& operation) {
       ImGui::Checkbox("##system-selected",&h.selected);
       ImGui::SetItemTooltip("Cut this hole system");ImGui::SameLine();
       const auto flags=p.systems.size()<=3?ImGuiTreeNodeFlags_DefaultOpen:ImGuiTreeNodeFlags_None;
-      if(!ImGui::TreeNodeEx("system",flags,"Hole %zu: X %.2f Y %.2f (%zu levels)",
-          i+1,h.center_x+app.job.origin_x,h.center_y+app.job.origin_y,h.levels.size())) {
+      if(!ImGui::TreeNodeEx("system",flags,"Hole %zu: X %.2f Y %.2f, R %.3f (%zu levels)",
+          i+1,h.center_x+app.job.origin_x,h.center_y+app.job.origin_y,
+          h.levels.empty()?0.0:h.levels.front().radius,h.levels.size())) {
         ImGui::PopID();continue;
       }
       if(begin_properties("hole-system")) {
@@ -254,6 +263,8 @@ void draw_hole_contours(App& app,OrbitScene& scene,cam::Operation& operation) {
       drag.x*drag.x+drag.y*drag.y<9) {
     auto& h=operation.holes.systems[hit_h];auto& l=h.levels[hit_l];
     if(!h.selected) {h.selected=true;l.selected=true;} else l.selected=!l.selected;
+    h.selected=std::any_of(h.levels.begin(),h.levels.end(),
+                           [](const auto& level) {return level.selected;});
   }
 }
 }

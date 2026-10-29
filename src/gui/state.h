@@ -244,6 +244,7 @@ struct LoadedModels {
   std::filesystem::path job_file;
   std::vector<std::string> warnings;
   bool opened_job = false, reset_setup = false;
+  bool replace_part = true, replace_stock = true;
   std::string error;
 };
 
@@ -267,6 +268,7 @@ struct App {
   Background<cam::PartialPlan> planner;
   Background<LoadedModels> model_loader;
   bool model_loading = false, model_load_cancelled = false;
+  int model_rotation_target = 0;
   std::string model_load_label, model_load_error;
   Background<cam::HoleDetection> hole_detector;
   std::string hole_detection_id;
@@ -352,6 +354,7 @@ struct App {
 
   std::string gcode;
   cam::PostResult post;
+  cam::ExportFlavor export_flavor = cam::ExportFlavor::MachineDefault;
   std::vector<int> posted_operations;
   std::filesystem::path gcode_file;
 

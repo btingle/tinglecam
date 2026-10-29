@@ -37,6 +37,8 @@ bool save_settings(App& app);
 void load_job_into(App& app, const std::filesystem::path& file, bool models = true);
 void load_meshes(App& app);
 void start_model_loading(App& app, bool reset_setup = false);
+// target: 0 both, 1 part, 2 stock; direction 0 resets orientation.
+void start_model_rotation(App& app, int target, int axis, int direction);
 void start_job_loading(App& app, const std::filesystem::path& file);
 void start_model_loading(App& app, const std::filesystem::path& file, bool part);
 bool take_model_load(App& app);

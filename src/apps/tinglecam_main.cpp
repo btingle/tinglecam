@@ -77,6 +77,12 @@ int main(int argc, char** argv) {
         box_margin_plus_z = std::stod(value());
       else if (argument == "--gcode") gcode_out = value();
       else if (argument == "--job") job_in = value();
+      else if (argument == "--export-flavor") {
+        const auto flavor=value();
+        if(flavor=="machine-default") app.export_flavor=cam::ExportFlavor::MachineDefault;
+        else if(flavor=="roland-mdx40a") app.export_flavor=cam::ExportFlavor::RolandMdx40a;
+        else throw std::runtime_error("--export-flavor must be machine-default or roland-mdx40a");
+      }
       else if (argument == "--tool") tool_id = value();
       else if (argument == "--machine") machine_id = value();
       else if (argument == "--material") material_id = value();
@@ -150,6 +156,8 @@ int main(int argc, char** argv) {
             "  --spindle-rpm RPM / --chip-load MM / --plunge-feed MM_PER_MIN\n"
             "                     Override the tool's cutting data for the material\n"
             "  --gcode PATH       Plan and post without opening a window, then exit\n"
+            "  --export-flavor machine-default|roland-mdx40a\n"
+            "                     Output dialect for GUI and headless export\n"
             "  --profile-planning Print planning phase timings and scale counters\n"
             "  --screenshot PATH  Render one frame to a binary PPM and exit\n"
             "  --box-stock MM     Use the part's bounding box, grown by MM in XY,\n"
@@ -358,7 +366,7 @@ int main(int argc, char** argv) {
                      metrics.xyz_simulation_milliseconds);
       }
     }
-    const cam::PostResult post = cam::post_job(plan, app.job, app.tools, app.machines);
+    const cam::PostResult post = cam::post_job(plan, app.job, app.tools, app.machines, app.export_flavor);
     for (const auto& warning : post.warnings)
       std::fprintf(stderr, "warning: %s\n", warning.c_str());
     if (!post.ok()) {

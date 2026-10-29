@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "simulation/heightmap.h"
+#include "cam/model_orientation.h"
 
 namespace cam {
 using ModelLoadProgress = std::function<bool(double, const std::string&)>;
@@ -34,12 +35,14 @@ class CadModel {
  public:
   static std::shared_ptr<CadModel> load(const std::filesystem::path& path,
                                         double tolerance = 0.01,
-                                        const ModelLoadProgress& progress = {});
+                                        const ModelLoadProgress& progress = {},
+                                        const ModelOrientation& orientation = {});
   ~CadModel();
   const wave::Mesh& mesh() const;
   const std::vector<std::size_t>& triangle_faces() const;
   const std::vector<CadFace>& faces() const;
   const std::string& fingerprint() const;
+  const ModelOrientation& orientation() const;
   SurfacePoint evaluate(std::size_t face, double u, double v) const;
   // Tests the complete native model, including unselected faces. A positive
   // ball contact is permitted within tolerance; buried centres are rejected.

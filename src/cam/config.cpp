@@ -513,6 +513,8 @@ json to_json(const Job& job) {
                   {"plus_z", margins.plus_z}}},
               {"part_mesh", job.part_mesh.string()},
               {"stock_mesh", job.stock_mesh.string()},
+              {"part_orientation", job.part_orientation.axes},
+              {"stock_orientation", job.stock_orientation.axes},
               {"origin_x", job.origin_x},
               {"origin_y", job.origin_y},
               {"origin_z", job.origin_z},
@@ -525,7 +527,8 @@ json to_json(const Job& job) {
 Job job_from(const json& node, std::vector<std::string>* warnings = nullptr) {
   report_unknown(node,
                  {"name", "machine", "material", "simulation_pitch", "tools",
-                  "part_mesh", "stock_mesh", "origin_x", "origin_y", "origin_z",
+                  "part_mesh", "stock_mesh", "part_orientation", "stock_orientation",
+                  "origin_x", "origin_y", "origin_z",
                   "box_stock", "box_stock_margins", "rapid_clearance_height",
                   "plunge_clearance_height",
                   "work_offset", "operations"},
@@ -551,6 +554,21 @@ Job job_from(const json& node, std::vector<std::string>* warnings = nullptr) {
   read(node, "stock_mesh", stock);
   job.part_mesh = part;
   job.stock_mesh = stock;
+  const auto orientation = [&](const char* key, ModelOrientation& value) {
+    if (node.contains(key)) {
+      const auto& entry = node.at(key);
+      if (!entry.is_array() || entry.size() != 3)
+        throw std::runtime_error(std::string("Expected three signed axes for ") + key);
+      for (int i = 0; i < 3; ++i) {
+        if (!entry[i].is_number_integer() || entry[i] < -3 || entry[i] > 3)
+          throw std::runtime_error(std::string("Expected integer axes for ") + key);
+        value.axes[i] = entry[i].get<int>();
+      }
+      value.validate();
+    }
+  };
+  orientation("part_orientation", job.part_orientation);
+  orientation("stock_orientation", job.stock_orientation);
   read(node, "origin_x", job.origin_x);
   read(node, "origin_y", job.origin_y);
   read(node, "origin_z", job.origin_z);

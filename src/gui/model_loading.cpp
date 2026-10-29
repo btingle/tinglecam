@@ -14,26 +14,34 @@ LoadedModels read_job(const std::filesystem::path& file) {
 }
 void load_geometry(LoadedModels& result, const cam::ProgressCallback& progress = {}) {
   const auto& job = result.job;
-  const int count = int(!job.part_mesh.empty()) + int(!job.stock_mesh.empty());
+  const bool part = result.replace_part && !job.part_mesh.empty();
+  const bool stock = result.replace_stock && !job.stock_mesh.empty();
+  const int count = int(part) + int(stock);
   int completed = 0;
   auto report = [&](double fraction, const std::string& stage) {
-    const auto& file = completed == 0 && !job.part_mesh.empty() ? job.part_mesh : job.stock_mesh;
+    const auto& file = completed == 0 && part ? job.part_mesh : job.stock_mesh;
     return !progress || progress((completed + fraction) / std::max(1, count),
                                   file.filename().string() + ": " + stage);
   };
-  if (!job.part_mesh.empty()) {
-    result.geometry.load_part(job.part_mesh, report);
+  if (part) {
+    result.geometry.load_part(job.part_mesh, report, job.part_orientation);
     ++completed;
   }
-  if (!job.stock_mesh.empty()) {
-    result.geometry.load_stock(job.stock_mesh, report);
+  if (stock) {
+    result.geometry.load_stock(job.stock_mesh, report, job.stock_orientation);
     ++completed;
   }
   result.geometry.set_box_stock(job.box_stock, job.box_stock_margins);
   if (progress && !progress(1.0, "Models ready")) throw std::runtime_error("Cancelled");
 }
 void apply_loaded_models(App& app, LoadedModels result) {
-  app.geometry = std::move(result.geometry);
+  if (result.replace_part && result.replace_stock)
+    app.geometry = std::move(result.geometry);
+  else {
+    app.geometry.replace_models(std::move(result.geometry),
+                                result.replace_part, result.replace_stock);
+    app.geometry.set_box_stock(result.job.box_stock, result.job.box_stock_margins);
+  }
   app.job = std::move(result.job);
   if (result.opened_job) {
     app.job_file = std::move(result.job_file);
@@ -119,11 +127,32 @@ void start_model_loading(App& app, const std::filesystem::path& file, bool part)
   if (part) request.part_mesh = file;
   else { request.stock_mesh = file; request.box_stock = false; }
   if (request.stock_mesh.empty()) request.box_stock = true;
-  begin_loading(app, file.filename().string(), [request = std::move(request)](
+  begin_loading(app, file.filename().string(), [request = std::move(request), part](
       const cam::ProgressCallback& progress) {
     LoadedModels result;
     result.job = request;
     result.reset_setup = true;
+    result.replace_part = part;
+    result.replace_stock = !part;
+    load_geometry(result, progress);
+    return result;
+  });
+}
+void start_model_rotation(App& app, int target, int axis, int direction) {
+  auto request = app.job;
+  const auto rotate = [&](cam::ModelOrientation& orientation) {
+    if (direction == 0) orientation = {};
+    else orientation.quarter_turn(axis, direction);
+  };
+  if (target != 2) rotate(request.part_orientation);
+  if (target != 1) rotate(request.stock_orientation);
+  begin_loading(app, "Rotating models", [request = std::move(request), target](
+      const cam::ProgressCallback& progress) {
+    LoadedModels result;
+    result.job = request;
+    result.reset_setup = true;
+    result.replace_part = target != 2;
+    result.replace_stock = target != 1;
     load_geometry(result, progress);
     return result;
   });

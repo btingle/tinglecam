@@ -37,7 +37,8 @@ settings requires identification again; editing machining settings does not.
 
 ## Cutting strategies
 
-- **Drilling:** use a drill matching the selected bore diameter. Supports a
+- **Drilling:** uses the selected drill independently of the bore diameter,
+  including linked pre-drilling operations. Supports a
   single feed descent or peck drilling, retract clearance, through-hole
   breakthrough, and an independent depth adjustment.
 - **Helical finishing:** follows the finished wall downwards, then completes a
@@ -54,6 +55,14 @@ using the same tool are batched across systems while retaining each system's
 shallow-to-deep dependencies. Simulation, playback, feeds, tool numbering and
 G-code use the actual tool at each pass. Arcs remain G2/G3; drilling expands into
 ordinary G0/G1 moves, including pecks, without requiring controller canned cycles.
+
+With a nonzero **Peck depth**, enable **Partial peck retract** to lift by the
+configured **Peck retract distance** above each peck floor (capped at the hole
+top). The drill returns within the already drilled depth before feeding the next
+peck. With this option off, each peck retracts above the opening by **Peck retract
+clearance**. The final retract still reaches the job's rapid clearance plane.
+These settings also apply to linked pre-drilling operations. Existing saved jobs
+retain full peck retracts.
 
 ## Drill geometry and pre-drilling
 

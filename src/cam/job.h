@@ -96,6 +96,8 @@ struct DrillParameters {
   DrillDepth depth_reference = DrillDepth::Tip;
   double peck_depth = 0.0; // Zero drills in one feed move.
   double peck_clearance = 1.0;
+  bool partial_peck_retract = false;
+  double peck_retract_distance = 0.5; // Lift from the last peck floor, capped at hole top.
   double breakthrough = 0.2; // Applied only to through holes.
   double depth_adjustment = 0.0; // Positive extends below the nominal hole floor.
 };
@@ -247,6 +249,7 @@ struct Job {
   std::string name = "Untitled";
   std::filesystem::path part_mesh;
   std::filesystem::path stock_mesh;
+  ModelOrientation part_orientation, stock_orientation;
   // One machine runs the program and one material is on it.
   std::string machine_id;
   std::string material_id;
@@ -499,13 +502,18 @@ class JobGeometry {
     return *this;
   }
 
-  void load_part(const std::filesystem::path& file, const ModelLoadProgress& = {});
-  void load_stock(const std::filesystem::path& file, const ModelLoadProgress& = {});
+  void load_part(const std::filesystem::path& file, const ModelLoadProgress& = {},
+                 const ModelOrientation& orientation = {});
+  void load_stock(const std::filesystem::path& file, const ModelLoadProgress& = {},
+                 const ModelOrientation& orientation = {});
   // Stand a rectangular blank in for a stock model: the part's bounding box
   // grown by directional margins. A loaded stock model always wins.
   // Drops a loaded stock model, so a blank named and then unnamed does not go
   // on winning over the box that replaced it.
   void clear_stock();
+  // Commit a background import without rebuilding the unchanged model. Callers
+  // must stop geometry users before replacing either model, as with load_part.
+  void replace_models(JobGeometry&& loaded, bool part, bool stock);
   void set_box_stock(bool enabled, const BoxStockMargins& margins);
   bool box_stock() const { return box_stock_ && stock_.empty(); }
   bool has_part() const { return !part_.empty(); }
@@ -513,6 +521,7 @@ class JobGeometry {
   double stock_bottom() const;
   const wave::MeshSlicer& part() const { return part_; }
   const std::shared_ptr<CadModel>& part_cad() const { return part_cad_; }
+  const ModelOrientation& part_orientation() const { return part_orientation_; }
   const wave::MeshSlicer& stock() const { return stock_; }
   // The Z range spanned by either mesh, which is what an operation may cover.
   // The union rather than the overlap: a blank standing proud of the part is
@@ -543,6 +552,7 @@ class JobGeometry {
     std::scoped_lock lock(slices_, other.slices_);
     part_ = std::move(other.part_);
     part_cad_ = std::move(other.part_cad_);
+    part_orientation_ = other.part_orientation_;
     stock_ = std::move(other.stock_);
     box_stock_ = other.box_stock_;
     box_margins_ = other.box_margins_;
@@ -557,6 +567,7 @@ class JobGeometry {
   // remembering underneath is a write, and this is what makes it one.
   mutable std::mutex slices_;
   std::shared_ptr<CadModel> part_cad_;
+  ModelOrientation part_orientation_;
   wave::MeshSlicer part_;
   wave::MeshSlicer stock_;
   bool box_stock_ = false;

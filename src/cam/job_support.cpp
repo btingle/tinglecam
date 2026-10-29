@@ -1,4 +1,6 @@
 #include "job_internal.h"
+#include <array>
+#include <set>
 #include <unordered_set>
 namespace cam { namespace detail {
 
@@ -288,14 +290,53 @@ void finish_job(JobPlan& plan) {
 
 wave::Paths64 swept_footprint(const LevelPlan& level, double radius) {
   wave::Paths64 swept;
+  // Sweeping an edge twice removes the same XY material. In particular, a
+  // helix projects hundreds of turns onto one circle. Offsetting that entire
+  // retraced polyline creates a quadratic number of coincident intersections
+  // inside Clipper. Offset simple runs of unique undirected edges instead;
+  // their union is the same footprint, independently of traversal count/Z.
+  std::set<std::array<int64_t, 4>> edges;
   for (const auto& move : level.toolpath.moves) {
     if (move.kind == wave::MoveKind::Retract || move.path.empty()) continue;
-    const auto band = move.path.size() == 1
-        ? wave::Paths64{Clipper2Lib::Ellipse(move.path.front(), wave::to_integer(radius),
-                                             wave::to_integer(radius), 48)}
-        : InflatePaths(wave::Paths64{move.path}, wave::to_integer(radius),
-                       JoinType::Round, EndType::Round);
-    swept.insert(swept.end(), band.begin(), band.end());
+    if (move.path.size() == 1) {
+      swept.push_back(Clipper2Lib::Ellipse(move.path.front(), wave::to_integer(radius),
+                                         wave::to_integer(radius), 48));
+      continue;
+    }
+    wave::Path64 run;
+    bool has_edge = false;
+    std::set<std::pair<int64_t, int64_t>> vertices;
+    const auto flush = [&] {
+      if (run.size() > 1) {
+        auto band = InflatePaths(wave::Paths64{run}, wave::to_integer(radius),
+                                 JoinType::Round, EndType::Round);
+        swept.insert(swept.end(), band.begin(), band.end());
+      }
+      run.clear();
+      vertices.clear();
+    };
+    for (std::size_t i = 1; i < move.path.size(); ++i) {
+      const auto a = move.path[i - 1], b = move.path[i];
+      if (a == b) continue;
+      has_edge = true;
+      std::array<int64_t, 4> edge{a.x, a.y, b.x, b.y};
+      if (std::pair{a.x, a.y} > std::pair{b.x, b.y})
+        edge = {b.x, b.y, a.x, a.y};
+      if (!edges.insert(edge).second) {
+        flush();
+        continue;
+      }
+      if (run.empty()) {
+        run.push_back(a);
+        vertices.emplace(a.x, a.y);
+      }
+      run.push_back(b);
+      if (!vertices.emplace(b.x, b.y).second) flush();
+    }
+    flush();
+    if (!has_edge)
+      swept.push_back(Clipper2Lib::Ellipse(move.path.front(), wave::to_integer(radius),
+                                         wave::to_integer(radius), 48));
   }
   return Union(swept, FillRule::NonZero);
 }

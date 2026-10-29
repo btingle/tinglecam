@@ -117,6 +117,8 @@ std::string hole_detection_signature(const JobGeometry& g,const HoleParameters& 
     key<<':'<<mesh.bounds.lower.x<<':'<<mesh.bounds.lower.y<<':'<<mesh.bounds.lower.z
        <<':'<<mesh.bounds.upper.x<<':'<<mesh.bounds.upper.y<<':'<<mesh.bounds.upper.z;
   }
+  if (g.part_orientation() != ModelOrientation{})
+    for (int axis : g.part_orientation().axes) key << ':' << axis;
   key<<':'<<p.inspection_depth<<':'<<p.circle_tolerance<<':'<<p.counterbores
      <<':'<<p.probe_inset<<':'<<p.slice_epsilon;
   return key.str();

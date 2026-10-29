@@ -31,6 +31,8 @@ json hole_parameters_json(const HoleParameters& p) {
       {"helix_angle_degrees",p.helix_angle_degrees},{"radial_margin",p.radial_margin},
       {"drilling",{{"depth_reference",drill_depth_name(p.drilling.depth_reference)},
           {"peck_depth",p.drilling.peck_depth},{"peck_clearance",p.drilling.peck_clearance},
+          {"partial_peck_retract",p.drilling.partial_peck_retract},
+          {"peck_retract_distance",p.drilling.peck_retract_distance},
           {"breakthrough",p.drilling.breakthrough},{"depth_adjustment",p.drilling.depth_adjustment}}},
       {"systems",std::move(systems)},{"detection_signature",p.detection_signature},
       {"id",p.id},{"source_id",p.source_id}};
@@ -53,6 +55,8 @@ HoleParameters hole_parameters_from_json(const json& j) {
       p.drilling.depth_reference=*mode;
     }
     read(d,"peck_depth",p.drilling.peck_depth);read(d,"peck_clearance",p.drilling.peck_clearance);
+    read(d,"partial_peck_retract",p.drilling.partial_peck_retract);
+    read(d,"peck_retract_distance",p.drilling.peck_retract_distance);
     read(d,"breakthrough",p.drilling.breakthrough);read(d,"depth_adjustment",p.drilling.depth_adjustment);
   }
   if(j.contains("systems")) {

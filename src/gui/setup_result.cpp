@@ -79,7 +79,11 @@ std::vector<CutVolume> cut_volumes(const App& app) {
         for(const auto& h:resolved.holes.systems) if(h.selected)
           for(const auto& l:h.levels) if(l.selected && l.radius>0 && l.top_z>l.bottom_z) {
             const auto* tool=app.tools.find(l.tool_id.empty()?resolved.tool_id:l.tool_id);
-            const double radius=!resolved.holes.source_id.empty() && tool?tool->diameter/2:l.radius;
+            const auto strategy=cam::effective_hole_strategy(resolved.holes,l);
+            const double radius=strategy==cam::HoleStrategy::Drill
+                ? (tool?tool->diameter/2:l.radius)
+                : l.radius-resolved.holes.radial_margin;
+            if(!(radius>0) || !std::isfinite(radius)) continue;
             const auto circle=Clipper2Lib::Ellipse(wave::Point64(wave::to_integer(h.center_x),wave::to_integer(h.center_y)),
                 wave::to_integer(radius),wave::to_integer(radius),96);
             volumes.push_back({{circle},l.bottom_z,l.top_z,selected});

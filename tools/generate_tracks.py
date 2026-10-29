@@ -217,16 +217,20 @@ def create_track_templates(grid_size, elevation_gain):
     sR = StraightCurveTransitionTrackTemplate(False, True, grid_size=grid_size, elevation_gain=elevation_gain)
     Ls = StraightCurveTransitionTrackTemplate(True, False, grid_size=grid_size, elevation_gain=elevation_gain)
     Rs = StraightCurveTransitionTrackTemplate(False, False, grid_size=grid_size, elevation_gain=elevation_gain)
+    slr = StraightCurveTransitionTrackTemplate(False, False, grid_size=grid_size, elevation_gain=0)
+    srl = StraightCurveTransitionTrackTemplate(True, False, grid_size=grid_size, elevation_gain=0)
 
-    all_template_names = ["s", "sSs", "lr", "L", "R", "sL", "sR", "Ls", "Rs"]
-    all_templates = [s, sSs, lr, L, R, sL, sR, Ls, Rs]
+    all_template_names = ["s", "sSs", "lr", "L", "R", "sL", "sR", "Ls", "Rs", "slr", "srl"]
+    all_templates = [s, sSs, lr, L, R, sL, sR, Ls, Rs, slr, srl]
     return all_template_names, all_templates
 
 
 @njit
-def compute_contours(result, template, resolution, profile, elevation_gain, clamp_bottom):
+def compute_contours(result, template, resolution, profile, elevation_gain, clamp_bottom, clamp_z=None):
     min_z = min(profile[:, 1])
     max_z = max(profile[:, 1])
+    if not clamp_z:
+        clamp_z = min_z
 
     for j in range(profile.shape[0]):
         template.set_sample_pt(profile[j])
@@ -241,27 +245,27 @@ def compute_contours(result, template, resolution, profile, elevation_gain, clam
         for k in range(resolution):
             sample = template.sample_path_t(k / (resolution - 1))
             if _clampmin:
-                sample[2] = _min_z
+                sample[2] = clamp_z
             else:
                 sample[2] = max(min(sample[2], _max_z), _min_z)
             result[j, k] = sample
 
 
-def create_all_tracks(grid_size, elevation_gain, profile, resolution=256, clamp_bottom=False):
+def create_all_tracks(grid_size, elevation_gain, profile, resolution=256, clamp_bottom=False, clamp_z=None):
     if resolution < 2:
         raise ValueError("Contour resolution must be at least 2")
     names, templates = create_track_templates(grid_size, elevation_gain)
     results = np.empty((len(templates), profile.shape[0], resolution, 3))
     for i, (name, template) in enumerate(zip(names, templates)):
         print(i, name)
-        compute_contours(results[i], template, resolution, profile, elevation_gain, clamp_bottom)
+        compute_contours(results[i], template, resolution, profile, elevation_gain, clamp_bottom, clamp_z)
     return names, results
 
 
 def main(grid_size, elevation_gain, profile_obj_path, save_dir, resolution=256,
          gcode=False, open_path=False, translate=(0, 0, 0), step=False,
          step_tolerance=0.01, step_max_samples=129, cap_ends=False,
-         profile_layer=None, profile_join_tolerance=1e-5, clamp_bottom=False):
+         profile_layer=None, profile_join_tolerance=1e-5, clamp_bottom=False, clamp_z=None):
     if __package__:
         from .track_profiles import default_profile, load_profile, resample_profile
         from .track_curves import as_curve_profile
@@ -293,7 +297,7 @@ def main(grid_size, elevation_gain, profile_obj_path, save_dir, resolution=256,
         else:
             from track_exports import export_sampled_tracks
         names, results = create_all_tracks(grid_size, elevation_gain,
-                                           resample_profile(profile), resolution, clamp_bottom)
+                                           resample_profile(profile), resolution, clamp_bottom, clamp_z)
         export_sampled_tracks(names, results, save_dir, gcode, translate, cap_ends)
 
 
@@ -331,6 +335,7 @@ def parse_args(argv=None):
     parser.add_argument("--translate", type=trans_type, default=[0, 0, 0],
                         help="G-code/preview translation X,Y,Z in mm")
     parser.add_argument("--clamp-bottom", action="store_true", help="clamp the bottommost points of the profile to the minimum z of the swept track (not available for STEP mode)")
+    parser.add_argument("--clamp-z", type=float, default=None, help="clamp to specific Z value")
     return parser.parse_args(argv)
 
 

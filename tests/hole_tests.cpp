@@ -2,6 +2,9 @@
 #include "cam/config.h"
 #include "cam/heightmap_simulation.h"
 #include "cam/post.h"
+#include "cam/job_internal.h"
+#include "cam/hole_config.h"
+#include <nlohmann/json.hpp>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -9,6 +12,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <numbers>
 #include <stdexcept>
 namespace {
@@ -140,6 +144,154 @@ void drilling_and_motion(Fixture& files) {
   check(std::any_of(helix.operations[0].levels[0].feeds.motion.begin(),helix.operations[0].levels[0].feeds.motion.end(),
       [](const auto& m) {return m.arc && m.to_z<m.from_z;}),"Helical finishing retains native helical moves without core constraints");
 }
+void retraced_footprints() {
+  using wave::MoveKind;
+  const auto point=[](double x,double y) {
+    return wave::Point64{wave::to_integer(x),wave::to_integer(y)};
+  };
+  const auto footprint=[&](const wave::Paths64& paths) {
+    cam::LevelPlan level;
+    for(const auto& path:paths) {
+      wave::ToolpathMove move;move.kind=MoveKind::Cut;move.path=path;
+      level.toolpath.moves.push_back(std::move(move));
+    }
+    return cam::detail::swept_footprint(level,.5);
+  };
+  const auto a=point(0,0),b=point(4,0),c=point(4,4),d=point(0,4),e=point(-4,0);
+  const auto expected=footprint({{a,b,c,d,a},{a,e}});
+  // Reverse traversal, repeated loops, and a branch after retracing must all
+  // cover the same material without inventing a connection between runs.
+  const auto actual=footprint({{a,b,c,d,a,d,c,b,a,e,a},{e,a,b,c,d,a}});
+  near(wave::material_area(Clipper2Lib::Xor(expected,actual,Clipper2Lib::FillRule::NonZero)),
+       0,.02,"Retraced paths preserve the swept footprint");
+  const wave::Paths64 core{{point(1,1),point(3,1),point(3,3),point(1,3)}};
+  near(wave::material_area(Clipper2Lib::Intersect(actual,core,Clipper2Lib::FillRule::NonZero)),
+       0,1e-8,"Closed retraced paths preserve the uncut central core");
+  near(wave::material_area(footprint({{a,a,a}})),
+       wave::material_area(footprint({{a}})),1e-8,"Stationary cutter retains its footprint");
+
+  // The failing job's first hole: a 3.175 mm cutter in a 4 mm bore, descending
+  // 12 mm at 3 degrees. Its 101 descending turns share one XY projection.
+  auto op=hole();op.stepdown=1;op.holes.helix_angle_degrees=3;
+  op.holes.radial_margin=.05;
+  auto& system=op.holes.systems.front();system.center_x=-70;system.center_y=-87.99991535257209;
+  auto& level=system.levels.front();level.radius=2.0000071910686055;level.top_z=6;level.bottom_z=-6;
+  auto mill=endmill();mill.diameter=3.175;
+  const auto rates=cam::resolve_cutting_feeds(mill,machine(),"material",{});
+  const auto deep=cam::plan_hole_operation(op,mill,machine(),rates,16,{}, {},0,1);
+  check(deep.ok(),deep.error);
+  const auto& planned=deep.levels.front();
+  check(std::count_if(planned.feeds.motion.begin(),planned.feeds.motion.end(),
+        [](const auto& phase) {return phase.arc;})==102,"Keep every helical turn in the XYZ motion");
+  near(planned.floor_z,-6,1e-8,"Deep helix reaches the requested floor");
+  level.bottom_z=5.99;
+  const auto shallow=cam::plan_hole_operation(op,mill,machine(),rates,16,{}, {},0,1);
+  check(shallow.ok(),shallow.error);
+  near(wave::material_area(Clipper2Lib::Xor(planned.swept,shallow.levels.front().swept,
+       Clipper2Lib::FillRule::NonZero)),0,1e-8,"Helix footprint is independent of repeated turns");
+  near(wave::material_area(planned.swept),std::numbers::pi*1.95*1.95,.08,
+       "Small helix sweeps the full bore inside the radial margin");
+}
+void independent_drill_diameter() {
+  auto op=hole();op.tool_id="drill";op.holes.strategy=cam::HoleStrategy::Drill;
+  auto& system=op.holes.systems.front();system.center_x=12;system.center_y=-8;
+  auto& level=system.levels.front();level.top_z=10;level.bottom_z=3;
+  const auto rates=cam::resolve_cutting_feeds(drill(),machine(),"material",{});
+  for(double radius:{1.0,3.0}) {
+    level.radius=radius; // The selected drill has a radius of 2 mm.
+    auto j=job(op);
+    const auto planned=plan({},j);
+    const auto posted=cam::post_job(planned,j,{{drill()}},{{machine()}});
+    check(posted.ok(),posted.error);
+    check(!posted.text.empty(),"Different drill and bore diameters export G-code");
+    op.holes.source_id="source";
+    const auto pilot=cam::plan_hole_operation(op,drill(),machine(),rates,20,{}, {},0,1);
+    check(pilot.ok(),pilot.error);
+    for(const auto& phase:pilot.levels.front().feeds.motion) {
+      near(wave::to_world(phase.to.x),12,1e-8,"Pilot drill stays on the hole centre X");
+      near(wave::to_world(phase.to.y),-8,1e-8,"Pilot drill stays on the hole centre Y");
+    }
+    op.holes.source_id.clear();
+  }
+}
+void partial_peck_retracts() {
+  auto op=hole();op.tool_id="drill";op.holes.strategy=cam::HoleStrategy::Drill;
+  auto& level=op.holes.systems.front().levels.front();
+  level.radius=2;level.top_z=10;level.bottom_z=3;
+  auto& drilling=op.holes.drilling;drilling.peck_depth=2;
+  const auto rates=cam::resolve_cutting_feeds(drill(),machine(),"material",{});
+  const auto plan_drill=[&] {
+    return cam::plan_hole_operation(op,drill(),machine(),rates,20,{}, {},0,1);
+  };
+  for(double distance:{0.0,.05,.5,5.0}) {
+    drilling.partial_peck_retract=distance>0;drilling.peck_retract_distance=distance;
+    const auto planned=plan_drill();check(planned.ok(),planned.error);
+    const auto& motion=planned.levels.front().feeds.motion;
+    int pecks=0;double drilled_to=10;
+    for(std::size_t i=0;i<motion.size();++i) {
+      const auto& phase=motion[i];
+      if(phase.rapid && phase.to_z<phase.from_z)
+        check(phase.to_z>=drilled_to,"Peck return cannot rapid into uncut material");
+      if(phase.rapid || phase.to_z>=phase.from_z) continue;
+      drilled_to=phase.to_z;++pecks;
+      near(phase.to_z,std::max(3.0,10-2.0*pecks),1e-8,"Pecks retain their programmed depths");
+      check(i+1<motion.size() && motion[i+1].rapid && motion[i+1].to_z>phase.to_z,
+            "Every peck retracts upward");
+      const double target=pecks==4?20:distance>0?std::min(10.0,phase.to_z+distance):11;
+      near(motion[i+1].to_z,target,1e-8,"Partial/full peck and final clearance heights");
+    }
+    check(pecks==4,"Partial retract preserves every peck, including the final short peck");
+    const auto j=job(op);
+    const auto saved=cam::job_from_json_text(cam::to_json_text(j));
+    check(cam::to_json_text(saved)==cam::to_json_text(j),"Peck retract settings round-trip");
+    const auto simulated=plan({},j);
+    const auto posted=cam::post_job(simulated,j,{{drill()}},{{machine()}});
+    check(posted.ok() && !posted.text.empty(),"Peck retracts simulate and export G-code");
+  }
+  drilling.partial_peck_retract=true;
+  for(double invalid:{0.0,-.5,std::numeric_limits<double>::infinity(),
+                      std::numeric_limits<double>::quiet_NaN()}) {
+    drilling.peck_retract_distance=invalid;
+    check(!plan_drill().ok(),"Reject invalid active partial retract distances");
+  }
+  drilling.peck_depth=0;drilling.peck_retract_distance=.5;
+  const auto single=plan_drill();check(single.ok(),single.error);
+  check(std::count_if(single.levels.front().feeds.motion.begin(),single.levels.front().feeds.motion.end(),
+        [](const auto& phase) {return !phase.rapid && phase.to_z<phase.from_z;})==1,
+        "Zero peck depth still drills in one feed move");
+  const auto legacy=cam::hole_parameters_from_json(nlohmann::json{
+      {"drilling",{{"peck_depth",2},{"peck_clearance",1}}}});
+  check(!legacy.drilling.partial_peck_retract,"Existing jobs retain full retract peck drilling");
+}
+void helical_radial_margin() {
+  auto op=hole();op.holes.strategy=cam::HoleStrategy::Helical;
+  auto& system=op.holes.systems.front();system.center_x=0;system.center_y=0;
+  auto& level=system.levels.front();level.radius=2;level.top_z=2;level.bottom_z=0;
+  for(double margin:{0.0,.25}) {
+    op.holes.radial_margin=margin;
+    auto j=job(op);j.simulation_pitch=.025;
+    const auto planned=plan({},j);
+    const auto& operation=planned.operations.front();
+    int arcs=0;
+    for(const auto& phase:operation.levels.front().feeds.motion) if(phase.arc) {
+      ++arcs;
+      for(double t:{0.0,.25,.5,.75,1.0}) {
+        const auto p=cam::motion_point(phase,t);
+        near(std::hypot(p.x,p.y)+endmill().diameter/2,level.radius-margin,.002,
+             "Helical cutter envelope includes the radial margin on every turn");
+      }
+    }
+    check(arcs>1,"Check descending helix and finishing circle");
+    check(bool(operation.stock_after),"Helix has simulated stock");
+    const auto& stock=*operation.stock_after;
+    const auto height=[&](double x) {
+      return stock.top(int(std::floor((x-stock.lower_x())/stock.pitch())),
+                       int(std::floor((0-stock.lower_y())/stock.pitch())));
+    };
+    near(height(1.9),margin>0?2:0,1e-6,"Simulation preserves the radial allowance at the wall");
+    near(height(1.5),0,1e-6,"Simulation clears inside the margin-adjusted wall");
+  }
+}
 void strategies_links_and_storage(Fixture& files) {
   cam::JobGeometry g;g.load_part(files.model());g.set_box_stock(true,{});
   auto op=hole();op.holes.automatic=true;op.holes.id="source";
@@ -170,9 +322,13 @@ void strategies_links_and_storage(Fixture& files) {
   check(changes==1,"Ready levels batch by tool across holes while keeping their depth dependencies");
   cam::Operation pilot=hole();pilot.name="Pilot";pilot.tool_id="pilot";
   pilot.holes.source_id="source";pilot.holes.strategy=cam::HoleStrategy::Drill;
+  pilot.holes.drilling.peck_depth=2;pilot.holes.drilling.partial_peck_retract=true;
+  pilot.holes.drilling.peck_retract_distance=.2;
   op.holes.systems[0].levels[2].strategy.reset();op.holes.systems[0].levels[2].tool_id.clear();
   j=job(op);j.operations.insert(j.operations.begin(),pilot);
   auto inherited=cam::resolve_hole_source(j,0);
+  check(inherited.holes.drilling.partial_peck_retract && inherited.holes.drilling.peck_retract_distance==.2,
+        "Linked pilots retain their independent partial retract settings");
   check(inherited.holes.systems.size()==1 && inherited.holes.systems[0].levels.size()==1,
         "Linked pre-drilling inherits selected milling systems once");
   near(inherited.holes.systems[0].levels[0].top_z,10,.001,"Pilot drilling starts above the whole system");
@@ -187,7 +343,7 @@ void strategies_links_and_storage(Fixture& files) {
 }
 }
 int main() {
-  try {Fixture files;detection(files);drilling_and_motion(files);strategies_links_and_storage(files);
+  try {Fixture files;helical_radial_margin();partial_peck_retracts();independent_drill_diameter();retraced_footprints();detection(files);drilling_and_motion(files);strategies_links_and_storage(files);
     std::cout<<"Hole discovery, nested levels, drilling, strategies, tool changes and storage passed\n";return 0;
   } catch(const std::exception& e) {std::cerr<<e.what()<<'\n';return 1;}
 }

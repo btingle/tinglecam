@@ -49,6 +49,8 @@
 #include <TopoDS_Compound.hxx>
 #include <TopoDS_Solid.hxx>
 #include <gp_Pnt2d.hxx>
+#include <gp_Trsf.hxx>
+#include <TopLoc_Location.hxx>
 #endif
 
 namespace cam {
@@ -67,6 +69,7 @@ struct CadModel::Impl {
   std::vector<std::size_t> triangle_faces;
   std::vector<CadFace> faces;
   std::string fingerprint;
+  ModelOrientation orientation;
   bool solid = false;
   std::set<std::pair<std::size_t, std::size_t>> adjacent_faces;
 #ifdef TINGLECAM_HAVE_OCCT
@@ -143,6 +146,7 @@ const std::vector<std::size_t>& CadModel::triangle_faces() const {
 }
 const std::vector<CadFace>& CadModel::faces() const { return impl_->faces; }
 const std::string& CadModel::fingerprint() const { return impl_->fingerprint; }
+const ModelOrientation& CadModel::orientation() const { return impl_->orientation; }
 bool CadModel::solid() const { return impl_->solid; }
 bool CadModel::adjacent(std::size_t a, std::size_t b) const {
   return impl_->adjacent_faces.contains(std::minmax(a, b));
@@ -279,7 +283,9 @@ std::vector<std::array<double, 2>> CadModel::matching_contour_parameters(
 
 std::shared_ptr<CadModel> CadModel::load(const std::filesystem::path& path,
                                          double tolerance,
-                                         const ModelLoadProgress& progress) {
+                                         const ModelLoadProgress& progress,
+                                         const ModelOrientation& orientation) {
+  orientation.validate();
 #ifndef TINGLECAM_HAVE_OCCT
   (void)path;
   (void)tolerance;
@@ -303,8 +309,21 @@ std::shared_ptr<CadModel> CadModel::load(const std::filesystem::path& path,
       throw std::runtime_error("Could not import STEP: " + path.string());
     auto model = std::shared_ptr<CadModel>(new CadModel);
     auto& data = *model->impl_;
+    data.orientation = orientation;
     data.shape = reader.OneShape();
     if (data.shape.IsNull()) throw std::runtime_error("STEP contains no shape");
+    if (orientation != ModelOrientation{}) {
+      double matrix[3][3]{};
+      for (int row = 0; row < 3; ++row) {
+        const int a = orientation.axes[row];
+        matrix[row][std::abs(a) - 1] = a < 0 ? -1 : 1;
+      }
+      gp_Trsf transform;
+      transform.SetValues(matrix[0][0], matrix[0][1], matrix[0][2], 0,
+                          matrix[1][0], matrix[1][1], matrix[1][2], 0,
+                          matrix[2][0], matrix[2][1], matrix[2][2], 0);
+      data.shape = data.shape.Moved(TopLoc_Location(transform));
+    }
     for (TopExp_Explorer solids(data.shape, TopAbs_SOLID); solids.More();
          solids.Next())
       data.solids.push_back(TopoDS::Solid(solids.Current()));

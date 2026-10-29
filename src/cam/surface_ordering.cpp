@@ -26,6 +26,8 @@ std::string surface_contour_signature(const CadModel& model,
       << operation.path_pitch << ':' << tool.diameter << ':' << int(tool.type);
   for (auto face : std::set<std::size_t>(s.faces.begin(), s.faces.end()))
     key << ':' << face;
+  if (model.orientation() != ModelOrientation{})
+    for (int axis : model.orientation().axes) key << ':' << axis;
   return key.str();
 }
 

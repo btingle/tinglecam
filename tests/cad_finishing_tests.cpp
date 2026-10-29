@@ -111,6 +111,36 @@ int main(int argc, char** argv) {
     check(load_progress == 1 && load_reports > 6,
           "STEP loading reports intermediate progress through completion");
     const auto original_model = geometry.part_cad();
+    ModelOrientation orientation;
+    orientation.quarter_turn(0, 1);
+    JobGeometry rotated_geometry;
+    rotated_geometry.load_part(file, {}, orientation);
+    const auto rotated_model = rotated_geometry.part_cad();
+    check(rotated_model->fingerprint() == original_model->fingerprint(),
+          "Rotation preserves persisted surface selections");
+    check(surface_contour_signature(*rotated_model, Operation{}, Tool{}) !=
+              surface_contour_signature(*original_model, Operation{}, Tool{}),
+          "Rotation invalidates cached native surface contours");
+    check(rotated_model->faces().size() == original_model->faces().size(),
+          "Rotation preserves STEP face identities");
+    for (const auto& face : original_model->faces()) {
+      const auto source = original_model->evaluate(face.id, .3, .7);
+      const auto actual = rotated_model->evaluate(face.id, .3, .7);
+      const auto expected_point = orientation.apply(source.point);
+      const auto expected_normal = orientation.apply(source.normal);
+      near(wave::distance(actual.point, expected_point), 0, 1e-9,
+           "Native STEP surface points rotate with the mesh");
+      near(wave::distance(actual.normal, expected_normal), 0, 1e-9,
+           "Native STEP normals rotate with the mesh");
+    }
+    near(rotated_geometry.part().mesh().bounds.lower.y, -4, 1e-5,
+         "Rotated STEP bounds");
+    near(rotated_geometry.part().mesh().bounds.upper.z, 6, 1e-5,
+         "Rotated STEP height");
+    check(!rotated_model->cutter_clear({4, -2, 2}, .5, 2, .01),
+          "Native collision checks use the rotated solid");
+    check(rotated_model->cutter_clear({4, 2, 2}, .5, 2, .01),
+          "Space outside the rotated solid is clear");
     bool load_cancelled = false;
     try {
       geometry.load_part(file, [](double fraction, const std::string&) {

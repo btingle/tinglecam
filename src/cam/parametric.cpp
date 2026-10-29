@@ -641,6 +641,9 @@ OperationPlan plan_hole_operation(const Operation& operation,const Tool& tool,
         std::isfinite(p.drilling.breakthrough) && p.drilling.breakthrough>=0 &&
         std::isfinite(p.drilling.depth_adjustment),
         "Drilling depths and clearances must be finite and nonnegative");
+    if(p.drilling.partial_peck_retract && p.drilling.peck_depth>0)
+      require(positive(p.drilling.peck_retract_distance),
+              "Partial peck retract distance must be finite and positive");
     std::optional<Point64> previous;double previous_z=rapid_plane;
     for(auto op=prior.rbegin();op!=prior.rend() && !previous;++op)
       if(*op && (*op)->ok()) for(auto l=(*op)->levels.rbegin();l!=(*op)->levels.rend();++l)
@@ -721,10 +724,6 @@ OperationPlan plan_hole_operation(const Operation& operation,const Tool& tool,
         path.line(entry,l.top_z,wave::MoveKind::Entry,true);
         if(strategy==HoleStrategy::Drill) {
           require(chosen->type==ToolType::Drill,"A drilling level requires a drill tool");
-          if(!p.source_id.empty()) require(chosen->diameter/2<=l.radius+std::max(.005,p.circle_tolerance),
-              "The pilot drill must fit inside the selected bore");
-          if(p.source_id.empty()) require(std::abs(chosen->diameter/2-l.radius)<=std::max(.005,p.circle_tolerance),
-              "Choose a drill matching the hole radius, or insert a pre-drilling operation");
           const double tip=drill_tip_height(*chosen);
           const double bottom=l.bottom_z-p.drilling.depth_adjustment-(l.through?p.drilling.breakthrough:0)-
               (p.drilling.depth_reference==DrillDepth::FullDiameter?tip:0);
@@ -738,8 +737,11 @@ OperationPlan plan_hole_operation(const Operation& operation,const Tool& tool,
             const double floor=std::max(bottom,l.top_z-peck*i);
             path.line(center,floor,wave::MoveKind::Entry);
             if(i<int(n)) {
-              path.line(center,std::min(rapid_plane,l.top_z+p.drilling.peck_clearance),wave::MoveKind::Retract,true);
-              path.line(center,std::min(l.top_z,floor+.1),wave::MoveKind::Entry,true);
+              const double retract=p.drilling.partial_peck_retract
+                  ? std::min(l.top_z,floor+p.drilling.peck_retract_distance)
+                  : std::min(rapid_plane,l.top_z+p.drilling.peck_clearance);
+              path.line(center,retract,wave::MoveKind::Retract,true);
+              path.line(center,std::min({retract,l.top_z,floor+.1}),wave::MoveKind::Entry,true);
             }
           }
         } else {

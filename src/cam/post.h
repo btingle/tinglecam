@@ -7,6 +7,8 @@
 
 namespace cam {
 
+enum class ExportFlavor { MachineDefault, RolandMdx40a };
+
 struct PostResult {
   std::string text;
   std::size_t line_count = 0;
@@ -29,7 +31,8 @@ struct PostResult {
 PostResult post_job(const JobPlan& plan,
                     const Job& job,
                     const ToolLibrary& tools,
-                    const MachineLibrary& machines);
+                    const MachineLibrary& machines,
+                    ExportFlavor flavor = ExportFlavor::MachineDefault);
 
 // Posts one already-planned operation as a complete, standalone program. The
 // operation keeps the job's origin, work offset, machine profile, and tool
@@ -38,7 +41,8 @@ PostResult post_operation(const JobPlan& plan,
                           const Job& job,
                           const ToolLibrary& tools,
                           const MachineLibrary& machines,
-                          std::size_t operation_index);
+                          std::size_t operation_index,
+                          ExportFlavor flavor = ExportFlavor::MachineDefault);
 
 // Posts a chosen set of already-planned operations as one standalone program,
 // retaining their original job order and machine/tool conventions.
@@ -46,6 +50,7 @@ PostResult post_operations(const JobPlan& plan,
                            const Job& job,
                            const ToolLibrary& tools,
                            const MachineLibrary& machines,
-                           const std::vector<std::size_t>& operation_indices);
+                           const std::vector<std::size_t>& operation_indices,
+                           ExportFlavor flavor = ExportFlavor::MachineDefault);
 
 }  // namespace cam

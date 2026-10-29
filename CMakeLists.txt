@@ -357,6 +357,11 @@ endif()
 add_executable(hole_tests tests/hole_tests.cpp)
 target_link_libraries(hole_tests PRIVATE tinglecam_core)
 add_test(NAME hole_tests COMMAND hole_tests)
+set_tests_properties(hole_tests PROPERTIES TIMEOUT 30)
+
+add_executable(post_flavor_tests tests/post_flavor_tests.cpp)
+target_link_libraries(post_flavor_tests PRIVATE tinglecam_core)
+add_test(NAME post_flavor_tests COMMAND post_flavor_tests)
 
 add_executable(hole_ui_tests tests/hole_ui_tests.cpp)
 target_link_libraries(hole_ui_tests PRIVATE tinglecam_app_ui)

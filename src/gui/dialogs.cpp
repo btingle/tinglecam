@@ -106,25 +106,25 @@ void write_job(App& app, const std::filesystem::path& destination) {
 
 void post_and_save(App& app, bool selected_only) {
   const std::vector<std::size_t> selected = selected_operation_indices(app);
-  app.post = selected_only
-      ? cam::post_operations(app.plan, app.job, app.tools, app.machines, selected)
-      : cam::post_job(app.plan, app.job, app.tools, app.machines);
-  app.posted_operations.clear();
-  if (selected_only && app.post.ok())
-    for (const std::size_t index : selected)
-      app.posted_operations.push_back(static_cast<int>(index));
-  log_warnings(app, "G-code", app.post.warnings);
-  app.gcode = app.post.text;
-  if (!app.post.ok()) {
-    say(app, app.post.error, true);
-    return;
-  }
   const auto directory = app.gcode_file.empty() ? job_directory(app)
                                                 : app.gcode_file.parent_path();
   const std::string name = app.gcode_file.empty()
       ? file_stem(app.job.name) + ".nc" : app.gcode_file.filename().string();
   open_file_dialog(app, "Export G-code", {".nc", ".ngc", ".gcode", ".tap"}, true,
-                   directory, name, [&app](const std::filesystem::path& file) {
+                   directory, name, [&app, selected_only, selected](const std::filesystem::path& file) {
+    app.post = selected_only
+        ? cam::post_operations(app.plan, app.job, app.tools, app.machines, selected, app.export_flavor)
+        : cam::post_job(app.plan, app.job, app.tools, app.machines, app.export_flavor);
+    app.posted_operations.clear();
+    if (selected_only && app.post.ok())
+      for (const std::size_t index : selected)
+        app.posted_operations.push_back(static_cast<int>(index));
+    log_warnings(app, "G-code", app.post.warnings);
+    app.gcode = app.post.text;
+    if (!app.post.ok()) {
+      say(app, app.post.error, true);
+      return;
+    }
     try {
       cam::write_file(file, app.gcode);
       app.gcode_file = file;
@@ -205,7 +205,8 @@ void draw_dialogs(App& app) {
       else dialog.error = "No such folder";
     }
 
-    const float footer = ImGui::GetFrameHeightWithSpacing() * 2.0f +
+    const bool exporting=dialog.saving && dialog.title=="Export G-code";
+    const float footer = ImGui::GetFrameHeightWithSpacing() * (exporting?3.0f:2.0f) +
                          ImGui::GetStyle().ItemSpacing.y;
     if (ImGui::BeginChild("entries", ImVec2(0, -footer), ImGuiChildFlags_Borders)) {
       std::filesystem::path enter;
@@ -231,6 +232,12 @@ void draw_dialogs(App& app) {
     }
     ImGui::EndChild();
 
+    if(exporting) {
+      int flavor=static_cast<int>(app.export_flavor);
+      ImGui::SetNextItemWidth(ui_size(app,240));
+      if(ImGui::Combo("Export flavor",&flavor,"Machine default\0Roland MDX-40A\0"))
+        app.export_flavor=static_cast<cam::ExportFlavor>(flavor);
+    }
     ImGui::AlignTextToFramePadding();
     ImGui::TextUnformatted(dialog.saving ? "Save as" : "File");
     ImGui::SameLine();

@@ -18,6 +18,41 @@ void finish(App& app) {
   }
   poll_hole_detection(app);
 }
+void click_selection() {
+  App app;
+  cam::Operation op;op.mode=cam::OperationMode::Hole;
+  const auto click=[&](double radius) {
+    auto& io=ImGui::GetIO();
+    io.AddMousePosEvent(float(200+radius*20),200);
+    for(bool pressed:{true,false}) {
+      io.AddMouseButtonEvent(ImGuiMouseButton_Left,pressed);
+      ImGui::NewFrame();
+      ImGui::Begin("Hole selection canvas");
+      OrbitScene scene;scene.hovered=true;scene.list=ImGui::GetWindowDrawList();
+      scene.projection.centre={200,200};scene.projection.scale=20;
+      scene.projection.right={1,0,0};scene.projection.up={0,1,0};
+      draw_hole_contours(app,scene,op);
+      ImGui::End();ImGui::Render();
+    }
+  };
+  auto& system=op.holes.systems.front();
+  click(3);
+  check(!system.selected && !system.levels.front().selected,
+        "Clicking off a single hole clears its list checkbox and level");
+  click(3);
+  check(system.selected && system.levels.front().selected,
+        "Clicking again selects the hole and its level");
+  auto inner=system.levels.front();inner.radius=1;system.levels.push_back(inner);
+  click(3);
+  check(system.selected && !system.levels[0].selected && system.levels[1].selected,
+        "A counterbore remains enabled while another level is selected");
+  click(1);
+  check(!system.selected && !system.levels[0].selected && !system.levels[1].selected,
+        "Clicking off the last counterbore level clears its list checkbox");
+  click(1);
+  check(system.selected && !system.levels[0].selected && system.levels[1].selected,
+        "Clicking a deselected counterbore enables the clicked level");
+}
 void run(const std::filesystem::path& directory) {
   // Discovery intentionally needs neither tool selection nor stock nor a plan.
   const auto model=std::filesystem::path(__FILE__).parent_path()/"fixtures/meshes/auto_pocket.obj";
@@ -54,6 +89,16 @@ void run(const std::filesystem::path& directory) {
   const auto tip_before=operation_signature(app,0,job_signature(app));
   app.tools.tools[0].point_angle_degrees=90;
   check(operation_signature(app,0,job_signature(app))!=tip_before,"Drill point changes invalidate the drilling plan");
+  auto& drilling=app.job.operations[0].holes.drilling;drilling.peck_depth=1;
+  const auto full_retract=operation_signature(app,0,job_signature(app));
+  drilling.partial_peck_retract=true;
+  check(operation_signature(app,0,job_signature(app))!=full_retract,
+        "Partial retract selection invalidates the drilling plan");
+  frame(app);frame(app);
+  const auto partial_retract=operation_signature(app,0,job_signature(app));
+  drilling.peck_retract_distance=.2;
+  check(operation_signature(app,0,job_signature(app))!=partial_retract,
+        "Partial retract distance invalidates the drilling plan");
   frame(app);frame(app);
   select_operation(app,1);frame(app);
   // Rendering the panel must not dirty a newly loaded/manual job just to
@@ -74,7 +119,7 @@ int main() {
   std::filesystem::create_directory(directory);ImGui::CreateContext();auto& io=ImGui::GetIO();
   io.IniFilename=nullptr;io.DisplaySize={1280,1000};io.DeltaTime=1.f/60;
   unsigned char* pixels;int w,h;io.Fonts->GetTexDataAsRGBA32(&pixels,&w,&h);
-  int result=0;try {run(directory);std::cout<<"Hole GUI discovery, editable levels and linked pre-drilling passed\n";}
+  int result=0;try {click_selection();run(directory);std::cout<<"Hole GUI discovery, editable levels and linked pre-drilling passed\n";}
   catch(const std::exception& e) {std::cerr<<e.what()<<'\n';result=1;}
   ImGui::DestroyContext();std::filesystem::remove_all(directory);return result;
 }

@@ -125,6 +125,34 @@ void model_row(App& app, const char* label, const std::filesystem::path& path,
   ImGui::PopID();
 }
 
+void model_rotation_controls(App& app) {
+  ImGui::BeginDisabled(app.model_loading ||
+      (!app.geometry.has_part() && app.job.stock_mesh.empty()));
+  ImGui::TextUnformatted("Model orientation");
+  ImGui::SetNextItemWidth(ui_size(app, 180));
+  ImGui::Combo("Rotate", &app.model_rotation_target, "Part and stock\0Part only\0Stock only\0");
+  ImGui::BeginDisabled((app.model_rotation_target == 2 && app.job.stock_mesh.empty()) ||
+                       (app.model_rotation_target == 1 && !app.geometry.has_part()));
+  const char* axes[]{"X", "Y", "Z"};
+  for (int axis = 0; axis < 3; ++axis) {
+    ImGui::PushID(axis);
+    if (axis) ImGui::SameLine();
+    ImGui::TextUnformatted(axes[axis]);
+    ImGui::SameLine();
+    if (ImGui::SmallButton("-90")) start_model_rotation(app, app.model_rotation_target, axis, -1);
+    ImGui::SameLine();
+    if (ImGui::SmallButton("+90")) start_model_rotation(app, app.model_rotation_target, axis, 1);
+    ImGui::PopID();
+  }
+  if (ImGui::SmallButton("Reset orientation"))
+    start_model_rotation(app, app.model_rotation_target, 0, 0);
+  ImGui::SetItemTooltip("Restore the selected models' original orientation.\n"
+      "Turns use world axes about the input coordinate origin.\n"
+      "Rotation resets work depths and the program origin from the new bounds.");
+  ImGui::EndDisabled();
+  ImGui::EndDisabled();
+}
+
 void origin_section(App& app) {
   const JobBounds bounds = job_bounds(app);
   if (!bounds.valid) {
@@ -246,6 +274,7 @@ void setup_panel(App& app) {
       choose_stock_model(app);
     if (!app.job.stock_mesh.empty()) model_row(app, "Stock model", app.job.stock_mesh, false);
     end_properties();
+    model_rotation_controls(app);
     if (app.job.box_stock && app.job.stock_mesh.empty() &&
         ImGui::BeginTable("margins", 4, ImGuiTableFlags_SizingStretchProp)) {
       bool changed = false;
@@ -398,7 +427,10 @@ void select_operation(App& app, int index) {
 // sits is deliberately absent: it moves posted coordinates and nothing else.
 std::string job_signature(const App& app) {
   const auto& m = app.job.box_stock_margins;
-  return app.job.part_mesh.string() + '\n' + app.job.stock_mesh.string() +
+  std::string orientation;
+  for (const auto& rotation : {app.job.part_orientation, app.job.stock_orientation})
+    for (int axis : rotation.axes) orientation += std::to_string(axis) + ',';
+  return orientation + '\n' + app.job.part_mesh.string() + '\n' + app.job.stock_mesh.string() +
          (app.job.box_stock ? "\nbox " : "\nmodel ") + std::to_string(m.minus_x) +
          ' ' + std::to_string(m.plus_x) + ' ' + std::to_string(m.minus_y) + ' ' +
          std::to_string(m.plus_y) + ' ' + std::to_string(m.minus_z) + ' ' +

@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <limits>
 #include <sstream>
+#include <stdexcept>
 
 namespace cam {
 namespace {
@@ -13,10 +14,16 @@ namespace {
 // as motion rather than as a pile of conditionals.
 class Writer {
  public:
-  Writer(const Machine& machine, PostResult& result)
-      : machine_(machine), result_(result) {}
+  Writer(const Machine& machine, PostResult& result, ExportFlavor flavor)
+      : machine_(machine), result_(result), roland_(flavor==ExportFlavor::RolandMdx40a) {}
 
   void comment(const std::string& text) {
+    if(roland_) {
+      std::string clean=sanitise(text);
+      for(char& c:clean) if(static_cast<unsigned char>(c)<32 || static_cast<unsigned char>(c)>126) c='_';
+      line("(" + clean + ")");
+      return;
+    }
     switch (machine_.controller) {
       case Controller::Fanuc:
       case Controller::Haas:
@@ -36,11 +43,15 @@ class Writer {
       out_ << '\n';
       return;
     }
-    if (machine_.line_numbers) {
+    if (machine_.line_numbers && text!="%") {
       out_ << 'N' << number_ << ' ';
       number_ += std::max(machine_.line_number_increment, 1);
     }
-    out_ << text << '\n';
+    std::string formatted=text;
+    if(roland_ && formatted.size()>=2 && (formatted[0]=='G' || formatted[0]=='M') &&
+        formatted[1]>='0' && formatted[1]<='9' &&
+        (formatted.size()==2 || formatted[2]==' ')) formatted.insert(1,"0");
+    out_ << formatted << '\n';
     ++result_.line_count;
   }
 
@@ -73,7 +84,7 @@ class Writer {
       if (last_feed_ < 0.0 || std::abs(rounded - last_feed_) >= 1.0) {
         if (!text.empty()) text += ' ';
         char buffer[32];
-        std::snprintf(buffer, sizeof buffer, "F%.0f",
+        std::snprintf(buffer, sizeof buffer, roland_?"F%.3f":"F%.0f",
                       machine_.output_inches ? rounded / 25.4 : rounded);
         text += buffer;
         last_feed_ = rounded;
@@ -106,6 +117,7 @@ class Writer {
       if (!text.empty() && text.back() == '.') text.pop_back();
     }
     if (text == "-0") text = "0";
+    if (roland_ && text.find('.') == std::string::npos) text += ".0";
     return text;
   }
 
@@ -114,7 +126,8 @@ class Writer {
     std::string clean;
     clean.reserve(text.size());
     for (const char character : text)
-      clean.push_back(character == '(' || character == ')' ? '_' : character);
+      clean.push_back(character == '(' || character == ')' || character == '\n' ||
+                         character == '\r' || character == '%' ? '_' : character);
     return clean;
   }
 
@@ -142,7 +155,7 @@ class Writer {
       if (last_feed_ < 0.0 || std::abs(rounded - last_feed_) >= 1.0) {
         if (!text.empty()) text += ' ';
         char buffer[32];
-        std::snprintf(buffer, sizeof buffer, "F%.0f",
+        std::snprintf(buffer, sizeof buffer, roland_?"F%.3f":"F%.0f",
                       machine_.output_inches ? rounded / 25.4 : rounded);
         text += buffer;
         last_feed_ = rounded;
@@ -160,6 +173,7 @@ class Writer {
 
   const Machine& machine_;
   PostResult& result_;
+  bool roland_;
   std::ostringstream out_;
   int number_ = 10;
   double position_x_ = 0.0;
@@ -182,8 +196,10 @@ std::string spindle_word(const Machine& machine, double rpm) {
 PostResult post_job(const JobPlan& plan,
                     const Job& job,
                     const ToolLibrary& tools,
-                    const MachineLibrary& machines) {
+                    const MachineLibrary& machines,
+                    ExportFlavor flavor) {
   PostResult result;
+  const bool roland=flavor==ExportFlavor::RolandMdx40a;
   if (!plan.ok()) {
     result.error = plan.error;
     return result;
@@ -206,24 +222,33 @@ PostResult post_job(const JobPlan& plan,
   // taken from the plan rather than worked out here: the planner costs every
   // lift against this height while choosing whether to lift at all, so the post
   // must not be the place that forms a second opinion about it.
-  Writer writer(*machine, result);
+  Writer writer(*machine, result, flavor);
   const double rapid_plane = plan.rapid_plane + job.origin_z;
   // ---- Preamble ---------------------------------------------------------
+  if(roland) writer.line("%");
   writer.comment(job.name.empty() ? std::string("TingleCAM") : job.name);
+  if(roland) writer.comment("Export flavor: Roland MDX-40A. Fit the tool before starting");
   writer.comment(std::string("Machine: ") + machine->name);
   if (machine->specifications_unverified)
     writer.comment("Machine limits in this profile are unverified placeholders");
-  writer.comment("Units: millimetres, absolute");
-  if (!machine->program_header.empty()) {
+  writer.comment(machine->output_inches?"Units: inches, absolute":"Units: millimetres, absolute");
+  if (!roland && !machine->program_header.empty()) {
     std::istringstream stream(machine->program_header);
     std::string text;
     while (std::getline(stream, text)) writer.line(text);
   }
   writer.line(machine->output_inches ? "G20" : "G21");
   writer.line("G90");
-  writer.line("G94");
+  if(!roland) writer.line("G94");
   writer.line("G17");
-  if (!machine->path_blending.empty()) writer.line(machine->path_blending);
+  if (!roland && !machine->path_blending.empty()) writer.line(machine->path_blending);
+  if(roland) writer.line("G40");
+  if(roland && !job.work_offset.empty() && job.work_offset!="G54" &&
+      job.work_offset!="G55" && job.work_offset!="G56" && job.work_offset!="G57" &&
+      job.work_offset!="G58" && job.work_offset!="G59") {
+    result.error="Roland MDX-40A export requires a G54–G59 work coordinate system";
+    return result;
+  }
   writer.line(job.work_offset.empty() ? "G54" : job.work_offset);
 
   std::string active_tool;
@@ -255,6 +280,8 @@ PostResult post_job(const JobPlan& plan,
 
       const bool changed=active_tool!=tool_assignment;
       if(changed) {
+        if(roland && !active_tool.empty())
+          throw std::runtime_error("Roland MDX-40A export requires one tool per file. Export checked operations using the same tool.");
         writer.comment("Tool " + std::to_string(tool_number) + " - " + tool->name);
         writer.comment("Cutter " + writer.coordinate(tool->diameter) + " mm");
         if(coolant_running) {writer.line("M9");coolant_running=false;}
@@ -263,7 +290,9 @@ PostResult post_job(const JobPlan& plan,
           writer.line("M5");
           spindle_running = false;
         }
-        switch (machine->tool_change) {
+        if(roland) {
+          writer.comment("Fit tool " + std::to_string(tool_number) + ": " + tool->name);
+        } else switch (machine->tool_change) {
           case ToolChange::Automatic:
             writer.line("T" + std::to_string(tool_number) + " M6");
             break;
@@ -277,7 +306,7 @@ PostResult post_job(const JobPlan& plan,
             writer.line("M0");
             break;
         }
-        if (machine->length_offset_mode == LengthOffsetMode::G43WithH)
+        if (!roland && machine->length_offset_mode == LengthOffsetMode::G43WithH)
           writer.line("G43 H" + std::to_string(length_offset));
         writer.reset_modal();
         active_tool = tool_assignment;
@@ -287,7 +316,9 @@ PostResult post_job(const JobPlan& plan,
         writer.line(spindle_word(*machine,rpm));
         spindle_running=true;active_rpm=rpm;
         if(machine->spindle_spinup_seconds>0) {
-          char buffer[48];std::snprintf(buffer,sizeof buffer,"G4 P%.1f",machine->spindle_spinup_seconds);
+          char buffer[48];
+          if(roland) std::snprintf(buffer,sizeof buffer,"G04 P%.0f",std::ceil(machine->spindle_spinup_seconds*1000));
+          else std::snprintf(buffer,sizeof buffer,"G4 P%.1f",machine->spindle_spinup_seconds);
           writer.line(buffer);
         }
       }
@@ -297,8 +328,8 @@ PostResult post_job(const JobPlan& plan,
         coolant_running = false;
       }
       if (source->coolant && !coolant_running) {
-        if (machine->coolant_flood) { writer.line("M8"); coolant_running = true; }
-        else if (machine->coolant_mist) { writer.line("M7"); coolant_running = true; }
+        if (!roland && machine->coolant_flood) { writer.line("M8"); coolant_running = true; }
+        else if (!roland && machine->coolant_mist) { writer.line("M7"); coolant_running = true; }
         else result.warnings.push_back(operation.operation_name +
             ": coolant requested but unavailable on this machine");
       }
@@ -311,8 +342,12 @@ PostResult post_job(const JobPlan& plan,
       if (level.nothing_to_cut || level.feeds.motion.empty()) continue;
       const auto* tool=tools.find(level.tool_id.empty()?operation.tool_id:level.tool_id);
       if(!tool) {result.error="Unknown tool in planned hole level";return result;}
-      if(activate_tool(tool,level.feeds.stats.spindle_rpm>0?level.feeds.stats.spindle_rpm:operation.spindle_rpm))
-        motion_positioned=false;
+      try {
+        if(activate_tool(tool,level.feeds.stats.spindle_rpm>0?level.feeds.stats.spindle_rpm:operation.spindle_rpm))
+          motion_positioned=false;
+      } catch(const std::runtime_error& error) {
+        result.error=error.what();return result;
+      }
       const double cut_z = level.floor_z + job.origin_z;
       writer.blank();
       // The posted depth, not the model's. Every other number in this file is
@@ -351,16 +386,17 @@ PostResult post_job(const JobPlan& plan,
   if (coolant_running) writer.line("M9");
   if (spindle_running) writer.line("M5");
   writer.line("G0 Z" + writer.coordinate(rapid_plane));
-  if (machine->tool_change == ToolChange::Automatic ||
-      machine->controller == Controller::LinuxCnc)
+  if (!roland && (machine->tool_change == ToolChange::Automatic ||
+      machine->controller == Controller::LinuxCnc))
     writer.line("G0 X" + writer.coordinate(machine->tool_change_x) + " Y" +
                 writer.coordinate(machine->tool_change_y));
-  if (!machine->program_footer.empty()) {
+  if (!roland && !machine->program_footer.empty()) {
     std::istringstream stream(machine->program_footer);
     std::string text;
     while (std::getline(stream, text)) writer.line(text);
   }
   writer.line("M30");
+  if(roland) writer.line("%");
 
   result.text = writer.take();
   result.estimated_minutes = plan.stats.cutting_minutes + plan.stats.rapid_minutes +
@@ -377,15 +413,17 @@ PostResult post_operation(const JobPlan& plan,
                           const Job& job,
                           const ToolLibrary& tools,
                           const MachineLibrary& machines,
-                          std::size_t operation_index) {
-  return post_operations(plan, job, tools, machines, {operation_index});
+                          std::size_t operation_index,
+                          ExportFlavor flavor) {
+  return post_operations(plan, job, tools, machines, {operation_index}, flavor);
 }
 
 PostResult post_operations(const JobPlan& plan,
                            const Job& job,
                            const ToolLibrary& tools,
                            const MachineLibrary& machines,
-                           const std::vector<std::size_t>& operation_indices) {
+                           const std::vector<std::size_t>& operation_indices,
+                           ExportFlavor flavor) {
   PostResult result;
   if (operation_indices.empty()) {
     result.error = "No operations were selected";
@@ -416,7 +454,7 @@ PostResult post_operations(const JobPlan& plan,
   }
   summarise_job(selected_plan);
   selected_plan.error.clear();
-  return post_job(selected_plan, selected_job, tools, machines);
+  return post_job(selected_plan, selected_job, tools, machines, flavor);
 }
 
 }  // namespace cam

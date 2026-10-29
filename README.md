@@ -67,7 +67,24 @@ Timing, memory measurements and the repeatable benchmark are documented in the
 
 Run the tests with `ctest --test-dir build --output-on-failure`.
 
+Choose **Roland MDX-40A** in the **Export flavor** dropdown in the export file
+dialog. The selection applies to whole-job and checked-operation exports,
+including Ctrl+E. Fit the tool before starting: Roland exports use one tool per
+file because the MDX-40A does not support the generic tool-change pause.
+For jobs with multiple tools, export checked operations using one tool at a time.
+This flavor controls NC syntax; feeds, spindle speed, and clearance still come
+from the planned job and its machine setup. Custom machine header/footer,
+path-blending, coolant, and tool-length-offset commands are omitted.
+Headless export accepts `--export-flavor roland-mdx40a`.
+
 The standalone [marble track generator](tools/README-tracks.md) in
 `tools/generate_tracks.py` exports track contours as OBJ, G-code, or STEP surfaces
 for CAD applications such as SolidWorks. It accepts continuous DXF profiles and
 can cap closed profiles to produce STEP solids.
+
+In Job setup, **Model orientation** provides ±90° turns around world X, Y, and Z
+through the input coordinate origin. Rotate part and stock together (the default),
+or select either model separately; Reset orientation restores the selected inputs.
+Orientations are saved in the job and apply to OBJ/STL meshes and native STEP
+surfaces. Rotation rebuilds box stock, resets work depths and the program origin
+from the new bounds, and invalidates toolpaths.

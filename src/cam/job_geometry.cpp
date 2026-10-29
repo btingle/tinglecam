@@ -15,40 +15,81 @@ const char* operation_mode_name(OperationMode value) {
   return "unknown";
 }
 
+namespace {
+wave::Mesh oriented_mesh(const std::filesystem::path& file,
+                         const std::shared_ptr<CadModel>& cad,
+                         const ModelOrientation& orientation) {
+  auto mesh = cad ? cad->mesh() : wave::load_triangle_mesh(file);
+  if (!cad) {
+    const auto a = orientation.apply(mesh.bounds.lower);
+    const auto b = orientation.apply(mesh.bounds.upper);
+    mesh.bounds.lower = {std::min(a.x, b.x), std::min(a.y, b.y), std::min(a.z, b.z)};
+    mesh.bounds.upper = {std::max(a.x, b.x), std::max(a.y, b.y), std::max(a.z, b.z)};
+    for (auto& triangle : mesh.triangles) {
+      triangle.a = orientation.apply(triangle.a);
+      triangle.b = orientation.apply(triangle.b);
+      triangle.c = orientation.apply(triangle.c);
+    }
+  }
+  return mesh;
+}
+}  // namespace
+
 void JobGeometry::load_part(const std::filesystem::path& file,
-                            const ModelLoadProgress& progress) {
+                            const ModelLoadProgress& progress,
+                            const ModelOrientation& orientation) {
+  orientation.validate();
   const auto report = [&](double f, const std::string& stage) {
     if (progress && !progress(f, stage)) throw std::runtime_error("Cancelled");
     return true;
   };
   report(0, "Reading part model");
   auto cad = step_filename(file) ? CadModel::load(file, .01,
-      [&](double f, const std::string& stage) { return report(.9 * f, stage); }) : nullptr;
+      [&](double f, const std::string& stage) { return report(.9 * f, stage); }, orientation) : nullptr;
   report(.9, "Preparing part mesh");
   wave::MeshSlicer imported;
-  imported.set_mesh(cad ? cad->mesh() : wave::load_triangle_mesh(file));
+  imported.set_mesh(oriented_mesh(file, cad, orientation));
   report(1, "Part model ready");
   part_ = std::move(imported);
   part_cad_ = std::move(cad);
+  part_orientation_ = orientation;
   part_slices_.clear();
   box_.clear();
 }
 
 void JobGeometry::load_stock(const std::filesystem::path& file,
-                             const ModelLoadProgress& progress) {
+                            const ModelLoadProgress& progress,
+                            const ModelOrientation& orientation) {
+  orientation.validate();
   const auto report = [&](double f, const std::string& stage) {
     if (progress && !progress(f, stage)) throw std::runtime_error("Cancelled");
     return true;
   };
   report(0, "Reading stock model");
   auto cad = step_filename(file) ? CadModel::load(file, .01,
-      [&](double f, const std::string& stage) { return report(.9 * f, stage); }) : nullptr;
+      [&](double f, const std::string& stage) { return report(.9 * f, stage); }, orientation) : nullptr;
   report(.9, "Preparing stock mesh");
   wave::MeshSlicer imported;
-  imported.set_mesh(cad ? cad->mesh() : wave::load_triangle_mesh(file));
+  imported.set_mesh(oriented_mesh(file, cad, orientation));
   report(1, "Stock model ready");
   stock_ = std::move(imported);
   stock_slices_.clear();
+}
+
+void JobGeometry::replace_models(JobGeometry&& loaded, bool part, bool stock) {
+  if (this == &loaded) return;
+  std::scoped_lock lock(slices_, loaded.slices_);
+  if (part) {
+    part_ = std::move(loaded.part_);
+    part_cad_ = std::move(loaded.part_cad_);
+    part_orientation_ = loaded.part_orientation_;
+    part_slices_ = std::move(loaded.part_slices_);
+    box_.clear();
+  }
+  if (stock) {
+    stock_ = std::move(loaded.stock_);
+    stock_slices_ = std::move(loaded.stock_slices_);
+  }
 }
 
 void JobGeometry::clear_stock() {
