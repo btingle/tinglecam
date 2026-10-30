@@ -87,6 +87,23 @@ int main() {
     const auto binary_mesh=wave::load_triangle_mesh(binary);
     check(binary_mesh.triangles.size()==1 && binary_mesh.bounds.lower.z==-8,
           "Vertical binary STL faces and bounds must survive loading");
+    // Stock exporters can emit degenerate closing faces with distinct vertex
+    // indices at identical positions, as in stock_obj/Ls.obj. These must be
+    // ignored without dropping valid neighboring faces or changing bounds.
+    write(obj,"v 0 0 0\nv 2 0 0\nv 0 2 0\n"
+              "v -12 -40 -6\nv -12 -40 -6\n"
+              "v -12 -39.794 -6\nv -12 -39.794 -6\n"
+              "v 10 0 0\nv 11 0 0\nv 12 0 0\nv 13 0 0\n"
+              "f 1 2 3\nf 4 5 6 7\nf 8 9 10 11\nf 1 1 2 2\nf 4 4 4\n");
+    const auto with_degenerate=wave::load_triangle_mesh(obj);
+    check(with_degenerate.triangles.size()==1 && with_degenerate.bounds.lower.x==0 &&
+              with_degenerate.bounds.upper.x==2 && with_degenerate.bounds.lower.z==0,
+          "Collapsed and collinear OBJ faces must be ignored without altering valid geometry");
+    write(obj,"v 0 0 0\nv 2 2 0\nv 0 2 0\nv 2 0 0\nf 1 2 3 4\n");
+    bool self_intersection_rejected=false;
+    try { (void)wave::load_triangle_mesh(obj); }
+    catch (const std::exception&) {self_intersection_rejected=true;}
+    check(self_intersection_rejected,"Cancelling non-degenerate faces must still be rejected");
     write(obj,"v 0 0 0\nv 1 0 0\nv 0 1 0\nf 0 2 3\n");
     bool rejected=false;
     try { (void)wave::load_triangle_mesh(obj); } catch (const std::exception&) {rejected=true;}

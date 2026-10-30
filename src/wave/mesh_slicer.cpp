@@ -76,25 +76,41 @@ std::int32_t obj_index(std::string_view token, std::size_t vertex_count) {
 // concave faces use ears, preserving the original 3D coordinates and winding.
 void append_face(Mesh& mesh, const std::vector<Vec3f>& vertices,
                  std::vector<std::int32_t> face) {
-  face.erase(std::unique(face.begin(), face.end()), face.end());
-  if (face.size() > 1 && face.front() == face.back()) face.pop_back();
   if (face.size() < 3) throw std::runtime_error("OBJ face has fewer than three vertices");
+  const auto same_position = [&](std::int32_t a, std::int32_t b) {
+    const auto p = vertices[a], q = vertices[b];
+    return p.x == q.x && p.y == q.y && p.z == q.z;
+  };
+  // Exporters can close a surface with collapsed quads, using different OBJ
+  // indices for identical positions. Like degenerate triangles, these carry
+  // no surface area and must not prevent the rest of the model loading.
+  face.erase(std::unique(face.begin(), face.end(), same_position), face.end());
+  if (face.size() > 1 && same_position(face.front(), face.back())) face.pop_back();
+  if (face.size() < 3) return;
   if (face.size() == 3) {
     append_triangle(mesh, {vertices[face[0]], vertices[face[1]], vertices[face[2]]});
     return;
   }
   double normal[3]{};
+  bool has_area = false;
   const auto origin = vertices[face[0]];
   for (std::size_t i = 1; i + 1 < face.size(); ++i) {
     const auto b = vertices[face[i]], c = vertices[face[i+1]];
     const double u[]{double(b.x)-origin.x, double(b.y)-origin.y, double(b.z)-origin.z};
     const double v[]{double(c.x)-origin.x, double(c.y)-origin.y, double(c.z)-origin.z};
-    for (int a = 0; a < 3; ++a)
-      normal[a] += u[(a+1)%3]*v[(a+2)%3] - u[(a+2)%3]*v[(a+1)%3];
+    for (int a = 0; a < 3; ++a) {
+      const double component = u[(a+1)%3]*v[(a+2)%3] - u[(a+2)%3]*v[(a+1)%3];
+      has_area |= component != 0;
+      normal[a] += component;
+    }
   }
   const int axis = int(std::max_element(normal, normal+3,
       [](double a, double b) { return std::abs(a) < std::abs(b); }) - normal);
-  if (normal[axis] == 0) throw std::runtime_error("OBJ face has no well-defined plane");
+  if (normal[axis] == 0) {
+    if (!has_area) return; // Entirely collinear, including distinct positions.
+    // A bow-tie can have cancelling signed area without being degenerate.
+    throw std::runtime_error("OBJ face has cancelling area (check for self intersections)");
+  }
   const double winding = normal[axis] > 0 ? 1 : -1;
   const auto xy = [&](std::int32_t id) {
     const auto p = vertices[id];

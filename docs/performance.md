@@ -10,7 +10,9 @@ OBJ polygons are triangulated in their dominant face plane, retaining their
 original winding and 3D coordinates. Convex polygons take a linear fan path;
 concave polygons use ear clipping. This keeps concave cutouts empty even on
 vertical faces. Negative and slashed indices, repeated closing indices, and
-inline comments are supported; index zero is rejected.
+inline comments are supported; index zero is rejected. Collapsed faces with
+coincident or collinear vertices are skipped, as with zero-area triangles;
+cancelling signed area in a non-degenerate face still reports an error.
 
 OBJ and both STL loaders retain vertical walls and their full Z bounds. The
 heightfield slicer excludes zero-area XY projections from its acceleration
