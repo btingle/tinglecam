@@ -517,9 +517,13 @@ json to_json(const Job& job) {
               {"stock_mesh", job.stock_mesh.string()},
               {"part_orientation", job.part_orientation.axes},
               {"stock_orientation", job.stock_orientation.axes},
+              {"stock_offset_x", job.stock_offset_x},
+              {"stock_offset_y", job.stock_offset_y},
+              {"stock_offset_z", job.stock_offset_z},
               {"origin_x", job.origin_x},
               {"origin_y", job.origin_y},
               {"origin_z", job.origin_z},
+              {"origin_relative_to_part", job.origin_relative_to_part},
               {"rapid_clearance_height", job.rapid_clearance_height},
               {"plunge_clearance_height", job.plunge_clearance_height},
               {"work_offset", job.work_offset},
@@ -530,7 +534,9 @@ Job job_from(const json& node, std::vector<std::string>* warnings = nullptr) {
   report_unknown(node,
                  {"name", "machine", "material", "simulation_pitch", "tools",
                   "part_mesh", "stock_mesh", "part_orientation", "stock_orientation",
+                  "stock_offset_x", "stock_offset_y", "stock_offset_z",
                   "origin_x", "origin_y", "origin_z",
+                  "origin_relative_to_part",
                   "box_stock", "box_stock_margins", "rapid_clearance_height",
                   "plunge_clearance_height",
                   "work_offset", "operations"},
@@ -571,9 +577,13 @@ Job job_from(const json& node, std::vector<std::string>* warnings = nullptr) {
   };
   orientation("part_orientation", job.part_orientation);
   orientation("stock_orientation", job.stock_orientation);
+  read(node, "stock_offset_x", job.stock_offset_x);
+  read(node, "stock_offset_y", job.stock_offset_y);
+  read(node, "stock_offset_z", job.stock_offset_z);
   read(node, "origin_x", job.origin_x);
   read(node, "origin_y", job.origin_y);
   read(node, "origin_z", job.origin_z);
+  read(node, "origin_relative_to_part", job.origin_relative_to_part);
   read(node, "box_stock", job.box_stock);
   if (node.contains("box_stock_margins")) {
     const auto& margins = node.at("box_stock_margins");

@@ -277,6 +277,13 @@ static void append_toolpath(Toolpath& toolpath, const WaveResult& wave,
       tolerance;
   const double effective_tool_radius =
       tool_radius > 0.0 ? tool_radius : wave.stepover * 0.5;
+  // Stock/wave rounding may use a stepover-sized slack; part clearance must
+  // only spend the geometry's micron rounding allowance.
+  const Paths64 protected_subject = InflatePaths(
+      wave.subject, -2.0, JoinType::Miter, EndType::Polygon);
+  const auto avoids_subject = [&](const Path64& path) {
+    return stays_clear(path, protected_subject, 2.0);
+  };
 
   std::vector<std::size_t> generation_offset(lineage.generations.size() + 1, 0);
   std::vector<Node> nodes;
@@ -388,6 +395,10 @@ static void append_toolpath(Toolpath& toolpath, const WaveResult& wave,
   Paths64 cleared = Union(air, initial_cleared, FillRule::NonZero);
   if (!toolpath.cleared.empty())
     cleared = Union(cleared, toolpath.cleared, FillRule::NonZero);
+  // Inherited removal describes material, while this region routes cutter
+  // centres. An earlier cut can leave air less than a cutter radius from the
+  // part; that air must not authorize links through the protected subject.
+  cleared = Difference(cleared, wave.subject, FillRule::NonZero);
   // Rebuilt whenever `cleared` grows, which is once per front rather than once
   // per link.
   Paths64 cleared_forbidden = forbidden_region(cleared, world, tolerance);
@@ -579,7 +590,8 @@ static void append_toolpath(Toolpath& toolpath, const WaveResult& wave,
         // detour and a lift to offer, and one of them is the right answer, so
         // the shortcut is dropped rather than the pass.
         if (preferred_boundary &&
-            !stays_clear(*preferred_boundary, travel_forbidden, tolerance))
+            (!stays_clear(*preferred_boundary, travel_forbidden, tolerance) ||
+             !avoids_subject(*preferred_boundary)))
           preferred_boundary.reset();
 
         // Free travel first: a move that never leaves cleared material costs
@@ -587,9 +599,11 @@ static void append_toolpath(Toolpath& toolpath, const WaveResult& wave,
         if (preferred_boundary) {
           emit(*preferred_boundary,
                !stays_clear(*preferred_boundary, cleared_forbidden, tolerance));
-        } else if (segment_avoids(position, entry, cleared_forbidden, tolerance)) {
+        } else if (segment_avoids(position, entry, cleared_forbidden, tolerance) &&
+                   avoids_subject(Path64{position, entry})) {
           emit(Path64{position, entry}, false);
-        } else if (segment_avoids(position, entry, travel_forbidden, tolerance)) {
+        } else if (segment_avoids(position, entry, travel_forbidden, tolerance) &&
+                   avoids_subject(Path64{position, entry})) {
           emit(Path64{position, entry}, true);
         } else {
           // A multiplier against the blocked straight line is not a meaningful
@@ -604,7 +618,13 @@ static void append_toolpath(Toolpath& toolpath, const WaveResult& wave,
           // around, and every corner of the box is convex seen from inside, so
           // no route ever runs out to one.
           const Router router(travel, tolerance);
-          const auto detour = router.route(position, entry);
+          auto detour = router.route(position, entry);
+          if (detour && !avoids_subject(*detour)) {
+            const Router protected_router(
+                routable_region(travel, tolerance, {position, entry}), tolerance);
+            detour = protected_router.route(position, entry);
+            if (detour && !avoids_subject(*detour)) detour.reset();
+          }
           const double detour_distance =
               detour ? path_length_world(*detour)
                      : std::numeric_limits<double>::infinity();
@@ -617,7 +637,8 @@ static void append_toolpath(Toolpath& toolpath, const WaveResult& wave,
           double lift_minutes = std::numeric_limits<double>::infinity();
           if (plunge) {
             approach = Path64{*plunge, entry};
-            if (!stays_clear(approach, travel_forbidden, tolerance)) {
+            if (!stays_clear(approach, travel_forbidden, tolerance) ||
+                !avoids_subject(approach)) {
               plunge.reset();
               approach.clear();
             } else {
@@ -817,6 +838,20 @@ Toolpath resample_toolpath(const Toolpath& source, double pitch) {
     for (double distance = pitch; distance < total - 1e-9; distance += pitch)
       samples.push_back(distance);
     samples.push_back(total);
+    // Keep real corners, including turns between a cut and its connecting
+    // move. Uniform samples across such a turn would shortcut the safe route
+    // through the part. Nearly straight tessellation vertices still disappear.
+    for (std::size_t i = 1; i < spans.size(); ++i) {
+      const auto& a = spans[i - 1];
+      const auto& b = spans[i];
+      const double dot = double(a.to.x - a.from.x) * double(b.to.x - b.from.x) +
+                         double(a.to.y - a.from.y) * double(b.to.y - b.from.y);
+      const double lengths = (a.end - a.begin) * (b.end - b.begin) *
+                             kIntegerScale * kIntegerScale;
+      if (dot < .99 * lengths) samples.push_back(b.begin);
+    }
+    std::sort(samples.begin(), samples.end());
+    samples.erase(std::unique(samples.begin(), samples.end()), samples.end());
 
     std::size_t span_index = 0;
     for (std::size_t sample = 1; sample < samples.size(); ++sample) {

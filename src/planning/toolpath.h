@@ -127,9 +127,9 @@ Toolpath build_toolpath(const std::vector<WavefrontStage>& stages,
                         const Paths64& initial_cleared = {});
 
 // Resamples every uninterrupted at-depth cutting path at a uniform travelled
-// distance. Original micro-vertices are not retained; motion-type changes are
-// assigned by the midpoint of each resulting interval. Retracts and entries
-// remain separate and discontinuities restart the pitch.
+// distance, retaining sharp corners. Micro-vertices on nearly straight sections
+// are not retained; motion types are assigned by each interval's midpoint.
+// Retracts and entries remain separate and discontinuities restart the pitch.
 Toolpath resample_toolpath(const Toolpath& toolpath, double pitch);
 
 // Where the tool is after travelling a given distance along the whole path.

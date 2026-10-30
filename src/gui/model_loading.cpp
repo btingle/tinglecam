@@ -28,7 +28,8 @@ void load_geometry(LoadedModels& result, const cam::ProgressCallback& progress =
     ++completed;
   }
   if (stock) {
-    result.geometry.load_stock(job.stock_mesh, report, job.stock_orientation);
+    result.geometry.load_stock(job.stock_mesh, report, job.stock_orientation,
+        {job.stock_offset_x, job.stock_offset_y, job.stock_offset_z});
     ++completed;
   }
   result.geometry.set_box_stock(job.box_stock, job.box_stock_margins);
@@ -59,8 +60,9 @@ void apply_loaded_models(App& app, LoadedModels result) {
   }
   if (result.reset_setup) {
     for (auto& operation : app.job.operations) depth_defaults(app, operation);
-    apply_origin_pick(app);
+    if (result.replace_part || !app.job.origin_relative_to_part) apply_origin_pick(app);
   }
+  app.stock_position_editing = false;
   app.surface_preview_key.clear();
   app.surface_preview = {};
   app.surface_depth_model.reset();
@@ -154,6 +156,29 @@ void start_model_rotation(App& app, int target, int axis, int direction) {
     result.replace_part = target != 2;
     result.replace_stock = target != 1;
     load_geometry(result, progress);
+    return result;
+  });
+}
+void start_stock_positioning(App& app, const std::array<double, 3>& offset) {
+  if (!app.geometry.has_stock() || app.geometry.box_stock()) return;
+  auto request = app.job;
+  const std::array<double,3> delta{offset[0]-request.stock_offset_x,
+      offset[1]-request.stock_offset_y, offset[2]-request.stock_offset_z};
+  request.stock_offset_x=offset[0];
+  request.stock_offset_y=offset[1];
+  request.stock_offset_z=offset[2];
+  auto mesh = app.geometry.stock().mesh();
+  begin_loading(app,"Positioning stock",[request=std::move(request),
+      mesh=std::move(mesh),delta](const cam::ProgressCallback& progress) mutable {
+    LoadedModels result;
+    result.job=std::move(request);
+    result.replace_part=false;
+    result.replace_stock=true;
+    result.reset_setup=true;
+    if (progress && !progress(0,"Preparing stock position"))
+      throw std::runtime_error("Cancelled");
+    result.geometry.set_stock_mesh(std::move(mesh),delta);
+    if (progress && !progress(1,"Stock positioned")) throw std::runtime_error("Cancelled");
     return result;
   });
 }

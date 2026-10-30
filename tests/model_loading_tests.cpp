@@ -3,6 +3,7 @@
 
 #include <future>
 #include <iostream>
+#include <limits>
 
 using namespace tinglecam_gui;
 
@@ -185,6 +186,28 @@ void run(const std::filesystem::path& directory) {
   check(app.model_load_error.empty() && app.job.operations.front().depth_from == 0 &&
             app.job.operations.front().depth_to == 4,
         "Replacing a model must reset depths against the new work bounds");
+
+  app.job.box_stock_margins = {2,5,3,7,1,4};
+  app.geometry.set_box_stock(true,app.job.box_stock_margins);
+  app.origin_pick = {0,1,2};
+  check(!app.job.origin_relative_to_part &&
+            !cam::job_from_json_text("{}").origin_relative_to_part,
+        "Stock remains the origin reference for new and older jobs");
+  apply_origin_pick(app);
+  check(app.job.origin_x==2 && app.job.origin_y==-5 && app.job.origin_z==-8,
+        "Stock origin picks include asymmetric box-stock margins");
+  app.job.origin_relative_to_part = true;
+  apply_origin_pick(app);
+  check(app.job.origin_x==0 && app.job.origin_y==-3 && app.job.origin_z==-4,
+        "Part origin picks use part bounds independently of stock margins");
+  cam::save_job(job_file,app.job);
+  load_job_into(app,job_file,true);
+  check(app.job.origin_relative_to_part && app.job.origin_y==-3 && app.job.origin_z==-4,
+        "Saving and reopening retains the origin reference and coordinates");
+  start_model_rotation(app,1,0,1);
+  finish(app);
+  check(app.model_load_error.empty() && app.job.origin_y==2 && app.job.origin_z==-6,
+        "Model rotation reapplies origin picks against the selected part bounds");
 }
 void check_model_reuse(const std::filesystem::path& directory,
                        const std::filesystem::path& part_file) {
@@ -242,6 +265,91 @@ void check_model_reuse(const std::filesystem::path& directory,
         "Part-only rotation reuses the loaded stock");
   std::filesystem::rename(held_stock, directory / "stock.obj");
 }
+
+void check_stock_position(const std::filesystem::path& directory) {
+  cam::Job job;
+  job.part_mesh=directory/"part.obj";
+  job.stock_mesh=directory/"stock.obj";
+  job.stock_offset_x=2; job.stock_offset_y=-3; job.stock_offset_z=1;
+  job.origin_relative_to_part=true;
+  job.origin_x=12.5; job.origin_y=-7; job.origin_z=3;
+  job.operations.emplace_back();
+  const auto file=directory/"positioned.json";
+  cam::save_job(file,job);
+  std::vector<std::string> warnings;
+  const auto saved=cam::load_job(file,&warnings);
+  check(warnings.empty() && saved.stock_offset_x==2 && saved.stock_offset_y==-3 &&
+            saved.stock_offset_z==1,"Stock placement must persist without unknown fields");
+  const auto legacy=cam::job_from_json_text("{}");
+  check(legacy.stock_offset_x==0 && legacy.stock_offset_y==0 && legacy.stock_offset_z==0,
+        "Older jobs retain their original stock placement");
+  App app;
+  load_job_into(app,file,true);
+  const auto* part=app.geometry.part().mesh().triangles.data();
+  const auto& bounds=app.geometry.stock().mesh().bounds;
+  check(bounds.lower.x==2 && bounds.lower.y==-3 && bounds.lower.z==1 &&
+            bounds.upper.x==10 && bounds.upper.y==3 && bounds.upper.z==5,
+        "Stock translation must update physical mesh bounds on all axes");
+  cam::JobGeometry nominal;
+  nominal.load_stock(job.stock_mesh);
+  auto expected=nominal.stock_outline(1,8);
+  for (auto& path:expected) for (auto& p:path) {p.x+=2000;p.y-=3000;}
+  check(wave::paths_equal_canonical(expected,app.geometry.stock_outline(2,8)),
+        "Stock slicing must translate XY and query the translated Z level");
+  const auto before=wave::Heightmap::from_mesh(nominal.stock().mesh(),.25);
+  const auto moved=wave::Heightmap::from_mesh(app.geometry.stock().mesh(),.25);
+  check(std::abs(before.volume()-moved.volume())<.001 &&
+            std::abs(moved.highest()-before.highest()-1)<.0001 &&
+            moved.lower_x()==2 && moved.lower_y()==-3,
+        "Simulation stock must move rigidly without changing its shape or volume");
+  cam::Tool tool; tool.id="test"; tool.name="Placement test mill"; tool.diameter=2;
+  auto op=job.operations.front(); op.tool_id=tool.id; op.depth_to=2;op.stepdown=1;
+  const auto plan=cam::plan_wavefronts(app.geometry,op,tool,{}, {10000,.01,2,100,2000},{});
+  if (!plan.ok()) throw std::runtime_error("Positioned-stock roughing: "+plan.error);
+  check(plan.levels.size()==2 && plan.levels[0].floor_z==4 &&
+            plan.levels[1].floor_z==3,
+        "Roughing levels must start from the translated stock top");
+
+  // Placement must reuse cached geometry, even without either source file.
+  std::filesystem::rename(job.part_mesh,directory/"position-part-held");
+  std::filesystem::rename(job.stock_mesh,directory/"position-stock-held");
+  start_stock_positioning(app,{-2,3,-1});
+  finish(app);
+  check(app.model_load_error.empty() && app.geometry.part().mesh().triangles.data()==part &&
+            app.geometry.stock().mesh().bounds.lower.x==-2 &&
+            app.geometry.stock().mesh().bounds.lower.y==3 &&
+            app.geometry.stock().mesh().bounds.lower.z==-1 && app.job.origin_x==12.5 &&
+            app.job.origin_y==-7 && app.job.origin_z==3,
+        "Repositioning reuses the part and preserves a part-relative manual origin");
+  const auto unchanged=cam::to_json_text(app.job);
+  start_stock_positioning(app,{std::numeric_limits<double>::quiet_NaN(),0,0});
+  finish(app);
+  check(!app.model_load_error.empty() && cam::to_json_text(app.job)==unchanged &&
+            app.geometry.stock().mesh().bounds.lower.x==-2,
+        "A failed placement must preserve job settings and loaded geometry");
+  app.job.origin_relative_to_part=false;
+  app.origin_pick={0,0,2};
+  start_stock_positioning(app,{2,-3,1});
+  finish(app);
+  check(app.model_load_error.empty() && app.job.origin_x==-2 && app.job.origin_y==3 &&
+            app.job.origin_z==-5,"Stock-relative origin picks must follow moved stock");
+  start_stock_positioning(app,{});
+  finish(app);
+  check(app.model_load_error.empty() && app.geometry.stock().mesh().bounds.lower.x==0 &&
+            app.geometry.stock().mesh().bounds.lower.y==0 &&
+            app.geometry.stock().mesh().bounds.lower.z==0,
+        "Resetting stock placement must remove the previous offset");
+  std::filesystem::rename(directory/"position-part-held",job.part_mesh);
+  std::filesystem::rename(directory/"position-stock-held",job.stock_mesh);
+  app.job.stock_offset_x=2; app.job.stock_offset_y=-3; app.job.stock_offset_z=1;
+  start_model_rotation(app,2,2,1);
+  finish(app);
+  check(app.model_load_error.empty() && app.geometry.stock().mesh().bounds.lower.x==-4 &&
+            app.geometry.stock().mesh().bounds.upper.x==2 &&
+            app.geometry.stock().mesh().bounds.lower.y==-3 &&
+            app.geometry.stock().mesh().bounds.upper.z==5,
+        "Stock offsets must use setup axes after model rotation");
+}
 }  // namespace
 
 int main() {
@@ -260,6 +368,7 @@ int main() {
   int result = EXIT_SUCCESS;
   try {
     run(directory);
+    check_stock_position(directory);
     check_model_reuse(directory, directory / "part.obj");
 #ifdef TINGLECAM_HAVE_OCCT
     const auto step = directory / "part.step";

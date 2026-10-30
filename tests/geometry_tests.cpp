@@ -557,6 +557,34 @@ void check_exterior_stock_reach() {
           "stock");
 }
 
+void check_inherited_clearance_respects_subject() {
+  const wave::Paths64 subject{test_box(-3,-3,3,3)};
+  const wave::Paths64 stock{test_box(-2,-2,2,2)};
+  const auto analysis=wave::analyze_wavefront(subject,stock,.25,.25,0,2000,128,{},
+      wave::kDefaultSignificantNodeAreaFraction,wave::kDefaultTinySplitAreaFactor,1.5);
+  const auto committed=wave::commit_wavefront_analysis(analysis);
+  // An inherited material opening can extend into today's radius-expanded
+  // keepout. It must never override that keepout for cutter-centre routing.
+  const wave::Paths64 inherited{test_box(-10,-10,10,10)};
+  const auto path=wave::build_toolpath(committed.stages,1.5,0,10,2000,1000,0,inherited);
+  require(path.stats.cut_count>0,"the exterior rim must produce cutting paths");
+  const auto interior=Clipper2Lib::InflatePaths(subject,-10,
+      Clipper2Lib::JoinType::Miter,Clipper2Lib::EndType::Polygon);
+  require(Clipper2Lib::Intersect(path.cleared,interior,
+      Clipper2Lib::FillRule::NonZero).empty(),
+      "inherited clearance must exclude the current protected subject");
+  for (const auto& move:path.moves) {
+    if (move.kind==wave::MoveKind::Retract || move.path.size()<2) continue;
+    Clipper2Lib::Clipper64 clipper;
+    clipper.AddOpenSubject({move.path});
+    clipper.AddClip(interior);
+    wave::Paths64 closed,open;
+    clipper.Execute(Clipper2Lib::ClipType::Intersection,
+                    Clipper2Lib::FillRule::NonZero,closed,open);
+    require(open.empty(),"exterior cuts and links must respect part clearance");
+  }
+}
+
 // The classification of a leading edge must not depend on how the offsetter
 // happened to vertex it. Whatever the sampling misses, every front the wave
 // grows has to descend from the front it grew out of: the toolpath sequences
@@ -650,6 +678,7 @@ int main(int argc, char** argv) {
 
     check_lead_in();
     check_exterior_stock_reach();
+    check_inherited_clearance_respects_subject();
     check_plunge_clearance();
     check_long_leading_edge_is_split();
 

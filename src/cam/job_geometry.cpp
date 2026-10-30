@@ -33,6 +33,35 @@ wave::Mesh oriented_mesh(const std::filesystem::path& file,
   }
   return mesh;
 }
+
+wave::MeshSlicer positioned_stock(wave::Mesh mesh,
+                                  const std::array<double, 3>& offset) {
+  for (double value : offset)
+    if (!std::isfinite(value)) throw std::invalid_argument("Stock offsets must be finite");
+  const auto translated = [&](wave::Vec3f p) {
+    return wave::Vec3f{float(double(p.x) + offset[0]),
+                       float(double(p.y) + offset[1]),
+                       float(double(p.z) + offset[2])};
+  };
+  const double limit = double(Clipper2Lib::MAX_COORD) / wave::kIntegerScale;
+  for (const auto p : {mesh.bounds.lower, mesh.bounds.upper}) {
+    const double coordinates[]{double(p.x) + offset[0], double(p.y) + offset[1],
+                               double(p.z) + offset[2]};
+    for (double value : coordinates)
+      if (!std::isfinite(value) || std::abs(value) > limit)
+        throw std::invalid_argument("Stock position exceeds the geometry coordinate range");
+  }
+  mesh.bounds.lower = translated(mesh.bounds.lower);
+  mesh.bounds.upper = translated(mesh.bounds.upper);
+  for (auto& triangle : mesh.triangles) {
+    triangle.a = translated(triangle.a);
+    triangle.b = translated(triangle.b);
+    triangle.c = translated(triangle.c);
+  }
+  wave::MeshSlicer result;
+  result.set_mesh(std::move(mesh));
+  return result;
+}
 }  // namespace
 
 void JobGeometry::load_part(const std::filesystem::path& file,
@@ -59,7 +88,8 @@ void JobGeometry::load_part(const std::filesystem::path& file,
 
 void JobGeometry::load_stock(const std::filesystem::path& file,
                             const ModelLoadProgress& progress,
-                            const ModelOrientation& orientation) {
+                            const ModelOrientation& orientation,
+                            const std::array<double, 3>& offset) {
   orientation.validate();
   const auto report = [&](double f, const std::string& stage) {
     if (progress && !progress(f, stage)) throw std::runtime_error("Cancelled");
@@ -69,9 +99,14 @@ void JobGeometry::load_stock(const std::filesystem::path& file,
   auto cad = step_filename(file) ? CadModel::load(file, .01,
       [&](double f, const std::string& stage) { return report(.9 * f, stage); }, orientation) : nullptr;
   report(.9, "Preparing stock mesh");
-  wave::MeshSlicer imported;
-  imported.set_mesh(oriented_mesh(file, cad, orientation));
+  auto imported = positioned_stock(oriented_mesh(file, cad, orientation), offset);
   report(1, "Stock model ready");
+  stock_ = std::move(imported);
+  stock_slices_.clear();
+}
+
+void JobGeometry::set_stock_mesh(wave::Mesh mesh, const std::array<double, 3>& offset) {
+  auto imported = positioned_stock(std::move(mesh), offset);
   stock_ = std::move(imported);
   stock_slices_.clear();
 }

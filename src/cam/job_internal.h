@@ -172,8 +172,8 @@ void accumulate(PlanStats& into, const PlanStats& from);
 void accumulate(PlanningMetrics& into, const PlanningMetrics& from);
 double distance_mm(const wave::Point64& a, const wave::Point64& b);
 double link_slack(double stepover);
-double subdivision_cleanup_reach(const Operation& operation, double radius,
-                                 bool finishing_subdivision);
+double stock_contact_reach(const Operation& operation, double radius,
+                           bool finishing_subdivision);
 wave::Paths64 open_space(const wave::Paths64& stock_slice,
                          const wave::Paths64& keep_out);
 

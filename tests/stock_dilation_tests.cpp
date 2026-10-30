@@ -6,6 +6,7 @@
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <utility>
 
 namespace {
 void check(bool condition, const char* message) {
@@ -27,6 +28,86 @@ void expanded(const wave::Paths64& before, const wave::Paths64& after, double am
         b.top==a.top-delta && b.bottom==a.bottom+delta,
         "Dilation must expand every boundary by the entered distance");
 }
+
+void check_outside_rim(const std::filesystem::path& part) {
+  auto cutter=tool();
+  cutter.diameter=6.35;
+  cutter.flute_length=20;
+  cutter.cutting={{"plastic",10000,.01,100}};
+  cam::Machine machine; machine.id="test"; machine.max_rpm=20000;
+  const cam::ToolLibrary tools{{cutter}};
+  const cam::MachineLibrary machines{{machine}};
+  const cam::MaterialLibrary materials{{{"plastic","Plastic"}}};
+  cam::Job job;
+  job.machine_id="test"; job.material_id="plastic";
+  job.simulation_pitch=.05;
+  cam::Operation op;
+  op.tool_id=cutter.id; op.depth_to=3; op.stepdown=1;
+  op.stepover_ratio=.15; op.path_pitch=.2;
+  op.radial_stock_to_leave=.2;
+  op.finishing_subdivisions=2;
+  job.operations={op};
+  cam::JobGeometry geometry;
+  geometry.load_part(part);
+
+  // Both rims are narrower than the cutter radius. The second is also
+  // narrower than radial allowance + cleanup tolerance, so borrowing the
+  // upward-cleanup reach would still miss it.
+  for (const auto [rim, lead_in] : {std::pair{1.,true}, std::pair{1.,false},
+                                  std::pair{.25,true}, std::pair{.25,false}}) {
+    job.operations.front().lead_in=lead_in;
+    geometry.set_box_stock(true,{rim,rim,rim,rim,0,0});
+    const auto planned=cam::plan_job(geometry,job,tools,machines,materials,{});
+    if (!planned.ok()) throw std::runtime_error("Outside-rim roughing: "+planned.error);
+    const auto& rough=planned.operations.front();
+    std::size_t coarse_levels=0;
+    for (const auto& level : rough.levels) {
+      if (level.finishing_index!=0) continue;
+      ++coarse_levels;
+      double removed=0;
+      for (const auto& phase : level.feeds.motion) removed+=phase.removed_volume;
+      check(removed>0,"Every downward level must remove the outside rim before cleanup");
+      check(!level.stock_checkpoints.empty(),"Rim cuts must retain simulated stock");
+      const auto allowance=Clipper2Lib::InflatePaths(level.part_slice,
+          wave::to_integer(op.radial_stock_to_leave+.04),
+          Clipper2Lib::JoinType::Round,Clipper2Lib::EndType::Polygon);
+      const auto waste=Clipper2Lib::Difference(level.stock_slice,allowance,
+          Clipper2Lib::FillRule::NonZero);
+      const auto after=level.stock_checkpoints.back().stock->slice(
+          level.floor_z+.5*level.axial_depth);
+      check(wave::material_area(Clipper2Lib::Intersect(after,waste,
+          Clipper2Lib::FillRule::NonZero))<.01,
+          "The coarse pass must clear its slab outside the radial allowance");
+      const auto protected_stock=Clipper2Lib::InflatePaths(level.part_slice,
+          wave::to_integer(op.radial_stock_to_leave-.05),
+          Clipper2Lib::JoinType::Round,Clipper2Lib::EndType::Polygon);
+      check(wave::material_area(Clipper2Lib::Difference(protected_stock,after,
+          Clipper2Lib::FillRule::NonZero))<.01,
+          "Exterior cuts must retain the part and its radial stock allowance");
+    }
+    check(coarse_levels==3,"Rim regression must exercise three downward levels");
+    check(rough.stats.unsafe_plunges==0 && rough.stats.unreachable_fronts==0,
+          "Exterior roughing must retain safe entries and reachable fronts");
+    check(rough.stats.gouge_area<.001,"Exterior roughing must preserve the part");
+  }
+
+  geometry.set_box_stock(true,{.1,.1,.1,.1,0,0});
+  const auto inside_allowance=cam::plan_job(geometry,job,tools,machines,materials,{});
+  check(inside_allowance.ok(),"Stock within the radial allowance must plan");
+  check(inside_allowance.operations.front().stats.cut_levels==0,
+        "Exterior reach must not cut a rim inside the radial stock allowance");
+
+  // A projected blank plus planning dilation must also discover the exterior
+  // paths, although planning dilation does not add simulated material.
+  geometry.set_box_stock(true,{0,0,0,0,0,0});
+  op.stock_boundary_dilation=1;
+  auto dilated=cam::plan_wavefronts(geometry,op,cutter,machine,feeds(),{});
+  cam::plan_toolpaths(dilated,op,cutter,machine,feeds(),{});
+  check(dilated.ok(),"Projected stock with dilation must plan exterior paths");
+  for (const auto& level : dilated.levels)
+    check(level.toolpath.stats.cut_count>0,
+          "Planning dilation must produce downward cuts around projected stock");
+}
 }
 int main() {
   const auto dir=std::filesystem::temp_directory_path()/"tinglecam-stock-dilation-tests";
@@ -38,6 +119,7 @@ int main() {
       out<<"v -2 -2 0\nv 2 -2 0\nv 2 2 0\nv -2 2 0\n"
             "v -2 -2 4\nv 2 -2 4\nv 2 2 4\nv -2 2 4\nf 1 4 3 2\nf 5 6 7 8\n";
     }
+    check_outside_rim(part);
     cam::JobGeometry geometry;
     geometry.load_part(part); geometry.set_box_stock(true,{8,8,8,8,0,0});
     cam::Operation op; op.tool_id="test"; op.depth_to=2; op.stepdown=1;

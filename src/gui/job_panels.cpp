@@ -38,8 +38,7 @@ void adopt_default_setup(App& app) {
   pick(app.job.material_id, app.settings.default_material, app.materials.materials);
 }
 
-// The box the program origin is placed against: the blank, because the blank
-// is what sits on the machine and what the operator touches off.
+// The bounds of the geometry selected as the origin reference.
 struct JobBounds {
   double low[3]{};
   double high[3]{};
@@ -68,6 +67,10 @@ JobBounds job_bounds(const App& app) {
     result.valid = true;
     return true;
   };
+  if (app.job.origin_relative_to_part) {
+    if (app.geometry.has_part()) take(app.geometry.part().mesh().bounds, "part");
+    return result;
+  }
   if (app.geometry.box_stock()) {
     double low = 0.0;
     double high = 0.0;
@@ -93,7 +96,7 @@ JobBounds job_bounds(const App& app) {
   return result;
 }
 
-// Put the origin where the picks say, on the blank as it stands now.
+// Put the origin where the picks say, on the selected geometry as it stands now.
 void apply_origin_pick(App& app) {
   const JobBounds bounds = job_bounds(app);
   if (!bounds.valid) return;
@@ -125,6 +128,29 @@ void model_row(App& app, const char* label, const std::filesystem::path& path,
   ImGui::PopID();
 }
 
+void stock_position_controls(App& app) {
+  if (app.job.stock_mesh.empty()) return;
+  ImGui::BeginDisabled(app.model_loading || !app.geometry.has_stock());
+  ImGui::TextUnformatted("Stock position");
+  if (!app.stock_position_editing)
+    app.stock_position_edit={app.job.stock_offset_x,app.job.stock_offset_y,app.job.stock_offset_z};
+  bool apply=false, active=false;
+  if (begin_properties("stock_position")) {
+    const char* labels[]{"Offset X","Offset Y","Offset Z"};
+    for (int axis=0;axis<3;++axis) {
+      prop_double(labels[axis],app.stock_position_edit[axis],.1f,"%.3f mm",
+          "Translate stock in setup axes after rotation. Work depths update when applied.");
+      active |= ImGui::IsItemActive();
+      apply |= ImGui::IsItemDeactivatedAfterEdit();
+    }
+    end_properties();
+  }
+  app.stock_position_editing=active;
+  if (apply) start_stock_positioning(app,app.stock_position_edit);
+  if (ImGui::SmallButton("Reset stock position")) start_stock_positioning(app,{});
+  ImGui::EndDisabled();
+}
+
 void model_rotation_controls(App& app) {
   ImGui::BeginDisabled(app.model_loading ||
       (!app.geometry.has_part() && app.job.stock_mesh.empty()));
@@ -154,6 +180,19 @@ void model_rotation_controls(App& app) {
 }
 
 void origin_section(App& app) {
+  ImGui::TextUnformatted("Relative to");
+  ImGui::SameLine();
+  if (ImGui::RadioButton("Stock", !app.job.origin_relative_to_part)) {
+    app.job.origin_relative_to_part = false;
+    apply_origin_pick(app);
+  }
+  ImGui::SameLine();
+  ImGui::BeginDisabled(!app.geometry.has_part());
+  if (ImGui::RadioButton("Part", app.job.origin_relative_to_part)) {
+    app.job.origin_relative_to_part = true;
+    apply_origin_pick(app);
+  }
+  ImGui::EndDisabled();
   const JobBounds bounds = job_bounds(app);
   if (!bounds.valid) {
     ImGui::TextDisabled("Load a part to place the program origin.");
@@ -189,19 +228,18 @@ void origin_section(App& app) {
     }
     ImGui::EndTable();
   }
-  // The origin itself, measured from the bottom-back-left corner of the blank:
-  // the corner an operator finds with an edge finder.
+  // Manual offsets use the same reference as the corner/centre picks.
   double offset[3] = {-app.job.origin_x - bounds.low[0],
                       -app.job.origin_y - bounds.low[1],
                       -app.job.origin_z - bounds.low[2]};
   bool edited = false;
   if (begin_properties("origin_values")) {
     static const char* const kFields[3] = {"Origin X", "Origin Y", "Origin Z"};
+    const std::string hint = std::string("Measured from the bottom-back-left corner of the ") +
+        bounds.what + ". Moving the origin needs no re-plan.";
     for (int axis = 0; axis < 3; ++axis)
       edited |= prop_double(kFields[axis], offset[axis], 0.1f, "%.3f mm",
-                            axis == 0 ? "Measured from the bottom-back-left corner of "
-                                        "the blank. Moving the origin needs no re-plan."
-                                      : nullptr);
+                            axis == 0 ? hint.c_str() : nullptr);
     end_properties();
   }
   if (edited) {
@@ -275,6 +313,7 @@ void setup_panel(App& app) {
     if (!app.job.stock_mesh.empty()) model_row(app, "Stock model", app.job.stock_mesh, false);
     end_properties();
     model_rotation_controls(app);
+    stock_position_controls(app);
     if (app.job.box_stock && app.job.stock_mesh.empty() &&
         ImGui::BeginTable("margins", 4, ImGuiTableFlags_SizingStretchProp)) {
       bool changed = false;
@@ -298,7 +337,7 @@ void setup_panel(App& app) {
       ImGui::EndTable();
       if (changed) {
         app.geometry.set_box_stock(app.job.box_stock, app.job.box_stock_margins);
-        apply_origin_pick(app);
+        if (!app.job.origin_relative_to_part) apply_origin_pick(app);
       }
     }
   }
@@ -430,6 +469,8 @@ std::string job_signature(const App& app) {
   std::string orientation;
   for (const auto& rotation : {app.job.part_orientation, app.job.stock_orientation})
     for (int axis : rotation.axes) orientation += std::to_string(axis) + ',';
+  for (double offset : {app.job.stock_offset_x, app.job.stock_offset_y, app.job.stock_offset_z})
+    orientation += std::to_string(offset) + ',';
   return orientation + '\n' + app.job.part_mesh.string() + '\n' + app.job.stock_mesh.string() +
          (app.job.box_stock ? "\nbox " : "\nmodel ") + std::to_string(m.minus_x) +
          ' ' + std::to_string(m.plus_x) + ' ' + std::to_string(m.minus_y) + ' ' +

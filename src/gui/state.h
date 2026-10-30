@@ -279,6 +279,8 @@ struct App {
   Background<LoadedModels> model_loader;
   bool model_loading = false, model_load_cancelled = false;
   int model_rotation_target = 0;
+  std::array<double, 3> stock_position_edit{};
+  bool stock_position_editing = false;
   std::string model_load_label, model_load_error;
   Background<cam::HoleDetection> hole_detector;
   std::string hole_detection_id;
@@ -331,7 +333,7 @@ struct App {
   ModelShow result_models = ModelShow::None;
   bool wireframe = false;
   NodeDebugColouring node_debug_colouring = NodeDebugColouring::None;
-  // Which corner, edge or centre of the blank the origin picker is aimed at:
+  // Which corner, edge or centre of the selected geometry the picker targets:
   // 0 low, 1 middle, 2 high per axis.
   std::array<int, 3> origin_pick{1, 1, 2};
   bool show_entry_front_chains = false;

@@ -253,6 +253,8 @@ struct Job {
   std::filesystem::path part_mesh;
   std::filesystem::path stock_mesh;
   ModelOrientation part_orientation, stock_orientation;
+  // Stock translation in setup axes, applied after its model orientation.
+  double stock_offset_x = 0.0, stock_offset_y = 0.0, stock_offset_z = 0.0;
   // One machine runs the program and one material is on it.
   std::string machine_id;
   std::string material_id;
@@ -266,6 +268,9 @@ struct Job {
   double origin_x = 0.0;
   double origin_y = 0.0;
   double origin_z = 0.0;
+  // Geometry used by the GUI's origin picker; posted coordinates use the
+  // explicit offsets above regardless of the selected reference.
+  bool origin_relative_to_part = false;
   // With no stock model, the blank is the part's bounding box grown by these
   // directional margins.
   bool box_stock = false;
@@ -508,7 +513,10 @@ class JobGeometry {
   void load_part(const std::filesystem::path& file, const ModelLoadProgress& = {},
                  const ModelOrientation& orientation = {});
   void load_stock(const std::filesystem::path& file, const ModelLoadProgress& = {},
-                 const ModelOrientation& orientation = {});
+                 const ModelOrientation& orientation = {},
+                 const std::array<double, 3>& offset = {});
+  // Rebuild stock from an already loaded mesh, without importing its source.
+  void set_stock_mesh(wave::Mesh mesh, const std::array<double, 3>& offset = {});
   // Stand a rectangular blank in for a stock model: the part's bounding box
   // grown by directional margins. A loaded stock model always wins.
   // Drops a loaded stock model, so a blank named and then unnamed does not go

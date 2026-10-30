@@ -40,7 +40,7 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
     return plan;
   const double radius = setup.radius;
   const double stepover = setup.stepover;
-  const double exterior_stock_reach = subdivision_cleanup_reach(
+  const double exterior_stock_reach = stock_contact_reach(
       operation, radius, prior_subdivisions != nullptr);
   const double first_bite_allowance = setup.first_bite_allowance;
   const double work_top = highest_model_z(geometry);
@@ -345,8 +345,8 @@ void plan_toolpaths(OperationPlan& plan,
   if (!resolve_setup(operation, tool, feeds, plan.error, nullptr, setup))
     return;
   const double radius = setup.radius;
-  const double cleanup_reach =
-      subdivision_cleanup_reach(operation, radius, finishing_subdivision);
+  const double exterior_stock_reach =
+      stock_contact_reach(operation, radius, finishing_subdivision);
   const double travel_feed = setup.travel_feed;
   const double span = std::max(progress_to - progress_from, 0.0);
   std::vector<std::string> level_failures;
@@ -448,7 +448,7 @@ void plan_toolpaths(OperationPlan& plan,
     const bool clearing = level.part_slice.empty();
     if ((operation.mode == OperationMode::Roughing || clearing) &&
         operation.rough_boundary_cleanup && !level.part_slice.empty() &&
-        (cleanup_reach > 0.0 ||
+        (exterior_stock_reach > 0.0 ||
          !level.wave.reached_generations.empty()))
       cleanup_levels.push_back(index);
   }
@@ -459,9 +459,9 @@ void plan_toolpaths(OperationPlan& plan,
     LevelPlan& level = plan.levels[index];
     try {
       // A centreline inside stock is safe only where the wave opened a route to
-      // it. The optional tolerance shell also admits a centreline just outside
+      // it. The exterior contact shell also admits a centreline just outside
       // stock, where the cut approaches the edge from air. Keeping those cases
-      // separate admits thin subdivision remnants without authorizing a
+      // separate admits outside rims and thin remnants without authorizing a
       // full-width cleanup through an unopened pocket.
       wave::Paths64 clip;
       if (!level.wave.reached_generations.empty()) {
@@ -476,11 +476,11 @@ void plan_toolpaths(OperationPlan& plan,
       if (operation.clip_contours_to_stock) {
         const wave::Paths64 reached_stock = Clipper2Lib::Intersect(
             clip, level.incoming_stock, Clipper2Lib::FillRule::NonZero);
-        clip = cleanup_reach > 0.0
+        clip = exterior_stock_reach > 0.0
                    ? Clipper2Lib::Union(
                          reached_stock,
                          stock_exterior_tolerance(level.incoming_stock,
-                                                  cleanup_reach),
+                                                  exterior_stock_reach),
                          Clipper2Lib::FillRule::NonZero)
                    : reached_stock;
       }
@@ -497,7 +497,10 @@ void plan_toolpaths(OperationPlan& plan,
       // own stops at the stock wall, so a cleanup contour ending on that
       // wall could not be joined to the next one round the outside.
       traversal.stay_down_region = level.toolpath.cleared;
-      traversal.stay_down_slack = link_slack(setup.stepover);
+      // These contours ride the part's clearance boundary. Only forgive
+      // independent micron rounding here, not a fraction of a stepover that
+      // could consume the radial allowance at a connector's endpoints.
+      traversal.stay_down_slack = 4.0;
       traversal.cutting_feed = travel_feed;
       traversal.rapid_feed = rapid_feed(machine);
       traversal.rapid_feed_z = rapid_feed_z(machine);
@@ -544,9 +547,9 @@ void plan_toolpaths(OperationPlan& plan,
             " mm, optional boundary cleanup skipped: " + error.what());
       }
     }
-    // A subdivision may leave less than one wavefront stepover against the
+    // A thin rim may be narrower than one wavefront stepover against the
     // boundary. In that case the propagated wave has no cutting contour, but
-    // the optional exterior tolerance shell can still authorize edge cleanup
+    // the exterior contact shell can still authorize edge cleanup
     // from air.
     // Decide that the whole level is empty only after cleanup had that chance.
     if (level.toolpath.moves.empty()) {

@@ -105,11 +105,15 @@ double link_slack(double stepover) {
                     32.0, 500.0);
 }
 
-double subdivision_cleanup_reach(const Operation& operation, double radius,
-                                 bool finishing_subdivision) {
-  return finishing_subdivision
-             ? std::clamp(radius - operation.cleanup_tolerance, 0.0, radius)
-             : 0.0;
+// Stock limits material, not cutter-centre travel. A roughing cutter can remove
+// an outside rim while its centre is in air, even when the radius-expanded
+// part covers the entire stock outline. Keep subdivision cleanup's tolerance,
+// but let coarse roughing reach every strip wider than the radial allowance.
+double stock_contact_reach(const Operation& operation, double radius,
+                           bool finishing_subdivision) {
+  if (finishing_subdivision)
+    return std::clamp(radius - operation.cleanup_tolerance, 0.0, radius);
+  return operation.mode == OperationMode::Roughing ? radius : 0.0;
 }
 
 // Everywhere the cutter's centre may be at one depth when nothing has been

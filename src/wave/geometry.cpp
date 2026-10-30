@@ -489,8 +489,8 @@ WaveResult seed_wavefront(const Paths64& raw_subject,
   // rather than from the stock solid: only boundary the wave actually starts
   // from gets a run-in, so stock the subject occludes contributes none. Growing
   // the solid instead would have manufactured a lead-in running along the part.
-  // Propagation normally occupies physical stock. For stock-aware subdivision
-  // passes it may additionally occupy nearby exterior air in which the cutter
+  // Propagation normally occupies physical stock. Stock-aware roughing and
+  // subdivision passes may also occupy nearby exterior air in which the cutter
   // can still reach stock. The physical stock remains separately recorded in
   // `result.stock`, so air-only fronts are still filtered from the toolpath.
   Paths64 domain = result.stock;

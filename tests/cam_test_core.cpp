@@ -233,6 +233,17 @@ void check_path_resampling() {
           std::hypot(wave::to_world(move.path[i].x - move.path[i - 1].x),
                      wave::to_world(move.path[i].y - move.path[i - 1].y)),
           0.2, 1e-6, "pitch carries across the original move boundary");
+
+  raw.moves.resize(1);
+  raw.moves.front().path={point(0,0),point(.35,0),point(.35,.65)};
+  raw.moves.front().length=1;
+  const auto bent=wave::resample_toolpath(raw,.2);
+  bool kept_corner=false;
+  for (const auto& move:bent.moves)
+    for (const auto& p:move.path) kept_corner |= p==point(.35,0);
+  require(kept_corner,"resampling must retain a corner on a safe route");
+  require_near(wave::toolpath_length(bent),1,1e-6,
+               "resampling must not shortcut a corner through an obstacle");
 }
 
 void check_level_floors() {
@@ -1037,8 +1048,15 @@ void check_multi_operation_plan(const std::filesystem::path& data,
           "the second roughing operation has an inherited planning level");
   require(roughing_inherited_less_stock,
           "the second roughing operation inherits the first rougher's removal");
-  require(plan.operations[1].stats.cut_levels == 0,
-          "an identical second roughing operation does not recut cleared air");
+  // Exterior contact exposes tiny boundary remnants in the sampled inherited
+  // stock. An identical rougher may skim those, but must not take bulk stock
+  // or spend its clearance allowance on the part.
+  const auto& repeated=plan.operations[1].stats;
+  const double rounding_volume=wave::to_world(2)*rough.depth_to*repeated.cutting_distance;
+  require(repeated.removed_volume<=rounding_volume+1e-9,
+          "an identical second rougher removes only geometry-rounding remnants");
+  require(plan.operations[0].stats.gouge_area<1e-6 && repeated.gouge_area<1e-6,
+          "initial and repeated exterior roughing preserve part clearance");
 
   bool inherited_less_stock = false;
   bool compared = false;
