@@ -461,6 +461,10 @@ void operation_panel(App& app) {
                "Resolution of the mesh slicer's acceleration grid.");
     }
     if (operation.mode == cam::OperationMode::Roughing) {
+      prop_double("Stock boundary dilation", operation.stock_boundary_dilation, 0.05f, "%.3f mm",
+                  "Extra XY planning margin around stock at every roughing depth. "
+                  "1 mm expands a 20 x 20 mm square to 22 x 22 mm. "
+                  "Material-removal simulation uses the loaded stock geometry.", 0.0);
       prop_double("Stock oversize", operation.stock_deviation, 0.01f, "%.3f mm",
                   "How much larger than its model the blank may be; the lead-in "
                   "leaves this much headroom on the first bite.", 0.0);

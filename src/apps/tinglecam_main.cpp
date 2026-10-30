@@ -21,6 +21,7 @@ int main(int argc, char** argv) {
   bool fixed_cleanup_stepover = false;
   double stepover = 0.0;
   double path_pitch = 0.0;
+  std::optional<double> stock_boundary_dilation;
   double simulation_pitch = 0.0, surface_stepover = 0.0, surface_tolerance = 0.0;
   std::vector<std::size_t> selected_faces;
   bool cad_info = false, flow_u = false, flip_normals = false;
@@ -94,6 +95,7 @@ int main(int argc, char** argv) {
         cleanup_stepover_limit = std::stod(value());
       else if (argument == "--fixed-cleanup-stepover") fixed_cleanup_stepover = true;
       else if (argument == "--stepover") stepover = std::stod(value());
+      else if (argument == "--stock-dilation") stock_boundary_dilation = std::stod(value());
       else if (argument == "--simulation-pitch") simulation_pitch = std::stod(value());
       else if (argument == "--surface-stepover") surface_stepover = std::stod(value());
       else if (argument == "--surface-tolerance") surface_tolerance = std::stod(value());
@@ -128,6 +130,7 @@ int main(int argc, char** argv) {
             "  --material ID      Workpiece material for the job\n"
             "  --stepover RATIO   Radial engagement as a fraction of diameter\n"
             "  --stepdown MM      Axial depth per pass\n"
+            "  --stock-dilation MM  Outward XY roughing stock-boundary margin (default 0)\n"
             "  --finishing-subdivisions N\n"
             "                     Coarse descent, then N-1 upward cuts per terrace\n"
             "  --depth-break MM  Intermediate coarse floor; repeat for multiple depths\n"
@@ -271,6 +274,7 @@ int main(int argc, char** argv) {
     if (fixed_cleanup_stepover) operation.adaptive_cleanup_stepover = false;
     if (stepover > 0.0) operation.stepover_ratio = stepover;
     if (path_pitch > 0.0) operation.path_pitch = path_pitch;
+    if (stock_boundary_dilation) operation.stock_boundary_dilation = *stock_boundary_dilation;
     if (surface_stepover > 0.0) operation.surface.stepover = surface_stepover;
     if (surface_tolerance > 0.0) operation.surface.chord_tolerance = surface_tolerance;
     if (flow_u) operation.surface.along_v = false;

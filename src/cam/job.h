@@ -201,6 +201,9 @@ struct Operation {
   double depth_from = 0.0;
   double depth_to = 5.0;
 
+  // Additional XY planning margin around each roughing stock slice. Applied
+  // once to the current incoming outline, independently of lead-in headroom.
+  double stock_boundary_dilation = 0.0;
   bool lead_in = true;
   // How much larger than its model the raw blank may be. The run-in is placed
   // so the first pass that touches the stock aims for a full stepover less

@@ -172,6 +172,14 @@ bool resolve_setup(const Operation& operation, const Tool& tool,
     return false;
   }
   if (operation.mode == OperationMode::Roughing) {
+    if (!std::isfinite(operation.stock_boundary_dilation) || operation.stock_boundary_dilation < 0) {
+      error = "Stock boundary dilation must be finite and nonnegative";
+      return false;
+    }
+    if (operation.stock_boundary_dilation > Clipper2Lib::max_coord / (4 * wave::kIntegerScale)) {
+      error = "Stock boundary dilation exceeds the geometry coordinate range";
+      return false;
+    }
     if (operation.depth_breaks.size() > 1024) {
       error = "At most 1024 depth breaks are supported";
       return false;

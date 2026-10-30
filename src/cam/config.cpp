@@ -257,6 +257,7 @@ json to_json(const Operation& operation) {
               {"depth_to", operation.depth_to},
               {"lead_in", operation.lead_in},
               {"stock_deviation", operation.stock_deviation},
+              {"stock_boundary_dilation", operation.stock_boundary_dilation},
               {"path_pitch", operation.path_pitch},
               {"entry_front_match_tolerance",
                operation.entry_front_match_tolerance},
@@ -306,7 +307,7 @@ Operation operation_from(const json& node, std::vector<std::string>* warnings = 
                   "finishing_subdivisions", "adaptive_cleanup_stepover",
                   "cleanup_stepover_limit", "depth_breaks", "radial_stock_to_leave",
                   "axial_stock_to_leave", "depth_from", "depth_to", "lead_in",
-                  "stock_deviation", "path_pitch", "entry_front_match_tolerance",
+                  "stock_deviation", "stock_boundary_dilation", "path_pitch", "entry_front_match_tolerance",
                   "tiny_split_area_factor", "clip_contours_to_stock",
                   "contour_direction", "rough_boundary_cleanup", "cleanup_tolerance",
                   "slice_grid"},
@@ -422,6 +423,7 @@ Operation operation_from(const json& node, std::vector<std::string>* warnings = 
   read(node, "depth_to", operation.depth_to);
   read(node, "lead_in", operation.lead_in);
   read(node, "stock_deviation", operation.stock_deviation);
+  read(node, "stock_boundary_dilation", operation.stock_boundary_dilation);
   read(node, "path_pitch", operation.path_pitch);
   read(node, "entry_front_match_tolerance",
        operation.entry_front_match_tolerance);

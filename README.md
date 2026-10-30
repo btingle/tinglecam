@@ -90,3 +90,12 @@ or select either model separately; Reset orientation restores the selected input
 Orientations are saved in the job and apply to OBJ/STL meshes and native STEP
 surfaces. Rotation rebuilds box stock, resets work depths and the program origin
 from the new bounds, and invalidates toolpaths.
+
+For roughing, **Advanced > Stock boundary dilation** adds an outward XY planning
+margin to the stock outline at each Z level. A value of **1 mm** expands a
+20×20 mm square to **22×22 mm**, retaining square corners. It defaults to zero,
+is saved with the operation and operation defaults, and also applies to cleanup
+subdivisions. The existing **Stock oversize** control adjusts entry headroom
+separately. The material-removal simulation uses the loaded stock geometry;
+use a stock model or box-stock margins to represent a physically larger blank.
+Headless planning accepts `--stock-dilation MM`.

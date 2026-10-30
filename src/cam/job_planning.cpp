@@ -2,6 +2,17 @@
 #include <unordered_map>
 namespace cam {
 using namespace detail;
+namespace {
+wave::Paths64 dilate_stock_boundary(const wave::Paths64& stock, double distance) {
+  if (stock.empty()) return {};
+  const auto delta = wave::to_integer(distance);
+  if (delta == 0) return stock;
+  return Clipper2Lib::InflatePaths(
+      Clipper2Lib::Union(stock, FillRule::NonZero), delta,
+      Clipper2Lib::JoinType::Miter, Clipper2Lib::EndType::Polygon);
+}
+}  // namespace
+
 OperationPlan plan_wavefronts(const JobGeometry& geometry,
                               const Operation& operation,
                               const Tool& tool,
@@ -88,6 +99,13 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
               ? level.stock_slice
               : stock_after_operations_at_z(level.stock_slice, floor_z,
                                             prior_operations);
+      if (operation.mode == OperationMode::Roughing && operation.stock_boundary_dilation > 0) {
+        // Dilate the stock actually available at this depth, after preceding
+        // operations. Current-operation cleanup is subtracted afterwards, so
+        // subdivisions neither compound the margin nor restore their own cuts.
+        level.stock_slice = dilate_stock_boundary(level.stock_slice, operation.stock_boundary_dilation);
+        level.incoming_stock = dilate_stock_boundary(level.incoming_stock, operation.stock_boundary_dilation);
+      }
       if (prior_subdivisions != nullptr)
         level.incoming_stock = stock_after_operation_at_z(
             level.incoming_stock, floor_z, *prior_subdivisions);

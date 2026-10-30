@@ -385,3 +385,7 @@ target_link_libraries(routing_benchmark PRIVATE wave_planning)
 add_executable(wave_reuse_tests tests/wave_reuse_tests.cpp)
 target_link_libraries(wave_reuse_tests PRIVATE tinglecam_core)
 add_test(NAME wave_reuse_tests COMMAND wave_reuse_tests)
+
+add_executable(stock_dilation_tests tests/stock_dilation_tests.cpp)
+target_link_libraries(stock_dilation_tests PRIVATE tinglecam_core)
+add_test(NAME stock_dilation_tests COMMAND stock_dilation_tests)
