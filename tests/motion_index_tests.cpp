@@ -13,6 +13,7 @@ int main() {
    p.from={i*1000,0};p.to={(i+1)*1000,0};p.from_z=i%5;p.to_z=(i+1)%5;
    p.length=i%11==0?0:std::hypot(1,p.to_z-p.from_z);p.rate=60*(1+i%9);
    p.path_distance_begin=i;p.path_distance_end=i+1;p.rapid=i%3==0;
+   if(i%7==0) p.fixture_contacts.push_back({.2,.6,{},{}});
    reference.motion.push_back(p);
   }
   auto indexed=reference;cam::index_feed_motion(indexed);
@@ -21,6 +22,7 @@ int main() {
   const auto compare=[&](double seconds) {
    auto a=cam::feed_motion_at_seconds(reference,seconds), b=cam::feed_motion_at_seconds(indexed,seconds);
    check(a.position==b.position && a.rapid==b.rapid,"Indexed cursor changes position or motion kind");
+   check(a.fixture_contact==b.fixture_contact,"Indexed playback changes fixture contact state");
    near(a.z,b.z);near(a.path_distance,b.path_distance);near(a.motion_distance,b.motion_distance);
    near(a.phase_distance,b.phase_distance);near(a.rate,b.rate);
    near(cam::feed_seconds_to(reference,a.path_distance),cam::feed_seconds_to(indexed,a.path_distance));

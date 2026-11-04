@@ -163,6 +163,60 @@ Heightmap::Heightmap(double x, double y, double width, double height,
   page->tiles.fill(tile);
   pages_.resize((tile_count_ + page_width - 1) / page_width, page);
 }
+Heightmap Heightmap::transformed(const ModelTransform& transform) const {
+  transform.validate();
+  if (!transform.preserves_columns())
+    throw std::invalid_argument("Direct stock inheritance requires the heightmap Z axis to remain Z (180 degree X/Y flips are supported; 90 degree X/Y rotations require conversion)");
+  if (empty()) return {};
+  const double limit=double(Clipper2Lib::MAX_COORD)/kIntegerScale;
+  for(double value:transform.offset)
+    if(std::abs(value)>limit) throw std::invalid_argument("Stock transfer exceeds the geometry coordinate range");
+  for(auto p:{Vec3d{x_,y_,lowest()},Vec3d{x_+columns_*pitch_,y_+rows_*pitch_,highest()}}) {
+    p=transform.apply(p);
+    for(double value:{p.x,p.y})
+      if(!std::isfinite(value) || std::abs(value)>limit)
+        throw std::invalid_argument("Stock transfer exceeds the geometry coordinate range");
+    if(std::isfinite(p.z) && std::abs(p.z)>limit)
+      throw std::invalid_argument("Stock transfer exceeds the geometry coordinate range");
+  }
+  if (transform.orientation == ModelOrientation{} && transform.offset[2] == 0) {
+    auto result = *this;
+    result.x_ += transform.offset[0]; result.y_ += transform.offset[1];
+    result.slice_cache_ = std::make_shared<SliceCache>();
+    return result;
+  }
+  const auto& axes = transform.orientation.axes;
+  const double lows[]{x_, y_}, highs[]{x_ + columns_*pitch_, y_ + rows_*pitch_};
+  const int sizes[]{columns_, rows_};
+  double origin[2]; int dimensions[2];
+  for (int i=0;i<2;++i) {
+    const int a = std::abs(axes[i])-1;
+    origin[i] = (axes[i] < 0 ? -highs[a] : lows[a]) + transform.offset[i];
+    dimensions[i] = sizes[a];
+  }
+  // Construct dimensions directly: floating-point ceil must not add a cell.
+  Heightmap result = *this;
+  result.x_=origin[0]; result.y_=origin[1];
+  result.columns_=dimensions[0]; result.rows_=dimensions[1];
+  result.tile_columns_=(result.columns_+tile_width-1)/tile_width;
+  result.tile_count_=std::size_t(result.tile_columns_)*((result.rows_+tile_width-1)/tile_width);
+  auto tile=std::make_shared<Tile>(); auto page=std::make_shared<Page>(); page->tiles.fill(tile);
+  result.pages_.assign((result.tile_count_+page_width-1)/page_width,page);
+  result.slice_cache_=std::make_shared<SliceCache>();
+  result.volume_=0; result.lowest_=infinity;
+  for (int r=0;r<result.rows_;++r) for (int c=0;c<result.columns_;++c) {
+    int source[2]; const int cell[]{c,r};
+    for(int i=0;i<2;++i) {
+      const int a=std::abs(axes[i])-1;
+      source[a]=axes[i]<0?sizes[a]-1-cell[i]:cell[i];
+    }
+    double low=bottom(source[0],source[1]), high=top(source[0],source[1]);
+    if(axes[2]<0) { const double old=low; low=-high; high=-old; }
+    result.set(c,r,low+transform.offset[2],high+transform.offset[2]);
+  }
+  result.compact();
+  return result;
+}
 std::size_t Heightmap::tile_index(int c, int r) const {
   return (r / tile_width) * tile_columns_ + c / tile_width;
 }
@@ -467,12 +521,13 @@ double Heightmap::highest() const {
   return value;
 }
 double Heightmap::lowest() const { return lowest_; }
-Paths64 Heightmap::outlines(double z, bool all) const {
+Paths64 Heightmap::outlines(double z, Outline mode) const {
   Paths64 rectangles;
   std::unordered_map<std::uint64_t, std::size_t> previous, current;
   const auto occupied = [&](float top, float bottom) {
     return finite(top) && top > bottom &&
-           (all || (top > z + 1e-7 && bottom <= z + 1e-7));
+           (mode == Outline::Footprint ||
+            (top > z + 1e-7 && (mode == Outline::Above || bottom <= z + 1e-7)));
   };
   for (int r = 0; r < rows_;) {
     int repeat = std::min(tile_width - r % tile_width, rows_ - r);
@@ -532,20 +587,20 @@ Paths64 Heightmap::outlines(double z, bool all) const {
   }
   return Clipper2Lib::Union(rectangles, Clipper2Lib::FillRule::NonZero);
 }
-std::shared_ptr<const Paths64> Heightmap::slice_shared(double z) const {
+std::shared_ptr<const Paths64> Heightmap::outline_shared(double z, bool above) const {
   if (!std::isfinite(z))
     throw std::invalid_argument("Stock slice Z must be finite");
   std::shared_ptr<SliceCache::Entry> entry;
   {
     std::lock_guard lock(slice_cache_->mutex);
-    auto [found, inserted] = slice_cache_->polygons.try_emplace(z);
+    auto [found, inserted] = slice_cache_->polygons.try_emplace(std::pair{z,above});
     if (inserted) found->second = std::make_shared<SliceCache::Entry>();
     entry = found->second;
   }
   // Coalesce concurrent requests for the same layer while allowing different
   // layers to polygonize independently. call_once also retries on failure.
   std::call_once(entry->ready, [&] {
-    entry->polygon = std::make_shared<const Paths64>(outlines(z, false));
+    entry->polygon = std::make_shared<const Paths64>(outlines(z, above ? Outline::Above : Outline::Section));
     std::lock_guard lock(slice_cache_->mutex);
     ++slice_cache_->conversions;
   });
@@ -555,8 +610,15 @@ std::size_t Heightmap::slice_conversions() const {
   std::lock_guard lock(slice_cache_->mutex);
   return slice_cache_->conversions;
 }
+std::shared_ptr<const Paths64> Heightmap::slice_shared(double z) const {
+  return outline_shared(z,false);
+}
+std::shared_ptr<const Paths64> Heightmap::project_above_shared(double z) const {
+  return outline_shared(z,true);
+}
 Paths64 Heightmap::slice(double z) const { return *slice_shared(z); }
-Paths64 Heightmap::footprint() const { return outlines(0, true); }
+Paths64 Heightmap::project_above(double z) const { return *project_above_shared(z); }
+Paths64 Heightmap::footprint() const { return outlines(0, Outline::Footprint); }
 
 double swept_cutter_height(double x, double y, Vec3d a, Vec3d b,
                            const MillingCutter& tool) {

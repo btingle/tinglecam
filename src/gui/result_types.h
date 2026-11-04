@@ -23,8 +23,6 @@ struct OrbitScene {
   Projection projection;
   Vec3 light;
   double spacing = 0.05;
-  std::vector<Facet> facets;
-  std::vector<ImVec2> pool;
 };
 
 }  // namespace tinglecam_gui

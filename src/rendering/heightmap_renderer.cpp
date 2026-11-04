@@ -28,7 +28,20 @@ bool same_camera(const Camera& a, const Camera& b) {
 bool same_cutter(const Cutter& a, const Cutter& b) {
   return same_vector(a.tip,b.tip) && a.radius == b.radius &&
          a.length == b.length && a.ball == b.ball &&
-         a.point_height==b.point_height && a.tip_flat_radius==b.tip_flat_radius;
+         a.point_height==b.point_height && a.tip_flat_radius==b.tip_flat_radius &&
+         a.fixture_contact == b.fixture_contact;
+}
+bool same_meshes(const std::vector<MeshDraw>& a, const std::vector<MeshDraw>& b) {
+  if (a.size() != b.size()) return false;
+  for (std::size_t i=0;i<a.size();++i) {
+    const auto& x=a[i]; const auto& y=b[i];
+    // Raw mutable meshes must always redraw, including in-place edits.
+    if (!x.source || !y.source || x.source != y.source ||
+        !same_vector(x.offset,y.offset) || x.colour != y.colour ||
+        x.wireframe != y.wireframe || x.first_triangle != y.first_triangle ||
+        x.triangle_count != y.triangle_count) return false;
+  }
+  return true;
 }
 // Resolve post-1.1 entry points through SDL, including on Windows. Nothing in
 // this backend requires NVIDIA, CUDA/GL sharing, or OpenGL compute support.
@@ -92,7 +105,7 @@ struct State {
   Gl& gl;
   GLint program, vao, array_buffer, unpack_buffer, pack_buffer, draw_fbo,
       read_fbo;
-  GLint viewport[4], active, textures[4], texture_2d, depth_func, polygon[2];
+  GLint viewport[4], scissor_box[4], active, textures[4], texture_2d, depth_func, polygon[2];
   GLint texture_buffer, cull_mode, front_face, pack_alignment, pack_row_length,
       pack_skip_rows, pack_skip_pixels;
   GLint blend_src_rgb, blend_dst_rgb, blend_src_alpha, blend_dst_alpha;
@@ -115,6 +128,7 @@ struct State {
     glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw_fbo);
     glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read_fbo);
     glGetIntegerv(GL_VIEWPORT, viewport);
+    glGetIntegerv(GL_SCISSOR_BOX, scissor_box);
     glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
     for (int i = 0; i < 4; ++i) {
       gl.ActiveTexture(GL_TEXTURE0 + i);
@@ -153,6 +167,7 @@ struct State {
     gl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, draw_fbo);
     gl.BindFramebuffer(GL_READ_FRAMEBUFFER, read_fbo);
     glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+    glScissor(scissor_box[0], scissor_box[1], scissor_box[2], scissor_box[3]);
     for (int i = 0; i < 4; ++i) {
       gl.ActiveTexture(GL_TEXTURE0 + i);
       glBindTexture(GL_TEXTURE_BUFFER, textures[i]);
@@ -235,8 +250,7 @@ std::vector<Vertex> mesh_vertices(const Mesh& mesh) {
     Vec3f n{a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z,
             a.x * b.y - a.y * b.x};
     const float length = std::sqrt(n.x * n.x + n.y * n.y + n.z * n.z);
-    if (length < 1e-12f) continue;
-    n = {n.x / length, n.y / length, n.z / length};
+    n = length < 1e-12f ? Vec3f{0,0,1} : Vec3f{n.x / length, n.y / length, n.z / length};
     for (auto p : {t.a, t.b, t.c}) vertices.push_back({p, n});
   }
   return vertices;
@@ -326,6 +340,16 @@ struct Renderer::Impl {
   std::vector<TileSlots> slots;
   std::vector<std::shared_ptr<const Heightmap::Page>> pages;
   Stats counters;
+  struct GpuMesh {
+    std::weak_ptr<const Mesh> source;
+    GLuint buffer = 0;
+    std::size_t triangles = 0, bytes = 0;
+    bool used = false;
+  };
+  std::map<const Mesh*, GpuMesh> mesh_cache;
+  std::vector<MeshDraw> drawn_meshes;
+  std::shared_ptr<const Mesh> cutter_source;
+  Cutter cutter_shape;
   Camera drawn_camera;
   Cutter drawn_cutter;
   bool frame_valid = false;
@@ -348,6 +372,7 @@ struct Renderer::Impl {
     gl.DeleteVertexArrays(1, &vao);
     gl.DeleteVertexArrays(1, &mesh_vao);
     gl.DeleteBuffers(1, &mesh_vbo);
+    for (const auto& [key, mesh] : mesh_cache) gl.DeleteBuffers(1, &mesh.buffer);
     gl.DeleteFramebuffers(1, &fbo);
     glDeleteTextures(1, &image);
     glDeleteTextures(1, &depth);
@@ -727,7 +752,7 @@ struct Renderer::Impl {
       glBindTexture(GL_TEXTURE_2D, texture);
       glTexImage2D(GL_TEXTURE_2D, 0, internal, w, h, 0, format, type, nullptr);
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, texture == image ? GL_LINEAR : GL_NEAREST);
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
       gl.FramebufferTexture2D(
@@ -772,32 +797,69 @@ struct Renderer::Impl {
     glDrawArrays(GL_LINES, 0, source->vertices.size());
   }
   void mesh(const MeshDraw& draw, const Camera& c) {
-    if (!draw.mesh || draw.mesh->triangles.empty()) return;
-    auto vertices = mesh_vertices(*draw.mesh);
+    const auto* source = draw.source ? draw.source.get() : draw.mesh;
+    if (!source || source->triangles.empty() || !draw.triangle_count) return;
+    gl.BindVertexArray(mesh_vao);
+    std::size_t count = source->triangles.size();
+    if (count > std::size_t(std::numeric_limits<GLsizei>::max())/3)
+      throw std::runtime_error("Mesh exceeds the OpenGL vertex limit");
+    if (draw.source) {
+      auto& cached = mesh_cache[source];
+      if (!cached.buffer) {
+        const auto vertices = mesh_vertices(*source);
+        if (vertices.size() > std::size_t(std::numeric_limits<GLsizei>::max()))
+          throw std::runtime_error("Mesh exceeds the OpenGL vertex limit");
+        gl.GenBuffers(1, &cached.buffer);
+        gl.BindBuffer(GL_ARRAY_BUFFER, cached.buffer);
+        cached.source = draw.source;
+        cached.triangles = source->triangles.size();
+        cached.bytes = vertices.size() * sizeof(Vertex);
+        gl.BufferData(GL_ARRAY_BUFFER, cached.bytes, vertices.data(), GL_STATIC_DRAW);
+        counters.mesh_upload_bytes += cached.bytes;
+      } else gl.BindBuffer(GL_ARRAY_BUFFER, cached.buffer);
+      cached.source = draw.source;
+      cached.used = true;
+      count = cached.triangles;
+    } else {
+      const auto vertices = mesh_vertices(*source);
+      gl.BindBuffer(GL_ARRAY_BUFFER, mesh_vbo);
+      gl.BufferData(GL_ARRAY_BUFFER, vertices.size()*sizeof(Vertex), vertices.data(), GL_STREAM_DRAW);
+      counters.mesh_upload_bytes += vertices.size()*sizeof(Vertex);
+    }
+    gl.VertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), nullptr);
+    gl.VertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), reinterpret_cast<void*>(sizeof(Vec3f)));
     gl.UseProgram(mesh_program);
     camera(mesh_program, c);
     gl.Uniform3f(gl.GetUniformLocation(mesh_program, "offset"), draw.offset.x,
                  draw.offset.y, draw.offset.z);
-    gl.Uniform4fv(gl.GetUniformLocation(mesh_program, "base_colour"), 1,
-                  draw.colour.data());
-    gl.BindVertexArray(mesh_vao);
-    gl.BindBuffer(GL_ARRAY_BUFFER, mesh_vbo);
-    gl.BufferData(GL_ARRAY_BUFFER, vertices.size() * sizeof(Vertex),
-                  vertices.data(), GL_STREAM_DRAW);
-    glEnable(GL_CULL_FACE);
-    glCullFace(GL_BACK);
-    glFrontFace(GL_CCW);
+    gl.Uniform4fv(gl.GetUniformLocation(mesh_program, "base_colour"), 1, draw.colour.data());
+    glEnable(GL_DEPTH_TEST);
+    if (draw.wireframe) glDisable(GL_CULL_FACE); else glEnable(GL_CULL_FACE);
+    glCullFace(GL_BACK); glFrontFace(GL_CCW);
     if (draw.colour[3] < 1) {
       glEnable(GL_BLEND);
-      gl.BlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE,
-                           GL_ONE_MINUS_SRC_ALPHA);
+      gl.BlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
       gl.BlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
-    } else
-      glDisable(GL_BLEND);
+    } else glDisable(GL_BLEND);
     glDepthMask(draw.colour[3] >= 1);
     glPolygonMode(GL_FRONT_AND_BACK, draw.wireframe ? GL_LINE : GL_FILL);
-    glDrawArrays(GL_TRIANGLES, 0, vertices.size());
+    const auto first = std::min(draw.first_triangle, count);
+    count = std::min(draw.triangle_count, count-first);
+    glDrawArrays(GL_TRIANGLES, first*3, count*3);
     glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+  }
+  void trim_meshes() {
+    counters.mesh_resident_bytes = counters.mesh_buffers = 0;
+    for (auto it=mesh_cache.begin(); it!=mesh_cache.end();) {
+      if (!it->second.used || it->second.source.expired()) {
+        gl.DeleteBuffers(1, &it->second.buffer);
+        it=mesh_cache.erase(it);
+      } else {
+        counters.mesh_resident_bytes += it->second.bytes;
+        ++counters.mesh_buffers;
+        ++it;
+      }
+    }
   }
 };
 Renderer::Renderer() : impl_(std::make_unique<Impl>()) {}
@@ -811,8 +873,8 @@ unsigned Renderer::render(const Heightmap& stock, const Camera& camera,
       camera.scale <= 0 || !std::isfinite(camera.reach) || camera.reach <= 0)
     throw std::invalid_argument("Invalid heightmap viewport or camera");
   auto& r = *impl_;
-  r.counters.line_upload_bytes = 0;
-  if (r.frame_valid && r.width == width && r.height == height && meshes.empty() && r.line_source == lines &&
+  r.counters.line_upload_bytes = r.counters.mesh_upload_bytes = 0;
+  if (r.frame_valid && r.width == width && r.height == height && same_meshes(r.drawn_meshes, meshes) && r.line_source == lines &&
       same_camera(r.drawn_camera,camera) && same_cutter(r.drawn_cutter,cutter) &&
       r.same_stock(stock)) {
     r.counters.changed_tiles = r.counters.uploaded_bytes = 0;
@@ -823,10 +885,9 @@ unsigned Renderer::render(const Heightmap& stock, const Camera& camera,
   r.init();
   r.target(width, height);
   r.update(stock);
-  // Mutable mesh pointers have no revision identifier, so frames with mesh
-  // overlays always redraw. Stock pages and the cutter/camera inputs have
-  // complete change detection and can safely reuse the rendered texture.
-  if (r.frame_valid && meshes.empty() && r.line_source == lines && r.counters.changed_tiles == 0 &&
+  // Immutable mesh handles include geometry lifetime in frame identity.
+  // Mutable raw-pointer callers retain their original always-redraw behavior.
+  if (r.frame_valid && same_meshes(r.drawn_meshes, meshes) && r.line_source == lines && r.counters.changed_tiles == 0 &&
       same_camera(r.drawn_camera,camera) && same_cutter(r.drawn_cutter,cutter)) {
     r.counters.reused_frame = true;
     return r.image;
@@ -861,11 +922,60 @@ unsigned Renderer::render(const Heightmap& stock, const Camera& camera,
   r.gl.Uniform1i(r.gl.GetUniformLocation(r.program, "empty_grid"),
                  r.nodes.empty());
   r.gl.BindVertexArray(r.vao);
-  glDrawArrays(GL_TRIANGLES, 0, 3);
-  for (const auto& mesh : meshes) r.mesh(mesh, camera);
+  if (!r.nodes.empty() && r.node_bounds[1][2]>r.node_bounds[0][2]) {
+    // Only launch stock rays inside its projected root bounds. The orthographic
+    // projection is linear, so the eight corners conservatively enclose every
+    // possible hit. Keep a two-pixel halo for rounding and derivative quads.
+    double left=width,bottom=height,right=0,top=0;
+    for(int corner=0;corner<8;++corner) {
+      const double x=r.node_bounds[(corner&1)?1:0][0]+r.origin_x-camera.centre.x;
+      const double y=r.node_bounds[(corner&2)?1:0][1]+r.origin_y-camera.centre.y;
+      const double z=r.node_bounds[(corner&4)?1:0][2]-camera.centre.z;
+      const double px=camera.pan_x+camera.scale*(x*camera.right.x+y*camera.right.y+z*camera.right.z);
+      const double py=height-camera.pan_y+camera.scale*(x*camera.up.x+y*camera.up.y+z*camera.up.z);
+      left=std::min(left,px);right=std::max(right,px);
+      bottom=std::min(bottom,py);top=std::max(top,py);
+    }
+    const int x0=int(std::clamp(std::floor(left)-2,0.,double(width)));
+    const int y0=int(std::clamp(std::floor(bottom)-2,0.,double(height)));
+    const int x1=int(std::clamp(std::ceil(right)+2,0.,double(width)));
+    const int y1=int(std::clamp(std::ceil(top)+2,0.,double(height)));
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(x0,y0,x1-x0,y1-y0);
+    if(x1>x0 && y1>y0) glDrawArrays(GL_TRIANGLES,0,3);
+    glDisable(GL_SCISSOR_TEST);
+  }
+  for (auto& [key, mesh] : r.mesh_cache) mesh.used = false;
+  // Opaque bodies establish depth before transparent models. Sort only draw
+  // objects, never triangles; camera transforms and shading stay on the GPU.
+  std::vector<const MeshDraw*> ordered;
+  for (const auto& draw : meshes) ordered.push_back(&draw);
+  const auto depth = [&](const MeshDraw& draw) {
+    const auto* m = draw.source ? draw.source.get() : draw.mesh;
+    if (!m) return 0.f;
+    const auto& b=m->bounds;
+    return ((b.lower.x+b.upper.x)*.5f+draw.offset.x)*camera.toward.x +
+           ((b.lower.y+b.upper.y)*.5f+draw.offset.y)*camera.toward.y +
+           ((b.lower.z+b.upper.z)*.5f+draw.offset.z)*camera.toward.z;
+  };
+  std::stable_sort(ordered.begin(), ordered.end(), [&](auto a, auto b) {
+    const bool at=a->colour[3]<1, bt=b->colour[3]<1;
+    if (at!=bt) return !at;
+    return at && depth(*a)<depth(*b);
+  });
+  for (const auto* draw : ordered) r.mesh(*draw, camera);
   if (cutter.radius > 0 && (cutter.ball?cutter.length>=cutter.radius:cutter.length>0)) {
-    auto shape = cutter_mesh(cutter);
-    r.mesh({&shape, cutter.tip, {.48f, .86f, 1.f, .38f}, false}, camera);
+    if (!r.cutter_source || cutter.radius!=r.cutter_shape.radius ||
+        cutter.length!=r.cutter_shape.length || cutter.ball!=r.cutter_shape.ball ||
+        cutter.point_height!=r.cutter_shape.point_height ||
+        cutter.tip_flat_radius!=r.cutter_shape.tip_flat_radius) {
+      r.cutter_source=std::make_shared<const Mesh>(cutter_mesh(cutter));
+      r.cutter_shape=cutter;
+    }
+    const std::array<float, 4> colour = cutter.fixture_contact
+        ? std::array<float, 4>{1.f, .08f, .04f, .85f}
+        : std::array<float, 4>{.48f, .86f, 1.f, .38f};
+    r.mesh({nullptr, cutter.tip, colour, false, r.cutter_source}, camera);
   }
   r.lines(lines, camera);
   if (auto error = glGetError(); error != GL_NO_ERROR)
@@ -873,7 +983,9 @@ unsigned Renderer::render(const Heightmap& stock, const Camera& camera,
                              std::to_string(error) + ")");
   r.drawn_camera = camera;
   r.drawn_cutter = cutter;
-  r.frame_valid = meshes.empty();
+  r.drawn_meshes = meshes;
+  r.trim_meshes();
+  r.frame_valid = same_meshes(meshes, meshes);
   return r.image;
 }
 Stats Renderer::stats() const { return impl_->counters; }

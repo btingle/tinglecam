@@ -2,6 +2,7 @@
 
 #include "mesh_slicer_cuda.h"
 #include "mesh_slicer_cpu.h"
+#include "cpu_bvh.h"
 
 #include <clipper2/clipper.h>
 
@@ -16,6 +17,8 @@
 #include <cstdio>
 #include <fstream>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -328,6 +331,13 @@ Mesh load_triangle_mesh(const std::filesystem::path& filename) {
 struct MeshSlicer::Impl {
   Mesh mesh;
   MeshBuildStats stats;
+  std::shared_ptr<Impl> source, query;
+  ModelTransform placement;
+  mutable std::mutex cache_mutex;
+  mutable std::map<std::array<int, 3>, std::shared_ptr<Impl>> rotations;
+  mutable std::unique_ptr<Mesh> display;
+  mutable std::once_flag sweep_ready;
+  mutable cpu::Bvh sweep_bvh;
   cuda_slicer::Handle* gpu = nullptr;
   cpu_slicer::Handle* cpu = nullptr;
   MeshSlicerBackend backend;
@@ -346,7 +356,7 @@ struct MeshSlicer::Impl {
   }
 };
 
-MeshSlicer::MeshSlicer(MeshSlicerBackend backend) : impl_(std::make_unique<Impl>(backend)) {}
+MeshSlicer::MeshSlicer(MeshSlicerBackend backend) : impl_(std::make_shared<Impl>(backend)) {}
 MeshSlicer::~MeshSlicer() = default;
 MeshSlicer::MeshSlicer(MeshSlicer&&) noexcept = default;
 MeshSlicer& MeshSlicer::operator=(MeshSlicer&&) noexcept = default;
@@ -355,10 +365,7 @@ bool cuda_slicer_available() { return cuda_slicer::available(); }
 
 void MeshSlicer::set_mesh(Mesh mesh) {
   if (mesh.triangles.empty()) throw std::invalid_argument("Mesh is empty");
-  cuda_slicer::destroy(impl_->gpu);
-  impl_->gpu = nullptr;
-  cpu_slicer::destroy(impl_->cpu);
-  impl_->cpu = nullptr;
+  impl_ = std::make_shared<Impl>(impl_->backend);
   impl_->mesh = std::move(mesh);
   impl_->stats = {};
   impl_->stats.input_triangles = impl_->mesh.triangles.size();
@@ -379,6 +386,15 @@ void MeshSlicer::set_mesh(Mesh mesh) {
 
 MeshSlice MeshSlicer::slice(float z, int grid_resolution) const {
   if (empty()) throw std::runtime_error("No mesh has been loaded");
+  if (impl_->source) {
+    MeshSlicer query;
+    query.impl_ = impl_->query;
+    auto result = query.slice(float(double(z) - impl_->placement.offset[2]), grid_resolution);
+    const auto dx = to_integer(impl_->placement.offset[0]);
+    const auto dy = to_integer(impl_->placement.offset[1]);
+    for (auto& ring : result.polygons) for (auto& p : ring) { p.x += dx; p.y += dy; }
+    return result;
+  }
   MeshSlice result;
   auto candidates = impl_->cpu
       ? cpu_slicer::query(impl_->cpu, z, result.query_milliseconds)
@@ -396,21 +412,173 @@ std::vector<float> MeshSlicer::vertical_raycast(
     const std::vector<Vec3f>& origins, float lower_z,
     double& milliseconds) const {
   if (empty()) throw std::runtime_error("No mesh has been loaded");
+  if (impl_->source) {
+    auto local = origins;
+    const auto& o = impl_->placement.offset;
+    for (auto& p : local) { p.x -= o[0]; p.y -= o[1]; p.z -= o[2]; }
+    MeshSlicer query;
+    query.impl_ = impl_->query;
+    auto result = query.vertical_raycast(local, float(double(lower_z) - o[2]), milliseconds);
+    for (auto& z : result) if (std::isfinite(z)) z += o[2];
+    return result;
+  }
   return impl_->cpu ? cpu_slicer::vertical_raycast(impl_->cpu, origins, lower_z, milliseconds)
                     : cuda_slicer::vertical_raycast(impl_->gpu, origins, lower_z, milliseconds);
 }
 
-const Mesh& MeshSlicer::mesh() const { return impl_->mesh; }
-const MeshBuildStats& MeshSlicer::stats() const { return impl_->stats; }
-void MeshSlicer::clear() {
-  cuda_slicer::destroy(impl_->gpu);
-  impl_->gpu = nullptr;
-  cpu_slicer::destroy(impl_->cpu);
-  impl_->cpu = nullptr;
-  impl_->mesh = {};
-  impl_->stats = {};
+namespace {
+struct SweepPoint { double x, y; };
+SweepPoint subtract(SweepPoint a, SweepPoint b) { return {a.x-b.x,a.y-b.y}; }
+double cross(SweepPoint a, SweepPoint b) { return a.x*b.y-a.y*b.x; }
+double point_segment_distance_squared(SweepPoint p,SweepPoint a,SweepPoint b) {
+  const auto d=subtract(b,a),v=subtract(p,a);
+  const double length=d.x*d.x+d.y*d.y;
+  const double t=length>0?std::clamp((v.x*d.x+v.y*d.y)/length,0.0,1.0):0;
+  const double x=v.x-t*d.x,y=v.y-t*d.y;
+  return x*x+y*y;
+}
+double segment_distance_squared(SweepPoint a,SweepPoint b,SweepPoint c,SweepPoint d) {
+  const auto u=subtract(b,a),v=subtract(d,c),w=subtract(c,a);
+  const double determinant=cross(u,v);
+  if(determinant!=0) {
+    const double t=cross(w,v)/determinant,s=cross(w,u)/determinant;
+    if(t>=0 && t<=1 && s>=0 && s<=1) return 0;
+  }
+  return std::min({point_segment_distance_squared(a,c,d),point_segment_distance_squared(b,c,d),
+                   point_segment_distance_squared(c,a,b),point_segment_distance_squared(d,a,b)});
+}
+// Clip one triangle against Z, then test its convex XY projection against a
+// capsule. Degenerate projections still protect thin/vertical fixture walls.
+bool triangle_touches_sweep(const Triangle3f& triangle,double z,SweepPoint from,SweepPoint to,
+                            double radius_squared) {
+  const std::array<SliceVertex,3> vertices{{{triangle.a.x,triangle.a.y,triangle.a.z},
+      {triangle.b.x,triangle.b.y,triangle.b.z},{triangle.c.x,triangle.c.y,triangle.c.z}}};
+  std::array<SweepPoint,4> polygon;
+  std::size_t count=0;
+  for(std::size_t i=0;i<vertices.size();++i) {
+    const auto a=vertices[i],b=vertices[(i+1)%vertices.size()];
+    const bool inside=a.z>=z,next_inside=b.z>=z;
+    if(inside) polygon[count++]={a.x,a.y};
+    if(inside!=next_inside) {
+      const double t=(z-a.z)/(b.z-a.z);
+      polygon[count++]={a.x+(b.x-a.x)*t,a.y+(b.y-a.y)*t};
+    }
+  }
+  if(count==0) return false;
+  double area=0;
+  bool from_positive=false,from_negative=false,to_positive=false,to_negative=false;
+  for(std::size_t i=0;i<count;++i) {
+    const auto a=polygon[i],b=polygon[(i+1)%count];
+    if(segment_distance_squared(from,to,a,b)<=radius_squared) return true;
+    area+=cross(subtract(a,polygon[0]),subtract(b,polygon[0]));
+    const double f=cross(subtract(b,a),subtract(from,a)),t=cross(subtract(b,a),subtract(to,a));
+    from_positive |= f>0;from_negative |= f<0;to_positive |= t>0;to_negative |= t<0;
+  }
+  return area!=0 && (!(from_positive && from_negative) || !(to_positive && to_negative));
+}
+}  // namespace
+
+bool MeshSlicer::projected_sweep_clear(Vec3d from,Vec3d to,double minimum_z,double radius) const {
+  for(double value:{from.x,from.y,from.z,to.x,to.y,to.z,minimum_z,radius})
+    if(!std::isfinite(value)) throw std::invalid_argument("Fixture sweep coordinates and radius must be finite");
+  if(radius<0) throw std::invalid_argument("Fixture sweep radius must be nonnegative");
+  if(empty()) return true;
+  if(impl_->source) {
+    const auto& offset=impl_->placement.offset;
+    from.x-=offset[0];from.y-=offset[1];from.z-=offset[2];
+    to.x-=offset[0];to.y-=offset[1];to.z-=offset[2];
+    MeshSlicer query;query.impl_=impl_->query;
+    return query.projected_sweep_clear(from,to,minimum_z-offset[2],radius);
+  }
+  const double left=std::min(from.x,to.x)-radius,right=std::max(from.x,to.x)+radius;
+  const double bottom=std::min(from.y,to.y)-radius,top=std::max(from.y,to.y)+radius;
+  const auto overlaps=[&](const cpu::Box& box) {
+    return box.hi.z>=minimum_z && box.hi.x>=left && box.lo.x<=right &&
+           box.hi.y>=bottom && box.lo.y<=top;
+  };
+  const auto& bounds=impl_->mesh.bounds;
+  if(!overlaps(cpu::Box{bounds.lower,bounds.upper})) return true;
+  std::call_once(impl_->sweep_ready,[&] {
+    std::vector<cpu::Box> boxes;boxes.reserve(impl_->mesh.triangles.size());
+    for(const auto& triangle:impl_->mesh.triangles) boxes.push_back(cpu::bounds(triangle));
+    impl_->sweep_bvh.build(boxes);
+  });
+  bool clear=true;
+  impl_->sweep_bvh.query(overlaps,[&](std::uint32_t index) {
+    if(triangle_touches_sweep(impl_->mesh.triangles[index],minimum_z,
+                              {from.x,from.y},{to.x,to.y},radius*radius)) {
+      clear=false;return false;
+    }
+    return true;
+  });
+  return clear;
 }
 
-bool MeshSlicer::empty() const { return impl_->mesh.triangles.empty(); }
+MeshSlicer MeshSlicer::placed(const ModelTransform& transform) const {
+  transform.validate();
+  if (empty()) return MeshSlicer(impl_->backend);
+  const auto source = impl_->source ? impl_->source : impl_;
+  auto query = source;
+  if (transform.orientation != ModelOrientation{}) {
+    std::lock_guard lock(source->cache_mutex);
+    auto& cached = source->rotations[transform.orientation.axes];
+    if (!cached) {
+      auto mesh = source->mesh;
+      for (auto& t : mesh.triangles) {
+        t.a = transform.orientation.apply(t.a);
+        t.b = transform.orientation.apply(t.b);
+        t.c = transform.orientation.apply(t.c);
+      }
+      const auto a = transform.orientation.apply(mesh.bounds.lower);
+      const auto b = transform.orientation.apply(mesh.bounds.upper);
+      mesh.bounds.lower = {std::min(a.x,b.x),std::min(a.y,b.y),std::min(a.z,b.z)};
+      mesh.bounds.upper = {std::max(a.x,b.x),std::max(a.y,b.y),std::max(a.z,b.z)};
+      MeshSlicer rotated(source->backend);
+      rotated.set_mesh(std::move(mesh));
+      cached = rotated.impl_;
+    }
+    query = cached;
+  }
+  const double limit = double(Clipper2Lib::MAX_COORD) / kIntegerScale;
+  for (const auto p : {query->mesh.bounds.lower, query->mesh.bounds.upper}) {
+    const double coordinates[]{double(p.x)+transform.offset[0], double(p.y)+transform.offset[1],
+                               double(p.z)+transform.offset[2]};
+    for (double value : coordinates)
+      if (!std::isfinite(value) || std::abs(value) > limit)
+        throw std::invalid_argument("Model position exceeds the geometry coordinate range");
+  }
+  MeshSlicer result(source->backend);
+  result.impl_->source = source;
+  result.impl_->query = query;
+  result.impl_->placement = transform;
+  return result;
+}
+const Mesh& MeshSlicer::source_mesh() const {
+  return impl_->source ? impl_->source->mesh : impl_->mesh;
+}
+const void* MeshSlicer::source_identity() const {
+  return impl_->source ? impl_->source.get() : impl_.get();
+}
+const Mesh& MeshSlicer::mesh() const {
+  if (!impl_->source) return impl_->mesh;
+  const auto& o = impl_->placement.offset;
+  if (o == std::array<double,3>{}) return impl_->query->mesh;
+  std::lock_guard lock(impl_->cache_mutex);
+  if (!impl_->display) {
+    auto display = std::make_unique<Mesh>(impl_->query->mesh);
+    const auto shift = [&](Vec3f p) { return Vec3f{float(p.x+o[0]),float(p.y+o[1]),float(p.z+o[2])}; };
+    for (auto& t : display->triangles) { t.a=shift(t.a); t.b=shift(t.b); t.c=shift(t.c); }
+    display->bounds.lower=shift(display->bounds.lower);
+    display->bounds.upper=shift(display->bounds.upper);
+    impl_->display=std::move(display);
+  }
+  return *impl_->display;
+}
+const MeshBuildStats& MeshSlicer::stats() const { return impl_->source ? impl_->query->stats : impl_->stats; }
+std::shared_ptr<const Mesh> MeshSlicer::shared_mesh() const {
+  return std::shared_ptr<const Mesh>(impl_, &mesh());
+}
+void MeshSlicer::clear() { impl_ = std::make_shared<Impl>(impl_->backend); }
+bool MeshSlicer::empty() const { return impl_->source ? impl_->query->mesh.triangles.empty() : impl_->mesh.triangles.empty(); }
 
 }  // namespace wave

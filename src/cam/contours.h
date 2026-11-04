@@ -31,7 +31,8 @@ wave::Paths64 stock_exterior_tolerance(const wave::Paths64& stock,
 std::vector<DerivedContour> derive_offset_contours(
     const wave::Paths64& sliced_boundaries,
     double outward_offset,
-    const wave::Paths64* stock_clip = nullptr);
+    const wave::Paths64* stock_clip = nullptr,
+    const wave::Paths64* forbidden_centres = nullptr);
 
 // Converts geometry into generic traversal tasks. Closed paths offer several
 // starting positions; open paths offer the permitted orientations.

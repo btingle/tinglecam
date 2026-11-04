@@ -21,6 +21,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace cam {
@@ -152,6 +153,8 @@ struct SurfaceParameters {
 };
 
 struct Operation {
+  std::string id; // Stable identity for stock-result references.
+  std::string setup_id;
   std::string name = "Rough";
   std::string tool_id;
   OperationMode mode = OperationMode::Roughing;
@@ -248,21 +251,18 @@ struct ToolAssignment {
   int length_offset = 0;
 };
 
-struct Job {
-  std::string name = "Untitled";
+struct SetupContext {
   std::filesystem::path part_mesh;
   std::filesystem::path stock_mesh;
   ModelOrientation part_orientation, stock_orientation;
   // Stock translation in setup axes, applied after its model orientation.
   double stock_offset_x = 0.0, stock_offset_y = 0.0, stock_offset_z = 0.0;
-  // One machine runs the program and one material is on it.
+  double part_offset_x = 0.0, part_offset_y = 0.0, part_offset_z = 0.0;
+  // Empty setup selections inherit document defaults.
   std::string machine_id;
   std::string material_id;
   // XY spacing of the stock simulation grid, mm.
   double simulation_pitch = 0.02;
-  // Every tool the operations use, with its pocket number. Tools missing from
-  // the table are numbered after it in order of first use.
-  std::vector<ToolAssignment> tools;
   // Where the program's origin sits relative to the mesh coordinates. Added to
   // every posted coordinate.
   double origin_x = 0.0;
@@ -282,8 +282,46 @@ struct Job {
   // first contact with the current remaining stock under the whole cutter.
   double plunge_clearance_height = 1.0;
   std::string work_offset = "G54";
+  bool pause_on_entry = true;
+  // References always name an earlier setup/operation, never a relative index.
+  std::string part_from_setup;
+  std::string fixtures_from_setup;
+  std::string properties_from_setup;
+  std::string stock_from_operation;
+  ModelTransform stock_transfer;
+  struct ProtectedModel {
+    enum class Role { Fixture, KeepAway };
+    std::string name = "Fixture";
+    std::filesystem::path mesh;
+    Role role = Role::Fixture;
+    ModelTransform placement;
+    double clearance = 0.5;
+  };
+  std::vector<ProtectedModel> fixtures;
+};
+
+struct Setup : SetupContext {
+  std::string id;
+  std::string name = "Setup";
+};
+
+// Top-level context fields retain compatibility with legacy single-setup jobs
+// and provide document defaults. Explicit setups own their local contexts.
+struct Job : SetupContext {
+  std::string name = "Untitled";
+  std::vector<ToolAssignment> tools;
+  std::vector<Setup> setups;
   std::vector<Operation> operations;
 };
+
+const Setup* find_setup(const Job&, const std::string& id);
+// Resolve geometry/property inheritance without copying imported resources.
+SetupContext resolve_setup_context(const Job&, const std::string& id);
+Job job_for_setup(const Job&, const std::string& id);
+// Migrate a legacy job and assign missing identities. Existing IDs never change.
+void ensure_setup_ids(Job&);
+std::string new_document_id();
+std::vector<std::string> validate_setups(const Job&);
 
 // The job's tool table with every tool the operations use, missing entries
 // numbered after the highest number already taken, in order of first use.
@@ -317,6 +355,7 @@ struct LevelPlan {
   std::size_t subdivision = 0;
   std::size_t subdivision_level = 0;
   wave::Paths64 part_slice;
+  wave::Paths64 fixture_keep_out; // Cutter-centre exclusion; never a finish target.
   wave::Paths64 stock_slice;
   // Material present when this operation reaches the level. The nominal stock
   // slice above is kept for planning and reference; this one has the swept
@@ -424,6 +463,8 @@ struct OperationPlan {
   // error says so, so every reader that already skips a failed operation skips
   // this one too; the flag is what tells a failure apart from a gap.
   bool planned = false;
+  std::string operation_id, setup_id;
+  double rapid_plane = 0.0;
   std::shared_ptr<const wave::Heightmap> stock_before, stock_after;
   std::string operation_name;
   std::string tool_id;
@@ -445,6 +486,7 @@ struct OperationPlan {
   PlanStats stats;
   PlanningMetrics metrics;
   std::vector<std::string> warnings;
+  std::vector<std::string> debug_messages;
   std::string error;  // non-empty when the operation could not be planned
 
   bool ok() const { return error.empty(); }
@@ -463,6 +505,7 @@ struct JobPlan {
   PlanStats stats;
   PlanningMetrics metrics;
   std::vector<std::string> warnings;
+  std::vector<std::string> debug_messages;
   std::string error;
   // The safe plane this plan was costed against, in job coordinates. Recorded
   // rather than recomputed, so the post cannot write a different one.
@@ -500,7 +543,7 @@ using ProgressCallback = std::function<bool(PlanningProgress, const std::string&
 // first.
 class JobGeometry {
  public:
-  JobGeometry() = default;
+  JobGeometry();
   // Movable, because loading a job builds a fresh one and hands it over. The
   // mutex below is not part of what moves: it guards this instance's caches,
   // and the instance being moved into has its own to guard what arrives with.
@@ -509,6 +552,22 @@ class JobGeometry {
     if (this != &other) take(std::move(other));
     return *this;
   }
+
+  void share_sources(const JobGeometry& source) { library_=source.library_; }
+  void place_models_from(const JobGeometry&, bool part, bool stock,
+                         const ModelTransform&, const ModelTransform&);
+  void configure(const SetupContext&, const ModelLoadProgress& = {});
+  // Share the import library while preparing an independent setup view.
+  JobGeometry context_view(const SetupContext&, const ModelLoadProgress& = {}) const;
+  void set_part_placement(const ModelTransform&);
+  void set_stock_placement(const ModelTransform&);
+  void set_inherited_stock(std::shared_ptr<const wave::Heightmap>);
+  const std::shared_ptr<const wave::Heightmap>& inherited_stock() const { return inherited_stock_; }
+  struct ProtectedView { SetupContext::ProtectedModel model; wave::MeshSlicer geometry; };
+  const std::vector<ProtectedView>& fixtures() const { return fixtures_; }
+  const wave::Paths64& fixture_keep_out(double z, int grid, double radius) const;
+  std::size_t fixture_slice_count() const;
+  bool fixture_clear(wave::Vec3d from, wave::Vec3d to, const wave::MillingCutter&) const;
 
   void load_part(const std::filesystem::path& file, const ModelLoadProgress& = {},
                  const ModelOrientation& orientation = {});
@@ -526,9 +585,9 @@ class JobGeometry {
   // must stop geometry users before replacing either model, as with load_part.
   void replace_models(JobGeometry&& loaded, bool part, bool stock);
   void set_box_stock(bool enabled, const BoxStockMargins& margins);
-  bool box_stock() const { return box_stock_ && stock_.empty(); }
+  bool box_stock() const { return !inherited_stock_ && box_stock_ && stock_.empty(); }
   bool has_part() const { return !part_.empty(); }
-  bool has_stock() const { return !stock_.empty() || (box_stock_ && !part_.empty()); }
+  bool has_stock() const { return bool(inherited_stock_) || !stock_.empty() || (box_stock_ && !part_.empty()); }
   double stock_bottom() const;
   const wave::MeshSlicer& part() const { return part_; }
   const std::shared_ptr<CadModel>& part_cad() const { return part_cad_; }
@@ -561,6 +620,11 @@ class JobGeometry {
                                double z, int grid) const;
   void take(JobGeometry&& other) noexcept {
     std::scoped_lock lock(slices_, other.slices_);
+    library_ = std::move(other.library_);
+    fixtures_ = std::move(other.fixtures_);
+    fixture_slices_ = std::move(other.fixture_slices_);
+    inherited_stock_ = std::move(other.inherited_stock_);
+    part_source_cad_ = std::move(other.part_source_cad_);
     part_ = std::move(other.part_);
     part_cad_ = std::move(other.part_cad_);
     part_orientation_ = other.part_orientation_;
@@ -569,6 +633,7 @@ class JobGeometry {
     box_margins_ = other.box_margins_;
     part_slices_ = std::move(other.part_slices_);
     stock_slices_ = std::move(other.stock_slices_);
+    inherited_slices_ = std::move(other.inherited_slices_);
     box_ = std::move(other.box_);
   }
 
@@ -577,6 +642,13 @@ class JobGeometry {
   // thread. Both are reads as far as the caller is concerned; only the
   // remembering underneath is a write, and this is what makes it one.
   mutable std::mutex slices_;
+  struct ModelLibrary;
+  std::shared_ptr<ModelLibrary> library_;
+  std::shared_ptr<CadModel> part_source_cad_;
+  std::vector<ProtectedView> fixtures_;
+  std::shared_ptr<const wave::Heightmap> inherited_stock_;
+  mutable std::map<SliceKey, wave::Paths64> inherited_slices_;
+  mutable std::map<std::tuple<std::int64_t,std::int64_t,int>,wave::Paths64> fixture_slices_;
   std::shared_ptr<CadModel> part_cad_;
   ModelOrientation part_orientation_;
   wave::MeshSlicer part_;
@@ -673,11 +745,11 @@ OperationPlan plan_operation(const JobGeometry& geometry,
                              const OperationPlan* prior_subdivisions = nullptr,
                              bool defer_links = false);
 
-// The material at one Z plane after a sequence of operations: the nominal
-// stock clipped to the newest simulated stock among them.
+// Nominal stock clipped to the newest simulated stock. By default query a
+// cross-section; roughing includes the projection of all material above Z.
 wave::Paths64 stock_after_operations_at_z(
     const wave::Paths64& nominal_stock, double z,
-    const PriorOperations& operations);
+    const PriorOperations& operations, bool include_above = false);
 
 // What one re-planning run produced. `operations` covers job operations
 // [first, first + operations.size()) and nothing else; the caller splices them

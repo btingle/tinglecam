@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -16,7 +17,7 @@ using namespace wave::heightfield;
 void check(bool value, const char* message) {
   if (!value) throw std::runtime_error(message);
 }
-void near(double a, double b, double e, const char* message) {
+void near(double a, double b, double e, const std::string& message) {
   if (std::abs(a - b) > e)
     throw std::runtime_error(std::string(message) + ": " + std::to_string(a) +
                              " / " + std::to_string(b));
@@ -97,8 +98,30 @@ void compare(Renderer& renderer, const Heightmap& stock, const Camera& c,
       const auto t = reference(
           stock, ro, {-c.toward.x, -c.toward.y, -c.toward.z}, 2 * c.reach);
       near(depths[std::size_t(y) * w + x], t / (2 * c.reach), 3e-5,
-           "GPU surface matches independent material-boundary reference");
+           "GPU surface matches independent material-boundary reference at pixel " + std::to_string(x) + "," + std::to_string(y));
     }
+}
+void patch_traversal(Renderer& renderer) {
+  // Rays cross sample-centre planes, tile seams, partial tiles and many empty
+  // intervals before hitting stepped tops or undersides. The reference scans
+  // every patch independently rather than sharing the shader's traversal.
+  auto stock=Heightmap::box({{-33,-31,0},{37,34,12},true},1);
+  for(int y=0;y<stock.rows();++y) for(int x=0;x<stock.columns();++x) {
+    if(x%11>=3 && y%17>=3) stock.set(x,y,0,0);
+    else stock.set(x,y,(x/13+y/9)%2?4:0,(x/9+y/7)%2?12:8);
+  }
+  Camera c{{2,1.5f,6},{1,0,0},{0,1,0},{0,0,1},{0,0,1},.417f,160,15.337f,11.761f};
+  compare(renderer,stock,c,31,23);
+  for(float pan:{-100.f,-4.27f,31.13f,100.f}) {
+    auto moved=c;moved.pan_x=pan;
+    compare(renderer,stock,moved,31,23);
+  }
+  c.up={0,-1,0};c.toward={0,0,-1};compare(renderer,stock,c,31,23);
+  for(float elevation:{0.f,.025f,.15f}) {
+    const float r=1/std::sqrt(2.f),s=std::sin(elevation),z=std::cos(elevation);
+    c.right={r,-r,0};c.up={-r*s,-r*s,z};c.toward={r*z,r*z,s};
+    compare(renderer,stock,c,31,23);
+  }
 }
 // An analytic bilinear sheet is reproduced exactly between sample centres.
 // Check ray depth against its world-space equation, independent of the shader's
@@ -213,7 +236,7 @@ void profile_sample(Renderer& renderer, const Heightmap& stock, bool along_x) {
   renderer.render(stock,c,1,1);
   near(renderer.read_depth().front(),.5,2e-6,"Compressed groove interpolates physical heights");
 }
-void benchmark(int width = 640, int height = 480) {
+void benchmark(int width = 640, int height = 480, const char* image_prefix = nullptr) {
   using Clock = std::chrono::steady_clock;
   for (double pitch : {.1, .025, .01}) {
     auto stock = Heightmap::box({{0, 0, 0}, {40, 40, 8}, true}, pitch);
@@ -252,6 +275,17 @@ void benchmark(int width = 640, int height = 480) {
               << " resident_bytes=" << renderer.stats().resident_bytes
               << " unchanged_upload_bytes=" << renderer.stats().uploaded_bytes
               << '\n';
+    if (image_prefix) {
+      const auto stem=std::string(image_prefix)+"-"+std::to_string(pitch);
+      const auto pixels=renderer.read_colour();
+      std::ofstream image(stem+".ppm",std::ios::binary);
+      image << "P6\n" << width << ' ' << height << "\n255\n";
+      for(int y=height-1;y>=0;--y) for(int x=0;x<width;++x)
+        image.write(reinterpret_cast<const char*>(pixels.data()+(std::size_t(y)*width+x)*4),3);
+      const auto depths=renderer.read_depth();
+      std::ofstream depth(stem+".depth",std::ios::binary);
+      depth.write(reinterpret_cast<const char*>(depths.data()),depths.size()*sizeof(float));
+    }
     if (pitch == .1) {
       auto lines=std::make_shared<Lines>();
       for (int i=0;i<100000;++i) {
@@ -357,6 +391,7 @@ int main(int argc, char** argv) {
       c={{14,5,3},{1,0,0},{0,-1,0},{0,0,-1},{0,0,-1},4,40,21.3f,18.1f};
       compare_sheet(renderer,sheet,c,1,.03,.05,0,true);
       wall_boundaries(renderer);
+      patch_traversal(renderer);
       // Camera movement and unchanged snapshots must not resend the grid.
       renderer.render(stock, c, 43, 37);
       renderer.render(stock, c, 43, 37);
@@ -473,6 +508,73 @@ int main(int argc, char** argv) {
       check(!renderer.stats().reused_frame,"Moving the cutter invalidates the rendered frame");
       check(renderer.read_colour() != plain,
             "An exposed ball cutter is visible");
+      const auto normal_cutter=renderer.read_colour();
+      Cutter contacting{{0,0,4},.8f,4,true};contacting.fixture_contact=true;
+      renderer.render(block,c,43,37,{},contacting);
+      const auto red_cutter=renderer.read_colour();
+      check(!renderer.stats().reused_frame && red_cutter!=normal_cutter,
+            "Fixture contact alone invalidates the frame and changes the tool colour");
+      int red_pixels=0;
+      for(std::size_t i=0;i<red_cutter.size();i+=4)
+        if(red_cutter[i]>red_cutter[i+1]+40 && red_cutter[i]>red_cutter[i+2]+40) ++red_pixels;
+      check(red_pixels>0,"Contacting cutter renders red pixels");
+      contacting.fixture_contact=false;
+      renderer.render(block,c,43,37,{},contacting);
+      check(renderer.read_colour()==normal_cutter,"Tool returns to its normal colour after contact");
+      check(renderer.stats().mesh_upload_bytes==0,
+            "Contact colour changes retain the cached cutter geometry");
+      {
+        Renderer cached;
+        Heightmap empty;
+        Camera view{{0,0,0},{1,0,0},{0,1,0},{0,0,1},{0,0,1},10,40,21.5f,18.5f};
+        auto geometry=std::make_shared<Mesh>();
+        geometry->triangles={{{-1,-1,5},{1,-1,5},{0,1,5}},
+                             {{2,-1,5},{4,-1,5},{3,1,5}}};
+        MeshDraw draw;draw.source=geometry;draw.colour={1,0,0,1};
+        cached.render(empty,view,43,37,{draw});
+        const auto original=cached.read_colour();
+        check(cached.stats().mesh_upload_bytes==6*6*sizeof(float) && cached.stats().mesh_buffers==1,
+              "Immutable scene geometry uploads one persistent vertex buffer");
+        check(cached.read_depth()[18*43+21]<1,"Mesh-only scenes write GPU depth without stock");
+        cached.render(empty,view,43,37,{draw});
+        check(cached.stats().reused_frame && cached.stats().mesh_upload_bytes==0 && cached.read_colour()==original,
+              "Static model overlays reuse the complete rendered frame");
+        view.pan_x+=3;
+        cached.render(empty,view,43,37,{draw});
+        check(!cached.stats().reused_frame && cached.stats().mesh_upload_bytes==0 && cached.read_colour()!=original,
+              "Camera changes transform cached vertices on the GPU without uploads");
+        view.pan_x-=3;draw.colour={0,1,0,1};
+        cached.render(empty,view,43,37,{draw});
+        check(cached.stats().mesh_upload_bytes==0 && cached.read_colour()!=original,
+              "Face colour and selection changes update uniforms without resending geometry");
+        draw.triangle_count=1;
+        cached.render(empty,view,43,37,{draw});
+        const auto first=cached.read_colour();
+        draw.first_triangle=1;
+        cached.render(empty,view,43,37,{draw});
+        check(cached.stats().mesh_upload_bytes==0 && cached.read_colour()!=first,
+              "CAD face ranges share a single vertex buffer and invalidate the frame correctly");
+        draw.first_triangle=0;draw.triangle_count=2;draw.wireframe=true;
+        cached.render(empty,view,43,37,{draw});
+        check(cached.stats().mesh_upload_bytes==0 && cached.read_colour()!=first,
+              "Wireframe mode uses the retained mesh buffer");
+        draw.wireframe=false;draw.offset.x=1;
+        cached.render(empty,view,43,37,{draw});
+        check(cached.stats().mesh_upload_bytes==0,"Placement changes use uniforms, not new vertices");
+        draw.colour[3]=.4f;cached.render(empty,view,43,37,{draw});
+        const auto translucent=cached.read_colour();
+        cached.render(empty,view,43,37,{draw});
+        check(cached.stats().reused_frame && cached.read_colour()==translucent,
+              "Translucent model frames can also be reused");
+        auto replacement=std::make_shared<Mesh>(*geometry);
+        for(auto& t:replacement->triangles) t.a.y=t.b.y=t.c.y=10;
+        draw.source=replacement;cached.render(empty,view,43,37,{draw});
+        check(!cached.stats().reused_frame && cached.stats().mesh_upload_bytes>0 && cached.stats().mesh_buffers==1,
+              "Replacing geometry uploads its own vertices and releases the previous GPU buffer");
+        cached.render(empty,view,43,37);
+        check(cached.stats().mesh_buffers==0 && cached.stats().mesh_resident_bytes==0,
+              "Hiding or unloading geometry releases unused GPU buffers");
+      }
       // Uniform stock stays compact even at 100 million simulation cells.
       auto huge = Heightmap::box({{0, 0, 0}, {100, 100, 10}, true}, .01);
       c = {{50, 50, 5}, {1, 0, 0}, {0, 1, 0}, {0, 0, 1}, {0, 0, 1},
@@ -490,7 +592,10 @@ int main(int argc, char** argv) {
       glEnable(GL_SCISSOR_TEST);
       glScissor(0, 0, 1, 1);
       renderer.render(block, c, 43, 37);
-      GLint viewport[4];
+      GLint viewport[4],scissor[4];
+      glGetIntegerv(GL_SCISSOR_BOX,scissor);
+      check(scissor[0]==0 && scissor[1]==0 && scissor[2]==1 && scissor[3]==1,
+            "Stock bounds clipping restores the caller's scissor rectangle");
       glGetIntegerv(GL_VIEWPORT, viewport);
       check(viewport[0] == 3 && viewport[1] == 4 && viewport[2] == 23 &&
                 viewport[3] == 27 && glIsEnabled(GL_SCISSOR_TEST),
@@ -506,7 +611,7 @@ int main(int argc, char** argv) {
     if (argc > 1 && std::string(argv[1]) == "--benchmark") {
       int width=argc>2?std::stoi(argv[2]):640,height=argc>3?std::stoi(argv[3]):480;
       check(width>0 && height>0 && width<=16384 && height<=16384,"Invalid benchmark viewport");
-      benchmark(width,height);
+      benchmark(width,height,argc>4?argv[4]:nullptr);
     }
   } catch (const std::exception& e) {
     std::cerr << e.what() << '\n';

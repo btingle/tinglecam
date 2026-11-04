@@ -359,11 +359,13 @@ wave::Paths64 swept_footprint(const LevelPlan& level, double radius) {
 // boundary for the wave planner to propagate along.
 wave::Paths64 stock_after_operation_at_z(
     const wave::Paths64& nominal_stock, double z,
-    const OperationPlan& operation) {
+    const OperationPlan& operation, bool include_above) {
   if (nominal_stock.empty() || !operation.ok()) return nominal_stock;
-  if (operation.stock_after)
-    return Clipper2Lib::Intersect(nominal_stock, *operation.stock_after->slice_shared(z),
-                                  FillRule::NonZero);
+  if (operation.stock_after) {
+    const auto shape=include_above ? operation.stock_after->project_above_shared(z)
+                                   : operation.stock_after->slice_shared(z);
+    return Clipper2Lib::Intersect(nominal_stock, *shape, FillRule::NonZero);
+  }
   wave::Paths64 removed;
   for (const LevelPlan& level : operation.levels) {
     constexpr double kZEpsilon = 1e-9;

@@ -49,8 +49,8 @@ int main(int argc, char** argv) {
       return argv[++i];
     };
     try {
-      if (argument == "--part") app.job.part_mesh = value();
-      else if (argument == "--stock") app.job.stock_mesh = value();
+      if (argument == "--part") app.context().part_mesh = value();
+      else if (argument == "--stock") app.context().stock_mesh = value();
       else if (argument == "--screenshot") screenshot = value();
       else if (argument == "--view") view_name = value();
       else if (argument == "--at") progress_fraction = std::stod(value());
@@ -201,30 +201,30 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "%s\n", error.what());
       return EXIT_FAILURE;
     }
-  } else if (!defer_models && (!app.job.part_mesh.empty() || !app.job.stock_mesh.empty()))
+  } else if (!defer_models && (!app.context().part_mesh.empty() || !app.context().stock_mesh.empty()))
     load_meshes(app);
-  if (!machine_id.empty()) app.job.machine_id = machine_id;
-  if (!material_id.empty()) app.job.material_id = material_id;
-  if (simulation_pitch > 0.0) app.job.simulation_pitch = simulation_pitch;
-  if (rapid_clearance > 0.0) app.job.rapid_clearance_height = rapid_clearance;
+  if (!machine_id.empty()) app.context().machine_id = machine_id;
+  if (!material_id.empty()) app.context().material_id = material_id;
+  if (simulation_pitch > 0.0) app.context().simulation_pitch = simulation_pitch;
+  if (rapid_clearance > 0.0) app.context().rapid_clearance_height = rapid_clearance;
   if (box_stock_uniform) {
     const double margin = *box_stock_uniform;
-    app.job.box_stock = true;
-    app.job.box_stock_margins = {margin, margin, margin, margin, 0.0, 0.0};
+    app.context().box_stock = true;
+    app.context().box_stock_margins = {margin, margin, margin, margin, 0.0, 0.0};
   }
   const auto apply_box_margin = [&](const std::optional<double>& value,
                                     double& target) {
     if (!value) return;
-    app.job.box_stock = true;
+    app.context().box_stock = true;
     target = *value;
   };
-  apply_box_margin(box_margin_minus_x, app.job.box_stock_margins.minus_x);
-  apply_box_margin(box_margin_plus_x, app.job.box_stock_margins.plus_x);
-  apply_box_margin(box_margin_minus_y, app.job.box_stock_margins.minus_y);
-  apply_box_margin(box_margin_plus_y, app.job.box_stock_margins.plus_y);
-  apply_box_margin(box_margin_minus_z, app.job.box_stock_margins.minus_z);
-  apply_box_margin(box_margin_plus_z, app.job.box_stock_margins.plus_z);
-  app.geometry.set_box_stock(app.job.box_stock, app.job.box_stock_margins);
+  apply_box_margin(box_margin_minus_x, app.context().box_stock_margins.minus_x);
+  apply_box_margin(box_margin_plus_x, app.context().box_stock_margins.plus_x);
+  apply_box_margin(box_margin_minus_y, app.context().box_stock_margins.minus_y);
+  apply_box_margin(box_margin_plus_y, app.context().box_stock_margins.plus_y);
+  apply_box_margin(box_margin_minus_z, app.context().box_stock_margins.minus_z);
+  apply_box_margin(box_margin_plus_z, app.context().box_stock_margins.plus_z);
+  app.geometry.set_box_stock(app.context().box_stock, app.context().box_stock_margins);
 
   if (cad_info) {
     const auto& cad=app.geometry.part_cad();
@@ -328,6 +328,8 @@ int main(int argc, char** argv) {
       return EXIT_FAILURE;
     }
     if (profile_planning) {
+      for (const auto& message : plan.debug_messages)
+        std::fprintf(stderr, "debug: %s\n", message.c_str());
       cam::report_plan_memory(plan);
       const cam::PlanningMetrics& m = plan.metrics;
       if (m.surface_samples) {
@@ -489,7 +491,7 @@ int main(int argc, char** argv) {
   int screenshot_delay = 0;
   auto previous_frame = std::chrono::steady_clock::now();
   app.screenshot_mode = screenshot_pending;
-  if (defer_models && (!app.job.part_mesh.empty() || !app.job.stock_mesh.empty()))
+  if (defer_models && (!app.context().part_mesh.empty() || !app.context().stock_mesh.empty()))
     start_model_loading(app, job_in.empty());
   bool startup_loading = app.model_loading;
   bool screenshot_plan_pending = screenshot_pending;

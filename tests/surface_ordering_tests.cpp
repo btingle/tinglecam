@@ -380,6 +380,32 @@ int main(int argc, char** argv) {
     {
       App app;
       app.geometry.load_part(file);
+      // Compare the indexed picker against an independent projection oracle,
+      // including rotated cameras, misses and overlapping native faces.
+      const auto& pick_model=*app.geometry.part_cad();
+      for (float yaw : {0.f,.4f,1.5f,3.f}) {
+        const auto basis=orbit_basis(yaw,.8f);
+        Projection projection{{500,400},{4,3,0},basis.right,basis.up,basis.toward,30};
+        for (int y=0;y<10;++y) for(int x=0;x<10;++x) {
+          ImVec2 mouse{float(350+x*31.17),float(250+y*29.83)};
+          std::optional<std::size_t> expected;
+          float best=-std::numeric_limits<float>::infinity();
+          for (std::size_t i=0;i<pick_model.mesh().triangles.size();++i) {
+            const auto& t=pick_model.mesh().triangles[i];
+            const Vec3 a{t.a.x,t.a.y,t.a.z},b{t.b.x,t.b.y,t.b.z},c{t.c.x,t.c.y,t.c.z};
+            const auto p=projection.point(a),q=projection.point(b),r=projection.point(c);
+            const float det=(q.y-r.y)*(p.x-r.x)+(r.x-q.x)*(p.y-r.y);
+            if(std::abs(det)<1e-8f) continue;
+            const float u=((q.y-r.y)*(mouse.x-r.x)+(r.x-q.x)*(mouse.y-r.y))/det;
+            const float v=((r.y-p.y)*(mouse.x-r.x)+(p.x-r.x)*(mouse.y-r.y))/det;
+            if(u<0 || v<0 || u+v>1) continue;
+            const float depth=u*projection.depth(a)+v*projection.depth(b)+(1-u-v)*projection.depth(c);
+            if(depth>best) {best=depth;expected=pick_model.triangle_faces()[i];}
+          }
+          require(pick_cad_face(app,projection,mouse)==expected,
+                  "Indexed face picking agrees with the projected native surface");
+        }
+      }
       app.tools.tools = {tool};
       app.job.operations = {op};
       app.job.operations[0].surface.order_roots.clear();

@@ -8,6 +8,8 @@ void check_user_settings() {
   const auto file = directory / "settings.json";
   cam::UserSettings settings = cam::default_user_settings();
   settings.ui_scale = 1.35;
+  settings.stock_render_scale = .75;
+  settings.surface_render_scale = .5;
   settings.ui_theme = cam::UiTheme::Ember;
   settings.custom_theme = "Workshop";
   settings.custom_themes = {{"Workshop", cam::UiFont::Mono, "style-bytes"}};
@@ -39,6 +41,8 @@ void check_user_settings() {
                "default cleanup ceiling survives settings persistence");
   require_near(loaded.ui_scale, 1.35, 1e-12,
                "UI scale survives settings persistence");
+  require_near(loaded.stock_render_scale,.75,1e-12,"Stock render resolution survives settings persistence");
+  require_near(loaded.surface_render_scale,.5,1e-12,"Surface render resolution survives settings persistence");
   require(loaded.ui_theme == cam::UiTheme::Ember,
           "UI theme survives settings persistence");
   require(loaded.custom_theme == "Workshop" &&
@@ -70,6 +74,15 @@ void check_user_settings() {
   const cam::UserSettings legacy = cam::load_user_settings(file);
   require_near(legacy.ui_scale, 1.2, 1e-12,
                "settings may omit optional operation defaults");
+  require(legacy.stock_render_scale==0 && legacy.surface_render_scale==1,
+          "Existing settings retain automatic stock and native surface resolution");
+  for(const auto invalid:{R"({"stock_render_scale":-0.1})", R"({"stock_render_scale":1.1})",
+                          R"({"surface_render_scale":0})"}) {
+    bool rejected=false;
+    try {cam::write_file(file,invalid);(void)cam::load_user_settings(file);}
+    catch(const std::exception&) {rejected=true;}
+    require(rejected,"Invalid render resolution is rejected");
+  }
   bool rejected = false;
   try {
     cam::write_file(file, R"({"ui_scale":4.0})");

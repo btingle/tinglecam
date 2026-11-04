@@ -96,7 +96,7 @@ wave::Paths64 stock_exterior_tolerance(const wave::Paths64& stock,
 
 std::vector<DerivedContour> derive_offset_contours(
     const wave::Paths64& sliced_boundaries, double outward_offset,
-    const wave::Paths64* stock_clip) {
+    const wave::Paths64* stock_clip, const wave::Paths64* forbidden_centres) {
   if (sliced_boundaries.empty()) return {};
   wave::Paths64 polygons = Union(sliced_boundaries, FillRule::NonZero);
   const std::int64_t delta = wave::to_integer(outward_offset);
@@ -107,20 +107,23 @@ std::vector<DerivedContour> derive_offset_contours(
   std::vector<DerivedContour> result;
   for (const wave::Path64& ring : polygons) {
     if (ring.size() < 2) continue;
-    if (!stock_clip) {
+    if (!stock_clip && (!forbidden_centres || forbidden_centres->empty())) {
       result.push_back({ring, true});
       continue;
     }
     wave::Path64 open = ring;
     open.push_back(ring.front());
-    Clipper64 clipper;
-    clipper.AddOpenSubject(wave::Paths64{open});
-    clipper.AddClip(*stock_clip);
-    wave::Paths64 closed_solution;
-    wave::Paths64 open_solution;
-    if (!clipper.Execute(ClipType::Intersection, FillRule::NonZero,
-                         closed_solution, open_solution))
-      throw std::runtime_error("Contour clipping failed");
+    wave::Paths64 open_solution{open};
+    const auto clip = [&](const wave::Paths64& region, ClipType type) {
+      Clipper64 clipper;
+      clipper.AddOpenSubject(open_solution); clipper.AddClip(region);
+      wave::Paths64 closed, pieces;
+      if(!clipper.Execute(type,FillRule::NonZero,closed,pieces))
+        throw std::runtime_error("Contour clipping failed");
+      open_solution=std::move(pieces);
+    };
+    if(stock_clip) clip(*stock_clip,ClipType::Intersection);
+    if(forbidden_centres && !forbidden_centres->empty()) clip(*forbidden_centres,ClipType::Difference);
     for (wave::Path64& piece : open_solution) {
       if (piece.size() < 2) continue;
       const bool closed = piece.front() == piece.back();

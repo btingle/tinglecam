@@ -169,9 +169,81 @@ void check_overlapping_surfaces() {
   }
 }
 
+void check_projected_sweeps() {
+  wave::Mesh slope;
+  slope.triangles={{{0,0,0},{12,0,12},{0,12,0}}};
+  slope.bounds={{0,0,0},{12,12,12},true};
+  wave::MeshSlicer slicer(wave::MeshSlicerBackend::CPU);slicer.set_mesh(slope);
+  const auto point=[&](double x,double y,double z,double radius) {
+    return slicer.projected_sweep_clear({x,y,z},{x,y,z},z,radius);
+  };
+  require(point(4,2,6,.9),"Sweeps must clip sloping fixture triangles at the requested height");
+  require(!point(5,2,6,1),"Exact tangency with fixture clearance must be rejected");
+  require(!point(7,2,6,.1),"A centre inside the projected surface is blocked");
+  require(point(7,7,6,.9),"Broad-phase box overlap alone does not prove contact");
+  require(!point(7,6,6,.9),"Disc clearance must include diagonal fixture edges");
+  require(slicer.projected_sweep_clear({-2,10,6},{14,10,6},6,.1),"Sweeps outside the clipped triangle are clear");
+  require(!slicer.projected_sweep_clear({-2,4,6},{14,4,6},6,.1),"A crossing between clear endpoints must be blocked");
+  require(slicer.projected_sweep_clear({-2,4,13},{14,4,13},13,1),"A sweep above the fixture is clear");
+
+  wave::Mesh wall;wall.triangles={{{0,0,0},{0,12,0},{0,0,12}}};
+  wall.bounds={{0,0,0},{0,12,12},true};
+  wave::MeshSlicer vertical(wave::MeshSlicerBackend::CPU);vertical.set_mesh(wall);
+  require(!vertical.projected_sweep_clear({.5,3,2},{.5,3,2},2,1),"Thin vertical fixtures remain obstacles");
+  require(vertical.projected_sweep_clear({2,3,2},{2,3,2},2,1),"Thin fixtures do not block unrelated nearby space");
+
+  // An independent polygon oracle checks all cube orientations and translated
+  // placements. Skip only the small boundary band affected by integer rounding.
+  std::vector<wave::ModelOrientation> orientations(1);
+  for(std::size_t i=0;i<orientations.size();++i) for(int axis=0;axis<3;++axis) {
+    auto next=orientations[i];next.quarter_turn(axis,1);
+    if(std::find(orientations.begin(),orientations.end(),next)==orientations.end()) orientations.push_back(next);
+  }
+  std::mt19937 random(4271);
+  std::uniform_real_distribution<double> coordinate(-15,15),height(-13,13);
+  std::size_t checked=0,blocked=0;
+  for(const auto orientation:orientations) {
+    const wave::ModelTransform placement{orientation,{21,-13,7}};
+    const auto placed=slicer.placed(placement);
+    for(int i=0;i<60;++i) {
+      const wave::Vec3d a{21+coordinate(random),-13+coordinate(random),0};
+      const wave::Vec3d b{21+coordinate(random),-13+coordinate(random),0};
+      const float z=float(7+height(random));
+      const auto region=placed.slice(z,32).polygons;
+      const auto reference=[&](double radius) {
+        const auto obstacles=Clipper2Lib::InflatePaths(region,wave::to_integer(radius),
+            Clipper2Lib::JoinType::Round,Clipper2Lib::EndType::Polygon);
+        Clipper2Lib::Clipper64 clipper;
+        clipper.AddOpenSubject({{{wave::to_integer(a.x),wave::to_integer(a.y)},
+                                 {wave::to_integer(b.x),wave::to_integer(b.y)}}});
+        clipper.AddClip(obstacles);
+        wave::Paths64 closed,open;
+        require(clipper.Execute(Clipper2Lib::ClipType::Intersection,Clipper2Lib::FillRule::NonZero,closed,open),
+                "Fixture reference clipping succeeds");
+        return open.empty();
+      };
+      const bool small=reference(.48),large=reference(.52);
+      if(small!=large) continue;
+      // A zero-area projection has no polygon oracle; covered separately above.
+      if(region.empty() && !placed.projected_sweep_clear(a,b,z,.5)) continue;
+      const bool clear=placed.projected_sweep_clear(a,b,z,.5);
+      require(clear==small,"Indexed fixture sweeps must match the independent outline oracle");
+      ++checked;if(!clear) ++blocked;
+    }
+  }
+  require(checked>1000 && blocked>40,"Fixture oracle exercises both blocked and clear sweeps across placements");
+  wave::MeshSlicer concurrent(wave::MeshSlicerBackend::CPU);concurrent.set_mesh(slope);
+  std::vector<std::future<bool>> queries;
+  for(int i=0;i<8;++i) queries.push_back(std::async(std::launch::async,[&] {
+    return !concurrent.projected_sweep_clear({-2,4,6},{14,4,6},6,.1);
+  }));
+  for(auto& query:queries) require(query.get(),"Shared fixture sweep acceleration supports concurrent queries");
+}
+
 int main(int argc, char** argv) {
   try {
     const bool expect_cpu = argc == 2 && std::string(argv[1]) == "--expect-cpu";
+    check_projected_sweeps();
     check_overlapping_surfaces();
     check_backend(wave::MeshSlicerBackend::CPU);
     check_backend(wave::MeshSlicerBackend::Default, expect_cpu);

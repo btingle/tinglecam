@@ -22,6 +22,7 @@ void angles_from_direction(const Vec3& direction, float current_yaw,
 }
 
 std::unique_ptr<wave::heightfield::Renderer> heightmap_view;
+std::unique_ptr<wave::heightfield::Renderer> setup_view, surface_depth_view;
 
 // A convex piece to paint, as a run of points in a shared pool. A frame builds
 // tens of thousands of these, so they carry an offset rather than a vector of
@@ -150,63 +151,6 @@ void append_slab(std::vector<Facet>& facets, std::vector<ImVec2>& pool,
     outline.fill = 0;
     outline.edge = edge;
     facets.push_back(outline);
-  }
-}
-
-// A loaded model as the triangles it was given, rather than as the stack of
-// prisms a slicer sees it as. Sampling the mesh at a fixed set of depths put a
-// staircase on every curved face and littered the flat ones with the hairline
-// slivers two independently decimated slices differ by -- neither of which is
-// in the model. Nothing in this view is a plan, so nothing here has any reason
-// to look at the models through a slicer.
-//
-// Faces turned away from the eye are dropped. Every model loaded here is a
-// closed solid wound outward, so those are exactly the faces the rest of the
-// solid stands in front of.
-void append_mesh(std::vector<Facet>& facets, std::vector<ImVec2>& pool,
-                 const wave::Mesh& mesh, const Projection& projection,
-                 const Vec3& light, const float colour[3], int alpha,
-                 bool wireframe) {
-  facets.reserve(facets.size() + mesh.triangles.size() / 2);
-  pool.reserve(pool.size() + mesh.triangles.size() * 3 / 2);
-  for (const wave::Triangle3f& triangle : mesh.triangles) {
-    const Vec3 corners[3]{{triangle.a.x, triangle.a.y, triangle.a.z},
-                          {triangle.b.x, triangle.b.y, triangle.b.z},
-                          {triangle.c.x, triangle.c.y, triangle.c.z}};
-    const Vec3 u{corners[1].x - corners[0].x, corners[1].y - corners[0].y,
-                 corners[1].z - corners[0].z};
-    const Vec3 v{corners[2].x - corners[0].x, corners[2].y - corners[0].y,
-                 corners[2].z - corners[0].z};
-    Vec3 normal{u.y * v.z - u.z * v.y, u.z * v.x - u.x * v.z,
-                u.x * v.y - u.y * v.x};
-    const float length = std::sqrt(normal.x * normal.x + normal.y * normal.y +
-                                   normal.z * normal.z);
-    if (length < 1e-12f) continue;  // degenerate, and it has no normal to shade
-    normal = {normal.x / length, normal.y / length, normal.z / length};
-    // Back faces are dropped from a solid because the rest of it stands in
-    // front of them. A wireframe has no front to stand in the way, and the far
-    // side of the model is exactly what it is being asked for.
-    if (!wireframe &&
-        normal.x * projection.toward.x + normal.y * projection.toward.y +
-            normal.z * projection.toward.z <= 0.0f)
-      continue;
-
-    Facet facet;
-    facet.first = static_cast<std::uint32_t>(pool.size());
-    facet.count = 3;
-    float depth = 0.0f;
-    for (const Vec3& corner : corners) {
-      pool.push_back(projection.point(corner));
-      depth += projection.depth(corner);
-    }
-    facet.depth = depth / 3.0f;
-    const ImU32 shade = shaded_alpha(colour,
-                                     normal.x * light.x + normal.y * light.y +
-                                         normal.z * light.z,
-                                     alpha);
-    facet.fill = wireframe ? 0 : shade;
-    facet.edge = wireframe ? shade : 0;
-    facets.push_back(facet);
   }
 }
 
@@ -359,10 +303,6 @@ void paint_facets(ImDrawList* list, std::vector<Facet>& facets,
   list->Flags = saved_flags;
 }
 
-void paint_scene(OrbitScene& scene) {
-  paint_facets(scene.list, scene.facets, scene.pool);
-}
-
 // A triad at the program origin, drawn over the scene rather than into it.
 // It is a statement about the coordinates, not a thing standing in the work, so
 // it should not be able to go behind the work and disappear -- the one moment
@@ -377,9 +317,9 @@ void draw_origin_gizmo(const App& app, const OrbitScene& scene) {
   // Where the program's zero sits, in the model's own coordinates. The job
   // carries the offset added to every posted coordinate, which is the negative
   // of the point it is measured from.
-  const Vec3 at{static_cast<float>(-app.job.origin_x),
-                static_cast<float>(-app.job.origin_y),
-                static_cast<float>(-app.job.origin_z)};
+  const Vec3 at{static_cast<float>(-app.effective_context().origin_x),
+                static_cast<float>(-app.effective_context().origin_y),
+                static_cast<float>(-app.effective_context().origin_z)};
   const float reach = 46.0f / projection.scale;
   const ImVec2 centre = projection.point(at);
 

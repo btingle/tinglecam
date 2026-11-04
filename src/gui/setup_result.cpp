@@ -1,5 +1,6 @@
 #include "gui_internal.h"
 #include "cam/heightmap_simulation.h"
+#include "wave/cpu_bvh.h"
 namespace tinglecam_gui {
 // ---------------------------------------------------------------------------
 // What a dimension-driven operation will take out of the work: the prism
@@ -35,6 +36,7 @@ std::vector<CutVolume> cut_volumes(const App& app) {
   std::vector<CutVolume> volumes;
   for (std::size_t i = 0; i < app.job.operations.size(); ++i) {
     const cam::Operation& operation = app.job.operations[i];
+    if(!app.job.setups.empty() && operation.setup_id!=app.job.setups.at(app.selected_setup).id) continue;
     if (!cam::is_parametric(operation.mode)) continue;
     const bool selected = static_cast<int>(i) == app.selected_operation;
     // Half-typed dimensions are normal while a field is being edited, and the
@@ -135,25 +137,91 @@ void append_cut_volumes(const std::vector<CutVolume>& volumes,
 
 // The Z range the operation will actually cut, so the depth range being set can
 // be seen against the models rather than read off two numbers.
-// Orthographic ray picking shares the exact projection used for display.
-std::optional<std::size_t> pick_cad_face(const cam::CadModel& cad,
-    const Projection& projection, ImVec2 mouse) {
+// Display geometry and native face ranges are immutable for a placed CAD model.
+// Selection changes only per-draw colours, never vertex buffers.
+struct SetupCadDisplay {
+  struct FaceRange { std::size_t face, first, count; };
+  std::shared_ptr<const cam::CadModel> model;
+  std::shared_ptr<const wave::Mesh> mesh;
+  std::vector<FaceRange> ranges;
+  wave::cpu::Bvh picking;
+  bool indexed = false;
+};
+SetupCadDisplay& cad_display(App& app) {
+  const auto& cad=app.geometry.part_cad();
+  if (!app.setup_cad_display || app.setup_cad_display->model != cad) {
+    auto display=std::make_shared<SetupCadDisplay>();
+    display->model=cad;
+    display->mesh=std::shared_ptr<const wave::Mesh>(cad,&cad->mesh());
+    const auto& faces=cad->triangle_faces();
+    for (std::size_t i=0;i<faces.size();) {
+      const auto first=i, face=faces[i];
+      while (i<faces.size() && faces[i]==face) ++i;
+      display->ranges.push_back({face,first,i-first});
+    }
+    app.setup_cad_display=std::move(display);
+  }
+  return *app.setup_cad_display;
+}
+
+// Use a spatial index for face picking, rather than projecting every triangle
+// again for each mouse event. The precise barycentric test stays in screen space.
+std::optional<std::size_t> pick_cad_face(App& app, const Projection& projection, ImVec2 mouse) {
+  auto& display=cad_display(app);
+  const auto& mesh=*display.mesh;
+  if (!display.indexed) {
+    std::vector<wave::cpu::Box> boxes;
+    boxes.reserve(mesh.triangles.size());
+    for (const auto& triangle : mesh.triangles) boxes.push_back(wave::cpu::bounds(triangle));
+    display.picking.build(boxes); display.indexed=true;
+  }
   std::optional<std::size_t> face;
-  float best = -std::numeric_limits<float>::infinity();
-  const auto& mesh = cad.mesh();
-  for (std::size_t i=0;i<mesh.triangles.size();++i) {
+  float best=-std::numeric_limits<float>::infinity();
+  const auto& bounds=mesh.bounds;
+  const float dx=(bounds.lower.x+bounds.upper.x)*.5f-projection.model_centre.x,
+              dy=(bounds.lower.y+bounds.upper.y)*.5f-projection.model_centre.y,
+              dz=(bounds.lower.z+bounds.upper.z)*.5f-projection.model_centre.z;
+  const float reach=std::sqrt(dx*dx+dy*dy+dz*dz)+
+      std::max({bounds.upper.x-bounds.lower.x,bounds.upper.y-bounds.lower.y,bounds.upper.z-bounds.lower.z,1.f})*4;
+  const float x=(mouse.x-projection.centre.x)/projection.scale,
+              y=-(mouse.y-projection.centre.y)/projection.scale;
+  wave::cpu::Ray ray;
+  ray.origin={projection.model_centre.x+projection.right.x*x+projection.up.x*y+projection.toward.x*reach,
+              projection.model_centre.y+projection.right.y*x+projection.up.y*y+projection.toward.y*reach,
+              projection.model_centre.z+projection.right.z*x+projection.up.z*y+projection.toward.z*reach};
+  ray.direction={-projection.toward.x,-projection.toward.y,-projection.toward.z}; ray.max=reach*2;
+  display.picking.query([&](const auto& box) {return wave::cpu::intersects(box,ray);}, [&](std::size_t i) {
     const auto& t=mesh.triangles[i];
     const Vec3 a{t.a.x,t.a.y,t.a.z},b{t.b.x,t.b.y,t.b.z},c{t.c.x,t.c.y,t.c.z};
     const auto p=projection.point(a),q=projection.point(b),r=projection.point(c);
     const float det=(q.y-r.y)*(p.x-r.x)+(r.x-q.x)*(p.y-r.y);
-    if(std::abs(det)<1e-8f) continue;
+    if (std::abs(det)<1e-8f) return true;
     const float u=((q.y-r.y)*(mouse.x-r.x)+(r.x-q.x)*(mouse.y-r.y))/det;
     const float v=((r.y-p.y)*(mouse.x-r.x)+(p.x-r.x)*(mouse.y-r.y))/det;
-    if(u<0||v<0||u+v>1) continue;
+    if (u<0 || v<0 || u+v>1) return true;
     const float depth=u*projection.depth(a)+v*projection.depth(b)+(1-u-v)*projection.depth(c);
-    if(depth>best) {best=depth;face=cad.triangle_faces()[i];}
-  }
+    if (depth>best) {best=depth;face=display.model->triangle_faces()[i];}
+    return true;
+  });
   return face;
+}
+
+std::shared_ptr<const wave::Mesh> cached_box_mesh(std::shared_ptr<const wave::Mesh>& cached,
+                                                 wave::Bounds3f bounds) {
+  const auto same=[](auto a,auto b) {return a.x==b.x && a.y==b.y && a.z==b.z;};
+  if (cached && same(cached->bounds.lower,bounds.lower) && same(cached->bounds.upper,bounds.upper)) return cached;
+  auto mesh=std::make_shared<wave::Mesh>(); mesh->bounds=bounds;
+  const auto a=bounds.lower,b=bounds.upper;
+  const wave::Vec3f p[]{{a.x,a.y,a.z},{b.x,a.y,a.z},{b.x,b.y,a.z},{a.x,b.y,a.z},
+                        {a.x,a.y,b.z},{b.x,a.y,b.z},{b.x,b.y,b.z},{a.x,b.y,b.z}};
+  const int faces[][3]{{0,2,1},{0,3,2},{4,5,6},{4,6,7},{0,1,5},{0,5,4},
+                       {1,2,6},{1,6,5},{2,3,7},{2,7,6},{3,0,4},{3,4,7}};
+  for (const auto& f:faces) mesh->triangles.push_back({p[f[0]],p[f[1]],p[f[2]]});
+  return cached=std::move(mesh);
+}
+wave::heightfield::MeshDraw model_draw(std::shared_ptr<const wave::Mesh> source,
+                                     std::array<float,4> colour, bool wireframe) {
+  return {nullptr,{},colour,wireframe,std::move(source)};
 }
 
 void draw_setup(App& app) {
@@ -196,6 +264,11 @@ void draw_setup(App& app) {
                                            app.setup_models == ModelShow::Both);
   // A rectangular blank has no mesh behind it; it is drawn as its prism.
   const bool boxed = app.geometry.box_stock();
+  const auto inherited=app.geometry.inherited_stock();
+  if(inherited!=app.setup_stock_display_source) {
+    app.setup_stock_display=inherited?std::make_shared<const wave::Mesh>(inherited->display_mesh()):nullptr;
+    app.setup_stock_display_source=inherited;
+  }
   const wave::Paths64 box =
       boxed ? app.geometry.stock_outline(low, operation ? operation->slice_grid : 32)
             : wave::Paths64{};
@@ -227,8 +300,14 @@ void draw_setup(App& app) {
         cover(bounds.left, bounds.top, bounds.right, bounds.bottom);
       }
     } else {
-      cover_mesh(app.geometry.stock().mesh());
+      cover_mesh(inherited?*app.setup_stock_display:app.geometry.stock().mesh());
     }
+  }
+  const double work_low=low, work_high=high;
+  for(const auto& f:app.geometry.fixtures()) {
+    cover_mesh(f.geometry.mesh());
+    low=std::min(low,double(f.geometry.mesh().bounds.lower.z));
+    high=std::max(high,double(f.geometry.mesh().bounds.upper.z));
   }
   for (const CutVolume& volume : volumes) {
     if (volume.rings.empty()) continue;
@@ -247,7 +326,7 @@ void draw_setup(App& app) {
   const bool selecting =
       operation && operation->mode == cam::OperationMode::SurfaceFinishing && cad;
   const auto hovered_face = selecting && scene.hovered && !app.orbit.cube_pressed
-      ? pick_cad_face(*cad, scene.projection, ImGui::GetIO().MousePos)
+      ? pick_cad_face(app, scene.projection, ImGui::GetIO().MousePos)
       : std::optional<std::size_t>{};
   const auto drag = ImGui::GetMouseDragDelta(ImGuiMouseButton_Left);
   if (hovered_face && !operation->surface.manual_order && !app.planner.running() &&
@@ -259,47 +338,61 @@ void draw_setup(App& app) {
     if (found == selection.faces.end()) selection.faces.push_back(*hovered_face);
     else selection.faces.erase(found);
   }
-  // Both bodies whole, the stock see-through when both are on.
+  std::vector<wave::heightfield::MeshDraw> models;
   if (draw_part) {
-    const float colour[3]{0.42f, 0.60f, 0.80f};
     if (selecting) {
-      wave::Mesh normal, selected, hover;
-      const auto& selection = operation->surface;
-      for (std::size_t i = 0; i < cad->mesh().triangles.size(); ++i) {
-        const auto id = cad->triangle_faces()[i];
-        auto* target = hovered_face && id == *hovered_face ? &hover
-            : (selection.model_fingerprint == cad->fingerprint() &&
-                       std::find(selection.faces.begin(), selection.faces.end(), id) !=
-                           selection.faces.end()
-                   ? &selected : &normal);
-        target->triangles.push_back(cad->mesh().triangles[i]);
+      const auto& display=cad_display(app);
+      const auto& selection=operation->surface;
+      for (const auto& range:display.ranges) {
+        auto colour=std::array<float,4>{.42f,.60f,.80f,1};
+        if (hovered_face && range.face==*hovered_face) colour={.95f,.7f,.25f,1};
+        else if (selection.model_fingerprint==cad->fingerprint() &&
+                 std::find(selection.faces.begin(),selection.faces.end(),range.face)!=selection.faces.end())
+          colour={.2f,.85f,.5f,1};
+        auto draw=model_draw(display.mesh,colour,app.wireframe);
+        draw.first_triangle=range.first; draw.triangle_count=range.count;
+        if (!models.empty() && models.back().source==draw.source && models.back().colour==draw.colour &&
+            models.back().first_triangle+models.back().triangle_count==draw.first_triangle)
+          models.back().triangle_count+=draw.triangle_count;
+        else models.push_back(std::move(draw));
       }
-      const float selected_colour[3]{0.2f, 0.85f, 0.5f}, hover_colour[3]{0.95f, 0.7f, 0.25f};
-      append_mesh(scene.facets, scene.pool, normal, scene.projection, scene.light, colour, 255, app.wireframe);
-      append_mesh(scene.facets, scene.pool, selected, scene.projection, scene.light, selected_colour, 255, app.wireframe);
-      append_mesh(scene.facets, scene.pool, hover, scene.projection, scene.light, hover_colour, 255, app.wireframe);
-    } else {
-      append_mesh(scene.facets, scene.pool, app.geometry.part().mesh(), scene.projection,
-                  scene.light, colour, app.wireframe ? 190 : 255, app.wireframe);
-    }
+    } else models.push_back(model_draw(cad?cad_display(app).mesh:app.geometry.part().shared_mesh(),
+                                       {.42f,.60f,.80f,app.wireframe?.75f:1.f},app.wireframe));
   }
   if (draw_stock) {
-    const float colour[3]{0.34f, 0.38f, 0.45f};
-    const int alpha = app.wireframe ? 150 : (draw_part ? 90 : 255);
-    if (boxed) {
-      const wave::Paths64 rings = drawable_region(box, scene.spacing);
-      if (!rings.empty()) {
-        const float face[3]{0.40f, 0.44f, 0.52f};
-        append_slab(scene.facets, scene.pool, rings, fill_mesh(rings, nullptr), rings, low,
-                    high, scene.projection, scene.light, colour, face,
-                    IM_COL32(160, 180, 205, 70), alpha, app.wireframe);
-      }
-    } else {
-      append_mesh(scene.facets, scene.pool, app.geometry.stock().mesh(), scene.projection,
-                  scene.light, colour, alpha, app.wireframe);
-    }
+    std::shared_ptr<const wave::Mesh> stock;
+    if (boxed && !box.empty()) {
+      const auto b=Clipper2Lib::GetBounds(box);
+      stock=cached_box_mesh(app.setup_box_display,
+          {{float(wave::to_world(b.left)),float(wave::to_world(b.top)),float(work_low)},
+           {float(wave::to_world(b.right)),float(wave::to_world(b.bottom)),float(work_high)},true});
+    } else stock=inherited?app.setup_stock_display:app.geometry.stock().shared_mesh();
+    if (stock) models.push_back(model_draw(stock,{.34f,.38f,.45f,app.wireframe?.59f:draw_part?.35f:1.f},app.wireframe));
   }
-  paint_scene(scene);
+  for (const auto& fixture:app.geometry.fixtures()) {
+    const bool clamp=fixture.model.role==cam::SetupContext::ProtectedModel::Role::Fixture;
+    models.push_back(model_draw(fixture.geometry.shared_mesh(),
+        {clamp?.75f:.9f,clamp?.35f:.65f,.18f,.75f},app.wireframe));
+  }
+  try {
+    if (!setup_view) setup_view=std::make_unique<wave::heightfield::Renderer>();
+    const auto vec=[](Vec3 v) {return wave::Vec3f{v.x,v.y,v.z};};
+    const auto dpi=ImGui::GetIO().DisplayFramebufferScale;
+    const float pixels=float(app.settings.surface_render_scale)*std::max({1.f,dpi.x,dpi.y});
+    const float span=std::max({float(wave::to_world(extent.Width())),float(wave::to_world(extent.Height())),float(high-low),.001f});
+    const auto& p=scene.projection;
+    wave::heightfield::Camera camera{vec(p.model_centre),vec(p.right),vec(p.up),vec(p.toward),vec(scene.light),
+        p.scale*pixels,span*4,(p.centre.x-scene.top_left.x)*pixels,(p.centre.y-scene.top_left.y)*pixels,
+        canvas_colours(app).background_rgba};
+    static const wave::Heightmap empty;
+    const auto texture=setup_view->render(empty,camera,int(std::ceil(scene.size.x*pixels)),
+                                          int(std::ceil(scene.size.y*pixels)),models);
+    scene.list->AddImage(static_cast<ImTextureID>(texture),scene.top_left,
+        {scene.top_left.x+scene.size.x,scene.top_left.y+scene.size.y},{0,1},{1,0});
+  } catch (const std::exception& e) {
+    setup_view.reset();
+    scene.list->AddText(scene.top_left,ImGui::GetColorU32(severity_colour(app,LogSeverity::Error)),e.what());
+  }
   if (selecting && operation->surface.manual_order) {
     refresh_surface_contours(app, *operation);
     draw_surface_contours(app, scene, *operation);
@@ -320,10 +413,10 @@ void draw_setup(App& app) {
 
   const CanvasColours colours = canvas_colours(app);
   char caption[260];
-  const double oz = app.job.origin_z;
+  const double oz = app.effective_context().origin_z;
   std::snprintf(caption, sizeof caption,
                 "Work Z %.2f to %.2f mm   Drag: orbit   Right-drag: pan   Wheel: zoom",
-                low + oz, high + oz);
+                work_low + oz, work_high + oz);
   view_caption(app, scene.list, scene.top_left, scene.size, 0, colours.caption, caption);
   if (operation && operation->mode == cam::OperationMode::SurfaceFinishing) {
     view_caption(app, scene.list, scene.top_left, scene.size, 1,
@@ -336,8 +429,8 @@ void draw_setup(App& app) {
   } else if (operation && (operation->mode == cam::OperationMode::Roughing ||
                            operation->mode == cam::OperationMode::ContourFinishing)) {
     std::snprintf(caption, sizeof caption, "%s cuts Z %.2f down to %.2f mm",
-                  operation->name.c_str(), cam::z_at_depth(high, operation->depth_from) + oz,
-                  cam::z_at_depth(high, operation->depth_to) + oz);
+                  operation->name.c_str(), cam::z_at_depth(work_high, operation->depth_from) + oz,
+                  cam::z_at_depth(work_high, operation->depth_to) + oz);
     view_caption(app, scene.list, scene.top_left, scene.size, 1,
                  ImGui::GetColorU32(severity_colour(app, LogSeverity::Info)), caption);
   }
@@ -485,7 +578,7 @@ void draw_result(App& app) {
       wave::to_integer(map.lower_y() + map.rows() * map.pitch())};
   double lowest = map.lowest(), highest = map.highest();
   const double material_lowest = lowest, material_highest = highest;
-  const cam::Machine* machine = app.machines.find(app.job.machine_id);
+  const cam::Machine* machine = app.machines.find(app.effective_context().machine_id);
   const double maximum_feed = machine ? cam::rapid_feed(*machine) : 1e12;
   prepare_result_preview(app, planned_operation, app.tools.find(planned_operation.tool_id), maximum_feed);
   const auto& motion_bounds = app.result_preview.motion_bounds;
@@ -525,7 +618,15 @@ void draw_result(App& app) {
     if (!heightmap_view) heightmap_view = std::make_unique<wave::heightfield::Renderer>();
     const auto vec = [](Vec3 v) { return wave::Vec3f{v.x, v.y, v.z}; };
     const auto framebuffer_scale = ImGui::GetIO().DisplayFramebufferScale;
-    const float pixel_scale = std::max({1.f, framebuffer_scale.x, framebuffer_scale.y});
+    // Start at half Setup's pixel density. Bound ray work on large/high-DPI
+    // canvases as well: doubling the window size must not quadruple ray cost.
+    const bool automatic=app.settings.stock_render_scale==0;
+    const float density=automatic ? .5f : float(app.settings.stock_render_scale);
+    float pixel_scale = density * std::max({1.f, framebuffer_scale.x, framebuffer_scale.y});
+    constexpr double max_result_pixels = 1024. * 1024.;
+    const double pixels = double(size.x) * size.y * pixel_scale * pixel_scale;
+    if (automatic && pixels > max_result_pixels)
+      pixel_scale *= float(std::sqrt(max_result_pixels / pixels));
     wave::heightfield::Camera camera{vec(projection.model_centre), vec(projection.right),
                                      vec(projection.up), vec(projection.toward), vec(light),
                                      projection.scale * pixel_scale, float(span * 4),
@@ -533,31 +634,24 @@ void draw_result(App& app) {
                                      (projection.centre.y - top_left.y) * pixel_scale,
                                      colours.background_rgba};
     std::vector<wave::heightfield::MeshDraw> models;
-    wave::Mesh box;
     const bool want_part = app.result_models == ModelShow::Part ||
                            app.result_models == ModelShow::Both;
     const bool want_stock = app.result_models == ModelShow::Stock ||
                             app.result_models == ModelShow::Both;
     if (want_part && app.geometry.has_part())
-      models.push_back({&app.geometry.part().mesh(), {}, {.82f, .62f, .34f, .37f}, app.wireframe});
+      models.push_back(model_draw(app.geometry.part().shared_mesh(), {.82f, .62f, .34f, .37f}, app.wireframe));
     if (want_stock) {
-      if (!app.geometry.box_stock() && app.geometry.has_stock()) {
-        models.push_back({&app.geometry.stock().mesh(), {}, {.34f, .38f, .45f, .22f},
-                          app.wireframe});
+      if (!app.geometry.box_stock() && app.geometry.has_stock() && !app.geometry.inherited_stock()) {
+        models.push_back(model_draw(app.geometry.stock().shared_mesh(), {.34f,.38f,.45f,.22f},app.wireframe));
       } else {
-        const float x0 = map.lower_x(), y0 = map.lower_y();
-        const float x1 = x0 + map.columns() * map.pitch();
-        const float y1 = y0 + map.rows() * map.pitch();
-        const float z0 = map.lowest(), z1 = map.highest();
-        const wave::Vec3f points[]{{x0, y0, z0}, {x1, y0, z0}, {x1, y1, z0}, {x0, y1, z0},
-                                   {x0, y0, z1}, {x1, y0, z1}, {x1, y1, z1}, {x0, y1, z1}};
-        const int faces[][3]{{0, 2, 1}, {0, 3, 2}, {4, 5, 6}, {4, 6, 7}, {0, 1, 5}, {0, 5, 4},
-                             {1, 2, 6}, {1, 6, 5}, {2, 3, 7}, {2, 7, 6}, {3, 0, 4}, {3, 4, 7}};
-        for (const auto& f : faces)
-          box.triangles.push_back({points[f[0]], points[f[1]], points[f[2]]});
-        models.push_back({&box, {}, {.34f, .38f, .45f, .22f}, app.wireframe});
+        models.push_back(model_draw(cached_box_mesh(app.result_box_display,
+            {{float(map.lower_x()),float(map.lower_y()),float(map.lowest())},
+             {float(map.lower_x()+map.columns()*map.pitch()),float(map.lower_y()+map.rows()*map.pitch()),float(map.highest())},true}),
+            {.34f,.38f,.45f,.22f},app.wireframe));
       }
     }
+    for(const auto& f:app.geometry.fixtures())
+      models.push_back(model_draw(f.geometry.shared_mesh(),{.8f,.35f,.15f,.65f},app.wireframe));
     wave::heightfield::Cutter cutter;
     if (cutter_cursor && active_tool)
       cutter = {{float(wave::to_world(cutter_cursor->position.x)),
@@ -565,7 +659,8 @@ void draw_result(App& app) {
                 float(active_tool->diameter / 2), float(active_tool->flute_length),
                 active_tool->type == cam::ToolType::BallEndMill,
                 active_tool->type==cam::ToolType::Drill?float(cam::drill_tip_height(*active_tool)):0,
-                active_tool->type==cam::ToolType::Drill?float(active_tool->tip_flat_diameter/2):0};
+                active_tool->type==cam::ToolType::Drill?float(active_tool->tip_flat_diameter/2):0,
+                cutter_cursor->fixture_contact};
     const auto texture = heightmap_view->render(*shown, camera,
                                                 int(std::ceil(size.x * pixel_scale)),
                                                 int(std::ceil(size.y * pixel_scale)), models,
@@ -588,7 +683,7 @@ void draw_result(App& app) {
   view_cube(app, list, top_left, size, hovered);
 
   char caption[200];
-  const double oz = app.job.origin_z;
+  const double oz = app.effective_context().origin_z;
   if (planned_operation.subdivisions.size() > 1)
     std::snprintf(caption, sizeof caption,
                   "%zu layers (%zu coarse + upward cleanup), Z %.2f to %.2f mm",

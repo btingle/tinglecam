@@ -184,6 +184,7 @@ add_library(tinglecam_core
   src/cam/hole_config.cpp
   src/cam/auto_pockets.cpp
   src/cam/feeds.cpp
+  src/cam/setups.cpp
   src/cam/job_geometry.cpp
   src/cam/job_planning.cpp
   src/cam/job_range.cpp
@@ -261,6 +262,8 @@ target_include_directories(tinglecam_app_ui PUBLIC src)
 
 add_executable(tinglecam src/apps/tinglecam_main.cpp)
 target_link_libraries(tinglecam PRIVATE tinglecam_app_ui)
+add_executable(scene_rendering_benchmark EXCLUDE_FROM_ALL tools/benchmarks/scene_rendering.cpp)
+target_link_libraries(scene_rendering_benchmark PRIVATE tinglecam_app_ui)
 if(TARGET SDL2::SDL2main)
   target_link_libraries(tinglecam PRIVATE SDL2::SDL2main)
 endif()
@@ -325,10 +328,13 @@ add_test(NAME demo_analysis_dump
 add_executable(heightmap_renderer_tests tests/heightmap_renderer_tests.cpp)
 target_link_libraries(heightmap_renderer_tests PRIVATE heightmap_rendering SDL2::SDL2 OpenGL::GL)
 add_test(NAME heightmap_renderer_tests COMMAND heightmap_renderer_tests)
+add_executable(scene_rendering_tests tests/scene_rendering_tests.cpp)
+target_link_libraries(scene_rendering_tests PRIVATE tinglecam_app_ui)
+add_test(NAME scene_rendering_tests COMMAND scene_rendering_tests)
 # Exercise the portable GLSL path on Mesa rather than relying on CUDA/GL
 # interop or an NVIDIA GL driver in the test environment.
 if(UNIX AND NOT APPLE)
-  set_tests_properties(heightmap_renderer_tests PROPERTIES
+  set_tests_properties(heightmap_renderer_tests scene_rendering_tests PROPERTIES
     ENVIRONMENT "SDL_VIDEODRIVER=offscreen;LIBGL_ALWAYS_SOFTWARE=1;MESA_GL_VERSION_OVERRIDE=3.2;MESA_GLSL_VERSION_OVERRIDE=150")
 endif()
 
@@ -389,3 +395,12 @@ add_test(NAME wave_reuse_tests COMMAND wave_reuse_tests)
 add_executable(stock_dilation_tests tests/stock_dilation_tests.cpp)
 target_link_libraries(stock_dilation_tests PRIVATE tinglecam_core)
 add_test(NAME stock_dilation_tests COMMAND stock_dilation_tests)
+
+add_executable(setup_tests tests/setup_tests.cpp)
+target_link_libraries(setup_tests PRIVATE tinglecam_core)
+add_test(NAME setup_tests COMMAND setup_tests)
+
+add_executable(setup_ui_tests tests/setup_ui_tests.cpp)
+target_link_libraries(setup_ui_tests PRIVATE tinglecam_app_ui)
+add_test(NAME setup_ui_tests COMMAND setup_ui_tests)
+set_tests_properties(setup_ui_tests PROPERTIES TIMEOUT 15)

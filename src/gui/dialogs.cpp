@@ -95,8 +95,12 @@ void write_job(App& app, const std::filesystem::path& destination) {
         std::filesystem::absolute(model), directory, error);
     return error ? std::filesystem::absolute(model) : relative;
   };
-  saved.part_mesh = relative_to_job(saved.part_mesh);
-  saved.stock_mesh = relative_to_job(saved.stock_mesh);
+  const auto relative_context=[&](cam::SetupContext& c) {
+    c.part_mesh=relative_to_job(c.part_mesh); c.stock_mesh=relative_to_job(c.stock_mesh);
+    for(auto& f:c.fixtures) f.mesh=relative_to_job(f.mesh);
+  };
+  relative_context(saved);
+  for(auto& setup:saved.setups) relative_context(setup);
   cam::save_job(destination, saved);
   app.job_file = destination;
   mark_job_saved(app);
@@ -340,10 +344,12 @@ void new_job(App& app) {
     app.planner.stop();
     app.surface_previewer.stop();
     app.hole_detector.stop();app.hole_detection_id.clear();
+    app.selected_setup=0;
     app.job = cam::Job{};
     app.geometry = cam::JobGeometry{};
     app.job_file.clear();
     adopt_default_setup(app);
+    cam::ensure_setup_ids(app.job);
     app.operation_selection.clear();
     invalidate_plan(app);
     select_operation(app, 0);
@@ -413,8 +419,8 @@ void request_quit(App& app) {
 }
 
 void choose_part_model(App& app) {
-  const auto directory = app.job.part_mesh.empty()
-      ? job_directory(app) : std::filesystem::absolute(app.job.part_mesh).parent_path();
+  const auto directory = app.context().part_mesh.empty()
+      ? job_directory(app) : std::filesystem::absolute(app.context().part_mesh).parent_path();
   open_file_dialog(app, "Part model", {".obj", ".stl", ".step", ".stp"}, false,
                    directory, "", [&app](const std::filesystem::path& file) {
     load_model(app, file, true);
@@ -422,10 +428,10 @@ void choose_part_model(App& app) {
 }
 
 void choose_stock_model(App& app) {
-  const auto directory = app.job.stock_mesh.empty()
-      ? (app.job.part_mesh.empty() ? job_directory(app)
-                                   : std::filesystem::absolute(app.job.part_mesh).parent_path())
-      : std::filesystem::absolute(app.job.stock_mesh).parent_path();
+  const auto directory = app.context().stock_mesh.empty()
+      ? (app.context().part_mesh.empty() ? job_directory(app)
+                                   : std::filesystem::absolute(app.context().part_mesh).parent_path())
+      : std::filesystem::absolute(app.context().stock_mesh).parent_path();
   open_file_dialog(app, "Stock model", {".obj", ".stl", ".step", ".stp"}, false,
                    directory, "", [&app](const std::filesystem::path& file) {
     load_model(app, file, false);

@@ -78,8 +78,14 @@ wave::Point64 interpolate_arc(const MotionPhase& phase, double t) {
   const double y = wave::to_world(phase.from.y);
   const double radius = std::hypot(x - cx, y - cy);
   const double start = std::atan2(y - cy, x - cx);
-  const double angle = start + (phase.clockwise ? -1.0 : 1.0) *
-                                   2.0 * std::acos(-1.0) * t;
+  double sweep = (phase.clockwise ? -1.0 : 1.0) * 2.0 * std::acos(-1.0);
+  if (phase.from != phase.to) {
+    sweep = std::atan2(wave::to_world(phase.to.y) - cy,
+                       wave::to_world(phase.to.x) - cx) - start;
+    if (phase.clockwise && sweep >= 0) sweep -= 2.0 * std::acos(-1.0);
+    if (!phase.clockwise && sweep <= 0) sweep += 2.0 * std::acos(-1.0);
+  }
+  const double angle = start + sweep * t;
   return {wave::to_integer(cx + radius * std::cos(angle)),
           wave::to_integer(cy + radius * std::sin(angle))};
 }
@@ -481,6 +487,10 @@ double feed_seconds_to(const FeedSchedule& schedule, double distance) {
 
 MotionCursor feed_motion_at_seconds(const FeedSchedule& schedule,
                                     double seconds) {
+  const auto contact_at = [](const MotionPhase& phase, double t) {
+    return std::any_of(phase.fixture_contacts.begin(), phase.fixture_contacts.end(),
+                       [t](const auto& contact) { return t >= contact.begin && t <= contact.end; });
+  };
   MotionCursor cursor;
   if (schedule.motion.empty()) return cursor;
   if (!(seconds > 0.0)) {
@@ -490,6 +500,7 @@ MotionCursor feed_motion_at_seconds(const FeedSchedule& schedule,
     cursor.path_distance = phase.path_distance_begin;
     cursor.kind = phase.kind;
     cursor.rapid = phase.rapid;
+    cursor.fixture_contact = contact_at(phase, 0);
     cursor.rate = phase.rate;
     cursor.engagement = phase.engagement;
     cursor.phase_length = phase.length;
@@ -525,6 +536,7 @@ MotionCursor feed_motion_at_seconds(const FeedSchedule& schedule,
           (phase.path_distance_end - phase.path_distance_begin) * t;
       cursor.kind = phase.kind;
       cursor.rapid = phase.rapid;
+      cursor.fixture_contact = contact_at(phase, t);
       cursor.rate = phase.rate;
       cursor.engagement = phase.engagement;
       cursor.phase_distance = phase.length * t;
@@ -544,6 +556,7 @@ MotionCursor feed_motion_at_seconds(const FeedSchedule& schedule,
   cursor.path_distance = phase.path_distance_end;
   cursor.kind = phase.kind;
   cursor.rapid = phase.rapid;
+  cursor.fixture_contact = contact_at(phase, 1);
   cursor.rate = phase.rate;
   cursor.engagement = phase.engagement;
   cursor.phase_distance = phase.length;

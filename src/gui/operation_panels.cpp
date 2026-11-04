@@ -4,7 +4,7 @@ namespace {
 
 // A depth below the work top, shown as a program Z.
 bool prop_depth(App& app, const char* label, double& depth, const char* help) {
-  const double offset = work_top(app) + app.job.origin_z;
+  const double offset = work_top(app) + app.effective_context().origin_z;
   double z = offset - depth;
   if (!prop_double(label, z, 0.1f, "%.3f mm", help)) return false;
   depth = offset - z;
@@ -33,7 +33,7 @@ void depth_breaks(App& app, cam::Operation& operation) {
   for (std::size_t i = 0; i < operation.depth_breaks.size(); ++i) {
     ImGui::PushID(static_cast<int>(i));
     property_label(i == 0 ? "Depth breaks" : "");
-    const double offset = work_top(app) + app.job.origin_z;
+    const double offset = work_top(app) + app.effective_context().origin_z;
     double z = offset - operation.depth_breaks[i];
     const float button = ImGui::GetFrameHeight();
     ImGui::SetNextItemWidth(-(button + ImGui::GetStyle().ItemSpacing.x));
@@ -67,7 +67,7 @@ void depth_breaks(App& app, cam::Operation& operation) {
 }
 
 void pockets_section(App& app, cam::Operation& operation) {
-  const double ox = app.job.origin_x, oy = app.job.origin_y, oz = app.job.origin_z;
+  const double ox = app.effective_context().origin_x, oy = app.effective_context().origin_y, oz = app.effective_context().origin_z;
   if (begin_properties("pocket-common")) {
     prop_double("Radial margin", operation.pocket_radial_margin, 0.02f, "%.3f mm",
                 "Stock left on the walls for a finishing pass. Negative cuts past "
@@ -148,15 +148,15 @@ void pockets_section(App& app, cam::Operation& operation) {
   if (remove >= 0) operation.pockets.erase(operation.pockets.begin() + remove);
   if (ImGui::Button("Add pocket")) {
     cam::PocketParameters pocket;
-    pocket.center_x = -app.job.origin_x;
-    pocket.center_y = -app.job.origin_y;
-    pocket.top_z = -app.job.origin_z;
+    pocket.center_x = -app.effective_context().origin_x;
+    pocket.center_y = -app.effective_context().origin_y;
+    pocket.top_z = -app.effective_context().origin_z;
     operation.pockets.push_back(pocket);
   }
 }
 
 void areas_section(App& app, cam::Operation& operation) {
-  const double ox = app.job.origin_x, oy = app.job.origin_y, oz = app.job.origin_z;
+  const double ox = app.effective_context().origin_x, oy = app.effective_context().origin_y, oz = app.effective_context().origin_z;
   auto& areas = operation.plane.areas;
   if (areas.empty()) areas.push_back(cam::ClearingArea{});
   int remove = -1;
@@ -180,9 +180,9 @@ void areas_section(App& app, cam::Operation& operation) {
   if (remove >= 0) areas.erase(areas.begin() + remove);
   if (ImGui::Button("Add area")) {
     cam::ClearingArea area;
-    area.center_x = -app.job.origin_x;
-    area.center_y = -app.job.origin_y;
-    area.top_z = -app.job.origin_z;
+    area.center_x = -app.effective_context().origin_x;
+    area.center_y = -app.effective_context().origin_y;
+    area.top_z = -app.effective_context().origin_z;
     areas.push_back(area);
   }
 }
@@ -264,9 +264,9 @@ void surface_section(App& app, cam::Operation& operation) {
 }
 
 void feeds_section(App& app, cam::Operation& operation, const cam::Tool* tool) {
-  const cam::Machine* machine = app.machines.find(app.job.machine_id);
-  const cam::Material* material = app.materials.find(app.job.material_id);
-  const cam::CuttingData* data = tool ? tool->cutting_for(app.job.material_id) : nullptr;
+  const cam::Machine* machine = app.machines.find(app.effective_context().machine_id);
+  const cam::Material* material = app.materials.find(app.effective_context().material_id);
+  const cam::CuttingData* data = tool ? tool->cutting_for(app.effective_context().material_id) : nullptr;
   if (!tool) {
     ImGui::TextDisabled("Choose a tool first.");
     return;
@@ -275,7 +275,7 @@ void feeds_section(App& app, cam::Operation& operation, const cam::Tool* tool) {
                           operation.cutting.plunge_feed;
   if (data) {
     ImGui::TextDisabled("From %s in %s", tool->name.c_str(),
-                        material ? material->name.c_str() : app.job.material_id.c_str());
+                        material ? material->name.c_str() : app.effective_context().material_id.c_str());
   } else if (overridden) {
     ImGui::TextDisabled("Set on this operation; %s has no data for %s", tool->name.c_str(),
                         material ? material->name.c_str() : "the job material");
@@ -285,7 +285,7 @@ void feeds_section(App& app, cam::Operation& operation, const cam::Tool* tool) {
                        material ? material->name.c_str() : "the job material");
     if (ImGui::SmallButton("Add it to the tool")) {
       app.builder_tool = *tool;
-      app.builder_tool.cutting.push_back({app.job.material_id});
+      app.builder_tool.cutting.push_back({app.effective_context().material_id});
       app.builder_is_new = false;
       app.builder_open = true;
     }
@@ -309,7 +309,7 @@ void feeds_section(App& app, cam::Operation& operation, const cam::Tool* tool) {
   if (machine) {
     try {
       const cam::CuttingFeeds feeds = cam::resolve_cutting_feeds(
-          *tool, *machine, app.job.material_id, operation.cutting);
+          *tool, *machine, app.effective_context().material_id, operation.cutting);
       ImGui::TextDisabled("Full engagement %.0f mm/min, light cuts up to %.0f",
                           feeds.full_feed(), feeds.travel_feed());
       if (feeds.full_feed() >= feeds.maximum_feed)
@@ -504,6 +504,7 @@ void operation_panel(App& app) {
 void start_plan(App& app, int first, int last) {
   if (app.model_loading || app.hole_detector.running()) return;
   poll_hole_detection(app);
+  cam::ensure_setup_ids(app.job);
   const int count = static_cast<int>(app.job.operations.size());
   if (count == 0) return;
   first = std::clamp(first, 0, count - 1);
@@ -568,9 +569,13 @@ void take_plan_result(App& app, cam::PartialPlan produced, bool screenshot) {
   app.plan.rapid_plane = produced.rapid_plane;
   cam::summarise_job(app.plan);
   for (const auto& operation : app.plan.operations)
-    if (operation.planned && operation.ok())
+    if (operation.planned && operation.ok()) {
       log_warnings(app, operation.operation_name.c_str(), operation.warnings);
+      for (const auto& message : operation.debug_messages)
+        log_message(app, LogSeverity::Debug, operation.operation_name, message);
+    }
   refresh_plan_states(app);
+  refresh_inherited_stock(app);
   select_operation(app, app.selected_operation);
   app.view.needs_fit = true;
   app.material.clear();
@@ -590,10 +595,13 @@ void take_plan_result(App& app, cam::PartialPlan produced, bool screenshot) {
 }
 
 bool plannable(const App& app, const cam::Operation& operation) {
-  if (operation.mode == cam::OperationMode::SurfaceFinishing)
-    return app.geometry.part_cad() && app.geometry.has_stock();
-  return cam::is_parametric(operation.mode) ||
-         (app.geometry.has_part() && app.geometry.has_stock());
+  if(cam::is_parametric(operation.mode)) return true;
+  if(app.job.setups.empty()) return app.geometry.has_part() && app.geometry.has_stock();
+  try {
+    const auto c=cam::resolve_setup_context(app.job,operation.setup_id);
+    return !c.part_mesh.empty() && (c.box_stock || !c.stock_mesh.empty() || !c.stock_from_operation.empty()) &&
+        (operation.mode!=cam::OperationMode::SurfaceFinishing || cam::step_filename(c.part_mesh));
+  } catch(const std::exception&) {return false;}
 }
 
 namespace {
@@ -640,8 +648,8 @@ void plan_buttons(App& app) {
   const int selected = std::clamp(app.selected_operation, 0,
                                   static_cast<int>(app.job.operations.size()) - 1);
   const std::vector<std::size_t> chosen = selected_operation_indices(app);
-  const int chosen_first = static_cast<int>(chosen.front());
-  const int chosen_last = static_cast<int>(chosen.back());
+  const int chosen_first = chosen.empty()?0:static_cast<int>(chosen.front());
+  const int chosen_last = chosen.empty()?0:static_cast<int>(chosen.back());
   const int last = static_cast<int>(app.job.operations.size()) - 1;
   // Planning one on its own is only meaningful when everything above it has a
   // result to hand it stock.
@@ -650,8 +658,8 @@ void plan_buttons(App& app) {
     if (!app.plan.operations[i].planned) { missing = i; break; }
   const int upto_from = first_out_of_date(app, selected);
   const int all_from = first_out_of_date(app, last);
-  const bool can_checked = missing < 0 && plannable_range(app, chosen_first, chosen_last);
-  const bool can_upto = upto_from >= 0 && plannable_range(app, upto_from, selected);
+  const bool can_checked = !chosen.empty() && missing < 0 && plannable_range(app, chosen_first, chosen_last);
+  const bool can_upto = app.selected_operation>=0 && upto_from >= 0 && plannable_range(app, upto_from, selected);
   const bool can_all = all_from >= 0 && plannable_range(app, all_from, last);
   const bool any_checked = std::any_of(app.operation_selection.begin(),
                                        app.operation_selection.end(),

@@ -141,6 +141,24 @@ int main(int argc, char** argv) {
           "Native collision checks use the rotated solid");
     check(rotated_model->cutter_clear({4, 2, 2}, .5, 2, .01),
           "Space outside the rotated solid is clear");
+    const auto held=file.parent_path()/"held-source.step";
+    std::filesystem::rename(file,held);
+    const ModelTransform placement{orientation,{2,3,4}};
+    const auto placed_model=original_model->placed(placement);
+    std::filesystem::rename(held,file);
+    check(placed_model->source_identity()==original_model->source_identity(),
+          "STEP placement shares native source geometry without reading its file");
+    check(placed_model==original_model->placed(placement),
+          "Equal native placements reuse their derived query view");
+    for(const auto& face:original_model->faces()) {
+      const auto point=original_model->evaluate(face.id,.3,.7);
+      const auto actual=placed_model->evaluate(face.id,.3,.7);
+      near(wave::distance(actual.point,placement.apply(point.point)),0,1e-9,
+           "Native STEP queries include setup translation");
+    }
+    check(surface_contour_signature(*placed_model,Operation{},Tool{})!=
+              surface_contour_signature(*rotated_model,Operation{},Tool{}),
+          "Translation invalidates native contour preview caches");
     bool load_cancelled = false;
     try {
       geometry.load_part(file, [](double fraction, const std::string&) {

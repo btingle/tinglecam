@@ -196,7 +196,7 @@ bool resolve_floors(const Operation& operation, const OperationSetup& setup,
 void finish_job(JobPlan& plan);
 wave::Paths64 stock_after_operation_at_z(
     const wave::Paths64& nominal_stock, double z,
-    const OperationPlan& operation);
+    const OperationPlan& operation, bool include_above = false);
 void append_inter_layer(wave::InterLayerTopology& into,
                         wave::InterLayerTopology from,
                         std::size_t layer_offset);

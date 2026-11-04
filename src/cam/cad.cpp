@@ -11,6 +11,7 @@
 #include <iomanip>
 #include <limits>
 #include <mutex>
+#include <map>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -65,6 +66,9 @@ bool step_filename(const std::filesystem::path& path) {
   return extension == ".step" || extension == ".stp";
 }
 struct CadModel::Impl {
+  std::shared_ptr<Impl> source;
+  mutable std::mutex placements_mutex;
+  mutable std::map<std::pair<std::array<int,3>,std::array<double,3>>,std::weak_ptr<CadModel>> placements;
   wave::Mesh mesh;
   std::vector<std::size_t> triangle_faces;
   std::vector<CadFace> faces;
@@ -140,7 +144,7 @@ struct CadModel::Impl {
   bool boundary_clear(const TopoDS_Shape& query, double clearance) const;
 #endif
 };
-CadModel::CadModel() : impl_(std::make_unique<Impl>()) {}
+CadModel::CadModel() : impl_(std::make_shared<Impl>()) {}
 CadModel::~CadModel() = default;
 const wave::Mesh& CadModel::mesh() const { return impl_->mesh; }
 const std::vector<std::size_t>& CadModel::triangle_faces() const {
@@ -311,21 +315,8 @@ std::shared_ptr<CadModel> CadModel::load(const std::filesystem::path& path,
       throw std::runtime_error("Could not import STEP: " + path.string());
     auto model = std::shared_ptr<CadModel>(new CadModel);
     auto& data = *model->impl_;
-    data.orientation = orientation;
     data.shape = reader.OneShape();
     if (data.shape.IsNull()) throw std::runtime_error("STEP contains no shape");
-    if (orientation != ModelOrientation{}) {
-      double matrix[3][3]{};
-      for (int row = 0; row < 3; ++row) {
-        const int a = orientation.axes[row];
-        matrix[row][std::abs(a) - 1] = a < 0 ? -1 : 1;
-      }
-      gp_Trsf transform;
-      transform.SetValues(matrix[0][0], matrix[0][1], matrix[0][2], 0,
-                          matrix[1][0], matrix[1][1], matrix[1][2], 0,
-                          matrix[2][0], matrix[2][1], matrix[2][2], 0);
-      data.shape = data.shape.Moved(TopLoc_Location(transform));
-    }
     for (TopExp_Explorer solids(data.shape, TopAbs_SOLID); solids.More();
          solids.Next())
       data.solids.push_back(TopoDS::Solid(solids.Current()));
@@ -452,11 +443,63 @@ std::shared_ptr<CadModel> CadModel::load(const std::filesystem::path& path,
     text << std::hex << hash;
     data.fingerprint = text.str();
     report(1, "STEP model ready");
-    return model;
+    return orientation == ModelOrientation{} ? model : model->placed({orientation, {}});
   } catch (const Standard_Failure& failure) {
     throw std::runtime_error(std::string("STEP import failed: ") +
                              failure.GetMessageString());
   }
+#endif
+}
+const void* CadModel::source_identity() const {
+  return impl_->source ? impl_->source.get() : impl_.get();
+}
+std::shared_ptr<CadModel> CadModel::placed(const ModelTransform& placement) const {
+  placement.validate();
+#ifndef TINGLECAM_HAVE_OCCT
+  throw std::runtime_error("STEP support is unavailable");
+#else
+  const auto source = impl_->source ? impl_->source : impl_;
+  const auto key=std::pair{placement.orientation.axes,placement.offset};
+  std::lock_guard lock(source->placements_mutex);
+  if(auto found=source->placements.find(key);found!=source->placements.end())
+    if(auto cached=found->second.lock()) return cached;
+  auto result = std::shared_ptr<CadModel>(new CadModel);
+  auto& data = *result->impl_;
+  data.source=source;
+  data.orientation=placement.orientation;
+  data.mesh=source->mesh;
+  const auto point = [&](wave::Vec3f p) {
+    const auto q=placement.apply(wave::Vec3d{p.x,p.y,p.z});
+    return wave::Vec3f{float(q.x),float(q.y),float(q.z)};
+  };
+  for(auto& t:data.mesh.triangles) {t.a=point(t.a);t.b=point(t.b);t.c=point(t.c);}
+  const auto a=point(data.mesh.bounds.lower), b=point(data.mesh.bounds.upper);
+  data.mesh.bounds.lower={std::min(a.x,b.x),std::min(a.y,b.y),std::min(a.z,b.z)};
+  data.mesh.bounds.upper={std::max(a.x,b.x),std::max(a.y,b.y),std::max(a.z,b.z)};
+  data.triangle_faces=source->triangle_faces; data.faces=source->faces;
+  data.fingerprint=source->fingerprint; data.solid=source->solid;
+  data.adjacent_faces=source->adjacent_faces; data.domains=source->domains;
+  double matrix[3][3]{};
+  for(int i=0;i<3;++i) {const int a=placement.orientation.axes[i];matrix[i][std::abs(a)-1]=a<0?-1:1;}
+  gp_Trsf transform;
+  transform.SetValues(matrix[0][0],matrix[0][1],matrix[0][2],placement.offset[0],
+                      matrix[1][0],matrix[1][1],matrix[1][2],placement.offset[1],
+                      matrix[2][0],matrix[2][1],matrix[2][2],placement.offset[2]);
+  const TopLoc_Location location(transform);
+  data.shape=source->shape.Moved(location);
+  if(!source->loose_geometry.IsNull()) {
+    data.loose_geometry=source->loose_geometry.Moved(location);
+    data.loose_bounds=source->loose_bounds.Transformed(transform);
+  }
+  for(const auto& solid:source->solids) data.solids.push_back(TopoDS::Solid(solid.Moved(location)));
+  for(std::size_t i=0;i<source->native_faces.size();++i) {
+    data.native_faces.push_back(TopoDS::Face(source->native_faces[i].Moved(location)));
+    Impl::CollisionFace collision;
+    collision.bounds=source->collision_faces[i].bounds.Transformed(transform);
+    data.collision_faces.push_back(std::move(collision));
+  }
+  source->placements[key]=result;
+  return result;
 #endif
 }
 SurfacePoint CadModel::evaluate(std::size_t index, double u, double v) const {

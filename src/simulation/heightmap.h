@@ -7,14 +7,12 @@
 #include <memory>
 #include <mutex>
 #include <vector>
+#include <utility>
 
 #include "wave/mesh_slicer.h"
 
 namespace wave {
 
-struct Vec3d {
-  double x = 0, y = 0, z = 0;
-};
 enum class CutterShape { Flat, Ball, Drill };
 struct MillingCutter {
   CutterShape shape = CutterShape::Flat;
@@ -66,7 +64,7 @@ class Heightmap {
       std::shared_ptr<const Paths64> polygon;
     };
     std::mutex mutex;
-    std::map<double, std::shared_ptr<Entry>> polygons;
+    std::map<std::pair<double, bool>, std::shared_ptr<Entry>> polygons;
     std::size_t conversions = 0;
   };
   struct MemoryUsage {
@@ -78,6 +76,8 @@ class Heightmap {
                                  double top, double pitch);
   static Heightmap from_mesh(const Mesh& mesh, double pitch);
   static Heightmap box(const Bounds3f& bounds, double pitch);
+  // Exact grid remapping; never meshes or resamples remaining material.
+  Heightmap transformed(const ModelTransform&) const;
   bool empty() const { return columns_ == 0 || rows_ == 0; }
   int columns() const { return columns_; }
   int rows() const { return rows_; }
@@ -98,6 +98,10 @@ class Heightmap {
   // Occupied grid cells at a depth, unioned into ordinary Clipper polygons.
   Paths64 slice(double z) const;
   std::shared_ptr<const Paths64> slice_shared(double z) const;
+  // XY projection of all material above Z, including columns whose underside
+  // is above the plane. Roughing needs this envelope rather than a section.
+  Paths64 project_above(double z) const;
+  std::shared_ptr<const Paths64> project_above_shared(double z) const;
   std::size_t slice_conversions() const;
   static MemoryUsage memory_usage(const std::vector<const Heightmap*>&);
   Paths64 footprint() const;
@@ -135,7 +139,9 @@ class Heightmap {
   double lowest_ = std::numeric_limits<double>::infinity();
   double x_ = 0, y_ = 0, pitch_ = 0.05;
   int columns_ = 0, rows_ = 0, tile_columns_ = 0;
-  Paths64 outlines(double z, bool all) const;
+  enum class Outline { Section, Above, Footprint };
+  Paths64 outlines(double z, Outline) const;
+  std::shared_ptr<const Paths64> outline_shared(double z, bool above) const;
   template <class Function>
   bool visit_sweep(Vec3d, Vec3d, double, Function) const;
 };

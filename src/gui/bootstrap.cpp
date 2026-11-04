@@ -74,6 +74,7 @@ void bootstrap(App& app) {
     say(app, error.what(), true);
   }
   adopt_default_setup(app);
+  cam::ensure_setup_ids(app.job);
   mark_job_saved(app);
 }
 

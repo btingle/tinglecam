@@ -2,7 +2,6 @@
 #include <bit>
 namespace cam {
 using namespace detail;
-using namespace detail;
 const char* operation_mode_name(OperationMode value) {
   switch (value) {
     case OperationMode::Roughing: return "roughing";
@@ -15,108 +14,163 @@ const char* operation_mode_name(OperationMode value) {
   return "unknown";
 }
 
-namespace {
-wave::Mesh oriented_mesh(const std::filesystem::path& file,
-                         const std::shared_ptr<CadModel>& cad,
-                         const ModelOrientation& orientation) {
-  auto mesh = cad ? cad->mesh() : wave::load_triangle_mesh(file);
-  if (!cad) {
-    const auto a = orientation.apply(mesh.bounds.lower);
-    const auto b = orientation.apply(mesh.bounds.upper);
-    mesh.bounds.lower = {std::min(a.x, b.x), std::min(a.y, b.y), std::min(a.z, b.z)};
-    mesh.bounds.upper = {std::max(a.x, b.x), std::max(a.y, b.y), std::max(a.z, b.z)};
-    for (auto& triangle : mesh.triangles) {
-      triangle.a = orientation.apply(triangle.a);
-      triangle.b = orientation.apply(triangle.b);
-      triangle.c = orientation.apply(triangle.c);
-    }
-  }
-  return mesh;
-}
-
-wave::MeshSlicer positioned_stock(wave::Mesh mesh,
-                                  const std::array<double, 3>& offset) {
-  for (double value : offset)
-    if (!std::isfinite(value)) throw std::invalid_argument("Stock offsets must be finite");
-  const auto translated = [&](wave::Vec3f p) {
-    return wave::Vec3f{float(double(p.x) + offset[0]),
-                       float(double(p.y) + offset[1]),
-                       float(double(p.z) + offset[2])};
+struct JobGeometry::ModelLibrary {
+  struct Asset {
+    std::filesystem::file_time_type modified{};
+    std::uintmax_t size=0;
+    wave::MeshSlicer geometry;
+    std::shared_ptr<CadModel> cad;
   };
-  const double limit = double(Clipper2Lib::MAX_COORD) / wave::kIntegerScale;
-  for (const auto p : {mesh.bounds.lower, mesh.bounds.upper}) {
-    const double coordinates[]{double(p.x) + offset[0], double(p.y) + offset[1],
-                               double(p.z) + offset[2]};
-    for (double value : coordinates)
-      if (!std::isfinite(value) || std::abs(value) > limit)
-        throw std::invalid_argument("Stock position exceeds the geometry coordinate range");
+  std::mutex mutex;
+  std::map<std::filesystem::path,Asset> assets;
+  Asset read(const std::filesystem::path& file,const ModelLoadProgress& progress) {
+    const auto key=std::filesystem::absolute(file).lexically_normal();
+    std::error_code ec;
+    const auto modified=std::filesystem::last_write_time(key,ec);
+    const auto size=ec?0:std::filesystem::file_size(key,ec);
+    std::lock_guard lock(mutex);
+    auto found=assets.find(key);
+    if(found!=assets.end() && (ec || (found->second.modified==modified && found->second.size==size)))
+      return found->second;
+    Asset asset;
+    asset.modified=modified; asset.size=size;
+    asset.cad=step_filename(file)?CadModel::load(file,.01,[&](double f,const std::string& stage) {
+      return !progress || progress(.85*f,stage);
+    }):nullptr;
+    if(progress && !progress(.9,"Preparing source geometry")) throw std::runtime_error("Cancelled");
+    asset.geometry.set_mesh(asset.cad?asset.cad->mesh():wave::load_triangle_mesh(file));
+    assets.insert_or_assign(key,asset);
+    return asset;
   }
-  mesh.bounds.lower = translated(mesh.bounds.lower);
-  mesh.bounds.upper = translated(mesh.bounds.upper);
-  for (auto& triangle : mesh.triangles) {
-    triangle.a = translated(triangle.a);
-    triangle.b = translated(triangle.b);
-    triangle.c = translated(triangle.c);
-  }
-  wave::MeshSlicer result;
-  result.set_mesh(std::move(mesh));
-  return result;
-}
-}  // namespace
+};
+
+JobGeometry::JobGeometry() : library_(std::make_shared<ModelLibrary>()) {}
 
 void JobGeometry::load_part(const std::filesystem::path& file,
                             const ModelLoadProgress& progress,
                             const ModelOrientation& orientation) {
   orientation.validate();
-  const auto report = [&](double f, const std::string& stage) {
-    if (progress && !progress(f, stage)) throw std::runtime_error("Cancelled");
-    return true;
-  };
-  report(0, "Reading part model");
-  auto cad = step_filename(file) ? CadModel::load(file, .01,
-      [&](double f, const std::string& stage) { return report(.9 * f, stage); }, orientation) : nullptr;
-  report(.9, "Preparing part mesh");
-  wave::MeshSlicer imported;
-  imported.set_mesh(oriented_mesh(file, cad, orientation));
-  report(1, "Part model ready");
-  part_ = std::move(imported);
-  part_cad_ = std::move(cad);
-  part_orientation_ = orientation;
-  part_slices_.clear();
-  box_.clear();
+  if(!library_) library_=std::make_shared<ModelLibrary>();
+  auto source=library_->read(file,progress);
+  auto placed=source.geometry.placed({orientation,{}});
+  auto cad=source.cad?source.cad->placed({orientation,{}}):nullptr;
+  if(progress && !progress(1,"Part model ready")) throw std::runtime_error("Cancelled");
+  part_=std::move(placed); part_source_cad_=std::move(source.cad);
+  part_cad_=std::move(cad); part_orientation_=orientation;
+  part_slices_.clear(); box_.clear();
 }
-
 void JobGeometry::load_stock(const std::filesystem::path& file,
-                            const ModelLoadProgress& progress,
-                            const ModelOrientation& orientation,
-                            const std::array<double, 3>& offset) {
-  orientation.validate();
-  const auto report = [&](double f, const std::string& stage) {
-    if (progress && !progress(f, stage)) throw std::runtime_error("Cancelled");
-    return true;
+                             const ModelLoadProgress& progress,
+                             const ModelOrientation& orientation,
+                             const std::array<double,3>& offset) {
+  if(!library_) library_=std::make_shared<ModelLibrary>();
+  auto source=library_->read(file,progress);
+  auto placed=source.geometry.placed({orientation,offset});
+  if(progress && !progress(1,"Stock model ready")) throw std::runtime_error("Cancelled");
+  stock_=std::move(placed); inherited_stock_.reset(); stock_slices_.clear();
+}
+void JobGeometry::place_models_from(const JobGeometry& source,bool part,bool stock,
+                                    const ModelTransform& part_placement,
+                                    const ModelTransform& stock_placement) {
+  std::scoped_lock lock(slices_,source.slices_);
+  library_=source.library_; fixtures_=source.fixtures_; fixture_slices_=source.fixture_slices_;
+  if(part) {part_=source.part_;part_source_cad_=source.part_source_cad_;set_part_placement(part_placement);}
+  if(stock) {stock_=source.stock_;set_stock_placement(stock_placement);}
+}
+void JobGeometry::set_part_placement(const ModelTransform& placement) {
+  auto placed=part_.placed(placement);
+  auto cad=part_source_cad_?part_source_cad_->placed(placement):nullptr;
+  part_=std::move(placed); part_cad_=std::move(cad); part_orientation_=placement.orientation;
+  part_slices_.clear(); box_.clear();
+}
+void JobGeometry::set_stock_placement(const ModelTransform& placement) {
+  stock_=stock_.placed(placement); stock_slices_.clear();
+}
+void JobGeometry::set_inherited_stock(std::shared_ptr<const wave::Heightmap> stock) {
+  inherited_stock_=std::move(stock); inherited_slices_.clear();
+}
+void JobGeometry::configure(const SetupContext& context,const ModelLoadProgress& progress) {
+  const bool part=!context.part_mesh.empty();
+  const bool stock=context.stock_from_operation.empty() && !context.stock_mesh.empty();
+  const int count=int(part)+int(stock)+int(context.fixtures.size());
+  int completed=0;
+  const auto report=[&](double f,const std::string& stage) {
+    return !progress || progress((completed+f)/std::max(1,count),stage);
   };
-  report(0, "Reading stock model");
-  auto cad = step_filename(file) ? CadModel::load(file, .01,
-      [&](double f, const std::string& stage) { return report(.9 * f, stage); }, orientation) : nullptr;
-  report(.9, "Preparing stock mesh");
-  auto imported = positioned_stock(oriented_mesh(file, cad, orientation), offset);
-  report(1, "Stock model ready");
-  stock_ = std::move(imported);
-  stock_slices_.clear();
+  if(part) {
+    load_part(context.part_mesh,report,context.part_orientation);
+    set_part_placement({context.part_orientation,{context.part_offset_x,context.part_offset_y,context.part_offset_z}});
+    ++completed;
+  } else {part_.clear();part_cad_.reset();part_source_cad_.reset();part_slices_.clear();}
+  clear_stock();
+  if(stock) {
+    load_stock(context.stock_mesh,report,context.stock_orientation,
+        {context.stock_offset_x,context.stock_offset_y,context.stock_offset_z});
+    ++completed;
+  }
+  set_box_stock(context.stock_from_operation.empty() && context.box_stock,context.box_stock_margins);
+  fixtures_.clear();fixture_slices_.clear();
+  for(const auto& fixture:context.fixtures) {
+    if(!std::isfinite(fixture.clearance) || fixture.clearance<0)
+      throw std::invalid_argument("Fixture clearance must be finite and nonnegative");
+    auto source=library_->read(fixture.mesh,report);
+    fixtures_.push_back({fixture,source.geometry.placed(fixture.placement)});
+    ++completed;
+  }
+  if(progress && !progress(1,"Setup models ready")) throw std::runtime_error("Cancelled");
+}
+JobGeometry JobGeometry::context_view(const SetupContext& context,const ModelLoadProgress& progress) const {
+  JobGeometry result;
+  result.library_=library_?library_:std::make_shared<ModelLibrary>();
+  result.configure(context,progress);
+  return result;
+}
+const wave::Paths64& JobGeometry::fixture_keep_out(double z,int grid,double radius) const {
+  const auto key=std::tuple{std::bit_cast<std::int64_t>(z),std::bit_cast<std::int64_t>(radius),grid};
+  {std::lock_guard lock(slices_);const auto found=fixture_slices_.find(key);if(found!=fixture_slices_.end()) return found->second;}
+  wave::Paths64 result;
+  for(const auto& fixture:fixtures_) {
+    // Inclusive clearance: touching a fixture is never a finishing target.
+    const auto slice=fixture.geometry.slice(float(z-fixture.model.clearance),grid).polygons;
+    auto inflated=offset_outward(slice,radius+fixture.model.clearance+1.0/wave::kIntegerScale);
+    result.insert(result.end(),inflated.begin(),inflated.end());
+  }
+  result=Union(result,FillRule::NonZero);
+  std::lock_guard lock(slices_);
+  return fixture_slices_.emplace(key,std::move(result)).first->second;
+}
+std::size_t JobGeometry::fixture_slice_count() const {
+  std::lock_guard lock(slices_);
+  return fixture_slices_.size();
+}
+bool JobGeometry::fixture_clear(wave::Vec3d from,wave::Vec3d to,const wave::MillingCutter& cutter) const {
+  // Preserve the downward-envelope/cylindrical-footprint constraint used by
+  // roughing, but query local triangles instead of rebuilding whole fixture
+  // polygons at every continuously varying finishing height. The small guard
+  // covers the former micron-grid rounding and swept-centreline padding.
+  constexpr double numerical_guard=.006;
+  for(const auto& fixture:fixtures_)
+    if(!fixture.geometry.projected_sweep_clear(from,to,
+        std::min(from.z,to.z)-fixture.model.clearance,
+        cutter.radius+fixture.model.clearance+numerical_guard)) return false;
+  return true;
 }
 
 void JobGeometry::set_stock_mesh(wave::Mesh mesh, const std::array<double, 3>& offset) {
-  auto imported = positioned_stock(std::move(mesh), offset);
+  wave::MeshSlicer source; source.set_mesh(std::move(mesh));
+  auto imported = source.placed({{},offset});
   stock_ = std::move(imported);
   stock_slices_.clear();
 }
 
 void JobGeometry::replace_models(JobGeometry&& loaded, bool part, bool stock) {
   if (this == &loaded) return;
+  if(loaded.library_) library_=loaded.library_;
   std::scoped_lock lock(slices_, loaded.slices_);
   if (part) {
     part_ = std::move(loaded.part_);
     part_cad_ = std::move(loaded.part_cad_);
+    part_source_cad_ = std::move(loaded.part_source_cad_);
     part_orientation_ = loaded.part_orientation_;
     part_slices_ = std::move(loaded.part_slices_);
     box_.clear();
@@ -128,6 +182,7 @@ void JobGeometry::replace_models(JobGeometry&& loaded, bool part, bool stock) {
 }
 
 void JobGeometry::clear_stock() {
+  inherited_stock_.reset(); inherited_slices_.clear();
   stock_.clear();
   stock_slices_.clear();
 }
@@ -167,6 +222,7 @@ void JobGeometry::set_box_stock(bool enabled, const BoxStockMargins& margins) {
 void JobGeometry::forget_slices() {
   part_slices_.clear();
   stock_slices_.clear();
+  inherited_slices_.clear();
 }
 
 const wave::Paths64& JobGeometry::outline(const wave::MeshSlicer& slicer,
@@ -196,6 +252,15 @@ const wave::Paths64& JobGeometry::part_outline(double z, int grid) const {
 }
 
 const wave::Paths64& JobGeometry::stock_outline(double z, int grid) const {
+  if(inherited_stock_) {
+    const SliceKey key{std::bit_cast<std::int64_t>(z),grid};
+    std::lock_guard lock(slices_);
+    if(const auto found=inherited_slices_.find(key);found!=inherited_slices_.end())
+      return found->second;
+    // Match mesh stock's downward envelope: a cutter at Z also encounters
+    // material whose underside is above Z, such as a flipped ball-mill lip.
+    return inherited_slices_.emplace(key,inherited_stock_->project_above(z)).first->second;
+  }
   if (!box_stock()) return outline(stock_, stock_slices_, z, grid);
   // One rectangle, the same at every depth, so the depth is not part of the
   // question. An empty part leaves it empty and the level reports nothing to
@@ -233,9 +298,9 @@ bool JobGeometry::work_range(double& low, double& high) const {
     return high > low;
   }
 
-  bool any = false;
-  double lowest = 0.0;
-  double highest = 0.0;
+  bool any = inherited_stock_ && std::isfinite(inherited_stock_->lowest()) && std::isfinite(inherited_stock_->highest());
+  double lowest = any?inherited_stock_->lowest():0.0;
+  double highest = any?inherited_stock_->highest():0.0;
   for (const wave::MeshSlicer* slicer : {&part_, &stock_}) {
     if (slicer->empty()) continue;
     const auto& bounds = slicer->mesh().bounds;
@@ -256,6 +321,7 @@ bool JobGeometry::work_range(double& low, double& high) const {
 }
 
 double JobGeometry::stock_bottom() const {
+  if(inherited_stock_) return inherited_stock_->lowest();
   if (!stock_.empty() && stock_.mesh().bounds.valid)
     return stock_.mesh().bounds.lower.z;
   if (box_stock_ && !part_.empty() && part_.mesh().bounds.valid)

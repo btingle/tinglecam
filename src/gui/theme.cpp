@@ -72,6 +72,8 @@ CanvasColours canvas_colours(const App& app) {
 ImVec4 severity_colour(const App& app, LogSeverity severity) {
   const bool light = light_theme(app);
   switch (severity) {
+    case LogSeverity::Debug:
+      return ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
     case LogSeverity::Info:
       return light ? ImVec4(0.18f, 0.32f, 0.52f, 1.0f) : ImVec4(0.65f, 0.78f, 0.9f, 1.0f);
     case LogSeverity::Warning:

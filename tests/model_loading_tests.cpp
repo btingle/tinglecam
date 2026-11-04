@@ -50,7 +50,7 @@ void run(const std::filesystem::path& directory) {
   finish(app);
   check(app.model_load_error.empty() && app.geometry.has_part() && app.geometry.has_stock(),
         "The worker must load both models and resolve paths against the job");
-  check(app.model_loader.progress().fraction == 1 && app.job.origin_x == saved.origin_x &&
+  check(app.model_loader.progress().fraction == 1 && app.context().origin_x == saved.origin_x &&
             app.job.operations.front().depth_from == .75 &&
             app.job.operations.front().depth_to == 2.25 && !app.geometry.box_stock(),
         "Successful job loading must finish progress and retain saved setup");
@@ -146,7 +146,7 @@ void run(const std::filesystem::path& directory) {
   cam::save_job(job_file, app.job);
   load_job_into(app, job_file, true);
   check(app.geometry.part().mesh().bounds.upper.z == 6 &&
-            app.job.part_orientation == cam::ModelOrientation{{1, -3, 2}},
+            app.context().part_orientation == cam::ModelOrientation{{1, -3, 2}},
         "Job reload restores the rotated geometry");
   start_model_rotation(app, 1, 2, 1);
   finish(app);
@@ -159,27 +159,28 @@ void run(const std::filesystem::path& directory) {
             app.geometry.stock().mesh().bounds.upper.z == 4,
         "Reset restores the imported orientation");
 
-  const auto before_failed_rotation = cam::to_json_text(app.job);
+  const auto* source_identity=app.geometry.part().source_identity();
   std::filesystem::rename(directory / "part.obj", directory / "held.obj");
   start_model_rotation(app, 0, 1, 1);
   finish(app);
   std::filesystem::rename(directory / "held.obj", directory / "part.obj");
-  check(!app.model_load_error.empty() && cam::to_json_text(app.job) == before_failed_rotation &&
-            app.geometry.part().mesh().bounds.upper.z == 4,
-        "A failed rotation preserves the job orientation and geometry");
+  check(app.model_load_error.empty() && app.geometry.part().source_identity()==source_identity &&
+            app.geometry.part().mesh().bounds.lower.z == -8,
+        "Rotation queries a placed view even when the original source file is unavailable");
+  start_model_rotation(app,0,0,0);finish(app);
 
-  app.job.stock_mesh.clear();
-  app.job.box_stock = true;
-  app.job.box_stock_margins.plus_z = 2;
+  app.context().stock_mesh.clear();
+  app.context().box_stock = true;
+  app.context().box_stock_margins.plus_z = 2;
   app.has_plan = true;
   start_model_rotation(app, 0, 0, 1);
   finish(app);
-  check(app.geometry.box_stock() && cam::highest_model_z(app.geometry) == 8 && !app.has_plan,
+  check(app.geometry.box_stock() && cam::highest_model_z(app.geometry) == 8 && stale_operations(app)>0,
         "Rotation rebuilds box stock and invalidates toolpaths");
   start_model_rotation(app, 0, 0, 0);
   finish(app);
 
-  app.job.box_stock_margins = {};
+  app.context().box_stock_margins = {};
   // Interactive model replacement still sets the work depth and origin.
   start_model_loading(app, directory / "part.obj", true);
   finish(app);
@@ -187,26 +188,26 @@ void run(const std::filesystem::path& directory) {
             app.job.operations.front().depth_to == 4,
         "Replacing a model must reset depths against the new work bounds");
 
-  app.job.box_stock_margins = {2,5,3,7,1,4};
-  app.geometry.set_box_stock(true,app.job.box_stock_margins);
+  app.context().box_stock_margins = {2,5,3,7,1,4};
+  app.geometry.set_box_stock(true,app.context().box_stock_margins);
   app.origin_pick = {0,1,2};
-  check(!app.job.origin_relative_to_part &&
+  check(!app.context().origin_relative_to_part &&
             !cam::job_from_json_text("{}").origin_relative_to_part,
         "Stock remains the origin reference for new and older jobs");
   apply_origin_pick(app);
-  check(app.job.origin_x==2 && app.job.origin_y==-5 && app.job.origin_z==-8,
+  check(app.context().origin_x==2 && app.context().origin_y==-5 && app.context().origin_z==-8,
         "Stock origin picks include asymmetric box-stock margins");
-  app.job.origin_relative_to_part = true;
+  app.context().origin_relative_to_part = true;
   apply_origin_pick(app);
-  check(app.job.origin_x==0 && app.job.origin_y==-3 && app.job.origin_z==-4,
+  check(app.context().origin_x==0 && app.context().origin_y==-3 && app.context().origin_z==-4,
         "Part origin picks use part bounds independently of stock margins");
   cam::save_job(job_file,app.job);
   load_job_into(app,job_file,true);
-  check(app.job.origin_relative_to_part && app.job.origin_y==-3 && app.job.origin_z==-4,
+  check(app.context().origin_relative_to_part && app.context().origin_y==-3 && app.context().origin_z==-4,
         "Saving and reopening retains the origin reference and coordinates");
   start_model_rotation(app,1,0,1);
   finish(app);
-  check(app.model_load_error.empty() && app.job.origin_y==2 && app.job.origin_z==-6,
+  check(app.model_load_error.empty() && app.context().origin_y==2 && app.context().origin_z==-6,
         "Model rotation reapplies origin picks against the selected part bounds");
 }
 void check_model_reuse(const std::filesystem::path& directory,
@@ -318,8 +319,8 @@ void check_stock_position(const std::filesystem::path& directory) {
   check(app.model_load_error.empty() && app.geometry.part().mesh().triangles.data()==part &&
             app.geometry.stock().mesh().bounds.lower.x==-2 &&
             app.geometry.stock().mesh().bounds.lower.y==3 &&
-            app.geometry.stock().mesh().bounds.lower.z==-1 && app.job.origin_x==12.5 &&
-            app.job.origin_y==-7 && app.job.origin_z==3,
+            app.geometry.stock().mesh().bounds.lower.z==-1 && app.context().origin_x==12.5 &&
+            app.context().origin_y==-7 && app.context().origin_z==3,
         "Repositioning reuses the part and preserves a part-relative manual origin");
   const auto unchanged=cam::to_json_text(app.job);
   start_stock_positioning(app,{std::numeric_limits<double>::quiet_NaN(),0,0});
@@ -327,12 +328,12 @@ void check_stock_position(const std::filesystem::path& directory) {
   check(!app.model_load_error.empty() && cam::to_json_text(app.job)==unchanged &&
             app.geometry.stock().mesh().bounds.lower.x==-2,
         "A failed placement must preserve job settings and loaded geometry");
-  app.job.origin_relative_to_part=false;
+  app.context().origin_relative_to_part=false;
   app.origin_pick={0,0,2};
   start_stock_positioning(app,{2,-3,1});
   finish(app);
-  check(app.model_load_error.empty() && app.job.origin_x==-2 && app.job.origin_y==3 &&
-            app.job.origin_z==-5,"Stock-relative origin picks must follow moved stock");
+  check(app.model_load_error.empty() && app.context().origin_x==-2 && app.context().origin_y==3 &&
+            app.context().origin_z==-5,"Stock-relative origin picks must follow moved stock");
   start_stock_positioning(app,{});
   finish(app);
   check(app.model_load_error.empty() && app.geometry.stock().mesh().bounds.lower.x==0 &&
@@ -341,7 +342,7 @@ void check_stock_position(const std::filesystem::path& directory) {
         "Resetting stock placement must remove the previous offset");
   std::filesystem::rename(directory/"position-part-held",job.part_mesh);
   std::filesystem::rename(directory/"position-stock-held",job.stock_mesh);
-  app.job.stock_offset_x=2; app.job.stock_offset_y=-3; app.job.stock_offset_z=1;
+  app.context().stock_offset_x=2; app.context().stock_offset_y=-3; app.context().stock_offset_z=1;
   start_model_rotation(app,2,2,1);
   finish(app);
   check(app.model_load_error.empty() && app.geometry.stock().mesh().bounds.lower.x==-4 &&

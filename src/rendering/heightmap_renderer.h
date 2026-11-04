@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <limits>
 #include <vector>
 
 #include "simulation/heightmap.h"
@@ -18,6 +19,11 @@ struct MeshDraw {
   Vec3f offset{};
   std::array<float, 4> colour{.42f, .60f, .80f, 1};
   bool wireframe = false;
+  // Immutable, owned geometry is uploaded once. The raw pointer above remains
+  // supported for mutable callers, which deliberately bypass caching.
+  std::shared_ptr<const Mesh> source;
+  std::size_t first_triangle = 0;
+  std::size_t triangle_count = std::numeric_limits<std::size_t>::max();
 };
 struct LineVertex {
   Vec3f position;
@@ -33,11 +39,13 @@ struct Cutter {
   float radius = 0, length = 0;
   bool ball = false;
   float point_height = 0, tip_flat_radius = 0;
+  bool fixture_contact = false;
 };
 struct Stats {
   std::size_t changed_tiles = 0, uploaded_bytes = 0, resident_bytes = 0;
   std::size_t tiles = 0, hierarchy_nodes = 0;
   std::size_t line_upload_bytes = 0;
+  std::size_t mesh_upload_bytes = 0, mesh_resident_bytes = 0, mesh_buffers = 0;
   bool reused_frame = false;
 };
 // OpenGL 3.2 / GLSL 1.50; no CUDA or compute-shader dependency. Construct,

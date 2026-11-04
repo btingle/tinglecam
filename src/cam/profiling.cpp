@@ -51,6 +51,8 @@ void report_plan_memory(const JobPlan& plan) {
       for (const auto& checkpoint : level.stock_checkpoints)
         maps.push_back(checkpoint.stock.get());
       checkpoints += level.stock_checkpoints.size();
+      for (const auto& phase : level.feeds.motion)
+        motion += phase.fixture_contacts.capacity() * sizeof(FixtureContact);
       motion += level.feeds.motion.capacity() * sizeof(MotionPhase) +
                 level.feeds.segments.capacity() * sizeof(FeedSegment) +
                 (level.feeds.motion_seconds.capacity()+level.feeds.motion_lengths.capacity()) * sizeof(double);

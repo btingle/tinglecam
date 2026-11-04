@@ -102,7 +102,7 @@ void tool_editor(App& app) {
   if (remove >= 0) tool.cutting.erase(tool.cutting.begin() + remove);
   if (ImGui::Button("Add material")) {
     cam::CuttingData data;
-    if (!tool.cutting_for(app.job.material_id)) data.material_id = app.job.material_id;
+    if (!tool.cutting_for(app.effective_context().material_id)) data.material_id = app.effective_context().material_id;
     tool.cutting.push_back(std::move(data));
   }
 
@@ -226,7 +226,7 @@ void material_library_window(App& app) {
     const cam::Material* material = app.materials.find(remove);
     const std::string name = material ? material->name : remove;
     std::string text = "Delete \"" + name + "\" from the library?";
-    if (app.job.material_id == remove) text += " The open job uses it.";
+    if (app.effective_context().material_id == remove) text += " The open job uses it.";
     text += " Tools keep their cutting data for it.";
     confirm(app, "Delete material", text, "Delete", [&app, remove, save] {
       auto library = app.materials;
@@ -296,7 +296,7 @@ void tool_library_window(App& app) {
       ImGui::TableSetColumnIndex(3);
       ImGui::Text("%d", tool.flutes);
       ImGui::TableSetColumnIndex(4);
-      if (tool.cutting_for(app.job.material_id)) ImGui::TextColored(success_colour(app), "has data");
+      if (tool.cutting_for(app.effective_context().material_id)) ImGui::TextColored(success_colour(app), "has data");
       else ImGui::TextColored(severity_colour(app, LogSeverity::Warning), "no data");
       ImGui::TableSetColumnIndex(5);
       if (ImGui::SmallButton("Edit")) {

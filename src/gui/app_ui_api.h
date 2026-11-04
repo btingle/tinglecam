@@ -37,6 +37,12 @@ bool save_settings(App& app);
 // The job.
 void load_job_into(App& app, const std::filesystem::path& file, bool models = true);
 void load_meshes(App& app);
+void select_setup(App& app, int index);
+void add_setup(App& app);
+void move_setup(App& app, int index, int destination);
+void move_operation_to_setup(App& app, int operation, int setup);
+void refresh_setup_geometry(App& app);
+void refresh_inherited_stock(App& app);
 void start_model_loading(App& app, bool reset_setup = false);
 // target: 0 both, 1 part, 2 stock; direction 0 resets orientation.
 void start_model_rotation(App& app, int target, int axis, int direction);

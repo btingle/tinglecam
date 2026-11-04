@@ -36,12 +36,15 @@ void add_pre_drilling(App&,int operation_index);
 void draw_hole_contours(App&,OrbitScene&,cam::Operation&);
 void refresh_surface_contours(App&, const cam::Operation&);
 void draw_surface_contours(App&, OrbitScene&, cam::Operation&);
+void refresh_surface_depth(App&, const OrbitScene&);
 void draw_model_loading(App&);
 void remember_recent_job(App&, const std::filesystem::path&);
 void depth_defaults(App&, cam::Operation&);
 void apply_origin_pick(App&);
 
 extern std::unique_ptr<wave::heightfield::Renderer> heightmap_view;
+extern std::unique_ptr<wave::heightfield::Renderer> setup_view, surface_depth_view;
+std::optional<std::size_t> pick_cad_face(App&, const Projection&, ImVec2 mouse);
 
 struct Transform {
   ImVec2 origin;
@@ -239,10 +242,6 @@ void fit_view(App& app, ImVec2 canvas);
 // The feed range drawn by the Feed colouring, over the passes on show.
 void feed_range(const App& app, double& lowest, double& highest);
 
-void append_mesh(std::vector<Facet>& facets, std::vector<ImVec2>& pool,
-                 const wave::Mesh& mesh, const Projection& projection,
-                 const Vec3& light, const float colour[3], int alpha,
-                 bool wireframe = false);
 void append_slab(std::vector<Facet>& facets, std::vector<ImVec2>& pool,
                  const Paths64& remaining, const Paths64& lid_mesh,
                  const Paths64& lid_rings, double bottom, double top,
@@ -258,7 +257,6 @@ void scene_message(const App& app, OrbitScene& scene, const char* message);
 void end_scene(OrbitScene& scene);
 void aim_scene(App& app, OrbitScene& scene, const Clipper2Lib::Rect64& extent,
                double lowest, double highest);
-void paint_scene(OrbitScene& scene);
 void draw_origin_gizmo(const App& app, const OrbitScene& scene);
 void aim_camera(App& app, const Vec3& direction);
 CubeFace cube_face(int axis, int sign);

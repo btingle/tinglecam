@@ -162,26 +162,26 @@ bool holes_section(App& app,cam::Operation& operation) {
       ImGui::SetItemTooltip("Cut this hole system");ImGui::SameLine();
       const auto flags=p.systems.size()<=3?ImGuiTreeNodeFlags_DefaultOpen:ImGuiTreeNodeFlags_None;
       if(!ImGui::TreeNodeEx("system",flags,"Hole %zu: X %.2f Y %.2f, R %.3f (%zu levels)",
-          i+1,h.center_x+app.job.origin_x,h.center_y+app.job.origin_y,
+          i+1,h.center_x+app.effective_context().origin_x,h.center_y+app.effective_context().origin_y,
           h.levels.empty()?0.0:h.levels.front().radius,h.levels.size())) {
         ImGui::PopID();continue;
       }
       if(begin_properties("hole-system")) {
-        prop_coordinate("Centre X",h.center_x,app.job.origin_x);
-        prop_coordinate("Centre Y",h.center_y,app.job.origin_y);
+        prop_coordinate("Centre X",h.center_x,app.effective_context().origin_x);
+        prop_coordinate("Centre Y",h.center_y,app.effective_context().origin_y);
         end_properties();
       }
       int remove_level=-1;
       for(std::size_t j=0;j<h.levels.size();++j) {
         auto& l=h.levels[j];ImGui::PushID(int(j));
         const bool open=ImGui::TreeNodeEx("level",ImGuiTreeNodeFlags_DefaultOpen,"Level %zu: R %.3f, Z %.3f to %.3f",
-            j+1,l.radius,l.top_z+app.job.origin_z,l.bottom_z+app.job.origin_z);
+            j+1,l.radius,l.top_z+app.effective_context().origin_z,l.bottom_z+app.effective_context().origin_z);
         if(open) {
           ImGui::Checkbox("Cut this level",&l.selected);
           if(begin_properties("hole-level")) {
             prop_double("Radius",l.radius,.01f,"%.3f mm",nullptr,.001);
-            prop_coordinate("Top Z",l.top_z,app.job.origin_z);
-            prop_coordinate("Bottom Z",l.bottom_z,app.job.origin_z);
+            prop_coordinate("Top Z",l.top_z,app.effective_context().origin_z);
+            prop_coordinate("Bottom Z",l.bottom_z,app.effective_context().origin_z);
             prop_check("Through hole",l.through);
             strategy_override(l.strategy);tool_override(app,l.tool_id);
             if(p.automatic) prop_value("Circle fit error","%.4f mm",l.fit_error);
@@ -205,8 +205,8 @@ bool holes_section(App& app,cam::Operation& operation) {
     }
     if(remove_hole>=0) p.systems.erase(p.systems.begin()+remove_hole);
     if(!p.automatic && ImGui::Button("Add hole")) {
-      cam::HoleSystem h;h.center_x=-app.job.origin_x;h.center_y=-app.job.origin_y;
-      h.levels.front().top_z=-app.job.origin_z;h.levels.front().bottom_z=h.levels.front().top_z-5;
+      cam::HoleSystem h;h.center_x=-app.effective_context().origin_x;h.center_y=-app.effective_context().origin_y;
+      h.levels.front().top_z=-app.effective_context().origin_z;h.levels.front().bottom_z=h.levels.front().top_z-5;
       p.systems.push_back(h);
     }
 

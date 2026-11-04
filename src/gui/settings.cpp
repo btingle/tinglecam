@@ -56,6 +56,26 @@ bool theme_selector(App& app) {
   return changed;
 }
 
+bool render_resolution(const char* label, double& scale, bool automatic) {
+  const std::string preview=scale==0 ? "Automatic" : std::to_string(int(std::round(scale*100)))+"%";
+  property_label(label, automatic
+      ? "Stock in the Result view. Automatic uses 50% resolution, limited to about one million pixels. Explicit percentages override that limit."
+      : "Model surfaces in the Setup view. Percentages are relative to display resolution; text and controls stay sharp.");
+  ImGui::PushID(label);
+  ImGui::SetNextItemWidth(-FLT_MIN);
+  bool changed=false;
+  if(ImGui::BeginCombo("##resolution",preview.c_str())) {
+    for(const double value:{0.,1.,.75,.5,.25}) {
+      if(value==0 && !automatic) continue;
+      const std::string name=value==0 ? "Automatic" : std::to_string(int(value*100))+"%";
+      if(ImGui::Selectable(name.c_str(),scale==value)) {scale=value;changed=true;}
+    }
+    ImGui::EndCombo();
+  }
+  ImGui::PopID();
+  return changed;
+}
+
 void custom_themes(App& app) {
   static std::array<char, 128> theme_name{};
   ImGui::SetNextItemWidth(ui_size(app, 200.0f));
@@ -148,6 +168,8 @@ void settings_window(App& app) {
       apply_ui_scale(app);
       changed = true;
     }
+    changed |= render_resolution("Stock / Result resolution", app.settings.stock_render_scale, true);
+    changed |= render_resolution("Surface / Setup resolution", app.settings.surface_render_scale, false);
     changed |= prop_check("Debug information", app.settings.show_debug,
                           "Planner overlays and detailed readouts in the views.");
     end_properties();

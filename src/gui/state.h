@@ -207,6 +207,7 @@ enum class LogSeverity {
   Info,
   Warning,
   Error,
+  Debug,
 };
 
 struct LogMessage {
@@ -243,6 +244,7 @@ struct LoadedModels {
   cam::JobGeometry geometry;
   std::filesystem::path job_file;
   std::vector<std::string> warnings;
+  int setup_index = 0;
   bool opened_job = false, reset_setup = false;
   bool replace_part = true, replace_stock = true;
   std::string error;
@@ -258,13 +260,31 @@ struct ResultPreview {
   wave::Bounds3f motion_bounds;
 };
 
+struct SetupCadDisplay;
 struct App {
   cam::ToolLibrary tools;
   cam::MachineLibrary machines;
   cam::MaterialLibrary materials;
   cam::UserSettings settings = cam::default_user_settings();
   cam::Job job;
+  int selected_setup = 0;
+  cam::SetupContext& context() {
+    if(job.setups.empty()) return job;
+    return job.setups.at(std::min(std::size_t(std::max(0,selected_setup)),job.setups.size()-1));
+  }
+  const cam::SetupContext& context() const {
+    if(job.setups.empty()) return job;
+    return job.setups.at(std::min(std::size_t(std::max(0,selected_setup)),job.setups.size()-1));
+  }
+  cam::SetupContext effective_context() const {
+    if(job.setups.empty()) return job;
+    try {return cam::resolve_setup_context(job,job.setups.at(selected_setup).id);}
+    catch(const std::exception&) {return context();}
+  }
   cam::JobGeometry geometry;
+  std::shared_ptr<const wave::Heightmap> setup_stock_display_source;
+  std::shared_ptr<const wave::Mesh> setup_stock_display, setup_box_display, result_box_display;
+  std::shared_ptr<SetupCadDisplay> setup_cad_display;
   // One entry per operation in the job, always: an operation with no result
   // carries an entry saying so.
   cam::JobPlan plan;
@@ -300,7 +320,7 @@ struct App {
   std::size_t planning_first = 0;
   std::vector<std::string> planning_signatures;
   std::vector<LogMessage> messages;
-  int message_filter = 0;  // 0 all, 1 info, 2 warnings, 3 errors
+  int message_filter = 0;  // 0 normal messages, 1 info, 2 warnings, 3 errors, 4 debug
   bool show_messages = false;
   std::string graphics_renderer;
   bool software_graphics = false;

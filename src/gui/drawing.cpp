@@ -292,8 +292,7 @@ void advance_playback(App& app, double seconds) {
              next_levels[first_cut].nothing_to_cut)
         ++first_cut;
       if (first_cut < static_cast<int>(next_levels.size())) {
-        app.selected_plan_operation = operation;
-        app.selected_operation = operation;
+        select_operation(app,operation);
         app.selected_level = first_cut;
         app.playback.distance = 0.0;
         app.playback.motion_seconds = 0.0;
@@ -352,7 +351,7 @@ void draw_origin_marker(const App& app, ImDrawList* list,
                         const Transform& to_screen) {
   const ImU32 outline = canvas_colours(app).outline;
   const ImVec2 centre = to_screen(Point64(
-      wave::to_integer(-app.job.origin_x), wave::to_integer(-app.job.origin_y)));
+      wave::to_integer(-app.effective_context().origin_x), wave::to_integer(-app.effective_context().origin_y)));
   static const ImVec2 kSteps[2] = {{46.0f, 0.0f}, {0.0f, -46.0f}};
   static const ImU32 kColours[2] = {IM_COL32(232, 96, 92, 255),
                                     IM_COL32(126, 205, 122, 255)};
@@ -518,18 +517,18 @@ void draw_canvas(App& app) {
     const cam::Tool* tool =
         app.tools.find(level->tool_id.empty()?app.plan.operations[app.selected_plan_operation].tool_id:level->tool_id);
     if (tool && !level->feeds.motion.empty()) {
-      const wave::Point64 position =
-          cam::feed_motion_at_seconds(level->feeds, app.playback.motion_seconds).position;
-      const ImVec2 centre = to_screen(position);
+      const auto cursor = cam::feed_motion_at_seconds(level->feeds, app.playback.motion_seconds);
+      const ImVec2 centre = to_screen(cursor.position);
       const float radius = std::max(static_cast<float>(tool->diameter * 0.5) * app.view.zoom, 2.0f);
-      const ImU32 ring = light_theme(app) ? IM_COL32(20, 24, 30, 220) : IM_COL32(255, 255, 255, 210);
+      const ImU32 ring = cursor.fixture_contact ? IM_COL32(255, 30, 15, 255)
+          : light_theme(app) ? IM_COL32(20, 24, 30, 220) : IM_COL32(255, 255, 255, 210);
       list->AddCircleFilled(centre, radius, (ring & 0x00ffffff) | 0x28000000);
       list->AddCircle(centre, radius, ring, 0, 1.6f);
       list->AddCircleFilled(centre, 2.5f, ring);
     }
     char caption[160];
     std::snprintf(caption, sizeof caption, "Floor Z %.3f mm   Drag: pan   Wheel: zoom",
-                  level->floor_z + app.job.origin_z);
+                  level->floor_z + app.effective_context().origin_z);
     view_caption(app, list, top_left, size, 0, colours.caption, caption);
   } else {
     const char* text = app.has_plan ? "This operation has no passes to show"

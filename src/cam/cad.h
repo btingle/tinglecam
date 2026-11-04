@@ -38,6 +38,8 @@ class CadModel {
                                         const ModelLoadProgress& progress = {},
                                         const ModelOrientation& orientation = {});
   ~CadModel();
+  std::shared_ptr<CadModel> placed(const ModelTransform&) const;
+  const void* source_identity() const;
   const wave::Mesh& mesh() const;
   const std::vector<std::size_t>& triangle_faces() const;
   const std::vector<CadFace>& faces() const;
@@ -69,7 +71,7 @@ class CadModel {
  private:
   CadModel();
   struct Impl;
-  std::unique_ptr<Impl> impl_;
+  std::shared_ptr<Impl> impl_;
 };
 bool step_filename(const std::filesystem::path& path);
 }  // namespace cam

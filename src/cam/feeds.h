@@ -3,6 +3,7 @@
 #include "cam/machine.h"
 #include "cam/tooling.h"
 #include "planning/toolpath.h"
+#include "wave/mesh_slicer.h"
 
 #include <cstddef>
 #include <optional>
@@ -79,8 +80,14 @@ struct FeedStats {
   double mean_engagement = 0.0;
 };
 
-// A commanded machine motion.  Unlike FeedSegment, this also represents the
-// vertical motions which surround retract traversals.  path_distance tracks
+struct FixtureContact {
+  // Fractions of the commanded move, with positions in setup coordinates.
+  double begin = 0, end = 0;
+  wave::Vec3d from{}, to{};
+};
+
+// A commanded machine motion. Unlike FeedSegment, this also represents the
+// vertical motions which surround retract traversals. path_distance tracks
 // the corresponding distance through the planar toolpath and deliberately
 // remains constant while the cutter is moving vertically.
 struct MotionPhase {
@@ -107,6 +114,7 @@ struct MotionPhase {
   bool arrival = false;
   // A stock-validated positioning move between roughing layers.
   bool inter_layer = false;
+  std::vector<FixtureContact> fixture_contacts;
 };
 
 struct MotionCursor {
@@ -115,6 +123,7 @@ struct MotionCursor {
   double path_distance = 0.0;
   wave::MoveKind kind = wave::MoveKind::Cut;
   bool rapid = false;
+  bool fixture_contact = false;
   double rate = 0.0;
   // Of the phase the cursor is in, as the stock simulation measured it.
   double engagement = 0.0;

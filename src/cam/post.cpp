@@ -1,4 +1,5 @@
 #include "cam/post.h"
+#include <map>
 
 #include <algorithm>
 #include <cmath>
@@ -194,7 +195,7 @@ std::string spindle_word(const Machine& machine, double rpm) {
 }  // namespace
 
 PostResult post_job(const JobPlan& plan,
-                    const Job& job,
+                    const Job& document,
                     const ToolLibrary& tools,
                     const MachineLibrary& machines,
                     ExportFlavor flavor) {
@@ -209,13 +210,37 @@ PostResult post_job(const JobPlan& plan,
     return result;
   }
 
+  std::size_t first_valid=0;
+  while(first_valid<plan.operations.size() && !plan.operations[first_valid].ok()) ++first_valid;
+  if(first_valid>=plan.operations.size() || first_valid>=document.operations.size()) {
+    result.error="No valid operation has a matching setup";return result;
+  }
+  Job job=document;
+  std::string active_setup;
+  std::map<std::string,Job> contexts;
+  try {
+    for(std::size_t i=0;i<document.operations.size() && i<plan.operations.size();++i) {
+      const auto& source=document.operations[i];
+      if(!plan.operations[i].ok() || document.setups.empty() || contexts.contains(source.setup_id)) continue;
+      contexts.emplace(source.setup_id,job_for_setup(document,source.setup_id));
+    }
+    if(!document.setups.empty() && !document.operations.empty()) {
+      active_setup=document.operations[first_valid].setup_id;
+      job=contexts.at(active_setup);
+      for(const auto& [id,context]:contexts)
+        if(context.machine_id!=job.machine_id) {
+          result.error="Setups using different machines must be exported separately; select operations from one machine";
+          return result;
+        }
+    }
+  } catch(const std::exception& e) { result.error=e.what(); return result; }
   const Machine* machine = machines.find(job.machine_id);
   if (!machine) {
     result.error = job.machine_id.empty() ? "The job has no machine"
                                           : "Unknown machine: " + job.machine_id;
     return result;
   }
-  const std::vector<ToolAssignment> tool_table = resolved_tool_table(job);
+  const std::vector<ToolAssignment> tool_table = resolved_tool_table(document);
 
   // The one rapid plane has to be above everything in the way. A 2D slice
   // cannot certify a lower traverse, so disconnected moves always use it. It is
@@ -223,12 +248,14 @@ PostResult post_job(const JobPlan& plan,
   // lift against this height while choosing whether to lift at all, so the post
   // must not be the place that forms a second opinion about it.
   Writer writer(*machine, result, flavor);
-  const double rapid_plane = plan.rapid_plane + job.origin_z;
+  double rapid_plane = (plan.operations[first_valid].rapid_plane > 0 || !document.setups.empty()
+      ? plan.operations[first_valid].rapid_plane : plan.rapid_plane) + job.origin_z;
   // ---- Preamble ---------------------------------------------------------
   if(roland) writer.line("%");
   writer.comment(job.name.empty() ? std::string("TingleCAM") : job.name);
   if(roland) writer.comment("Export flavor: Roland MDX-40A. Fit the tool before starting");
   writer.comment(std::string("Machine: ") + machine->name);
+  if(const auto* setup=find_setup(document,active_setup)) writer.comment("Setup: "+setup->name);
   if (machine->specifications_unverified)
     writer.comment("Machine limits in this profile are unverified placeholders");
   writer.comment(machine->output_inches?"Units: inches, absolute":"Units: millimetres, absolute");
@@ -266,10 +293,26 @@ PostResult post_job(const JobPlan& plan,
                                 operation.error);
       continue;
     }
-    const Operation* source = operation_index < job.operations.size()
-                                  ? &job.operations[operation_index]
+    const Operation* source = operation_index < document.operations.size()
+                                  ? &document.operations[operation_index]
                                   : nullptr;
     if(!source) continue;
+    if(!document.setups.empty() && source->setup_id!=active_setup) {
+      writer.line("G0 Z"+writer.coordinate(rapid_plane));
+      if(coolant_running) { writer.line("M9"); coolant_running=false; }
+      if(spindle_running) { writer.line("M5"); spindle_running=false; }
+      job=contexts.at(source->setup_id);
+      const auto* setup=find_setup(document,source->setup_id);
+      writer.blank(); writer.comment("Setup: "+(setup?setup->name:source->setup_id));
+      if(job.pause_on_entry) writer.line("M0");
+      if(roland && job.work_offset!="G54" && job.work_offset!="G55" && job.work_offset!="G56" &&
+         job.work_offset!="G57" && job.work_offset!="G58" && job.work_offset!="G59") {
+        result.error="Roland MDX-40A export requires a G54–G59 work coordinate system"; return result;
+      }
+      writer.line(job.work_offset.empty()?"G54":job.work_offset);
+      writer.reset_modal(); active_setup=source->setup_id;
+    }
+    rapid_plane=(!document.setups.empty()?operation.rapid_plane:plan.rapid_plane)+job.origin_z;
     writer.blank();writer.comment("Operation: "+operation.operation_name);
     const auto activate_tool=[&](const Tool* tool,double rpm) {
       const ToolAssignment* assignment = find_tool_assignment(tool_table, tool->id);

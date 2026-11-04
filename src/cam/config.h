@@ -45,6 +45,9 @@ struct CustomUiTheme {
 
 struct UserSettings {
   double ui_scale = 1.0;
+  // Fractions of display resolution. Zero selects automatic stock resolution.
+  double stock_render_scale = 0.0;
+  double surface_render_scale = 1.0;
   UiTheme ui_theme = UiTheme::Default;
   std::string custom_theme;
   std::vector<CustomUiTheme> custom_themes;

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "geometry.h"
+#include "model_transform.h"
 
 #include <cstddef>
 #include <filesystem>
@@ -14,6 +15,10 @@ struct Vec3f {
   float x = 0.0f;
   float y = 0.0f;
   float z = 0.0f;
+};
+
+struct Vec3d {
+  double x = 0, y = 0, z = 0;
 };
 
 struct Triangle3f {
@@ -68,8 +73,14 @@ class MeshSlicer {
   ~MeshSlicer();
   MeshSlicer(MeshSlicer&&) noexcept;
   MeshSlicer& operator=(MeshSlicer&&) noexcept;
-  MeshSlicer(const MeshSlicer&) = delete;
-  MeshSlicer& operator=(const MeshSlicer&) = delete;
+  MeshSlicer(const MeshSlicer&) = default;
+  MeshSlicer& operator=(const MeshSlicer&) = default;
+
+  // Read-only placement of the shared source. Rotated query structures are
+  // cached per source orientation; translations never rebuild a BVH.
+  MeshSlicer placed(const ModelTransform&) const;
+  const Mesh& source_mesh() const;
+  const void* source_identity() const;
 
   void set_mesh(Mesh mesh);
   // Back to holding nothing. `set_mesh` rejects an empty mesh, so this is how a
@@ -81,13 +92,20 @@ class MeshSlicer {
   std::vector<float> vertical_raycast(const std::vector<Vec3f>& origins,
                                       float lower_z,
                                       double& milliseconds) const;
+  // Test a swept XY disc against the downward envelope above minimum_z.
+  // Uses a lazily built, shared BVH and local triangle clipping: no global
+  // polygon union, Z quantization, or per-height cache is needed.
+  bool projected_sweep_clear(Vec3d from, Vec3d to, double minimum_z,
+                             double radius) const;
   const Mesh& mesh() const;
+  // Keeps the immutable placed display geometry alive across model replacement.
+  std::shared_ptr<const Mesh> shared_mesh() const;
   const MeshBuildStats& stats() const;
   bool empty() const;
 
  private:
   struct Impl;
-  std::unique_ptr<Impl> impl_;
+  std::shared_ptr<Impl> impl_;
 };
 
 }  // namespace wave

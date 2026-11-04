@@ -60,6 +60,27 @@ vec2 cell_heights(ivec2 cell) {
   ivec2 local = cell - tile * 32;
   return vec2(height_at(d.z, d.w, local), height_at(d.x, d.y, local));
 }
+// Most patches lie inside one compressed tile. Decode its descriptor once
+// for all four corners; seams and clamped borders use the general sampler.
+vec2 tile_heights(ivec4 d, ivec2 local) {
+  return vec2(height_at(d.z,d.w,local),height_at(d.x,d.y,local));
+}
+void patch_heights(ivec2 base, out vec2 a, out vec2 b, out vec2 c, out vec2 d) {
+  ivec2 lo=clamp(base,ivec2(0),grid_size-1);
+  ivec2 hi=clamp(base+ivec2(1),ivec2(0),grid_size-1);
+  ivec2 tile=lo/32;
+  if(all(equal(tile,hi/32))) {
+    ivec4 descriptor=texelFetch(tile_data,tile.y*((grid_size.x+31)/32)+tile.x);
+    lo-=tile*32;hi-=tile*32;
+    a=tile_heights(descriptor,lo);
+    b=tile_heights(descriptor,ivec2(hi.x,lo.y));
+    c=tile_heights(descriptor,ivec2(lo.x,hi.y));
+    d=tile_heights(descriptor,hi);
+  } else {
+    a=cell_heights(base);b=cell_heights(base+ivec2(1,0));
+    c=cell_heights(base+ivec2(0,1));d=cell_heights(base+ivec2(1));
+  }
+}
 bool occupied(vec2 h) { return !any(isnan(h)) && h.y > h.x; }
 bool continuous_edge(ivec2 a, ivec2 b, float ha, float hb, bool top) {
   float jump = hb - ha;
@@ -287,21 +308,12 @@ bool wall_patch_hit(vec3 start, vec3 rd, ivec2 base, vec2 raw[4], bvec4 valid,
   }
   return hit;
 }
-bool interval_hit(vec3 ro, vec3 rd, ivec2 owner, float begin, float end,
+bool interval_hit(vec3 ro, vec3 rd, ivec2 base, float begin, float end,
                   vec3 front, inout float closest, inout vec3 normal) {
-  vec2 h = cell_heights(owner);
   vec3 start = ro + rd * begin;
-  ivec2 base = ivec2(floor((ro.xy + rd.xy * ((begin + end) * .5)) / pitch - .5));
-  vec2 a = cell_heights(base), b = cell_heights(base+ivec2(1,0));
-  vec2 c = cell_heights(base+ivec2(0,1)), d = cell_heights(base+ivec2(1));
+  vec2 a,b,c,d;patch_heights(base,a,b,c,d);
   bvec4 valid=bvec4(occupied(a),occupied(b),occupied(c),occupied(d));
   if(!any(valid)) return false;
-  // A missing nearest sample can only acquire material where all three other
-  // corners contribute. One or two neighbours cannot exceed 50% in its cell.
-  vec2 fraction=fract((ro.xy+rd.xy*((begin+end)*.5))/pitch);
-  vec2 margin=min(fraction,1.0-fraction);
-  if(!occupied(h) && min(margin.x,margin.y)>1e-4 &&
-     int(valid.x)+int(valid.y)+int(valid.z)+int(valid.w)<3) return false;
   vec4 limits=vec4(1e30,-1e30,1e30,-1e30);
   vec2 raw[4];raw[0]=a;raw[1]=b;raw[2]=c;raw[3]=d;
   for(int i=0;i<4;++i) if(valid[i]) {
@@ -310,23 +322,23 @@ bool interval_hit(vec3 ro, vec3 rd, ivec2 owner, float begin, float end,
   }
   float finish_z=ro.z+rd.z*end;
   float ray_low=min(start.z,finish_z),ray_high=max(start.z,finish_z);
-  // Most traversed intervals do not touch a cap. Reject them before running
-  // discontinuity reconstruction or solving a bilinear intersection.
   if(ray_low>limits.w+1e-6 || ray_high<limits.x-1e-6) return false;
   if(all(valid) && begin>0.0 && start.z>=limits.y && start.z<=limits.z && limits.z>limits.y) {
     closest=begin;normal=front;return true;
   }
-  // Empty owner cells may contain part of a reconstructed neighbouring wall.
-  if(!occupied(h)) {
-    for(int i=0;i<4;++i) if(valid[i]) {
-      owner=base+ivec2(i%2,i/2);h=raw[i];break;
-    }
+  // Missing samples always require occupancy reconstruction, which does not
+  // depend on a nearest-cell owner. Skip unused connected-cap coefficients.
+  if(!all(valid)) {
+    vec4 slice;
+    if(stable_slice(base,raw,valid,ray_low,ray_high,slice))
+      return slice_hit(slice,start,rd,base,begin,end,front,closest,normal);
+    return wall_patch_hit(start,rd,base,raw,valid,begin,end,front,closest,normal);
   }
   bvec4 bottom_connected,top_connected;
   vec4 low_samples=vec4(a.x,b.x,c.x,d.x), high_samples=vec4(a.y,b.y,c.y,d.y);
-  vec4 bottom=coefficients(base,owner,low_samples,valid,h.x,false,bottom_connected);
-  vec4 top=coefficients(base,owner,high_samples,valid,h.y,true,top_connected);
-  if(!all(valid) || !all(bottom_connected) || !all(top_connected)) {
+  vec4 bottom=coefficients(base,base,low_samples,valid,a.x,false,bottom_connected);
+  vec4 top=coefficients(base,base,high_samples,valid,a.y,true,top_connected);
+  if(!all(bottom_connected) || !all(top_connected)) {
     vec4 slice;
     if(stable_slice(base,raw,valid,ray_low,ray_high,slice))
       return slice_hit(slice,start,rd,base,begin,end,front,closest,normal);
@@ -344,52 +356,35 @@ bool interval_hit(vec3 ro, vec3 rd, ivec2 owner, float begin, float end,
     hit=cap_hit(start,rd,base,bottom,top,false,begin,end,closest,normal)||hit;
   return hit;
 }
-bool leaf_hit(int tile, bool flat_tile, vec3 ro, vec3 rd, vec3 lo, vec3 hi,
+bool leaf_hit(bool flat_tile, vec3 ro, vec3 rd, vec3 lo, vec3 hi,
               inout float closest, out vec3 normal) {
   float a, b; vec3 n;
-  if (!box_hit(ro, rd, lo, hi, closest, false, a, b, n)) return false;
   if (flat_tile) {
     if (!box_hit(ro, rd, lo, hi, closest, true, a, b, n)) return false;
     closest = a; normal = n; return true;
   }
-  ivec2 begin=ivec2(tile%((grid_size.x+31)/32),tile/((grid_size.x+31)/32))*32;
-  ivec2 end = min(begin + ivec2(32), grid_size);
-  ivec2 cell = clamp(ivec2(floor((ro.xy + rd.xy * a) / pitch)), begin, end - 1);
-  ivec2 step = ivec2(sign(rd.xy));
-  vec2 next = vec2(1e30), delta = vec2(1e30);
-  for (int k = 0; k < 2; ++k) if (step[k] != 0) {
-    float edge = float(cell[k] + (step[k] > 0 ? 1 : 0)) * pitch;
-    next[k] = max(a, (edge - ro[k]) / rd[k]);
-    delta[k] = pitch / abs(rd[k]);
+  if (!box_hit(ro, rd, lo, hi, closest, false, a, b, n)) return false;
+  // March directly between sample-centre planes. These bound the bilinear
+  // patches; integer cell edges inside a patch do not change its surface.
+  ivec2 patch=ivec2(floor((ro.xy+rd.xy*a)/pitch-.5));
+  ivec2 step=ivec2(sign(rd.xy));
+  vec2 next=vec2(1e30),delta=vec2(1e30);
+  for(int k=0;k<2;++k) if(step[k]!=0) {
+    float edge=(float(patch[k]+(step[k]>0?1:0))+.5)*pitch;
+    next[k]=max(a,(edge-ro[k])/rd[k]);
+    delta[k]=pitch/abs(rd[k]);
   }
-  float entered = a; vec3 front = n;
-  // A line crosses at most 63 XY cells in a 32x32 tile (including corners).
-  for (int i = 0; i < 66; ++i) {
-    float boundary = min(min(next.x, next.y), min(b, closest));
-    // Split at sample centres so each interval uses one bilinear patch.
-    vec2 middle = vec2(1e30);
-    for (int k = 0; k < 2; ++k) if (step[k] != 0)
-      middle[k] = ((float(cell[k]) + .5) * pitch - ro[k]) / rd[k];
-    float start = entered;
-    for (int part = 0; part < 3; ++part) {
-      float finish = boundary;
-      for (int k = 0; k < 2; ++k)
-        if (middle[k] > start + 1e-6) finish = min(finish, middle[k]);
-      if (finish >= start && interval_hit(ro, rd, cell, start, finish, front, closest, normal))
-        return true;
-      if (finish >= boundary) break;
-      front = middle.x <= middle.y ? vec3(-step.x, 0, 0) : vec3(0, -step.y, 0);
-      if (middle.x <= finish + 1e-6) middle.x = 1e30;
-      if (middle.y <= finish + 1e-6) middle.y = 1e30;
-      start = finish;
-    }
-    if (boundary >= b || boundary >= closest) break;
-    bool sx = next.x <= next.y, sy = next.y <= next.x;
-    front = sx ? vec3(-step.x, 0, 0) : vec3(0, -step.y, 0);
-    if (sx) { cell.x += step.x; next.x += delta.x; }
-    if (sy) { cell.y += step.y; next.y += delta.y; }
-    if (any(lessThan(cell, begin)) || any(greaterThanEqual(cell, end))) break;
-    entered = boundary;
+  float entered=a;vec3 front=n;
+  // A tile spans at most 33 patches on either axis, including its border halo.
+  for(int i=0;i<68;++i) {
+    float boundary=min(min(next.x,next.y),min(b,closest));
+    if(interval_hit(ro,rd,patch,entered,boundary,front,closest,normal)) return true;
+    if(boundary>=b || boundary>=closest) break;
+    bool sx=next.x<=next.y,sy=next.y<=next.x;
+    front=sx?vec3(-step.x,0,0):vec3(0,-step.y,0);
+    if(sx) {patch.x+=step.x;next.x+=delta.x;}
+    if(sy) {patch.y+=step.y;next.y+=delta.y;}
+    entered=boundary;
   }
   return false;
 }
@@ -410,34 +405,33 @@ vec2 sample_gradient(ivec2 cell, bool top) {
   }
   return gradient;
 }
-float normal_weight(vec2 delta, float radius) {
-  vec2 w=max(vec2(0),vec2(radius+1.0)-abs(delta));
-  return w.x*w.y;
-}
 vec3 wall_normal(vec3 position, vec3 geometric) {
-  // Integrate actual samples rather than subsampling a coarse lattice: sparse
-  // binary samples alias badly on walls almost aligned with a grid axis.
+  // The four weighted gradients share separable triangular kernels. Blend
+  // their X/Y weights and moments first, then accumulate one gradient rather
+  // than four. This is the same dense filter, with the same radius and samples.
   int radius=int(clamp(ceil(1.0/(scale*pitch)),2.0,4.0));
   vec2 coordinates=position.xy/pitch-.5;
   ivec2 base=ivec2(floor(coordinates));
-  vec2 g00=vec2(0),g10=vec2(0),g01=vec2(0),g11=vec2(0);
+  vec2 uv=clamp(coordinates-vec2(base),vec2(0),vec2(1));
+  vec2 gradient=vec2(0);
+  float extent=float(radius+1);
   for(int y=0;y<10;++y) {
     if(y>2*radius+1) break;
+    float py=float(y-radius);
+    float wy0=max(0.0,extent-abs(py)),wy1=max(0.0,extent-abs(py-1.0));
+    float wy=mix(wy0,wy1,uv.y),my=mix(py*wy0,(py-1.0)*wy1,uv.y);
     for(int x=0;x<10;++x) {
       if(x>2*radius+1) break;
       ivec2 cell=base+ivec2(x-radius,y-radius);
       if(any(lessThan(cell,ivec2(0))) || any(greaterThanEqual(cell,grid_size))) continue;
       vec2 h=cell_heights(cell);
       if(!occupied(h) || position.z<h.x || position.z>h.y) continue;
-      vec2 p=vec2(x-radius,y-radius);
-      g00-=p*normal_weight(p,float(radius));
-      p-=vec2(1,0);g10-=p*normal_weight(p,float(radius));
-      p+=vec2(1,-1);g01-=p*normal_weight(p,float(radius));
-      p-=vec2(1,0);g11-=p*normal_weight(p,float(radius));
+      float px=float(x-radius);
+      float wx0=max(0.0,extent-abs(px)),wx1=max(0.0,extent-abs(px-1.0));
+      float wx=mix(wx0,wx1,uv.x),mx=mix(px*wx0,(px-1.0)*wx1,uv.x);
+      gradient-=vec2(mx*wy,wx*my);
     }
   }
-  vec2 uv=clamp(coordinates-vec2(base),vec2(0),vec2(1));
-  vec2 gradient=mix(mix(g00,g10,uv.x),mix(g01,g11,uv.x),uv.y);
   if(dot(gradient,gradient)<1e-8) return geometric;
   vec3 result=normalize(vec3(gradient,0));
   return dot(result,geometric)>-.05?result:geometric;
@@ -449,13 +443,13 @@ vec3 shading_normal(vec2 position, vec3 geometric) {
   if (!occupied(h)) return geometric;
   bool top = geometric.z > 0.0;
   ivec2 base = ivec2(floor(position / pitch - .5));
-  vec2 a = cell_heights(base), b = cell_heights(base+ivec2(1,0));
-  vec2 c = cell_heights(base+ivec2(0,1)), d = cell_heights(base+ivec2(1));
+  vec2 a,b,c,d;patch_heights(base,a,b,c,d);
   bvec4 selected;
   vec4 z = top ? vec4(a.y,b.y,c.y,d.y) : vec4(a.x,b.x,c.x,d.x);
   coefficients(base,owner,z,bvec4(occupied(a),occupied(b),occupied(c),occupied(d)),
                top ? h.y : h.x,top,selected);
-  vec2 fallback = sample_gradient(owner,top);
+  vec2 fallback = vec2(0);
+  if (!all(selected)) fallback = sample_gradient(owner,top);
   vec2 gradients[4];
   for (int i=0;i<4;++i)
     gradients[i] = selected[i] ? sample_gradient(base+ivec2(i%2,i/2),top) : fallback;
@@ -481,27 +475,39 @@ void main() {
   float closest = 2.0 * reach;
   vec3 normal = vec3(0);
   bool hit = false;
-  int stack[32]; int count = 1; stack[0] = 0;
-  while (count > 0) {
-    int node = stack[--count]; float entry;
-    if (!node_hit(node, ro, rd, closest, entry)) continue;
+  int stack[32]; int count = 0, node = 0;
+  bool check_bounds = true;
+  while (true) {
     ivec4 info = texelFetch(tree_data, node);
     if (info.z >= 0) {
+      // Leaf intersection already tests its bounds and computes entry normals.
       vec3 n;
-      if (leaf_hit(info.z, info.w != 0, ro, rd, texelFetch(bounds_data, node * 2).xyz,
+      if (leaf_hit(info.w != 0, ro, rd, texelFetch(bounds_data, node * 2).xyz,
                    texelFetch(bounds_data, node * 2 + 1).xyz, closest, n)) {
         hit = true; normal = n;
       }
     } else {
-      float a, b;
-      bool ha = node_hit(info.x, ro, rd, closest, a);
-      bool hb = node_hit(info.y, ro, rd, closest, b);
-      if (ha && hb) {
-        if (a <= b) { stack[count++] = info.y; stack[count++] = info.x; }
-        else { stack[count++] = info.x; stack[count++] = info.y; }
-      } else if (ha) stack[count++] = info.x;
-      else if (hb) stack[count++] = info.y;
+      // Descend into the nearer child immediately: its bounds were just tested.
+      // Deferred internal nodes still need a new test against the latest hit.
+      float entry;
+      if (!check_bounds || node_hit(node,ro,rd,closest,entry)) {
+        float a, b;
+        bool ha = node_hit(info.x, ro, rd, closest, a);
+        bool hb = node_hit(info.y, ro, rd, closest, b);
+        if (ha || hb) {
+          if (ha && hb) {
+            bool left_first=a<=b;
+            stack[count++]=left_first?info.y:info.x;
+            node=left_first?info.x:info.y;
+          } else node=ha?info.x:info.y;
+          check_bounds=false;
+          continue;
+        }
+      }
     }
+    if (count==0) break;
+    node=stack[--count];
+    check_bounds=true;
   }
   // Evaluate derivatives before hit-dependent branches, including background
   // lanes in the fragment quad. Fine cap normals can use these derivatives;

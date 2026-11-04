@@ -49,9 +49,11 @@ auto projection_values(const Projection& p) {
       p.right.x, p.right.y, p.right.z, p.up.x, p.up.y, p.up.z,
       p.toward.x, p.toward.y, p.toward.z, p.scale};
 }
+} // namespace
+
 // A cached, two-pixel depth grid keeps contact lines and hit testing on the
 // visible part surface. It does not move the geometry towards the camera.
-void contact_depth(App& app, const OrbitScene& scene) {
+void refresh_surface_depth(App& app, const OrbitScene& scene) {
   const auto model = app.geometry.part_cad();
   if (app.surface_depth_model == model &&
       projection_values(app.surface_depth_projection) == projection_values(scene.projection) &&
@@ -66,6 +68,33 @@ void contact_depth(App& app, const OrbitScene& scene) {
   const int width = app.surface_depth_width = std::max(1, int(std::ceil(scene.size.x / 2)));
   const int height = app.surface_depth_height = std::max(1, int(std::ceil(scene.size.y / 2)));
   app.surface_depth.assign(std::size_t(width) * height, -std::numeric_limits<float>::infinity());
+  if (SDL_GL_GetCurrentContext()) {
+    // The application's display has a GL context. Rasterize the part on the
+    // GPU at the existing two-pixel picking resolution and read depth only
+    // when this camera/model changes. The CPU oracle below supports headless
+    // UI tests which deliberately have no graphics context.
+    if (!surface_depth_view) surface_depth_view=std::make_unique<wave::heightfield::Renderer>();
+    const auto vec=[](Vec3 v) { return wave::Vec3f{v.x,v.y,v.z}; };
+    const auto& p=scene.projection;
+    const auto b=model->mesh().bounds;
+    const float dx=(b.lower.x+b.upper.x)*.5f-p.model_centre.x,
+                dy=(b.lower.y+b.upper.y)*.5f-p.model_centre.y,
+                dz=(b.lower.z+b.upper.z)*.5f-p.model_centre.z;
+    const float reach=std::sqrt(dx*dx+dy*dy+dz*dz)+
+        std::max({b.upper.x-b.lower.x,b.upper.y-b.lower.y,b.upper.z-b.lower.z,1.f})*4;
+    wave::heightfield::Camera camera{vec(p.model_centre),vec(p.right),vec(p.up),vec(p.toward),vec(scene.light),
+        p.scale/2,reach,(p.centre.x-scene.top_left.x)/2,(p.centre.y-scene.top_left.y)/2};
+    wave::heightfield::MeshDraw draw;
+    draw.source=std::shared_ptr<const wave::Mesh>(model,&model->mesh());
+    static const wave::Heightmap empty;
+    surface_depth_view->render(empty,camera,width,height,{draw});
+    const auto depths=surface_depth_view->read_depth();
+    for (int y=0;y<height;++y) for (int x=0;x<width;++x) {
+      const auto depth=depths[std::size_t(height-1-y)*width+x];
+      if (depth<1) app.surface_depth[std::size_t(y)*width+x]=(0.5f-depth)*2*reach;
+    }
+    return;
+  }
   for (const auto& triangle : model->mesh().triangles) {
     const auto a = view_point(triangle.a), b = view_point(triangle.b), c = view_point(triangle.c);
     auto p = scene.projection.point(a), q = scene.projection.point(b), r = scene.projection.point(c);
@@ -90,6 +119,7 @@ void contact_depth(App& app, const OrbitScene& scene) {
       }
   }
 }
+namespace {
 bool contact_visible(const App& app, const Projection& projection, wave::Vec3d point) {
   const auto p = projection.point(view_point(point));
   const int x = int(std::floor((p.x-app.surface_depth_origin.x)/2));
@@ -127,7 +157,7 @@ void draw_surface_contours(App& app, OrbitScene& scene, cam::Operation& operatio
   const auto none = cam::SurfaceContourOrder::none;
   if (preview.signature != app.surface_preview_key || !preview.error.empty() ||
       preview.contours.empty() || order.depth.size() != preview.contours.size()) return;
-  contact_depth(app, scene);
+  refresh_surface_depth(app, scene);
   const auto screen = [&](wave::Vec3d p) { return scene.projection.point(view_point(p)); };
   const auto visible = [&](wave::Vec3d p) { return contact_visible(app, scene.projection, p); };
   const auto mouse = ImGui::GetIO().MousePos;

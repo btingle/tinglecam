@@ -1,0 +1,86 @@
+solid part
+  facet normal 0 0 0
+    outer loop
+      vertex 4 3 1
+      vertex 16 9 1
+      vertex 16 3 1
+    endloop
+  endfacet
+  facet normal 0 0 0
+    outer loop
+      vertex 4 3 1
+      vertex 4 9 1
+      vertex 16 9 1
+    endloop
+  endfacet
+  facet normal 0 0 0
+    outer loop
+      vertex 4 3 5
+      vertex 16 3 5
+      vertex 16 9 5
+    endloop
+  endfacet
+  facet normal 0 0 0
+    outer loop
+      vertex 4 3 5
+      vertex 16 9 5
+      vertex 4 9 5
+    endloop
+  endfacet
+  facet normal 0 0 0
+    outer loop
+      vertex 4 3 1
+      vertex 16 3 1
+      vertex 16 3 5
+    endloop
+  endfacet
+  facet normal 0 0 0
+    outer loop
+      vertex 4 3 1
+      vertex 16 3 5
+      vertex 4 3 5
+    endloop
+  endfacet
+  facet normal 0 0 0
+    outer loop
+      vertex 16 3 1
+      vertex 16 9 1
+      vertex 16 9 5
+    endloop
+  endfacet
+  facet normal 0 0 0
+    outer loop
+      vertex 16 3 1
+      vertex 16 9 5
+      vertex 16 3 5
+    endloop
+  endfacet
+  facet normal 0 0 0
+    outer loop
+      vertex 16 9 1
+      vertex 4 9 1
+      vertex 4 9 5
+    endloop
+  endfacet
+  facet normal 0 0 0
+    outer loop
+      vertex 16 9 1
+      vertex 4 9 5
+      vertex 16 9 5
+    endloop
+  endfacet
+  facet normal 0 0 0
+    outer loop
+      vertex 4 9 1
+      vertex 4 3 1
+      vertex 4 3 5
+    endloop
+  endfacet
+  facet normal 0 0 0
+    outer loop
+      vertex 4 9 1
+      vertex 4 3 5
+      vertex 4 9 5
+    endloop
+  endfacet
+endsolid part

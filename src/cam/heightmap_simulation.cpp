@@ -4,6 +4,7 @@
 #include <cmath>
 #include <numbers>
 #include <stdexcept>
+#include <type_traits>
 
 #include "cam/parametric.h"
 #include "job_internal.h"
@@ -60,12 +61,43 @@ void sweep_phase(const MotionPhase& phase, double fraction, double pitch,
     auto b = motion_point(phase, double(i) / pieces);
     if (double(i) / pieces > fraction)
       b = wave::interpolate(a, b, fraction * pieces - (i - 1));
-    function(a, b);
+    if constexpr (std::is_invocable_v<F, wave::Vec3d, wave::Vec3d, double, double>)
+      function(a, b, double(i - 1) / pieces, std::min(fraction, double(i) / pieces));
+    else
+      function(a, b);
     a = b;
   }
 }
+void record_fixture_contacts(MotionPhase& phase, const JobGeometry& geometry,
+                             const wave::MillingCutter& cutter, double pitch) {
+  phase.fixture_contacts.clear();
+  if (geometry.fixtures().empty()) return;
+  // Only refine colliding sweeps. Clear moves still cost one indexed query.
+  // Localize contact conservatively to 0.05 mm of tool travel, independently
+  // of the stock grid. Keep fractions so arcs and vertical moves play back too.
+  const auto visit = [&](auto&& self, wave::Vec3d a, wave::Vec3d b,
+                         double begin, double end) -> void {
+    if (geometry.fixture_clear(a, b, cutter)) return;
+    if (phase.length * (end - begin) > 0.05) {
+      const double middle = (begin + end) / 2;
+      const auto p = motion_point(phase, middle);
+      self(self, a, p, begin, middle);
+      self(self, p, b, middle, end);
+    } else if (!phase.fixture_contacts.empty() &&
+               phase.fixture_contacts.back().end == begin) {
+      phase.fixture_contacts.back().end = end;
+      phase.fixture_contacts.back().to = b;
+    } else {
+      phase.fixture_contacts.push_back({begin, end, a, b});
+    }
+  };
+  sweep_phase(phase, 1, pitch, [&](auto a, auto b, double begin, double end) {
+    visit(visit, a, b, begin, end);
+  });
+}
 wave::Heightmap initial_stock(const JobGeometry& geometry, const Job& job,
                               double pitch) {
+  if(geometry.inherited_stock()) return *geometry.inherited_stock();
   if (geometry.has_stock()) {
     if (!geometry.box_stock())
       return wave::Heightmap::from_mesh(geometry.stock().mesh(), pitch);
@@ -378,10 +410,15 @@ void simulate_operation_xyz(OperationPlan& plan, const JobGeometry& geometry,
       throw std::runtime_error("Stock simulation supports end mills and drills");
     auto stock = stock_before_operation(geometry, job, prior, job.simulation_pitch);
     plan.stock_before = std::make_shared<const wave::Heightmap>(stock);
-    if (std::abs(stock.pitch() - job.simulation_pitch) > 1e-8)
-      plan.warnings.push_back("Earlier operations were simulated at " +
-                              std::to_string(stock.pitch()) +
-                              " mm; plan them again to use the new grid pitch");
+    if (std::abs(stock.pitch() - job.simulation_pitch) > 1e-8) {
+      if(geometry.inherited_stock())
+        plan.debug_messages.push_back("Inherited stock keeps its source grid pitch of " +
+                                std::to_string(stock.pitch()) + " mm without resampling");
+      else
+        plan.warnings.push_back("Earlier operations were simulated at " +
+                                std::to_string(stock.pitch()) +
+                                " mm; plan them again to use the new grid pitch");
+    }
     const bool roughing = operation.mode == OperationMode::Roughing;
     const double vertical_rate = std::max(rapid_feed_z(machine), 1.0);
     // Keep even a zero-clearance approach above contact after the post rounds
@@ -414,7 +451,7 @@ void simulate_operation_xyz(OperationPlan& plan, const JobGeometry& geometry,
           !progress(double(l) / std::max(std::size_t{1}, plan.levels.size()),
                     "Simulating stock"))
         throw std::runtime_error("Cancelled");
-      if (roughing && previous && !level.nothing_to_cut && !level.feeds.motion.empty() &&
+      if (geometry.fixtures().empty() && roughing && previous && !level.nothing_to_cut && !level.feeds.motion.empty() &&
           detail::link_layers(*previous, level, stock, cutter, travel, vertical_rate,
                       rapid_plane, slack))
         finish_level_motion(*previous, feeds, stock.pitch());
@@ -480,6 +517,7 @@ void simulate_operation_xyz(OperationPlan& plan, const JobGeometry& geometry,
             !progress(double(l) / std::max(std::size_t{1}, plan.levels.size()),
                       "Simulating stock"))
           throw std::runtime_error("Cancelled");
+        record_fixture_contacts(phase, geometry, cutter, stock.pitch());
         const bool lift = phase.from == phase.to && phase.to_z >= phase.from_z;
         if (phase.rapid && !lift) {
           bool clear = true;
@@ -583,6 +621,21 @@ void simulate_operation_xyz(OperationPlan& plan, const JobGeometry& geometry,
       plan.stats.rapid_minutes += level.feeds.stats.rapid_minutes;
     }
     plan.stock_after = std::make_shared<const wave::Heightmap>(stock);
+    std::size_t contact_moves = 0;
+    const FixtureContact* first_contact = nullptr;
+    for (const auto& level : plan.levels)
+      for (const auto& phase : level.feeds.motion)
+        if (!phase.fixture_contacts.empty()) {
+          ++contact_moves;
+          if (!first_contact) first_contact = &phase.fixture_contacts.front();
+        }
+    if (first_contact) {
+      const auto p = first_contact->from;
+      plan.warnings.push_back(std::to_string(contact_moves) +
+          " motion(s) contact fixture or keep-away clearance; tool shown red during contact in playback. "
+          "First contact near (" + std::to_string(p.x) + ", " + std::to_string(p.y) +
+          ", " + std::to_string(p.z) + ") mm in setup coordinates");
+    }
     if (plan.stats.unsafe_plunges > 0)
       plan.warnings.push_back(std::to_string(plan.stats.unsafe_plunges) +
                               " roughing descent(s) land on stock and plunge");

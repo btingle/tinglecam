@@ -93,12 +93,16 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
                            std::numeric_limits<float>::infinity())
           : protected_z;
       level.part_slice = geometry.part_outline(slice_z, operation.slice_grid);
+      // Wave routing tolerates micron rounding at its protected boundary.
+      // Keep that numerical slack outside the requested fixture clearance.
+      level.fixture_keep_out = geometry.fixture_keep_out(floor_z,operation.slice_grid,radius + .01);
       level.stock_slice = geometry.stock_outline(floor_z, operation.slice_grid);
+      const bool include_above=operation.mode==OperationMode::Roughing || level.part_slice.empty();
       level.incoming_stock =
           prior_operations.empty()
               ? level.stock_slice
               : stock_after_operations_at_z(level.stock_slice, floor_z,
-                                            prior_operations);
+                                            prior_operations, include_above);
       if (operation.mode == OperationMode::Roughing && operation.stock_boundary_dilation > 0) {
         // Dilate the stock actually available at this depth, after preceding
         // operations. Current-operation cleanup is subtracted afterwards, so
@@ -108,7 +112,7 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
       }
       if (prior_subdivisions != nullptr)
         level.incoming_stock = stock_after_operation_at_z(
-            level.incoming_stock, floor_z, *prior_subdivisions);
+            level.incoming_stock, floor_z, *prior_subdivisions, include_above);
       plan.metrics.slicing_milliseconds += elapsed_milliseconds(slice_start);
 
       if (level.stock_slice.empty() || level.incoming_stock.empty()) {
@@ -124,6 +128,10 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
               ? absent_subject(level.incoming_stock)
               : offset_outward(level.part_slice,
                                radius + operation.radial_stock_to_leave);
+      if(!level.fixture_keep_out.empty()) {
+        const auto part_centres=level.part_slice.empty()?wave::Paths64{}:keep_outs[index];
+        keep_outs[index]=Union(part_centres,level.fixture_keep_out,FillRule::NonZero);
+      }
       plan.metrics.preparation_milliseconds +=
           elapsed_milliseconds(preparation_start);
 
@@ -383,14 +391,16 @@ void plan_toolpaths(OperationPlan& plan,
       // was built.
       const bool clearing = level.part_slice.empty();
       if (operation.mode == OperationMode::ContourFinishing && !clearing) {
-        const wave::Paths64 keep_out =
+        wave::Paths64 keep_out =
             level.part_slice.empty()
                 ? absent_subject(level.stock_slice)
                 : offset_outward(level.part_slice,
                                  radius + operation.radial_stock_to_leave);
+        keep_out=Union(keep_out,level.fixture_keep_out,FillRule::NonZero);
         const auto contours = derive_offset_contours(
             level.part_slice, radius + operation.radial_stock_to_leave,
-            operation.clip_contours_to_stock ? &level.stock_slice : nullptr);
+            operation.clip_contours_to_stock ? &level.stock_slice : nullptr,
+            &level.fixture_keep_out);
         auto tasks = contour_traversal_tasks(contours,
                                              operation.contour_direction);
         add_safe_stock_approaches(tasks, level.stock_slice, keep_out, radius);
@@ -414,7 +424,7 @@ void plan_toolpaths(OperationPlan& plan,
         // from an earlier subdivision of this same operation, whose geometry
         // must remain subject to the existing subdivision routing rules.
         const wave::Paths64 prior_stock = stock_after_operations_at_z(
-            level.stock_slice, level.floor_z, prior_operations);
+            level.stock_slice, level.floor_z, prior_operations, true);
         const wave::Paths64 prior_removed = Clipper2Lib::Difference(
             level.stock_slice, prior_stock,
             Clipper2Lib::FillRule::NonZero);
@@ -422,9 +432,10 @@ void plan_toolpaths(OperationPlan& plan,
         // a new cutter centre can ride exactly on its edge. Keep the same small
         // slack used by at-depth links inside the inherited opening; this
         // avoids turning rounding at a prior pocket wall into a gouge.
-        const wave::Paths64 initial_cleared = Clipper2Lib::InflatePaths(
+        const wave::Paths64 initial_cleared = Clipper2Lib::Difference(Clipper2Lib::InflatePaths(
             prior_removed, -link_slack(setup.stepover),
-            Clipper2Lib::JoinType::Round, Clipper2Lib::EndType::Polygon);
+            Clipper2Lib::JoinType::Round, Clipper2Lib::EndType::Polygon),
+            level.fixture_keep_out,FillRule::NonZero);
         level.toolpath = wave::build_toolpath(
             level.wave_stages, radius, level.floor_z, rapid_plane,
             rapid_feed(machine), travel_feed, rapid_feed_z(machine),
@@ -485,9 +496,10 @@ void plan_toolpaths(OperationPlan& plan,
                    : reached_stock;
       }
       const auto contours = derive_offset_contours(
-          level.part_slice, radius + operation.radial_stock_to_leave, &clip);
-      const auto keep_out=offset_outward(level.part_slice,
-                                         radius+operation.radial_stock_to_leave);
+          level.part_slice, radius + operation.radial_stock_to_leave, &clip, &level.fixture_keep_out);
+      const auto keep_out=Union(offset_outward(level.part_slice,
+                                         radius+operation.radial_stock_to_leave),
+                                level.fixture_keep_out,FillRule::NonZero);
       auto tasks =
           contour_traversal_tasks(contours, operation.contour_direction);
       add_safe_stock_approaches(tasks, level.incoming_stock, keep_out,
@@ -500,9 +512,9 @@ void plan_toolpaths(OperationPlan& plan,
       // wall could not be joined to the next one round the outside.
       // Boundary-only cleanup may have no wave at all. The surrounding air
       // still connects its contours, with the full cutter/radial keepout.
-      traversal.stay_down_region = Clipper2Lib::Union(
+      traversal.stay_down_region = Clipper2Lib::Difference(Clipper2Lib::Union(
           level.toolpath.cleared, open_space(level.incoming_stock,keep_out),
-          Clipper2Lib::FillRule::NonZero);
+          Clipper2Lib::FillRule::NonZero),level.fixture_keep_out,FillRule::NonZero);
       // These contours ride the part's clearance boundary. Only forgive
       // independent micron rounding here, not a fraction of a stepover that
       // could consume the radial allowance at a connector's endpoints.
@@ -694,7 +706,7 @@ void plan_toolpaths(OperationPlan& plan,
         error << "\n  - " << detail;
       plan.error = error.str();
     } else {
-      plan.warnings.push_back("Nothing was left to cut at any depth");
+      plan.debug_messages.push_back("Nothing was left to cut at any depth");
     }
   }
   if (plan.stats.gouge_area > 0.0)
@@ -745,13 +757,13 @@ OperationPlan plan_operation(const JobGeometry& geometry,
 
 wave::Paths64 stock_after_operations_at_z(
     const wave::Paths64& nominal_stock, double z,
-    const PriorOperations& operations) {
+    const PriorOperations& operations, bool include_above) {
   if (nominal_stock.empty()) return {};
   // The newest simulated stock already contains every earlier operation.
   for (std::size_t i = operations.size(); i > 0; --i)
     if (operations[i - 1] && operations[i - 1]->ok() &&
         operations[i - 1]->stock_after)
-      return stock_after_operation_at_z(nominal_stock, z, *operations[i - 1]);
+      return stock_after_operation_at_z(nominal_stock, z, *operations[i - 1], include_above);
   return Clipper2Lib::Union(nominal_stock, Clipper2Lib::FillRule::NonZero);
 }
 
@@ -828,6 +840,7 @@ OperationPlan plan_subdivided_operation(
   result.subdivisions.resize(groups);
   std::vector<wave::InterLayerTopology> topologies(groups);
   std::vector<std::vector<std::string>> warnings(groups);
+  std::vector<std::vector<std::string>> debug_messages(groups);
   const auto collect = [&](std::size_t group, OperationPlan&& planned) {
     const auto& entry = schedule[group];
     if (!planned.ok()) {
@@ -850,6 +863,7 @@ OperationPlan plan_subdivided_operation(
     accumulate(result.metrics, planned.metrics);
     result.spindle_rpm = std::max(result.spindle_rpm, planned.spindle_rpm);
     warnings[group] = std::move(planned.warnings);
+    debug_messages[group] = std::move(planned.debug_messages);
     return true;
   };
   const double coarse_to = progress_from + span / count;
@@ -902,6 +916,8 @@ OperationPlan plan_subdivided_operation(
       execution.push_back(std::move(result.levels[subdivision.first_level + i]));
     subdivision.first_level = first;
     append_inter_layer(result.inter_layer, std::move(topologies[group]), first);
+    for (const auto& message : debug_messages[group])
+      result.debug_messages.push_back(group == 0 ? message : schedule[group].pass.name + ": " + message);
     for (const auto& warning : warnings[group]) {
       if (std::find(setup_warnings.begin(), setup_warnings.end(), warning) ==
           setup_warnings.end())

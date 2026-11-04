@@ -56,8 +56,10 @@ See [holes and counterbores](docs/hole-mode.md) or open
 For face selection, ball-nose compensation, the experimental heightmap stock
 simulator, SDK options and CLI examples, see
 [STEP finishing and heightmap simulation](docs/step-finishing-heightmap.md).
-The 3D heightmap result is raycast directly at full resolution using OpenGL 3.2
+The 3D heightmap result raycasts the full simulation grid using OpenGL 3.2
 fragment shaders; this renderer does not require CUDA or CUDA/OpenGL interop.
+Tools > Settings provides independent render-resolution controls for Stock/Result
+and Surface/Setup; these affect display quality without changing simulation pitch.
 The mesh slicer uses CUDA when available, with a cuBQL CPU fallback.
 Under WSL, startup automatically selects Mesa's D3D12 driver and the mesh GPU.
 The active renderer is shown under Tools > Settings; explicit
@@ -84,7 +86,12 @@ The standalone [marble track generator](tools/README-tracks.md) in
 for CAD applications such as SolidWorks. It accepts continuous DXF profiles and
 can cap closed profiles to produce STEP solids.
 
-In Job setup, **Model orientation** provides ±90° turns around world X, Y, and Z
+Jobs support multiple setups with independent machining contexts, shared model
+placements, fixture/keep-away geometry, and direct inheritance of remaining
+heightmap stock. See [setups and stock inheritance](docs/setups.md), or open
+`data/examples/two-setups.json`.
+
+In Setup, **Model orientation** provides ±90° turns around world X, Y, and Z
 through the input coordinate origin. Rotate part and stock together (the default),
 or select either model separately; Reset orientation restores the selected inputs.
 Orientations are saved in the job and apply to OBJ/STL meshes and native STEP

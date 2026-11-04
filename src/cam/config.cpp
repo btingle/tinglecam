@@ -220,7 +220,7 @@ json to_json(const Operation& operation) {
     cutting["chip_load"] = *operation.cutting.chip_load;
   if (operation.cutting.plunge_feed)
     cutting["plunge_feed"] = *operation.cutting.plunge_feed;
-  json result{{"name", operation.name},
+  json result{{"id", operation.id}, {"setup",operation.setup_id}, {"name", operation.name},
               {"mode", operation_mode_name(operation.mode)},
               {"tool", operation.tool_id},
               {"cutting", std::move(cutting)},
@@ -284,6 +284,8 @@ json to_json(const UserSettings& settings) {
                       {"style", theme.style_blob}});
   const PanelLayout& layout = settings.panel_layout;
   return json{{"ui_scale", settings.ui_scale},
+              {"stock_render_scale", settings.stock_render_scale},
+              {"surface_render_scale", settings.surface_render_scale},
               {"ui_theme", ui_theme_name(settings.ui_theme)},
               {"custom_theme", settings.custom_theme},
               {"custom_themes", std::move(themes)},
@@ -301,7 +303,7 @@ json to_json(const UserSettings& settings) {
 Operation operation_from(const json& node, std::vector<std::string>* warnings = nullptr,
                          const std::string& where = {}) {
   report_unknown(node,
-                 {"name", "mode", "tool", "cutting", "surface", "stepover_ratio",
+                 {"id", "setup", "name", "mode", "tool", "cutting", "surface", "stepover_ratio",
                   "stepdown", "coolant", "pockets", "holes", "auto_identify_pockets",
                   "pocket_radial_margin", "pocket_auto", "plane",
                   "finishing_subdivisions", "adaptive_cleanup_stepover",
@@ -313,6 +315,8 @@ Operation operation_from(const json& node, std::vector<std::string>* warnings = 
                   "slice_grid"},
                  where, warnings);
   Operation operation;
+  read(node, "id", operation.id);
+  read(node, "setup", operation.setup_id);
   read(node, "name", operation.name);
   read_enum(node, "mode", operation.mode, operation_mode_from_name);
   read(node, "tool", operation.tool_id);
@@ -440,6 +444,8 @@ Operation operation_from(const json& node, std::vector<std::string>* warnings = 
 UserSettings settings_from(const json& node) {
   UserSettings settings = default_user_settings();
   read(node, "ui_scale", settings.ui_scale);
+  read(node, "stock_render_scale", settings.stock_render_scale);
+  read(node, "surface_render_scale", settings.surface_render_scale);
   read_enum(node, "ui_theme", settings.ui_theme, ui_theme_from_name);
   read(node, "custom_theme", settings.custom_theme);
   if (node.contains("custom_themes")) {
@@ -457,6 +463,12 @@ UserSettings settings_from(const json& node) {
         settings.custom_themes.push_back(std::move(theme));
     }
   }
+  if (!std::isfinite(settings.stock_render_scale) ||
+      (settings.stock_render_scale != 0 &&
+       (settings.stock_render_scale < .25 || settings.stock_render_scale > 1)) ||
+      !std::isfinite(settings.surface_render_scale) ||
+      settings.surface_render_scale < .25 || settings.surface_render_scale > 1)
+    throw std::runtime_error("Render resolution must be between 25% and 100%, or automatic for stock");
   if (!(settings.ui_scale >= 0.5 && settings.ui_scale <= 3.0) ||
       !std::isfinite(settings.ui_scale))
     throw std::runtime_error("UI scale must be finite and between 0.5 and 3.0");
@@ -490,7 +502,40 @@ UserSettings settings_from(const json& node) {
   return settings;
 }
 
+json transform_json(const ModelTransform& t) {
+  return {{"orientation",t.orientation.axes},{"offset",t.offset}};
+}
+ModelTransform transform_from(const json& node) {
+  ModelTransform t;
+  if(!node.is_object()) throw std::runtime_error("Expected placement object");
+  if(node.contains("orientation")) {
+    const auto& axes=node.at("orientation");
+    if(!axes.is_array() || axes.size()!=3) throw std::runtime_error("Expected three signed placement axes");
+    for(int i=0;i<3;++i) {
+      if(!axes[i].is_number_integer() || axes[i]<-3 || axes[i]>3)
+        throw std::runtime_error("Expected integer placement axes");
+      t.orientation.axes[i]=axes[i].get<int>();
+    }
+  }
+  if(node.contains("offset")) t.offset=node.at("offset").get<std::array<double,3>>();
+  t.validate();
+  return t;
+}
 json to_json(const Job& job) {
+  json setups=json::array(), fixtures=json::array();
+  for(const auto& setup:job.setups) {
+    Job context;
+    static_cast<SetupContext&>(context)=setup;
+    context.name=setup.name;
+    auto entry=to_json(context);
+    entry.erase("tools"); entry.erase("operations"); entry.erase("setups");
+    entry["id"]=setup.id;
+    setups.push_back(std::move(entry));
+  }
+  for(const auto& f:job.fixtures)
+    fixtures.push_back({{"name",f.name},{"mesh",f.mesh.string()},
+        {"role",f.role==SetupContext::ProtectedModel::Role::Fixture?"fixture":"keep_away"},
+        {"placement",transform_json(f.placement)},{"clearance",f.clearance}});
   json operations = json::array();
   for (const auto& operation : job.operations)
     operations.push_back(to_json(operation));
@@ -501,6 +546,14 @@ json to_json(const Job& job) {
                      {"number", entry.number},
                      {"length_offset", entry.length_offset}});
   return json{{"name", job.name},
+              {"setups",std::move(setups)}, {"fixtures",std::move(fixtures)},
+              {"part_from_setup",job.part_from_setup},
+              {"fixtures_from_setup",job.fixtures_from_setup},
+              {"properties_from_setup",job.properties_from_setup},
+              {"stock_from_operation",job.stock_from_operation},
+              {"stock_transfer",transform_json(job.stock_transfer)},
+              {"part_offset_x",job.part_offset_x}, {"part_offset_y",job.part_offset_y},
+              {"part_offset_z",job.part_offset_z},
               {"machine", job.machine_id},
               {"material", job.material_id},
               {"simulation_pitch", job.simulation_pitch},
@@ -526,20 +579,23 @@ json to_json(const Job& job) {
               {"origin_relative_to_part", job.origin_relative_to_part},
               {"rapid_clearance_height", job.rapid_clearance_height},
               {"plunge_clearance_height", job.plunge_clearance_height},
-              {"work_offset", job.work_offset},
+              {"work_offset", job.work_offset}, {"pause_on_entry",job.pause_on_entry},
               {"operations", operations}};
 }
 
-Job job_from(const json& node, std::vector<std::string>* warnings = nullptr) {
+Job job_from(const json& node, std::vector<std::string>* warnings = nullptr, bool context_only = false) {
   report_unknown(node,
-                 {"name", "machine", "material", "simulation_pitch", "tools",
+                 {"id", "name", "machine", "material", "simulation_pitch", "tools",
+                  "setups", "fixtures", "part_from_setup", "fixtures_from_setup",
+                  "properties_from_setup", "stock_from_operation", "stock_transfer",
+                  "part_offset_x", "part_offset_y", "part_offset_z",
                   "part_mesh", "stock_mesh", "part_orientation", "stock_orientation",
                   "stock_offset_x", "stock_offset_y", "stock_offset_z",
                   "origin_x", "origin_y", "origin_z",
                   "origin_relative_to_part",
                   "box_stock", "box_stock_margins", "rapid_clearance_height",
                   "plunge_clearance_height",
-                  "work_offset", "operations"},
+                  "work_offset", "pause_on_entry", "operations"},
                  "Job", warnings);
   Job job;
   std::string part;
@@ -577,6 +633,38 @@ Job job_from(const json& node, std::vector<std::string>* warnings = nullptr) {
   };
   orientation("part_orientation", job.part_orientation);
   orientation("stock_orientation", job.stock_orientation);
+  read(node, "part_offset_x", job.part_offset_x);
+  read(node, "part_offset_y", job.part_offset_y);
+  read(node, "part_offset_z", job.part_offset_z);
+  read(node, "part_from_setup", job.part_from_setup);
+  read(node, "fixtures_from_setup", job.fixtures_from_setup);
+  read(node, "properties_from_setup", job.properties_from_setup);
+  read(node, "stock_from_operation", job.stock_from_operation);
+  if(node.contains("stock_transfer")) job.stock_transfer=transform_from(node.at("stock_transfer"));
+  if(node.contains("fixtures")) {
+    if(!node.at("fixtures").is_array()) throw std::runtime_error("Expected fixtures array");
+    for(const auto& entry:node.at("fixtures")) {
+      SetupContext::ProtectedModel fixture;
+      read(entry,"name",fixture.name);
+      std::string path,role="fixture"; read(entry,"mesh",path); read(entry,"role",role);
+      fixture.mesh=path;
+      if(role!="fixture" && role!="keep_away") throw std::runtime_error("Unknown protected geometry role: "+role);
+      fixture.role=role=="fixture"?SetupContext::ProtectedModel::Role::Fixture:SetupContext::ProtectedModel::Role::KeepAway;
+      if(entry.contains("placement")) fixture.placement=transform_from(entry.at("placement"));
+      read(entry,"clearance",fixture.clearance);
+      if(!std::isfinite(fixture.clearance) || fixture.clearance<0) throw std::runtime_error("Invalid fixture clearance");
+      job.fixtures.push_back(std::move(fixture));
+    }
+  }
+  if(node.contains("setups")) {
+    if(!node.at("setups").is_array()) throw std::runtime_error("Expected setups array");
+    for(const auto& entry:node.at("setups")) {
+      auto nested=job_from(entry,warnings,true);
+      Setup setup; static_cast<SetupContext&>(setup)=std::move(nested);
+      read(entry,"id",setup.id); read(entry,"name",setup.name);
+      job.setups.push_back(std::move(setup));
+    }
+  }
   read(node, "stock_offset_x", job.stock_offset_x);
   read(node, "stock_offset_y", job.stock_offset_y);
   read(node, "stock_offset_z", job.stock_offset_z);
@@ -599,10 +687,12 @@ Job job_from(const json& node, std::vector<std::string>* warnings = nullptr) {
   read(node, "rapid_clearance_height", job.rapid_clearance_height);
   read(node, "plunge_clearance_height", job.plunge_clearance_height);
   read(node, "work_offset", job.work_offset);
+  read(node, "pause_on_entry", job.pause_on_entry);
   if (node.contains("operations") && node.at("operations").is_array())
     for (const auto& entry : node.at("operations"))
       job.operations.push_back(operation_from(
           entry, warnings, "Operation " + std::to_string(job.operations.size() + 1)));
+  if(!context_only && !job.setups.empty()) ensure_setup_ids(job);
   return job;
 }
 
@@ -717,6 +807,12 @@ UserSettings load_user_settings(const std::filesystem::path& path) {
 
 void save_user_settings(const std::filesystem::path& path,
                         const UserSettings& settings) {
+  if (!std::isfinite(settings.stock_render_scale) ||
+      (settings.stock_render_scale != 0 &&
+       (settings.stock_render_scale < .25 || settings.stock_render_scale > 1)) ||
+      !std::isfinite(settings.surface_render_scale) ||
+      settings.surface_render_scale < .25 || settings.surface_render_scale > 1)
+    throw std::runtime_error("Render resolution must be between 25% and 100%, or automatic for stock");
   if (!(settings.ui_scale >= 0.5 && settings.ui_scale <= 3.0) ||
       !std::isfinite(settings.ui_scale))
     throw std::runtime_error("UI scale must be finite and between 0.5 and 3.0");
@@ -864,7 +960,9 @@ void save_material(const std::filesystem::path& path,
   write_file(path, to_json(material).dump(2) + "\n");
 }
 Job load_job(const std::filesystem::path& path, std::vector<std::string>* warnings) {
-  return job_from(parse(read_file(path), path), warnings);
+  auto job=job_from(parse(read_file(path), path), warnings);
+  ensure_setup_ids(job);
+  return job;
 }
 void save_job(const std::filesystem::path& path, const Job& job) {
   write_file(path, to_json(job).dump(2) + "\n");

@@ -1,0 +1,103 @@
+{
+  "name": "Two-sided roughing with fixtures",
+  "machine": "grbl-router",
+  "material": "aluminium-6082",
+  "simulation_pitch": 0.1,
+  "setups": [
+    {
+      "id": "setup-top",
+      "name": "Top side",
+      "part_mesh": "setups/part.stl",
+      "stock_mesh": "setups/stock.stl",
+      "simulation_pitch": 0.1,
+      "origin_z": -6,
+      "fixtures": [
+        {
+          "name": "Right clamp",
+          "mesh": "setups/clamp.stl",
+          "role": "fixture",
+          "clearance": 0.5
+        }
+      ]
+    },
+    {
+      "id": "setup-bottom",
+      "name": "Bottom side",
+      "part_from_setup": "setup-top",
+      "part_orientation": [
+        1,
+        -2,
+        -3
+      ],
+      "part_offset_y": 12,
+      "part_offset_z": 6,
+      "stock_from_operation": "rough-top",
+      "stock_transfer": {
+        "orientation": [
+          1,
+          -2,
+          -3
+        ],
+        "offset": [
+          0,
+          12,
+          6
+        ]
+      },
+      "simulation_pitch": 0.1,
+      "origin_z": -6,
+      "work_offset": "G55",
+      "pause_on_entry": true,
+      "fixtures": [
+        {
+          "name": "Left clamp",
+          "mesh": "setups/clamp.stl",
+          "role": "fixture",
+          "clearance": 0.5,
+          "placement": {
+            "orientation": [
+              1,
+              2,
+              3
+            ],
+            "offset": [
+              -20,
+              0,
+              0
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "operations": [
+    {
+      "id": "rough-top",
+      "setup": "setup-top",
+      "name": "Rough top",
+      "mode": "roughing",
+      "tool": "3mm-2f-alu",
+      "stepdown": 1,
+      "stepover_ratio": 0.3,
+      "depth_from": 0,
+      "depth_to": 3,
+      "path_pitch": 0.25,
+      "radial_stock_to_leave": 0.2,
+      "rough_boundary_cleanup": true
+    },
+    {
+      "id": "rough-bottom",
+      "setup": "setup-bottom",
+      "name": "Rough bottom",
+      "mode": "roughing",
+      "tool": "3mm-2f-alu",
+      "stepdown": 1,
+      "stepover_ratio": 0.3,
+      "depth_from": 0,
+      "depth_to": 3,
+      "path_pitch": 0.25,
+      "radial_stock_to_leave": 0.2,
+      "rough_boundary_cleanup": true
+    }
+  ]
+}

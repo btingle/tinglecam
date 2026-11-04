@@ -278,7 +278,7 @@ void motion_readout(const App& app, const cam::LevelPlan* level) {
     if (motion.from_z == motion.to_z) {
       ImGui::SameLine(0.0f, gap);
       ImGui::Text("Engagement %.1f%%", motion.engagement * 100.0);
-      const cam::Machine* machine = app.machines.find(app.job.machine_id);
+      const cam::Machine* machine = app.machines.find(app.effective_context().machine_id);
       if (machine && motion.rate >= cam::rapid_feed(*machine) - 1e-6) {
         ImGui::SameLine();
         ImGui::TextDisabled("(machine maximum)");
@@ -286,11 +286,15 @@ void motion_readout(const App& app, const cam::LevelPlan* level) {
     }
   }
   ImGui::SameLine(0.0f, gap);
-  ImGui::Text("Z %.3f mm", motion.z + app.job.origin_z);
+  ImGui::Text("Z %.3f mm", motion.z + app.effective_context().origin_z);
+  if (motion.fixture_contact) {
+    ImGui::SameLine(0.0f, gap);
+    ImGui::TextColored(severity_colour(app, LogSeverity::Error), "Fixture / keep-away contact");
+  }
   if (app.settings.show_debug && ImGui::BeginItemTooltip()) {
     ImGui::Text("XYZ travel %.1f of %.1f mm", motion.motion_distance,
                 cam::feed_motion_length(level->feeds));
-    ImGui::Text("Rapid plane Z %.3f mm", app.plan.rapid_plane + app.job.origin_z);
+    ImGui::Text("Rapid plane Z %.3f mm", app.plan.operations[app.selected_plan_operation].rapid_plane + app.effective_context().origin_z);
     ImGui::EndTooltip();
   }
 
@@ -340,7 +344,7 @@ void transport_bar(App& app) {
     app.playback.motion_seconds = 0.0;
   }
   if (level && ImGui::BeginItemTooltip()) {
-    ImGui::Text("Floor Z %.3f mm, cutting %.3f mm", level->floor_z + app.job.origin_z,
+    ImGui::Text("Floor Z %.3f mm, cutting %.3f mm", level->floor_z + app.effective_context().origin_z,
                 level->axial_depth);
     const auto& subdivisions = app.plan.operations[app.selected_plan_operation].subdivisions;
     if (subdivisions.size() > 1)

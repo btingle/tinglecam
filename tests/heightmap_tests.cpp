@@ -91,6 +91,17 @@ int main() {
           "Ramp removal uses actual XYZ");
     check(!ramp.slice(6).empty() && !ramp.slice(1).empty(),
           "Grid supplies planner slice polygons");
+    auto raised=Heightmap::box({{0,0,3},{2,2,4},true},.25);
+    check(raised.slice(1).empty(),"A plane below a suspended sheet remains empty");
+    near(material_area(raised.project_above(1)),4,1e-9,"Above-plane projection includes a suspended sheet");
+    check(raised.project_above(4).empty(),"Above-plane projection excludes material ending at the floor");
+    const auto section=raised.slice_shared(1),envelope=raised.project_above_shared(1);
+    check(section!=envelope && section->empty() && material_area(*envelope)==4 &&
+          raised.project_above_shared(1)==envelope,
+          "Cross-section and above-plane projection cache independently");
+    auto lowered=raised;lowered.cut({-1,1,0},{3,1,0},{CutterShape::Flat,3,20});
+    check(lowered.project_above(1).empty() && raised.project_above_shared(1)==envelope,
+          "Cuts invalidate their projection without changing an inherited snapshot");
     check(!ramp.display_mesh(1000).triangles.empty(),
           "Grid supplies display triangles");
     auto fine_preview = Heightmap::box({{0, 0, 0}, {10, 10, 10}, true}, .025);
