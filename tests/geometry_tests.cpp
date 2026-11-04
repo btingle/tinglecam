@@ -1,4 +1,5 @@
 #include "planning/toolpath.h"
+#include "planning/traversal.h"
 #include "wave/analysis.h"
 #include "wave/geometry.h"
 #include "wave/mesh_slicer.h"
@@ -224,6 +225,51 @@ double gouge_length(const wave::Toolpath& toolpath, const wave::Paths64& subject
                             wave::to_world(piece[i].y - piece[i - 1].y));
   }
   return total;
+}
+
+void check_different_boundary_components_use_routing() {
+  auto [wave_result,lineage]=outer_box_detour_case();
+  wave_result.subject={{{14000,-3000},{16000,-3000},{16000,13000},{14000,13000}}};
+  lineage.boundary_components=wave_result.stock;
+  for (std::size_t i=0;i<2;++i) {
+    auto& front=lineage.generations[0].fronts[i];
+    front.path.front().y=0;
+    front.path.back().y=10000;
+    front.boundary_contacts[0]={true,i,front.path.front()};
+    front.boundary_contacts[1]={true,i,front.path.back()};
+  }
+  // Shared scheduling-node identity does not guarantee a common boundary
+  // ring. Geometry must decide whether to link, detour, or lift between cuts.
+  wave::LayerTopology topology;
+  topology.nodes.resize(1);
+  topology.nodes[0].fronts={{0,0},{0,1}};
+  topology.front_nodes={{0,0}};
+  const auto path=wave::build_toolpath(wave_result,lineage,.5,-1,10,2000,1000,0,&topology);
+  require(path.stats.cut_count==2,"different boundary rings must retain both cutting fronts");
+  require(path.stats.entry_count==0 && path.stats.skipped_entry_count==0 &&
+              path.stats.unreachable_fronts==0,
+          "a boundary mismatch must use safe connections without dropping fronts");
+  require(gouge_length(path,wave_result.subject,10)==0,
+          "fallback connections must avoid the protected part between boundaries");
+}
+
+void check_cleanup_boundary_connection() {
+  // A valid centreline corridor along the part boundary, thinner than the
+  // routing inset. Eroding it must not force a lift between boundary contours.
+  const wave::Paths64 outside{{{-10000,-10000},{10000,-10000},{10000,10000},{-10000,10000}}};
+  const wave::Paths64 part{{{-9994,-9994},{9994,-9994},{9994,9994},{-9994,9994}}};
+  wave::TraversalSettings settings;
+  settings.stay_down_region=Clipper2Lib::Difference(outside,part,Clipper2Lib::FillRule::NonZero);
+  settings.stay_down_slack=4;
+  settings.initial_position=wave::Point64(-9994,0);
+  settings.prefer_stay_down_when_legal=true;
+  settings.floor_z=-2; settings.rapid_plane=20;
+  const wave::TraversalTask next{0,{{{{9994,0},{9994,1000}},std::nullopt}}};
+  const auto joined=wave::plan_traversal({next},settings).toolpath;
+  require(joined.stats.retract_count==0 && joined.stats.link_count==1,
+          "cleanup contours joined by a valid boundary must stay down");
+  require(gouge_length(joined,part,1)==0,
+          "a boundary connection must preserve the protected side of the boundary");
 }
 
 wave::Path64 test_box(double x0, double y0, double x1, double y1) {
@@ -678,6 +724,8 @@ int main(int argc, char** argv) {
 
     check_lead_in();
     check_exterior_stock_reach();
+    check_different_boundary_components_use_routing();
+    check_cleanup_boundary_connection();
     check_inherited_clearance_respects_subject();
     check_plunge_clearance();
     check_long_leading_edge_is_split();

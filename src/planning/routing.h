@@ -118,4 +118,10 @@ class Router {
 Paths64 routable_region(const Paths64& region, double slack,
                         const std::vector<Point64>& anchors);
 
+// Follow a compensated cutter-centre boundary when both endpoints lie on the same
+// ring, within integer-grid rounding. Preserves narrow boundary connections
+// that a routing inset can erase, without moving the route into the obstacle.
+std::optional<Path64> boundary_route(const Paths64& region, const Point64& from,
+                                    const Point64& to, double snap = 4.0);
+
 }  // namespace wave

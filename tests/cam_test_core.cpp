@@ -244,6 +244,14 @@ void check_path_resampling() {
   require(kept_corner,"resampling must retain a corner on a safe route");
   require_near(wave::toolpath_length(bent),1,1e-6,
                "resampling must not shortcut a corner through an obstacle");
+  raw.moves.front().kind=wave::MoveKind::Link;
+  raw.moves.front().path={point(0,0),point(.35,0),point(.7,.02)};
+  raw.moves.front().length=.35+std::hypot(.35,.02);
+  const auto shallow=wave::resample_toolpath(raw,.5);
+  kept_corner=false;
+  for(const auto& move:shallow.moves)
+    for(const auto& p:move.path) kept_corner |= p==point(.35,0);
+  require(kept_corner,"sampling must retain shallow bends on clearance-boundary links");
 }
 
 void check_level_floors() {

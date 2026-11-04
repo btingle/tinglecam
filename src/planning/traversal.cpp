@@ -81,7 +81,8 @@ class Crossings {
   // outside it by that same pulling in. See `routable_region`.
   Crossings(const Paths64& region, double slack,
             const std::vector<Point64>& anchors)
-      : router_(slack > 0.0 ? routable_region(region, slack, anchors)
+      : region_(region), slack_(slack),
+        router_(slack > 0.0 ? routable_region(region, slack, anchors)
                             : Paths64{},
                 slack) {}
 
@@ -90,11 +91,15 @@ class Crossings {
     const Key key{from.x, from.y, to.x, to.y};
     const auto found = cache_.find(key);
     if (found != cache_.end()) return found->second;
-    return cache_.emplace(key, router_.route(from, to)).first->second;
+    auto route=router_.route(from,to);
+    if(!route) route=boundary_route(region_,from,to,std::min(slack_,4.0));
+    return cache_.emplace(key,std::move(route)).first->second;
   }
 
  private:
   using Key = std::array<std::int64_t, 4>;
+  Paths64 region_;
+  double slack_;
   Router router_;
   mutable std::map<Key, std::optional<Path64>> cache_;
 };

@@ -126,11 +126,12 @@ double stock_contact_reach(const Operation& operation, double radius,
 wave::Paths64 open_space(const wave::Paths64& stock_slice,
                          const wave::Paths64& keep_out) {
   if (stock_slice.empty()) return {};
-  Clipper2Lib::Rect64 world = Clipper2Lib::GetBounds(stock_slice);
+  const auto obstacles=Clipper2Lib::Union(stock_slice,keep_out,FillRule::NonZero);
+  Clipper2Lib::Rect64 world = Clipper2Lib::GetBounds(obstacles);
   // Room for the tool to stand clear of the stock, and for a route to go round
   // the outside of it rather than being pinned against the edge of the box.
   const std::int64_t margin =
-      std::max<std::int64_t>(16, (world.right - world.left) / 4);
+      std::max<std::int64_t>(16, std::max(world.Width(),world.Height()) / 4);
   world.left -= margin;
   world.top -= margin;
   world.right += margin;
@@ -141,7 +142,7 @@ wave::Paths64 open_space(const wave::Paths64& stock_slice,
       wave::Point64(world.left, world.bottom)};
   return Clipper2Lib::Difference(
       wave::Paths64{box},
-      Clipper2Lib::Union(stock_slice, keep_out, Clipper2Lib::FillRule::NonZero),
+      obstacles,
       Clipper2Lib::FillRule::NonZero);
 }
 

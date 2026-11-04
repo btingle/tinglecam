@@ -82,7 +82,56 @@ Path64 disc_around(const Point64& centre, double radius) {
   return ring;
 }
 
+struct BoundaryProjection {
+  Point64 point;
+  std::size_t edge=0;
+  double distance=std::numeric_limits<double>::infinity();
+};
+
+BoundaryProjection project_boundary(const Path64& ring,const Point64& point) {
+  BoundaryProjection result;
+  for(std::size_t i=0;i<ring.size();++i) {
+    const auto a=ring[i],b=ring[(i+1)%ring.size()];
+    const double dx=double(b.x-a.x),dy=double(b.y-a.y);
+    const double square=dx*dx+dy*dy;
+    const double t=square>0 ? std::clamp(
+        (double(point.x-a.x)*dx+double(point.y-a.y)*dy)/square,0.0,1.0) : 0;
+    const Point64 projected(a.x+std::llround(t*dx),a.y+std::llround(t*dy));
+    const double distance=length_of(point,projected);
+    if(distance<result.distance) result={projected,i,distance};
+  }
+  return result;
+}
+
 }  // namespace
+
+std::optional<Path64> boundary_route(const Paths64& region,const Point64& from,
+                                    const Point64& to,double snap) {
+  std::optional<Path64> best;
+  double best_length=std::numeric_limits<double>::infinity();
+  for(const auto& ring:region) {
+    if(ring.size()<3) continue;
+    const auto a=project_boundary(ring,from),b=project_boundary(ring,to);
+    if(a.distance>snap || b.distance>snap) continue;
+    for(const bool forward:{true,false}) {
+      Path64 path{from};
+      const auto append=[&](const Point64& p) {if(path.back()!=p)path.push_back(p);};
+      append(a.point);
+      auto edge=a.edge;
+      while(edge!=b.edge) {
+        append(ring[forward ? (edge+1)%ring.size() : edge]);
+        edge=forward ? (edge+1)%ring.size() : (edge+ring.size()-1)%ring.size();
+      }
+      append(b.point); append(to);
+      const double length=path_length(path);
+      if(length<best_length && path.size()>=2) {
+        best_length=length;
+        best=std::move(path);
+      }
+    }
+  }
+  return best;
+}
 
 Paths64 routable_region(const Paths64& region, double slack,
                         const std::vector<Point64>& anchors) {

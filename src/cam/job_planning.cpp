@@ -486,9 +486,11 @@ void plan_toolpaths(OperationPlan& plan,
       }
       const auto contours = derive_offset_contours(
           level.part_slice, radius + operation.radial_stock_to_leave, &clip);
+      const auto keep_out=offset_outward(level.part_slice,
+                                         radius+operation.radial_stock_to_leave);
       auto tasks =
           contour_traversal_tasks(contours, operation.contour_direction);
-      add_safe_stock_approaches(tasks, level.incoming_stock, level.wave.subject,
+      add_safe_stock_approaches(tasks, level.incoming_stock, keep_out,
                                 radius);
       wave::TraversalSettings traversal;
       traversal.allow_stay_down = true;
@@ -496,7 +498,11 @@ void plan_toolpaths(OperationPlan& plan,
       // well as the material the wave took out. The reached region on its
       // own stops at the stock wall, so a cleanup contour ending on that
       // wall could not be joined to the next one round the outside.
-      traversal.stay_down_region = level.toolpath.cleared;
+      // Boundary-only cleanup may have no wave at all. The surrounding air
+      // still connects its contours, with the full cutter/radial keepout.
+      traversal.stay_down_region = Clipper2Lib::Union(
+          level.toolpath.cleared, open_space(level.incoming_stock,keep_out),
+          Clipper2Lib::FillRule::NonZero);
       // These contours ride the part's clearance boundary. Only forgive
       // independent micron rounding here, not a fraction of a stepover that
       // could consume the radial allowance at a connector's endpoints.

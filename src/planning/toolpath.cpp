@@ -560,11 +560,10 @@ static void append_toolpath(Toolpath& toolpath, const WaveResult& wave,
             const BoundaryContact& from =
                 previous.boundary_contacts[previous_side];
             const BoundaryContact& to = front.boundary_contacts[target_side];
-            if (from.valid && to.valid) {
-              if (from.component != to.component)
-                throw std::runtime_error(
-                    "Wavefront topology error: adjacent fronts in one node "
-                    "name different boundary components");
+            // A shared node can contain fronts on different boundary rings.
+            // There is no boundary arc between those contacts; leave the
+            // shortcut unset and use the checked routing/lift options below.
+            if (from.valid && to.valid && from.component == to.component) {
               Path64 path = boundary_arc(lineage, from, to);
               if (path.front() != position) path.insert(path.begin(), position);
               if (path.back() != entry) path.push_back(entry);
@@ -619,11 +618,15 @@ static void append_toolpath(Toolpath& toolpath, const WaveResult& wave,
           // no route ever runs out to one.
           const Router router(travel, tolerance);
           auto detour = router.route(position, entry);
-          if (detour && !avoids_subject(*detour)) {
-            const Router protected_router(
-                routable_region(travel, tolerance, {position, entry}), tolerance);
-            detour = protected_router.route(position, entry);
-            if (detour && !avoids_subject(*detour)) detour.reset();
+          if (!detour || !avoids_subject(*detour)) {
+            auto boundary=boundary_route(travel,position,entry,boundary_slack(wave.stepover));
+            if(boundary && avoids_subject(*boundary)) detour=std::move(boundary);
+            else if(detour) {
+              const Router protected_router(
+                  routable_region(travel, tolerance, {position, entry}), tolerance);
+              detour = protected_router.route(position, entry);
+              if (detour && !avoids_subject(*detour)) detour.reset();
+            }
           }
           const double detour_distance =
               detour ? path_length_world(*detour)
@@ -844,11 +847,17 @@ Toolpath resample_toolpath(const Toolpath& source, double pitch) {
     for (std::size_t i = 1; i < spans.size(); ++i) {
       const auto& a = spans[i - 1];
       const auto& b = spans[i];
-      const double dot = double(a.to.x - a.from.x) * double(b.to.x - b.from.x) +
-                         double(a.to.y - a.from.y) * double(b.to.y - b.from.y);
+      const double ax=double(a.to.x-a.from.x),ay=double(a.to.y-a.from.y);
+      const double bx=double(b.to.x-b.from.x),by=double(b.to.y-b.from.y);
+      const double dot=ax*bx+ay*by;
       const double lengths = (a.end - a.begin) * (b.end - b.begin) *
                              kIntegerScale * kIntegerScale;
-      if (dot < .99 * lengths) samples.push_back(b.begin);
+      // A routed connector already follows the clearance boundary. Even a
+      // shallow turn must survive sampling rather than becoming a chord
+      // through the part. Collinear routing vertices can still disappear.
+      const bool routing_turn=(a.kind!=MoveKind::Cut || b.kind!=MoveKind::Cut) &&
+                              (ax*by!=ay*bx || dot<0);
+      if (routing_turn || dot < .99 * lengths) samples.push_back(b.begin);
     }
     std::sort(samples.begin(), samples.end());
     samples.erase(std::unique(samples.begin(), samples.end()), samples.end());
