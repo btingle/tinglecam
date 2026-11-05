@@ -282,6 +282,49 @@ std::vector<SliceVertex> clip_triangle(const Triangle3f& triangle, double z) {
   return output;
 }
 
+// One union over a whole triangle soup sweeps every edge across the full
+// width of the part. Union compact Morton-ordered chunks first, then merge
+// their outlines pairwise, so each sweep only sees a local patch.
+Paths64 union_pieces(Paths64 pieces) {
+  constexpr std::size_t kChunk = 1024;
+  const auto bounds = Clipper2Lib::GetBounds(pieces);
+  const double sx = 65535.0 / std::max<std::int64_t>(1, bounds.right - bounds.left);
+  const double sy = 65535.0 / std::max<std::int64_t>(1, bounds.bottom - bounds.top);
+  const auto spread = [](std::uint64_t v) {
+    v = (v | (v << 8)) & 0x00ff00ffu;
+    v = (v | (v << 4)) & 0x0f0f0f0fu;
+    v = (v | (v << 2)) & 0x33333333u;
+    return (v | (v << 1)) & 0x55555555u;
+  };
+  std::vector<std::pair<std::uint64_t, std::size_t>> order(pieces.size());
+  for (std::size_t i = 0; i < pieces.size(); ++i) {
+    std::int64_t x = 0, y = 0;
+    for (const auto& point : pieces[i]) { x += point.x; y += point.y; }
+    const auto n = static_cast<std::int64_t>(pieces[i].size());
+    order[i] = {spread(std::uint64_t((x / n - bounds.left) * sx)) |
+                    spread(std::uint64_t((y / n - bounds.top) * sy)) << 1,
+                i};
+  }
+  std::sort(order.begin(), order.end());
+  std::vector<Paths64> level;
+  for (std::size_t i = 0; i < order.size(); i += kChunk) {
+    Paths64 chunk;
+    for (std::size_t j = i; j < std::min(order.size(), i + kChunk); ++j)
+      chunk.push_back(std::move(pieces[order[j].second]));
+    level.push_back(Clipper2Lib::Union(chunk, Clipper2Lib::FillRule::NonZero));
+  }
+  while (level.size() > 1) {
+    std::vector<Paths64> merged;
+    for (std::size_t i = 0; i < level.size(); i += 2) {
+      if (i + 1 == level.size()) { merged.push_back(std::move(level[i])); break; }
+      level[i].insert(level[i].end(), level[i + 1].begin(), level[i + 1].end());
+      merged.push_back(Clipper2Lib::Union(level[i], Clipper2Lib::FillRule::NonZero));
+    }
+    level = std::move(merged);
+  }
+  return std::move(level.front());
+}
+
 Paths64 polygons_from_candidates(const Mesh& mesh,
                                  const std::vector<std::uint32_t>& candidates,
                                  float z, std::size_t& contributing) {
@@ -308,7 +351,7 @@ Paths64 polygons_from_candidates(const Mesh& mesh,
     }
   }
   if (pieces.empty()) return {};
-  return Clipper2Lib::Union(pieces, Clipper2Lib::FillRule::NonZero);
+  return union_pieces(std::move(pieces));
 }
 
 }  // namespace
