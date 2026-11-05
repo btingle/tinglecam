@@ -84,6 +84,8 @@ bool prop_double(const char* label, double& value, float speed,
 bool prop_int(const char* label, int& value, float speed, int minimum,
               int maximum, const char* help = nullptr);
 bool prop_check(const char* label, bool& value, const char* help = nullptr);
+// Grid pitch, wave simplification and engagement sampling rows.
+bool planning_controls(cam::PlanningSettings& planning);
 bool prop_text(const char* label, std::string& value, const char* help = nullptr);
 // A coordinate stored in the model frame and shown in the program frame.
 bool prop_coordinate(const char* label, double& stored, double offset,

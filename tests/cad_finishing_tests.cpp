@@ -218,7 +218,7 @@ int main(int argc, char** argv) {
     Job job;
     job.machine_id = "machine";
     job.material_id = "test";
-    job.simulation_pitch = .1;
+    job.planning.simulation_pitch = .1;
     job.operations = {operation};
     ToolLibrary tools{{tool}};
     MachineLibrary machines{{machine}};

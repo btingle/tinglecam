@@ -73,6 +73,7 @@ void bootstrap(App& app) {
   } catch (const std::exception& error) {
     say(app, error.what(), true);
   }
+  app.job.planning = app.settings.planning_defaults;
   adopt_default_setup(app);
   cam::ensure_setup_ids(app.job);
   mark_job_saved(app);

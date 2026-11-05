@@ -1,8 +1,11 @@
 #include "topology_detail.h"
+#include "parallel.h"
 
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
+#include <utility>
+#include <vector>
 
 namespace wave {
 using namespace detail;
@@ -36,9 +39,10 @@ FrontLineage build_front_lineage(const WaveResult& wave,
                                          ? free_space
                                          : wave.static_boundaries;
   result.boundary_components = static_boundaries;
-  result.generations.reserve(wave.generations.size());
-
-  for (std::size_t generation = 0; generation < wave.generations.size(); ++generation) {
+  // Each generation's fronts depend only on that generation's band and
+  // reached set, so they are extracted in parallel.
+  result.generations.resize(wave.generations.size());
+  parallel_for(0, wave.generations.size(), [&](std::size_t generation) {
     Paths64 unreached = Difference(free_space, wave.reached_generations[generation],
                                    FillRule::NonZero);
     unreached = Union(unreached, FillRule::NonZero);
@@ -71,8 +75,8 @@ FrontLineage build_front_lineage(const WaveResult& wave,
                                       front_probe_pitch(wave.stepover));
     }
     classify_front_contacts(fronts, static_boundaries, contact_tolerance);
-    result.generations.push_back({std::move(fronts), std::move(bands)});
-  }
+    result.generations[generation] = {std::move(fronts), std::move(bands)};
+  });
 
   // Entry identity belongs to the wave source itself. Deriving it from the
   // stock wall splits one source whenever the protected subject happens to
@@ -90,12 +94,19 @@ FrontLineage build_front_lineage(const WaveResult& wave,
                                static_cast<std::int64_t>(stepover_integer)));
   const double tolerance = std::clamp(stepover_integer * 0.001, 4.0, 100.0);
 
-  for (std::size_t generation = 1; generation < result.generations.size(); ++generation) {
-    auto& previous = result.generations[generation - 1].fronts;
-    auto& current = result.generations[generation].fronts;
+  // Matching parents to children only reads fronts, so each transition is
+  // matched in parallel; links and events are then applied in order.
+  const std::size_t generation_count = result.generations.size();
+  std::vector<std::vector<Paths64>> transition_reaches(generation_count);
+  std::vector<std::vector<std::pair<std::size_t, std::size_t>>> transition_links(
+      generation_count);
+  parallel_for(1, generation_count, [&](std::size_t generation) {
+    const auto& previous = result.generations[generation - 1].fronts;
+    const auto& current = result.generations[generation].fronts;
     Paths64 band_guard = InflatePaths(wave.generations[generation], tolerance,
                                       JoinType::Miter, EndType::Polygon);
-    std::vector<Paths64> terminal_reaches(previous.size());
+    auto& terminal_reaches = transition_reaches[generation];
+    terminal_reaches.resize(previous.size());
     for (std::size_t parent = 0; parent < previous.size(); ++parent) {
       Paths64 candidate = front_reach(previous[parent], stepover_integer + tolerance,
                                       softening_integer);
@@ -109,9 +120,18 @@ FrontLineage build_front_lineage(const WaveResult& wave,
           candidate, wave.generations[generation], FillRule::NonZero);
       for (std::size_t child = 0; child < current.size(); ++child) {
         if (open_intersection_length(current[child], candidate) <= tolerance) continue;
-        previous[parent].children.push_back(child);
-        current[child].parents.push_back(parent);
+        transition_links[generation].push_back({parent, child});
       }
+    }
+  });
+
+  for (std::size_t generation = 1; generation < generation_count; ++generation) {
+    auto& previous = result.generations[generation - 1].fronts;
+    auto& current = result.generations[generation].fronts;
+    const auto& terminal_reaches = transition_reaches[generation];
+    for (const auto& [parent, child] : transition_links[generation]) {
+      previous[parent].children.push_back(child);
+      current[child].parents.push_back(parent);
     }
 
     // A merge normally leaves a current front carrying all of its parents.

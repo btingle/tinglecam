@@ -219,7 +219,7 @@ PartialPlan plan_operation_range(const JobGeometry& base_geometry,
       else
         result = plan_subdivided_operation(
             *active_geometry, operation, *tool, *machine, feeds, stage_progress,
-            from, to, rapid_plane, setup_prior);
+            from, to, rapid_plane, setup_prior, active_job->planning);
       if(result.ok() && !area_roughing) {
         const auto simulation_started=PlanningClock::now();
         simulate_operation_xyz(result,*active_geometry,*active_job,operation,*tool,*machine,feeds,setup_prior,simulation_progress,&tools);

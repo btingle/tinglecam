@@ -37,7 +37,7 @@ OperationPlan plan_roughing_areas(const JobGeometry& geometry, const Job& job,
     PriorOperations history=prior;
     if(result.stock_after) history.push_back(&result);
     auto planned=plan_subdivided_operation(geometry,pass,tool,machine,feeds,progress,start,seam,
-                                           rapid_plane,history);
+                                           rapid_plane,history,job.planning);
     if(planned.ok()) {
       const auto simulation_start=PlanningClock::now();
       simulate_operation_xyz(planned,geometry,job,pass,tool,machine,feeds,history,

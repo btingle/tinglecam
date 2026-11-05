@@ -22,7 +22,8 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
                               double progress_from,
                               double progress_to,
                               const PriorOperations& prior_operations,
-                              const OperationPlan* prior_subdivisions) {
+                              const OperationPlan* prior_subdivisions,
+                              const PlanningSettings& planning) {
   OperationPlan plan;
   plan.operation_name = operation.name;
   plan.tool_id = operation.tool_id;
@@ -216,7 +217,8 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
       const auto analyses = wave::analyze_stock_wavefronts(
           keep_outs[index], level.incoming_stock, stepover, stepover, lead_in,
           2000, 128, {}, wave::kDefaultSignificantNodeAreaFraction,
-          operation.tiny_split_area_factor, exterior_stock_reach, machining_limit);
+          operation.tiny_split_area_factor, exterior_stock_reach, machining_limit,
+          planning.wave_simplify_tolerance);
       wave::CommittedWavefront committed =
           wave::commit_wavefront_analyses(analyses);
       level.wave_stages = std::move(committed.stages);
@@ -759,14 +761,16 @@ OperationPlan plan_operation(const JobGeometry& geometry,
                              double rapid_plane,
                              const PriorOperations& prior_operations,
                              const OperationPlan* prior_subdivisions,
-                             bool defer_links) {
+                             bool defer_links,
+                             const PlanningSettings& planning) {
   const auto planning_start = PlanningClock::now();
   // Wavefronts are the cheaper half; give the toolpaths the larger share of the
   // reported progress so the bar does not stall in the second stage.
   const double seam = progress_from + (progress_to - progress_from) * 0.4;
   OperationPlan plan = plan_wavefronts(geometry, operation, tool, machine,
                                        feeds, progress, progress_from, seam,
-                                       prior_operations, prior_subdivisions);
+                                       prior_operations, prior_subdivisions,
+                                       planning);
   plan_toolpaths(plan, operation, tool, machine, feeds, progress, seam,
                  progress_to, rapid_plane, prior_operations, prior_subdivisions,
                  defer_links);
@@ -791,7 +795,7 @@ OperationPlan plan_subdivided_operation(
     const Tool& tool, const Machine& machine, const CuttingFeeds& feeds,
     const ProgressCallback& progress, double progress_from,
     double progress_to, double rapid_plane,
-    const PriorOperations& prior_operations) {
+    const PriorOperations& prior_operations, const PlanningSettings& planning) {
   OperationPlan result;
   result.operation_name = operation.name;
   result.tool_id = operation.tool_id;
@@ -888,7 +892,8 @@ OperationPlan plan_subdivided_operation(
   const double coarse_to = progress_from + span / count;
   if (!collect(0, plan_operation(geometry, schedule[0].pass, tool, machine,
           feeds, progress, progress_from, coarse_to, rapid_plane,
-          prior_operations, nullptr, operation.mode == OperationMode::Roughing)))
+          prior_operations, nullptr, operation.mode == OperationMode::Roughing,
+          planning)))
     return result;
 
   // Different coarse terraces occupy disjoint open Z intervals. At a cleanup
@@ -907,7 +912,7 @@ OperationPlan plan_subdivided_operation(
               [&](PlanningProgress p, const std::string&) { return report(p.fraction); };
           planned[terrace] = plan_operation(geometry, schedule[group].pass,
               tool, machine, feeds, worker_progress, 0, 1, rapid_plane,
-              prior_operations, &result, true);
+              prior_operations, &result, true, planning);
         }, progress, progress_from + span * finishing / count,
         progress_from + span * (finishing + 1) / count,
         operation.name + ": cleanup subdivision " + std::to_string(finishing) +

@@ -23,6 +23,8 @@ int main(int argc, char** argv) {
   double path_pitch = 0.0;
   std::optional<double> stock_boundary_dilation;
   double simulation_pitch = 0.0, surface_stepover = 0.0, surface_tolerance = 0.0;
+  double engagement_sampling = 0.0;
+  std::optional<double> wave_simplify;
   std::vector<std::size_t> selected_faces;
   bool cad_info = false, flow_u = false, flip_normals = false;
   double entry_front_tolerance = 0.0;
@@ -97,6 +99,8 @@ int main(int argc, char** argv) {
       else if (argument == "--stepover") stepover = std::stod(value());
       else if (argument == "--stock-dilation") stock_boundary_dilation = std::stod(value());
       else if (argument == "--simulation-pitch") simulation_pitch = std::stod(value());
+      else if (argument == "--engagement-sampling") engagement_sampling = std::stod(value());
+      else if (argument == "--wave-simplify") wave_simplify = std::stod(value());
       else if (argument == "--surface-stepover") surface_stepover = std::stod(value());
       else if (argument == "--surface-tolerance") surface_tolerance = std::stod(value());
       else if (argument == "--face") {
@@ -137,8 +141,11 @@ int main(int argc, char** argv) {
             "  --cleanup-stepover-limit RATIO\n"
             "                     Adaptive cleanup width ceiling (default 0.5 diameter)\n"
             "  --fixed-cleanup-stepover  Keep the base width on cleanup layers\n"
-            "  --path-pitch MM    Engagement and feed sampling interval (default 1.0)\n"
+            "  --path-pitch MM    Toolpath point spacing (default 1.0)\n"
             "  --simulation-pitch MM  XY stock-grid spacing for the job (default 0.02)\n"
+            "  --engagement-sampling MM\n"
+            "                     Motion sample length for engagement and feeds (default 0.2)\n"
+            "  --wave-simplify MM Wavefront simplification tolerance (default 0.025; 0 off)\n"
             "  --cad-info         Print imported STEP face IDs and source identity\n"
             "  --face N           Select CAD face N (1-based, repeatable)\n"
             "  --surface-stepover MM / --surface-tolerance MM\n"
@@ -205,7 +212,9 @@ int main(int argc, char** argv) {
     load_meshes(app);
   if (!machine_id.empty()) app.context().machine_id = machine_id;
   if (!material_id.empty()) app.context().material_id = material_id;
-  if (simulation_pitch > 0.0) app.context().simulation_pitch = simulation_pitch;
+  if (simulation_pitch > 0.0) app.job.planning.simulation_pitch = simulation_pitch;
+  if (engagement_sampling > 0.0) app.job.planning.engagement_sampling = engagement_sampling;
+  if (wave_simplify) app.job.planning.wave_simplify_tolerance = *wave_simplify;
   if (rapid_clearance > 0.0) app.context().rapid_clearance_height = rapid_clearance;
   if (box_stock_uniform) {
     const double margin = *box_stock_uniform;

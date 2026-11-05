@@ -14,7 +14,7 @@ when one exists. Fixtures are not automatically carried forward. The
   orientation and translation remain independent.
 - **Fixtures from** adds an earlier setup's fixtures to the local fixtures. Use
   **Make inherited fixtures local** to edit their placements independently.
-- **Properties from** links machine/material, simulation pitch, clearances,
+- **Properties from** links machine/material, clearances,
   origin/reference, and work offset as a group. Choosing **Local** retains the
   effective values and makes them editable. Empty machine/material selections
   in a setup resolve to the document defaults.

@@ -2,7 +2,11 @@
   "name": "Pockets and plane clearing example",
   "machine": "grbl-router",
   "material": "aluminium-6082",
-  "simulation_pitch": 0.1,
+  "planning": {
+    "engagement_sampling": 1.0,
+    "simulation_pitch": 0.1,
+    "wave_simplify_tolerance": 0.025
+  },
   "rapid_clearance_height": 10,
   "operations": [
     {

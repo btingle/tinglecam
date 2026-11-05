@@ -12,6 +12,11 @@
   "fixtures_from_setup": "",
   "machine": "grbl-router",
   "material": "new-material",
+  "planning": {
+    "engagement_sampling": 0.2,
+    "simulation_pitch": 0.1,
+    "wave_simplify_tolerance": 0.025
+  },
   "name": "Untitled",
   "operations": [
     {
@@ -422,7 +427,6 @@
       "plunge_clearance_height": 1.0,
       "properties_from_setup": "",
       "rapid_clearance_height": 10.0,
-      "simulation_pitch": 0.1,
       "stock_from_operation": "",
       "stock_mesh": "../../../mnt/c/Users/btingle/Documents/cad_models/parametric/stock/slr_op0_blank.step",
       "stock_offset_x": 20.0,
@@ -500,7 +504,6 @@
       "plunge_clearance_height": 1.0,
       "properties_from_setup": "",
       "rapid_clearance_height": 10.0,
-      "simulation_pitch": 0.1,
       "stock_from_operation": "id-1793770594876126342-4",
       "stock_mesh": "../../../mnt/c/Users/btingle/Documents/cad_models/meshes/stock_obj/Ls.obj",
       "stock_offset_x": 0.0,
@@ -526,7 +529,6 @@
       "work_offset": "G54"
     }
   ],
-  "simulation_pitch": 0.02,
   "stock_from_operation": "",
   "stock_mesh": "",
   "stock_offset_x": 0.0,

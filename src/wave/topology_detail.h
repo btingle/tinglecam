@@ -57,8 +57,10 @@ Path64 boundary_walk(const FrontLineage& lineage,
                      const BoundaryContact& to, bool forward);
 double path_length_integer(const Path64& path, bool closed = false);
 bool whole_open_path_inside(const Path64& path, const Paths64& region);
-bool area_contains_with_tolerance(const Paths64& upper, const Paths64& lower,
-                                  double tolerance);
+// Region within `tolerance` of `area`; empty when `area` is.
+Paths64 tolerance_envelope(const Paths64& area, double tolerance);
+// Whether nonempty `area` lies wholly inside `envelope`.
+bool envelope_contains(const Paths64& envelope, const Paths64& area);
 void append_path(Path64& destination, const Path64& source);
 OrientedFront orient_after(const LeadingFront& front,
                            const OrientedFront* previous);

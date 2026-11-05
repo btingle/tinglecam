@@ -40,7 +40,7 @@ void check_outside_rim(const std::filesystem::path& part) {
   const cam::MaterialLibrary materials{{{"plastic","Plastic"}}};
   cam::Job job;
   job.machine_id="test"; job.material_id="plastic";
-  job.simulation_pitch=.05;
+  job.planning.simulation_pitch=.05;
   cam::Operation op;
   op.tool_id=cutter.id; op.depth_to=3; op.stepdown=1;
   op.stepover_ratio=.15; op.path_pitch=.2;
@@ -145,7 +145,7 @@ int main() {
     op.finishing_subdivisions=2;
     cam::Job cleanup_job;
     cleanup_job.machine_id="test"; cleanup_job.material_id="plastic";
-    cleanup_job.simulation_pitch=.25; cleanup_job.operations={op};
+    cleanup_job.planning.simulation_pitch=.25; cleanup_job.operations={op};
     auto cutting_tool=tool(); cutting_tool.cutting={{"plastic",10000,.01,100}};
     cam::Machine machine; machine.id="test"; machine.name="Test machine"; machine.max_rpm=20000;
     const cam::ToolLibrary tools{{cutting_tool}};

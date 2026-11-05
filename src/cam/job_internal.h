@@ -228,6 +228,6 @@ OperationPlan plan_subdivided_operation(
     const Tool& tool, const Machine& machine, const CuttingFeeds& feeds,
     const ProgressCallback& progress, double progress_from,
     double progress_to, double rapid_plane,
-    const PriorOperations& prior_operations);
+    const PriorOperations& prior_operations, const PlanningSettings& planning);
 
 }  // namespace cam

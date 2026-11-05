@@ -60,6 +60,14 @@ The 3D heightmap result raycasts the full simulation grid using OpenGL 3.2
 fragment shaders; this renderer does not require CUDA or CUDA/OpenGL interop.
 Tools > Settings provides independent render-resolution controls for Stock/Result
 and Surface/Setup; these affect display quality without changing simulation pitch.
+
+**Planning (whole job)** in the setup panel holds three settings shared by every
+setup: **Stock grid pitch** (simulation XY spacing), **Wave simplification**
+(how far wavefronts may deviate to shed crowded vertices; default 0.025 mm, zero
+disables) and **Engagement sampling** (motion sample length that sets feeds;
+default 0.2 mm). Per-operation **Sample spacing** only sets toolpath point
+spacing. New jobs start from the defaults under Tools > Settings. Headless runs
+accept `--simulation-pitch`, `--wave-simplify` and `--engagement-sampling`.
 The mesh slicer uses CUDA when available, with a cuBQL CPU fallback.
 Under WSL, startup automatically selects Mesa's D3D12 driver and the mesh GPU.
 The active renderer is shown under Tools > Settings; explicit

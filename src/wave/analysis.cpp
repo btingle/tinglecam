@@ -23,11 +23,11 @@ Rollout rollout(const Paths64& domain, const std::vector<WaveSeed>& seeds,
                 std::size_t max_iterations,
                 const Paths64& static_boundaries,
                 const Paths64& cached_reached,
-                double tiny_split_area_factor) {
+                double tiny_split_area_factor, double simplify_tolerance) {
   Rollout result;
   result.wave = build_wavefront_from_seeds(
       domain, seeds, stepover, softening, max_iterations, static_boundaries,
-      cached_reached);
+      cached_reached, simplify_tolerance);
   result.lineage = build_front_lineage(result.wave, tiny_split_area_factor);
   result.topology = build_layer_topology(result.lineage, false);
   return result;
@@ -203,7 +203,8 @@ WavefrontAnalysis analyze_wavefront(
     std::size_t max_layers, const EntryMute& muted,
     double significant_node_area_fraction,
     double tiny_split_area_factor,
-    double exterior_stock_reach, const Paths64& machining_limit) {
+    double exterior_stock_reach, const Paths64& machining_limit,
+    double simplify_tolerance) {
   if (max_layers == 0)
     throw std::invalid_argument("Wavefront analysis layer limit must be positive");
   if (!std::isfinite(significant_node_area_fraction) ||
@@ -243,7 +244,7 @@ WavefrontAnalysis analyze_wavefront(
 
     Rollout baseline = rollout(domain, seeds, stepover, softening,
                                max_iterations, free_space, cached_reached,
-                               tiny_split_area_factor);
+                               tiny_split_area_factor, simplify_tolerance);
     std::vector<std::size_t> entry_nodes;
     layer.entries = node_entries_at(baseline.lineage, baseline.topology, 0,
                                     &entry_nodes);
@@ -306,7 +307,7 @@ WavefrontAnalysis analyze_wavefront(
 
       Rollout candidate = rollout(domain, candidate_seeds, stepover, softening,
                                   max_iterations, free_space, cached_reached,
-                                  tiny_split_area_factor);
+                                  tiny_split_area_factor, simplify_tolerance);
       WavefrontStrategyTrial trial;
       trial.retained_entries = candidate_indices;
       trial.previous_node_count = selected.topology.nodes.size();
@@ -363,7 +364,8 @@ std::vector<WavefrontAnalysis> analyze_stock_wavefronts(
     double softening, double lead_in, std::size_t max_iterations,
     std::size_t max_layers, const EntryMute& muted,
     double significant_node_area_fraction, double tiny_split_area_factor,
-    double exterior_stock_reach, const Paths64& machining_limit) {
+    double exterior_stock_reach, const Paths64& machining_limit,
+    double simplify_tolerance) {
   // Use the polygon tree so holes stay with their outer ring, while islands
   // nested inside holes become independent stock components themselves.
   Clipper64 clipper;
@@ -393,7 +395,8 @@ std::vector<WavefrontAnalysis> analyze_stock_wavefronts(
     auto analysis = analyze_wavefront(
         raw_subject, island, stepover, softening, lead_in, max_iterations,
         max_layers, muted, significant_node_area_fraction,
-        tiny_split_area_factor, exterior_stock_reach, machining_limit);
+        tiny_split_area_factor, exterior_stock_reach, machining_limit,
+        simplify_tolerance);
     // Propagation owns one island, but its cutter may reach neighbouring stock.
     // Routing must not mistake that material for empty air.
     analysis.seed.stock = physical_stock;

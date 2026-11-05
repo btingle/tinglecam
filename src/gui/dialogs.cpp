@@ -346,6 +346,7 @@ void new_job(App& app) {
     app.hole_detector.stop();app.hole_detection_id.clear();
     app.selected_setup=0;
     app.job = cam::Job{};
+    app.job.planning = app.settings.planning_defaults;
     app.geometry = cam::JobGeometry{};
     app.job_file.clear();
     adopt_default_setup(app);

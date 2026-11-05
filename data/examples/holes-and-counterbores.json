@@ -2,7 +2,11 @@
   "name": "Holes and nested counterbores",
   "machine": "grbl-router",
   "material": "aluminium-6082",
-  "simulation_pitch": 0.02,
+  "planning": {
+    "engagement_sampling": 1.0,
+    "simulation_pitch": 0.02,
+    "wave_simplify_tolerance": 0.025
+  },
   "rapid_clearance_height": 10,
   "operations": [
     {

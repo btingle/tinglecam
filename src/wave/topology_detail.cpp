@@ -611,16 +611,17 @@ bool whole_open_path_inside(const Path64& path, const Paths64& region) {
   return inside + 1.0 >= total;
 }
 
-bool area_contains_with_tolerance(const Paths64& upper, const Paths64& lower,
-                                  double tolerance) {
-  if (upper.empty() || lower.empty()) return false;
-  Paths64 envelope = upper;
-  if (tolerance > 0.0)
-    envelope = InflatePaths(
-        Union(upper, FillRule::NonZero),
-        static_cast<double>(std::max<std::int64_t>(1, to_integer(tolerance))),
-        JoinType::Round, EndType::Polygon);
-  return Difference(lower, envelope, FillRule::NonZero).empty();
+Paths64 tolerance_envelope(const Paths64& area, double tolerance) {
+  if (area.empty() || tolerance <= 0.0) return area;
+  return InflatePaths(
+      Union(area, FillRule::NonZero),
+      static_cast<double>(std::max<std::int64_t>(1, to_integer(tolerance))),
+      JoinType::Round, EndType::Polygon);
+}
+
+bool envelope_contains(const Paths64& envelope, const Paths64& area) {
+  if (envelope.empty() || area.empty()) return false;
+  return Difference(area, envelope, FillRule::NonZero).empty();
 }
 
 double absolute_area(const Paths64& paths) {

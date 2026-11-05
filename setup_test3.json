@@ -506,6 +506,11 @@
     3
   ],
   "pause_on_entry": true,
+  "planning": {
+    "engagement_sampling": 0.2,
+    "simulation_pitch": 0.1,
+    "wave_simplify_tolerance": 0.025
+  },
   "plunge_clearance_height": 1.0,
   "properties_from_setup": "",
   "rapid_clearance_height": 10.0,
@@ -544,7 +549,6 @@
       "plunge_clearance_height": 1.0,
       "properties_from_setup": "",
       "rapid_clearance_height": 10.0,
-      "simulation_pitch": 0.1,
       "stock_from_operation": "",
       "stock_mesh": "../../../mnt/c/Users/btingle/Documents/cad_models/meshes/slr_setup_p0_stock_4x.stl",
       "stock_offset_x": 0.0,
@@ -622,7 +626,6 @@
       "plunge_clearance_height": 1.0,
       "properties_from_setup": "",
       "rapid_clearance_height": 10.0,
-      "simulation_pitch": 0.1,
       "stock_from_operation": "id-1793857642461588129-3",
       "stock_mesh": "../../../mnt/c/Users/btingle/Documents/cad_models/meshes/slr_setup_p0_stock_4x.stl",
       "stock_offset_x": 0.0,
@@ -648,7 +651,6 @@
       "work_offset": "G54"
     }
   ],
-  "simulation_pitch": 0.02,
   "stock_from_operation": "",
   "stock_mesh": "",
   "stock_offset_x": 0.0,

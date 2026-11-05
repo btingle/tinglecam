@@ -481,7 +481,7 @@ int main(int argc, char** argv) {
         review.name = "STEP contour propagation";
         review.part_mesh = std::filesystem::absolute(argv[1]);
         review.box_stock = true;
-        review.simulation_pitch = .3;
+        review.planning.simulation_pitch = .3;
         review.machine_id = "grbl-router";
         review.material_id = "hdpe";
         actual_op.tool_id = "6mm-ball-alu";

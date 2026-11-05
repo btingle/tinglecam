@@ -36,7 +36,7 @@ const cam::MachineLibrary machines{{machine()}};
 const cam::MaterialLibrary materials{{{"plastic","Plastic"}}};
 cam::Job job(const std::filesystem::path& mesh) {
   cam::Job j;j.part_mesh=mesh;j.box_stock=true;j.box_stock_margins={6,6,6,6,0,0};
-  j.machine_id="machine";j.material_id="plastic";j.simulation_pitch=.25;
+  j.machine_id="machine";j.material_id="plastic";j.planning.simulation_pitch=.25;
   cam::Operation op;op.tool_id="mill";op.depth_to=3;op.stepdown=1;op.stepover_ratio=.4;
   op.path_pitch=.5;op.radial_stock_to_leave=.2;op.finishing_subdivisions=2;
   op.roughing_areas={{"NW",7,7,26,26},{"NE",33,7,26,26},

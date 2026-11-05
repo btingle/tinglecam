@@ -21,6 +21,7 @@ void check_user_settings() {
   settings.default_machine = "makera-z1";
   settings.default_material = "hdpe";
   settings.recent_jobs = {"/tmp/a.json", "/tmp/b.json"};
+  settings.planning_defaults = {0.1, 0.04, 0.3};
   cam::operation_default(settings, cam::OperationMode::Pocket)
       .pockets.front().width = 47.0;
   cam::operation_default(settings, cam::OperationMode::PlaneClearing)
@@ -41,6 +42,10 @@ void check_user_settings() {
                "default cleanup ceiling survives settings persistence");
   require_near(loaded.ui_scale, 1.35, 1e-12,
                "UI scale survives settings persistence");
+  require(loaded.planning_defaults.simulation_pitch == 0.1 &&
+              loaded.planning_defaults.wave_simplify_tolerance == 0.04 &&
+              loaded.planning_defaults.engagement_sampling == 0.3,
+          "planning defaults survive settings persistence");
   require_near(loaded.stock_render_scale,.75,1e-12,"Stock render resolution survives settings persistence");
   require_near(loaded.surface_render_scale,.5,1e-12,"Surface render resolution survives settings persistence");
   require(loaded.ui_theme == cam::UiTheme::Ember,

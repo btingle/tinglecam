@@ -46,7 +46,6 @@ SetupContext resolve_setup_context(const Job& job, const std::string& id) {
     const auto p=parent(setup->properties_from_setup);
     // Explicit geometry and property inheritance are independent.
     context.machine_id=p.machine_id; context.material_id=p.material_id;
-    context.simulation_pitch=p.simulation_pitch;
     context.rapid_clearance_height=p.rapid_clearance_height;
     context.plunge_clearance_height=p.plunge_clearance_height;
     context.origin_x=p.origin_x; context.origin_y=p.origin_y; context.origin_z=p.origin_z;

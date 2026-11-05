@@ -137,7 +137,9 @@ WaveResult seed_wavefront(const Paths64& raw_subject,
 // state but only the supplied curves may produce the next wave; this is the
 // later-generation counterpart of dropping an unselected generation-zero seed
 // component. Without cached state, each curve is expanded into an ordinary
-// standalone seed region.
+// standalone seed region. A positive `simplify_tolerance` (mm) simplifies each
+// region just before it is offset, so crowded fronts stop accumulating
+// vertices; the offset is far larger, so growth still covers what was reached.
 WaveResult build_wavefront_from_seeds(
     const Paths64& raw_domain,
     const std::vector<WaveSeed>& seeds,
@@ -145,7 +147,8 @@ WaveResult build_wavefront_from_seeds(
     double softening = 0.0,
     std::size_t max_iterations = 2000,
     const Paths64& static_boundaries = {},
-    const Paths64& cached_reached = {});
+    const Paths64& cached_reached = {},
+    double simplify_tolerance = 0.0);
 
 bool paths_equal_canonical(const Paths64& lhs, const Paths64& rhs);
 double to_world(std::int64_t value);

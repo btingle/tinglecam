@@ -2,6 +2,11 @@
   "name": "Four parts, area-first roughing",
   "machine": "grbl-router",
   "material": "aluminium-6082",
+  "planning": {
+    "engagement_sampling": 0.25,
+    "simulation_pitch": 0.1,
+    "wave_simplify_tolerance": 0.025
+  },
   "part_mesh": "roughing-areas/parts.stl",
   "box_stock": true,
   "box_stock_margins": {
@@ -12,7 +17,6 @@
     "minus_z": 0,
     "plus_z": 0
   },
-  "simulation_pitch": 0.1,
   "rapid_clearance_height": 10,
   "operations": [
     {

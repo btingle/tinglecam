@@ -68,7 +68,7 @@ cam::Operation hole() {
   op.stepdown=2;op.path_pitch=.5;op.holes.helix_angle_degrees=10;return op;
 }
 cam::Job job(cam::Operation op) {
-  cam::Job j;j.material_id="material";j.machine_id="machine";j.simulation_pitch=.25;
+  cam::Job j;j.material_id="material";j.machine_id="machine";j.planning.simulation_pitch=.25;
   j.operations={std::move(op)};return j;
 }
 cam::JobPlan plan(const cam::JobGeometry& g,const cam::Job& j) {
@@ -269,7 +269,7 @@ void helical_radial_margin() {
   auto& level=system.levels.front();level.radius=2;level.top_z=2;level.bottom_z=0;
   for(double margin:{0.0,.25}) {
     op.holes.radial_margin=margin;
-    auto j=job(op);j.simulation_pitch=.025;
+    auto j=job(op);j.planning.simulation_pitch=.025;
     const auto planned=plan({},j);
     const auto& operation=planned.operations.front();
     int arcs=0;

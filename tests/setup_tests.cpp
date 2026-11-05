@@ -75,7 +75,7 @@ void setups(const std::filesystem::path& directory) {
   write_box(directory/"part.obj",4,3,0,8,5,2);
   write_box(directory/"stock.obj",0,0,0,12,8,4);
   cam::Job job;job.name="Two sided";job.machine_id="test";job.material_id="plastic";
-  job.part_mesh=directory/"part.obj";job.stock_mesh=directory/"stock.obj";job.simulation_pitch=.25;
+  job.part_mesh=directory/"part.obj";job.stock_mesh=directory/"stock.obj";job.planning.simulation_pitch=.25;
   cam::ensure_setup_ids(job);
   auto& first=job.setups.front();first.name="Top";
   job.operations.push_back(facing(first.id,4,1));
@@ -85,7 +85,7 @@ void setups(const std::filesystem::path& directory) {
   second.part_orientation={{1,-2,-3}};second.part_offset_y=8;second.part_offset_z=4;
   second.stock_from_operation=job.operations.front().id;
   second.stock_transfer={{{1,-2,-3}},{0,8,4}};
-  second.work_offset="G55";second.origin_x=20;second.origin_z=-4;second.simulation_pitch=.1;
+  second.work_offset="G55";second.origin_x=20;second.origin_z=-4;
   job.setups.push_back(second);
   job.operations.push_back(facing(second.id,4,.5));
   check(cam::validate_setups(job).empty(),"Two-sided inheritance must validate");
@@ -96,10 +96,7 @@ void setups(const std::filesystem::path& directory) {
   const cam::MaterialLibrary materials{{{"plastic","Plastic"}}};
   const auto plan=cam::plan_job(geometry,job,tools,machines,materials,{});check_plan(plan);
   near(plan.operations[0].stock_after->highest(),3,"First setup faces stock down to Z3");
-  near(plan.operations[1].stock_before->pitch(),.25,"Inherited stock retains the source pitch without resampling");
-  check(std::any_of(plan.operations[1].debug_messages.begin(),plan.operations[1].debug_messages.end(),
-      [](const auto& message) {return message.find("Inherited stock keeps its source grid pitch")!=std::string::npos;}),
-      "Inherited pitch is recorded as a debug diagnostic rather than a warning");
+  near(plan.operations[1].stock_before->pitch(),.25,"Inherited stock uses the job's grid pitch");
   near(plan.operations[1].stock_before->lowest(),1,"Flipped setup inherits the machined side as its lower surface");
   near(plan.operations[1].stock_before->highest(),4,"Flipped setup exposes the original bottom");
   near(plan.operations[1].stock_before->volume(),plan.operations[0].stock_after->volume(),"Setup transfer preserves remaining material");
@@ -175,7 +172,7 @@ void raised_rim_roughing(const std::filesystem::path& directory) {
 void fixtures(const std::filesystem::path& directory) {
   write_box(directory/"clamp.obj",8.5,2,0,12,6,5);
   cam::Job job;job.part_mesh=directory/"part.obj";job.stock_mesh=directory/"stock.obj";
-  job.machine_id="test";job.material_id="plastic";job.simulation_pitch=.25;
+  job.machine_id="test";job.material_id="plastic";job.planning.simulation_pitch=.25;
   cam::SetupContext::ProtectedModel fixture;fixture.mesh=directory/"clamp.obj";fixture.clearance=.2;
   job.fixtures={fixture};cam::ensure_setup_ids(job);
   cam::Operation op;op.id=cam::new_document_id();op.setup_id=job.setups.front().id;
@@ -277,7 +274,7 @@ void fixtures(const std::filesystem::path& directory) {
 }
 void empty_roughing_debug(const std::filesystem::path& directory) {
   cam::Job job;job.part_mesh=job.stock_mesh=directory/"stock.obj";
-  job.machine_id="test";job.material_id="plastic";job.simulation_pitch=.25;
+  job.machine_id="test";job.material_id="plastic";job.planning.simulation_pitch=.25;
   cam::Operation op;op.tool_id="test";op.depth_to=1;op.stepdown=.5;
   op.radial_stock_to_leave=0;op.rough_boundary_cleanup=false;job.operations={op};
   cam::ensure_setup_ids(job);

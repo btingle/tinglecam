@@ -471,14 +471,26 @@ InterLayerTopology build_inter_layer_topology(
     std::vector<std::size_t> upper_count(upper.size(), 0);
     std::vector<std::size_t> lower_count(lower.size(), 0);
     std::vector<std::pair<std::size_t, std::size_t>> candidates;
+    // Each upper envelope is tested against every lower node; build it once.
+    // A lower footprint reaching outside an envelope's bounds cannot fit in it.
+    std::vector<Paths64> envelopes(upper.size());
+    std::vector<Rect64> envelope_bounds(upper.size());
+    for (std::size_t a = 0; a < upper.size(); ++a) {
+      if (upper[a].kind != FrontNode::Kind::Propagation) continue;
+      envelopes[a] = tolerance_envelope(upper[a].footprint,
+                                        kNodeZAssociationTolerance);
+      envelope_bounds[a] = GetBounds(envelopes[a]);
+    }
+    std::vector<Rect64> lower_bounds(lower.size());
+    for (std::size_t b = 0; b < lower.size(); ++b)
+      lower_bounds[b] = GetBounds(lower[b].footprint);
     for (std::size_t a = 0; a < upper.size(); ++a)
       for (std::size_t b = 0; b < lower.size(); ++b)
         if (upper[a].kind == FrontNode::Kind::Propagation &&
             lower[b].kind == FrontNode::Kind::Propagation &&
             upper[a].evaluation_order == lower[b].evaluation_order &&
-            area_contains_with_tolerance(
-                upper[a].footprint, lower[b].footprint,
-                kNodeZAssociationTolerance)) {
+            envelope_bounds[a].Contains(lower_bounds[b]) &&
+            envelope_contains(envelopes[a], lower[b].footprint)) {
           ++upper_count[a];
           ++lower_count[b];
           candidates.push_back({a, b});

@@ -37,7 +37,7 @@ int main() {
     machine.rapid_feed = 3000; machine.rapid_feed_z = 1500;
     const auto feeds = resolve_cutting_feeds(tool,machine,"test",{});
     Job job;
-    job.machine_id = "test"; job.material_id = "test"; job.simulation_pitch = .1;
+    job.machine_id = "test"; job.material_id = "test"; job.planning.simulation_pitch = .1;
     Operation op;
     op.mode = OperationMode::SurfaceFinishing; op.tool_id = tool.id;
     job.operations = {op};

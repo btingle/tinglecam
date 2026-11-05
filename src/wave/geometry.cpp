@@ -595,7 +595,8 @@ WaveResult build_wavefront(const Paths64& raw_subject,
 WaveResult build_wavefront_from_seeds(
     const Paths64& raw_domain, const std::vector<WaveSeed>& seeds,
     double stepover, double softening, std::size_t max_iterations,
-    const Paths64& static_boundaries, const Paths64& cached_reached) {
+    const Paths64& static_boundaries, const Paths64& cached_reached,
+    double simplify_tolerance) {
   if (raw_domain.empty()) throw std::invalid_argument("Remaining domain is empty");
   if (seeds.empty()) throw std::invalid_argument("Explicit wave seeds are empty");
   if (!(stepover > 0.0)) throw std::invalid_argument("Stepover must be positive");
@@ -603,6 +604,13 @@ WaveResult build_wavefront_from_seeds(
     throw std::invalid_argument("Softening must be between zero and stepover");
   if (max_iterations == 0)
     throw std::invalid_argument("Iteration limit must be positive");
+  if (!std::isfinite(simplify_tolerance) || simplify_tolerance < 0.0 ||
+      simplify_tolerance >= stepover)
+    throw std::invalid_argument("Simplify tolerance must be below the stepover");
+  const double simplify = static_cast<double>(to_integer(simplify_tolerance));
+  const auto simplified = [&](const Paths64& paths) {
+    return simplify > 0.0 ? SimplifyPaths(paths, simplify) : paths;
+  };
 
   WaveResult result;
   result.domain = Union(raw_domain, FillRule::NonZero);
@@ -653,7 +661,7 @@ WaveResult build_wavefront_from_seeds(
   result.reached_generations.push_back(reached);
 
   for (std::size_t iteration = 0; iteration < max_iterations; ++iteration) {
-    Paths64 next = inflate_with_softening(reached, delta, softening_delta);
+    Paths64 next = inflate_with_softening(simplified(reached), delta, softening_delta);
     next = Intersect(next, result.domain, FillRule::NonZero);
     Paths64 wave = Difference(next, reached, FillRule::NonZero);
     if (!cached_reached.empty()) {
@@ -665,7 +673,7 @@ WaveResult build_wavefront_from_seeds(
         }
         influence = Union(influence, FillRule::NonZero);
       } else {
-        influence = inflate_with_softening(active, delta, softening_delta);
+        influence = inflate_with_softening(simplified(active), delta, softening_delta);
       }
       wave = Intersect(wave, influence, FillRule::NonZero);
       next = Union(reached, wave, FillRule::NonZero);

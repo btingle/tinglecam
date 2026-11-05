@@ -277,6 +277,30 @@ json to_json(const Operation& operation) {
   return result;
 }
 
+json to_json(const PlanningSettings& planning) {
+  return {{"simulation_pitch", planning.simulation_pitch},
+          {"wave_simplify_tolerance", planning.wave_simplify_tolerance},
+          {"engagement_sampling", planning.engagement_sampling}};
+}
+
+PlanningSettings planning_from(const json& node, std::vector<std::string>* warnings,
+                               const char* where) {
+  if (!node.is_object()) throw std::runtime_error(std::string("Expected ") + where + " object");
+  report_unknown(node, {"simulation_pitch", "wave_simplify_tolerance", "engagement_sampling"},
+                 where, warnings);
+  PlanningSettings planning;
+  read(node, "simulation_pitch", planning.simulation_pitch);
+  read(node, "wave_simplify_tolerance", planning.wave_simplify_tolerance);
+  read(node, "engagement_sampling", planning.engagement_sampling);
+  if (!std::isfinite(planning.simulation_pitch) || planning.simulation_pitch < 0.001)
+    throw std::runtime_error("Stock grid pitch must be at least 0.001 mm");
+  if (!std::isfinite(planning.wave_simplify_tolerance) || planning.wave_simplify_tolerance < 0)
+    throw std::runtime_error("Wave simplify tolerance must be finite and nonnegative");
+  if (!std::isfinite(planning.engagement_sampling) || planning.engagement_sampling < 0.05)
+    throw std::runtime_error("Engagement sampling must be at least 0.05 mm");
+  return planning;
+}
+
 json to_json(const UserSettings& settings) {
   json defaults = json::object();
   for (const OperationMode mode : kOperationModes)
@@ -302,6 +326,7 @@ json to_json(const UserSettings& settings) {
               {"default_machine", settings.default_machine},
               {"default_material", settings.default_material},
               {"recent_jobs", settings.recent_jobs},
+              {"planning_defaults", to_json(settings.planning_defaults)},
               {"operation_defaults", std::move(defaults)}};
 }
 
@@ -501,6 +526,9 @@ UserSettings settings_from(const json& node) {
   read(node, "default_machine", settings.default_machine);
   read(node, "default_material", settings.default_material);
   read(node, "recent_jobs", settings.recent_jobs);
+  if (node.contains("planning_defaults"))
+    settings.planning_defaults =
+        planning_from(node.at("planning_defaults"), nullptr, "planning_defaults");
   if (node.contains("operation_defaults")) {
     const auto& defaults = node.at("operation_defaults");
     if (!defaults.is_object())
@@ -543,6 +571,7 @@ json to_json(const Job& job) {
     context.name=setup.name;
     auto entry=to_json(context);
     entry.erase("tools"); entry.erase("operations"); entry.erase("setups");
+    entry.erase("planning");
     entry["id"]=setup.id;
     setups.push_back(std::move(entry));
   }
@@ -570,7 +599,7 @@ json to_json(const Job& job) {
               {"part_offset_z",job.part_offset_z},
               {"machine", job.machine_id},
               {"material", job.material_id},
-              {"simulation_pitch", job.simulation_pitch},
+              {"planning", to_json(job.planning)},
               {"tools", std::move(tools)},
               {"box_stock", job.box_stock},
               {"box_stock_margins", {
@@ -599,7 +628,7 @@ json to_json(const Job& job) {
 
 Job job_from(const json& node, std::vector<std::string>* warnings = nullptr, bool context_only = false) {
   report_unknown(node,
-                 {"id", "name", "machine", "material", "simulation_pitch", "tools",
+                 {"id", "name", "machine", "material", "planning", "tools",
                   "setups", "fixtures", "part_from_setup", "fixtures_from_setup",
                   "properties_from_setup", "stock_from_operation", "stock_transfer",
                   "part_offset_x", "part_offset_y", "part_offset_z",
@@ -617,7 +646,10 @@ Job job_from(const json& node, std::vector<std::string>* warnings = nullptr, boo
   read(node, "name", job.name);
   read(node, "machine", job.machine_id);
   read(node, "material", job.material_id);
-  read(node, "simulation_pitch", job.simulation_pitch);
+  if (node.contains("planning")) {
+    if (context_only) throw std::runtime_error("Planning settings belong to the job, not a setup");
+    job.planning = planning_from(node.at("planning"), warnings, "Planning");
+  }
   if (node.contains("tools")) {
     if (!node.at("tools").is_array()) throw std::runtime_error("Expected a tools array");
     for (const auto& entry : node.at("tools")) {

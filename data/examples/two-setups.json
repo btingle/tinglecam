@@ -2,14 +2,17 @@
   "name": "Two-sided roughing with fixtures",
   "machine": "grbl-router",
   "material": "aluminium-6082",
-  "simulation_pitch": 0.1,
+  "planning": {
+    "engagement_sampling": 0.25,
+    "simulation_pitch": 0.1,
+    "wave_simplify_tolerance": 0.025
+  },
   "setups": [
     {
       "id": "setup-top",
       "name": "Top side",
       "part_mesh": "setups/part.stl",
       "stock_mesh": "setups/stock.stl",
-      "simulation_pitch": 0.1,
       "origin_z": -6,
       "fixtures": [
         {
@@ -44,7 +47,6 @@
           6
         ]
       },
-      "simulation_pitch": 0.1,
       "origin_z": -6,
       "work_offset": "G55",
       "pause_on_entry": true,

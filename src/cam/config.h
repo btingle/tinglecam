@@ -57,6 +57,7 @@ struct UserSettings {
   // What a new job starts with.
   std::string default_machine;
   std::string default_material;
+  PlanningSettings planning_defaults{};
   // Most recent first.
   std::vector<std::string> recent_jobs;
   std::array<Operation, 6> operation_defaults{};

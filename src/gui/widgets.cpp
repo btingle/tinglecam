@@ -13,6 +13,26 @@ bool begin_properties(const char* id) {
 
 void end_properties() { ImGui::EndTable(); }
 
+bool planning_controls(cam::PlanningSettings& planning) {
+  if (!begin_properties("planning")) return false;
+  bool changed = prop_double(
+      "Stock grid pitch", planning.simulation_pitch, 0.001f, "%.3f mm",
+      "XY spacing of the stock simulation. Smaller is more exact and slower.",
+      0.001, 10.0);
+  changed |= prop_double(
+      "Wave simplification", planning.wave_simplify_tolerance, 0.001f, "%.3f mm",
+      "Wavefronts may deviate this far to shed crowded vertices before each "
+      "step. Larger is faster; zero keeps every vertex.",
+      0.0, 0.5);
+  changed |= prop_double(
+      "Engagement sampling", planning.engagement_sampling, 0.01f, "%.2f mm",
+      "Length of the motion samples whose material removal sets the feed. "
+      "Smaller follows load changes more closely and simulates slower.",
+      0.05, 10.0);
+  end_properties();
+  return changed;
+}
+
 void help_marker(const char* text) {
   ImGui::SameLine(0.0f, ImGui::GetStyle().ItemInnerSpacing.x);
   ImGui::TextDisabled("(?)");

@@ -174,6 +174,8 @@ void settings_window(App& app) {
                           "Planner overlays and detailed readouts in the views.");
     end_properties();
   }
+  ImGui::SeparatorText("New job planning defaults");
+  changed |= planning_controls(app.settings.planning_defaults);
   if (ImGui::Button("Reset panel layout")) {
     app.settings.panel_layout = cam::default_panel_layout();
     changed = true;

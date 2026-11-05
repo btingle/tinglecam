@@ -128,9 +128,9 @@ Snapshots share a paged directory of 32x32 tiles until written. Uniform heights
 and repeated rows/columns are stored compactly without reducing resolution;
 only changed pages, tiles and height arrays are copied.
 
-In the GUI, **Stock grid pitch** is a job setting under **Machine** in the
-setup panel. Changing it marks every operation out of date; plan again to
-rebuild the stock at the new pitch.
+In the GUI, **Stock grid pitch** is under **Planning (whole job)** in the
+setup panel, and applies to every setup. Changing it marks every operation out
+of date; plan again to rebuild the stock at the new pitch.
 
 The 3D result uses native OpenGL raycasting at that full resolution, without converting
 stock into a mesh or decimating its cells. Simulation pitch does not set

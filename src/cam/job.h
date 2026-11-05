@@ -260,6 +260,18 @@ struct ToolAssignment {
   int length_offset = 0;
 };
 
+// Job-wide planning resolution. New jobs start from the application defaults.
+struct PlanningSettings {
+  // XY spacing of the stock simulation grid, mm.
+  double simulation_pitch = 0.02;
+  // Wave regions are simplified to this deviation before each growth offset,
+  // so inward-moving fronts stop accumulating vertices, mm. Zero disables it.
+  double wave_simplify_tolerance = 0.025;
+  // Motion is split into samples of this length to measure engagement and set
+  // feeds, mm.
+  double engagement_sampling = 0.2;
+};
+
 struct SetupContext {
   std::filesystem::path part_mesh;
   std::filesystem::path stock_mesh;
@@ -270,8 +282,6 @@ struct SetupContext {
   // Empty setup selections inherit document defaults.
   std::string machine_id;
   std::string material_id;
-  // XY spacing of the stock simulation grid, mm.
-  double simulation_pitch = 0.02;
   // Where the program's origin sits relative to the mesh coordinates. Added to
   // every posted coordinate.
   double origin_x = 0.0;
@@ -318,6 +328,7 @@ struct Setup : SetupContext {
 // and provide document defaults. Explicit setups own their local contexts.
 struct Job : SetupContext {
   std::string name = "Untitled";
+  PlanningSettings planning;
   std::vector<ToolAssignment> tools;
   std::vector<Setup> setups;
   std::vector<Operation> operations;
@@ -695,7 +706,8 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
                               double progress_from = 0.0,
                               double progress_to = 1.0,
                               const PriorOperations& prior_operations = {},
-                              const OperationPlan* prior_subdivisions = nullptr);
+                              const OperationPlan* prior_subdivisions = nullptr,
+                              const PlanningSettings& planning = {});
 
 // The one plane every disconnected move traverses at, in job coordinates; the
 // post adds origin_z to it. A 2D slice cannot certify a lower traverse, so this
@@ -755,7 +767,8 @@ OperationPlan plan_operation(const JobGeometry& geometry,
                              double rapid_plane = 10.0,
                              const PriorOperations& prior_operations = {},
                              const OperationPlan* prior_subdivisions = nullptr,
-                             bool defer_links = false);
+                             bool defer_links = false,
+                             const PlanningSettings& planning = {});
 
 // Nominal stock clipped to the newest simulated stock. By default query a
 // cross-section; roughing includes the projection of all material above Z.

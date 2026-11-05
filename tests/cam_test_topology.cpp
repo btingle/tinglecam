@@ -381,7 +381,7 @@ void check_serialisation() {
   cam::Job job;
   job.machine_id = "test";
   job.material_id = "plastic";
-  job.simulation_pitch = 0.07;
+  job.planning = {0.07, 0.03, 0.4};
   job.tools = {{"test-tool", 4, 9}};
   cam::Operation operation;
   operation.path_pitch = 0.15;
@@ -429,7 +429,10 @@ void check_serialisation() {
   }
   require(job_back.machine_id == "test" && job_back.material_id == "plastic",
           "the job's machine and material survive");
-  require_near(job_back.simulation_pitch, 0.07, 1e-12, "the stock grid pitch survives");
+  require(job_back.planning.simulation_pitch == 0.07 &&
+              job_back.planning.wave_simplify_tolerance == 0.03 &&
+              job_back.planning.engagement_sampling == 0.4,
+          "the job's planning settings survive");
   require(job_back.tools.size() == 1 && job_back.tools.front().number == 4 &&
               job_back.tools.front().length_offset == 9,
           "the tool table survives");

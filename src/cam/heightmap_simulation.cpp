@@ -409,23 +409,18 @@ void simulate_operation_xyz(OperationPlan& plan, const JobGeometry& geometry,
                             const ProgressCallback& progress,const ToolLibrary* tools) {
   const Tool& tool=base_tool;const auto& feeds=base_feeds;
   try {
-    if (!std::isfinite(job.simulation_pitch) || job.simulation_pitch < 0.001)
+    if (!std::isfinite(job.planning.simulation_pitch) || job.planning.simulation_pitch < 0.001)
       throw std::runtime_error("Stock grid pitch must be at least 0.001 mm");
     if (!std::isfinite(job.plunge_clearance_height) || job.plunge_clearance_height < 0)
       throw std::runtime_error("Plunge clearance must be finite and nonnegative");
     if (tool.type != ToolType::FlatEndMill && tool.type != ToolType::BallEndMill && tool.type!=ToolType::Drill)
       throw std::runtime_error("Stock simulation supports end mills and drills");
-    auto stock = stock_before_operation(geometry, job, prior, job.simulation_pitch);
+    auto stock = stock_before_operation(geometry, job, prior, job.planning.simulation_pitch);
     plan.stock_before = std::make_shared<const wave::Heightmap>(stock);
-    if (std::abs(stock.pitch() - job.simulation_pitch) > 1e-8) {
-      if(geometry.inherited_stock())
-        plan.debug_messages.push_back("Inherited stock keeps its source grid pitch of " +
-                                std::to_string(stock.pitch()) + " mm without resampling");
-      else
-        plan.warnings.push_back("Earlier operations were simulated at " +
-                                std::to_string(stock.pitch()) +
-                                " mm; plan them again to use the new grid pitch");
-    }
+    if (std::abs(stock.pitch() - job.planning.simulation_pitch) > 1e-8)
+      plan.warnings.push_back("Earlier operations were simulated at " +
+                              std::to_string(stock.pitch()) +
+                              " mm; plan them again to use the new grid pitch");
     const bool roughing = operation.mode == OperationMode::Roughing;
     const double vertical_rate = std::max(rapid_feed_z(machine), 1.0);
     // Keep even a zero-clearance approach above contact after the post rounds
@@ -477,7 +472,7 @@ void simulate_operation_xyz(OperationPlan& plan, const JobGeometry& geometry,
                        operation.mode == OperationMode::SurfaceFinishing
                    ? 1
                    : std::max(1, int(std::ceil(phase.length /
-                                               std::max(0.05, operation.path_pitch))));
+                                               std::max(0.05, job.planning.engagement_sampling))));
       };
       std::size_t phase_count = 0;
       for (const auto& phase : level.feeds.motion) phase_count += pieces(phase);

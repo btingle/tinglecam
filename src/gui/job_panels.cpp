@@ -394,7 +394,6 @@ void inheritance_controls(App& app) {
   if(setup_source_combo(app,"Properties from",context.properties_from_setup)) {
     if(context.properties_from_setup.empty()) {
       context.machine_id=effective.machine_id;context.material_id=effective.material_id;
-      context.simulation_pitch=effective.simulation_pitch;
       context.rapid_clearance_height=effective.rapid_clearance_height;
       context.plunge_clearance_height=effective.plunge_clearance_height;
       context.origin_x=effective.origin_x;context.origin_y=effective.origin_y;context.origin_z=effective.origin_z;
@@ -595,31 +594,6 @@ void setup_panel(App& app) {
       app.settings.default_material = controls_context.material_id;
       save_settings(app);
     }
-    const bool inherited_stock = !inherited_context.stock_from_operation.empty();
-    ImGui::BeginDisabled(inherited_stock);
-    if (inherited_stock) {
-      // Prefer the actual result. Before planning, trace the source setups to
-      // display the pitch that will be inherited, without editing local settings.
-      auto source = inherited_context;
-      double pitch = source.simulation_pitch;
-      for (std::size_t depth = 0; depth < app.job.setups.size(); ++depth) {
-        const auto op = std::find_if(app.job.operations.begin(), app.job.operations.end(),
-            [&](const auto& entry) { return entry.id == source.stock_from_operation; });
-        if (op == app.job.operations.end()) break;
-        try { source = cam::resolve_setup_context(app.job, op->setup_id); }
-        catch (const std::exception&) { break; }
-        pitch = source.simulation_pitch;
-        if (source.stock_from_operation.empty()) break;
-      }
-      if (app.geometry.inherited_stock()) pitch = app.geometry.inherited_stock()->pitch();
-      prop_double("Stock grid pitch", pitch, 0.001f, "%.3f mm",
-                  "Inherited stock keeps its source grid pitch. Edit the source setup to change it.",
-                  0.001, 10.0);
-    } else {
-      prop_double("Stock grid pitch", controls_context.simulation_pitch, 0.001f, "%.3f mm",
-                  "XY spacing of the stock simulation. Smaller is more exact and slower.", 0.001, 10.0);
-    }
-    ImGui::EndDisabled();
     prop_double("Rapid clearance", controls_context.rapid_clearance_height, 0.1f, "%.2f mm",
                 "Height of the safe plane above the tallest of part and blank. "
                 "Every lift goes to this one plane.", 0.1, 1000.0);
@@ -646,6 +620,7 @@ void setup_panel(App& app) {
   ImGui::EndDisabled();
   ImGui::Checkbox("Pause before this setup",&app.context().pause_on_entry);
   ImGui::SetItemTooltip("Stop spindle and coolant and issue M0 when export enters this setup.");
+  if (ImGui::CollapsingHeader("Planning (whole job)")) planning_controls(app.job.planning);
   if (ImGui::CollapsingHeader("Tool numbers")) tool_numbers_section(app);
   ImGui::EndDisabled();
 }
@@ -762,6 +737,7 @@ std::string operation_signature(const App& app, std::size_t index,
   try {
     static_cast<cam::SetupContext&>(context)=cam::resolve_setup_context(app.job,operation.setup_id);
   } catch(const std::exception& e) {dependency+=e.what();}
+  context.planning=app.job.planning;
   const auto revision=[&](const std::filesystem::path& file) {
     if(file.empty()) return;
     std::error_code error;
