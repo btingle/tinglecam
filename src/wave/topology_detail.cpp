@@ -15,35 +15,98 @@ using namespace Clipper2Lib;
 
 using namespace Clipper2Lib;
 
-bool point_in_nonzero_paths(const Point64& point, const Paths64& paths) {
-  int winding = 0;
-  for (const auto& path : paths) {
-    const auto relation = PointInPolygon(point, path);
-    if (relation == PointInPolygonResult::IsOn) return true;
-    if (relation == PointInPolygonResult::IsInside)
-      winding += Area(path) >= 0.0 ? 1 : -1;
-  }
-  return winding != 0;
-}
-
 bool point_on_segment(const Point64& point, const Point64& a, const Point64& b) {
   if (!IsCollinear(a, point, b)) return false;
   return point.x >= std::min(a.x, b.x) && point.x <= std::max(a.x, b.x) &&
          point.y >= std::min(a.y, b.y) && point.y <= std::max(a.y, b.y);
 }
 
-bool segment_on_paths(const Point64& a, const Point64& b, const Paths64& paths) {
-  for (const auto& path : paths) {
-    for (std::size_t i = 0; i < path.size(); ++i) {
-      const Point64& edge_a = path[i];
-      const Point64& edge_b = path[(i + 1) % path.size()];
-      if (point_on_segment(a, edge_a, edge_b) &&
-          point_on_segment(b, edge_a, edge_b))
-        return true;
+namespace {
+// Ring edges bucketed into horizontal bands. Any edge that can contain a point,
+// or cross the horizontal ray from it, spans the point's y, so a query only
+// tests the edges of one band instead of every edge of every ring.
+class EdgeBands {
+ public:
+  explicit EdgeBands(const Paths64& paths) {
+    std::size_t edges = 0;
+    std::int64_t low = std::numeric_limits<std::int64_t>::max();
+    std::int64_t high = std::numeric_limits<std::int64_t>::min();
+    for (const auto& path : paths) {
+      sign_.push_back(Area(path) >= 0.0 ? 1 : -1);
+      edges += path.size();
+      for (const auto& point : path) {
+        low = std::min(low, point.y);
+        high = std::max(high, point.y);
+      }
+    }
+    if (edges == 0) return;
+    const std::size_t count = std::clamp<std::size_t>(edges / 4, 1, 4096);
+    low_ = low;
+    height_ = std::max<std::int64_t>(1, (high - low) / std::int64_t(count) + 1);
+    bands_.resize(count + 1);
+    for (std::size_t index = 0; index < paths.size(); ++index) {
+      const Path64& path = paths[index];
+      for (std::size_t i = 0; i < path.size(); ++i) {
+        const Point64& a = path[i];
+        const Point64& b = path[(i + 1) % path.size()];
+        const std::size_t last = band(std::max(a.y, b.y));
+        for (std::size_t j = band(std::min(a.y, b.y)); j <= last; ++j)
+          bands_[j].push_back({a, b, index, path.size() >= 3});
+      }
     }
   }
-  return false;
-}
+
+  // NonZero containment, boundary inclusive. Rings under three points are
+  // ignored, as PointInPolygon does.
+  bool contains(const Point64& point) const {
+    const auto* edges = at(point.y);
+    if (!edges) return false;
+    std::vector<char> odd(sign_.size(), 0);
+    for (const Edge& edge : *edges) {
+      if (!edge.polygon) continue;
+      if (point_on_segment(point, edge.a, edge.b)) return true;
+      if ((edge.a.y > point.y) == (edge.b.y > point.y)) continue;
+      const __int128 cross =
+          __int128(edge.b.x - edge.a.x) * (point.y - edge.a.y) -
+          __int128(point.x - edge.a.x) * (edge.b.y - edge.a.y);
+      if (edge.b.y > edge.a.y ? cross > 0 : cross < 0) odd[edge.path] ^= 1;
+    }
+    int winding = 0;
+    for (std::size_t path = 0; path < odd.size(); ++path)
+      if (odd[path]) winding += sign_[path];
+    return winding != 0;
+  }
+
+  // Whether one ring edge contains the whole segment.
+  bool covers(const Point64& a, const Point64& b) const {
+    const auto* edges = at(a.y);
+    if (!edges) return false;
+    for (const Edge& edge : *edges)
+      if (point_on_segment(a, edge.a, edge.b) && point_on_segment(b, edge.a, edge.b))
+        return true;
+    return false;
+  }
+
+ private:
+  struct Edge {
+    Point64 a, b;
+    std::size_t path;
+    bool polygon;
+  };
+  std::size_t band(std::int64_t y) const {
+    return std::size_t((y - low_) / height_);
+  }
+  const std::vector<Edge>* at(std::int64_t y) const {
+    if (bands_.empty() || y < low_) return nullptr;
+    const std::size_t index = band(y);
+    return index < bands_.size() ? &bands_[index] : nullptr;
+  }
+  std::int64_t low_ = 0;
+  std::int64_t height_ = 1;
+  std::vector<std::vector<Edge>> bands_;
+  std::vector<int> sign_;
+};
+}  // namespace
 
 std::pair<Point64, Point64> normal_probes(const Point64& a, const Point64& b,
                                          std::int64_t distance) {
@@ -180,9 +243,10 @@ Path64 densify_ring(const Path64& ring, double max_segment) {
   return result;
 }
 
+namespace {
 void extract_ring_fronts(const Path64& raw_ring, std::size_t band,
-                         const Paths64& unreached,
-                         const Paths64& static_boundaries,
+                         const EdgeBands& unreached,
+                         const EdgeBands& static_boundaries,
                          double probe_pitch,
                          std::vector<LeadingFront>& fronts) {
   const Path64 ring = densify_ring(raw_ring, probe_pitch);
@@ -196,10 +260,9 @@ void extract_ring_fronts(const Path64& raw_ring, std::size_t band,
     const Point64& b = ring[(i + 1) % count];
     segment_length[i] = std::hypot(static_cast<double>(b.x - a.x),
                                    static_cast<double>(b.y - a.y));
-    if (a == b || segment_on_paths(a, b, static_boundaries)) continue;
+    if (a == b || static_boundaries.covers(a, b)) continue;
     const auto [plus, minus] = normal_probes(a, b, probe_distance);
-    if (point_in_nonzero_paths(plus, unreached) ||
-        point_in_nonzero_paths(minus, unreached)) {
+    if (unreached.contains(plus) || unreached.contains(minus)) {
       leading[i] = true;
       ++leading_count;
     }
@@ -246,6 +309,7 @@ void extract_ring_fronts(const Path64& raw_ring, std::size_t band,
     }
   }
 }
+}  // namespace
 
 // How finely the leading test samples a ring. A front is responsible for a
 // stepover of material, so a run shorter than a quarter of one bounds a child
@@ -266,9 +330,11 @@ std::vector<LeadingFront> extract_leading_fronts(const std::vector<Paths64>& ban
                                                  const Paths64& static_boundaries,
                                                  double probe_pitch) {
   std::vector<LeadingFront> fronts;
+  const EdgeBands unreached_edges(unreached);
+  const EdgeBands static_edges(static_boundaries);
   for (std::size_t band = 0; band < bands.size(); ++band)
     for (const auto& ring : bands[band])
-      extract_ring_fronts(ring, band, unreached, static_boundaries, probe_pitch,
+      extract_ring_fronts(ring, band, unreached_edges, static_edges, probe_pitch,
                           fronts);
   return fronts;
 }

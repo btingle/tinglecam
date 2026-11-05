@@ -191,6 +191,31 @@ std::vector<TraversalChoice> exact_order(
           initial + path_length_mm(path) / settings.cutting_feed;
     }
 
+  // A link's cost depends only on the variant pair, never on the visited set,
+  // so price each pair once instead of once per mask.
+  std::vector<std::size_t> first_variant(count + 1, 0);
+  for (std::size_t task = 0; task < count; ++task)
+    first_variant[task + 1] = first_variant[task] + tasks[task].variants.size();
+  const std::size_t total_variants = first_variant[count];
+  std::vector<double> link_minutes(total_variants * total_variants,
+                                   std::numeric_limits<double>::infinity());
+  std::vector<double> cut_minutes(total_variants);
+  for (std::size_t last = 0; last < count; ++last)
+    for (std::size_t last_variant = 0; last_variant < tasks[last].variants.size();
+         ++last_variant) {
+      const TraversalVariant& from_choice = tasks[last].variants[last_variant];
+      const std::size_t from = first_variant[last] + last_variant;
+      cut_minutes[from] = path_length_mm(from_choice.path) / settings.cutting_feed;
+      for (std::size_t next = 0; next < count; ++next) {
+        if (next == last) continue;
+        for (std::size_t next_variant = 0;
+             next_variant < tasks[next].variants.size(); ++next_variant)
+          link_minutes[from * total_variants + first_variant[next] + next_variant] =
+              connector(from_choice.path.back(), tasks[next].variants[next_variant],
+                        settings, crossings).minutes;
+      }
+    }
+
   for (std::size_t mask = 1; mask < masks; ++mask) {
     for (std::size_t last = 0; last < count; ++last) {
       if ((mask & (std::size_t{1} << last)) == 0) continue;
@@ -198,19 +223,16 @@ std::vector<TraversalChoice> exact_order(
            last_variant < tasks[last].variants.size(); ++last_variant) {
         const State current = states[mask][last][last_variant];
         if (!std::isfinite(current.cost)) continue;
-        const Point64& from = tasks[last].variants[last_variant].path.back();
+        const double* links =
+            &link_minutes[(first_variant[last] + last_variant) * total_variants];
         for (std::size_t next = 0; next < count; ++next) {
           if ((mask & (std::size_t{1} << next)) != 0) continue;
           const std::size_t next_mask = mask | (std::size_t{1} << next);
           for (std::size_t next_variant = 0;
                next_variant < tasks[next].variants.size(); ++next_variant) {
-            const TraversalVariant& next_choice =
-                tasks[next].variants[next_variant];
-            const Path64& path = next_choice.path;
+            const std::size_t to = first_variant[next] + next_variant;
             const double candidate =
-                current.cost +
-                connector(from, next_choice, settings, crossings).minutes +
-                path_length_mm(path) / settings.cutting_feed;
+                current.cost + links[to] + cut_minutes[to];
             State& destination = states[next_mask][next][next_variant];
             if (candidate >= destination.cost) continue;
             destination.cost = candidate;

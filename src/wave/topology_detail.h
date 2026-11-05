@@ -36,11 +36,6 @@ class DisjointSet {
 };
 
 std::vector<Paths64> band_components(const Paths64& wave_band);
-void extract_ring_fronts(const Path64& raw_ring, std::size_t band,
-                         const Paths64& unreached,
-                         const Paths64& static_boundaries,
-                         double probe_pitch,
-                         std::vector<LeadingFront>& fronts);
 double front_probe_pitch(double stepover);
 std::vector<LeadingFront> extract_leading_fronts(
     const std::vector<Paths64>& bands, const Paths64& unreached,
