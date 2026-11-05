@@ -213,21 +213,22 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
   if (!parallel_for_levels(unique_wave_levels, [&](std::size_t index, const LevelProgress&) {
     LevelPlan& level = plan.levels[index];
     try {
-      wave::WavefrontAnalysis analysis = wave::analyze_wavefront(
+      const auto analyses = wave::analyze_stock_wavefronts(
           keep_outs[index], level.incoming_stock, stepover, stepover, lead_in,
           2000, 128, {}, wave::kDefaultSignificantNodeAreaFraction,
           operation.tiny_split_area_factor, exterior_stock_reach, machining_limit);
       wave::CommittedWavefront committed =
-          wave::commit_wavefront_analysis(analysis);
+          wave::commit_wavefront_analyses(analyses);
       level.wave_stages = std::move(committed.stages);
       level.wave = std::move(committed.wave);
       level.lineage = std::move(committed.lineage);
       level.topology = std::move(committed.topology);
-      for (const wave::WavefrontDecisionLayer& decision : analysis.layers)
-        for (const wave::WavefrontStrategyTrial& trial : decision.trials) {
-          ++level.analysis_trials;
-          if (trial.accepted) ++level.accepted_analysis_trials;
-        }
+      for (const auto& analysis : analyses)
+        for (const wave::WavefrontDecisionLayer& decision : analysis.layers)
+          for (const wave::WavefrontStrategyTrial& trial : decision.trials) {
+            ++level.analysis_trials;
+            if (trial.accepted) ++level.accepted_analysis_trials;
+          }
     } catch (...) {
       wave_errors[index] = std::current_exception();
     }

@@ -110,6 +110,25 @@ WavefrontAnalysis analyze_wavefront(
     double exterior_stock_reach = 0.0,
     const Paths64& machining_limit = {});
 
+// Analyze connected physical stock islands separately, before expanding their
+// approach/contact domains. Overlapping exterior air must not erase an island's
+// entry boundaries. Every result retains the complete physical stock for safe
+// downstream routing, and every island sees the complete protected subject.
+std::vector<WavefrontAnalysis> analyze_stock_wavefronts(
+    const Paths64& raw_subject,
+    const Paths64& raw_stock,
+    double stepover,
+    double softening = 0.0,
+    double lead_in = 0.0,
+    std::size_t max_iterations = 2000,
+    std::size_t max_layers = 128,
+    const EntryMute& muted = {},
+    double significant_node_area_fraction =
+        kDefaultSignificantNodeAreaFraction,
+    double tiny_split_area_factor = kDefaultTinySplitAreaFactor,
+    double exterior_stock_reach = 0.0,
+    const Paths64& machining_limit = {});
+
 // Discards the speculative suffixes and returns exactly the node layer chosen
 // at each recursive decision. The returned stages are suitable for sequencing
 // directly into tool motion.
@@ -118,5 +137,11 @@ std::vector<WavefrontStage> committed_wavefront_stages(
 
 CommittedWavefront commit_wavefront_analysis(
     const WavefrontAnalysis& analysis);
+
+// Finish one island's recursive stages before starting the next. The combined
+// display geometry keeps independent topology and boundary-contact identities;
+// toolpath construction uses the individual stages and shares cleared state.
+CommittedWavefront commit_wavefront_analyses(
+    const std::vector<WavefrontAnalysis>& analyses);
 
 }  // namespace wave

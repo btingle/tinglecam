@@ -410,3 +410,8 @@ add_executable(roughing_areas_tests tests/roughing_areas_tests.cpp)
 target_link_libraries(roughing_areas_tests PRIVATE tinglecam_core)
 add_test(NAME roughing_areas_tests COMMAND roughing_areas_tests)
 set_tests_properties(roughing_areas_tests PROPERTIES TIMEOUT 45)
+
+add_executable(stock_island_tests tests/stock_island_tests.cpp)
+target_link_libraries(stock_island_tests PRIVATE wave_simulation)
+add_test(NAME stock_island_tests COMMAND stock_island_tests)
+set_tests_properties(stock_island_tests PROPERTIES TIMEOUT 30)

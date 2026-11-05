@@ -358,6 +358,51 @@ WavefrontAnalysis analyze_wavefront(
   return analysis;
 }
 
+std::vector<WavefrontAnalysis> analyze_stock_wavefronts(
+    const Paths64& raw_subject, const Paths64& raw_stock, double stepover,
+    double softening, double lead_in, std::size_t max_iterations,
+    std::size_t max_layers, const EntryMute& muted,
+    double significant_node_area_fraction, double tiny_split_area_factor,
+    double exterior_stock_reach, const Paths64& machining_limit) {
+  // Use the polygon tree so holes stay with their outer ring, while islands
+  // nested inside holes become independent stock components themselves.
+  Clipper64 clipper;
+  clipper.AddSubject(raw_stock);
+  PolyTree64 tree;
+  Paths64 open;
+  if (!clipper.Execute(ClipType::Union, FillRule::NonZero, tree, open))
+    throw std::runtime_error("Cannot separate physical stock islands");
+  std::vector<Paths64> islands;
+  const auto collect = [&](const auto& self, const PolyPath64& parent) -> void {
+    for (std::size_t i = 0; i < parent.Count(); ++i) {
+      const auto& outer = *parent.Child(i);
+      Paths64 island{outer.Polygon()};
+      for (std::size_t h = 0; h < outer.Count(); ++h)
+        island.push_back(outer.Child(h)->Polygon());
+      islands.push_back(std::move(island));
+      for (std::size_t h = 0; h < outer.Count(); ++h)
+        self(self, *outer.Child(h));
+    }
+  };
+  collect(collect, tree);
+  if (islands.empty()) islands.push_back(raw_stock); // Preserve input validation.
+  const Paths64 physical_stock = Union(raw_stock, FillRule::NonZero);
+  std::vector<WavefrontAnalysis> results;
+  results.reserve(islands.size());
+  for (const auto& island : islands) {
+    auto analysis = analyze_wavefront(
+        raw_subject, island, stepover, softening, lead_in, max_iterations,
+        max_layers, muted, significant_node_area_fraction,
+        tiny_split_area_factor, exterior_stock_reach, machining_limit);
+    // Propagation owns one island, but its cutter may reach neighbouring stock.
+    // Routing must not mistake that material for empty air.
+    analysis.seed.stock = physical_stock;
+    analysis.seed.stock_boundary = physical_stock.front();
+    results.push_back(std::move(analysis));
+  }
+  return results;
+}
+
 std::vector<WavefrontStage> committed_wavefront_stages(
     const WavefrontAnalysis& analysis) {
   std::vector<WavefrontStage> result;
@@ -565,10 +610,11 @@ std::vector<WavefrontStage> committed_wavefront_stages(
   return result;
 }
 
-CommittedWavefront commit_wavefront_analysis(
-    const WavefrontAnalysis& analysis) {
+namespace {
+CommittedWavefront combine_committed_stages(
+    const WavefrontAnalysis& analysis, std::vector<WavefrontStage> stages) {
   CommittedWavefront result;
-  result.stages = committed_wavefront_stages(analysis);
+  result.stages = std::move(stages);
   result.wave = analysis.seed;
   result.wave.generations.clear();
   result.wave.reached_generations.clear();
@@ -577,12 +623,17 @@ CommittedWavefront commit_wavefront_analysis(
 
   Paths64 reached;
   for (const WavefrontStage& stage : result.stages) {
-    if (result.lineage.boundary_components.empty())
-      result.lineage.boundary_components = stage.lineage.boundary_components;
-    else if (!paths_equal_canonical(result.lineage.boundary_components,
-                                     stage.lineage.boundary_components))
-      throw std::runtime_error(
-          "Committed wave layers use different static boundaries");
+    std::vector<std::size_t> boundary_remap;
+    for (const auto& boundary : stage.lineage.boundary_components) {
+      auto& boundaries = result.lineage.boundary_components;
+      const auto found = std::find(boundaries.begin(), boundaries.end(), boundary);
+      boundary_remap.push_back(std::size_t(found - boundaries.begin()));
+      if (found == boundaries.end()) boundaries.push_back(boundary);
+    }
+    const auto remap_contacts = [&](LeadingFront& front) {
+      for (auto& contact : front.boundary_contacts)
+        if (contact.valid) contact.component = boundary_remap.at(contact.component);
+    };
 
     const std::size_t generation_offset = result.lineage.generations.size();
     const std::size_t node_offset = result.topology.nodes.size();
@@ -603,6 +654,8 @@ CommittedWavefront commit_wavefront_analysis(
       const FrontGeneration& source_generation =
           stage.lineage.generations[generation];
       result.lineage.generations.push_back(source_generation);
+      for (auto& front : result.lineage.generations.back().fronts)
+        remap_contacts(front);
 
       std::vector<std::size_t> front_nodes =
           stage.topology.front_nodes[generation];
@@ -616,9 +669,10 @@ CommittedWavefront commit_wavefront_analysis(
       result.wave.reached_generations.push_back(reached);
     }
 
-    result.lineage.entry_fronts.insert(result.lineage.entry_fronts.end(),
-                                       stage.lineage.entry_fronts.begin(),
-                                       stage.lineage.entry_fronts.end());
+    for (auto front : stage.lineage.entry_fronts) {
+      remap_contacts(front);
+      result.lineage.entry_fronts.push_back(std::move(front));
+    }
     for (const std::size_t entry : stage.topology.entry_fronts)
       result.topology.entry_fronts.push_back(entry_offset + entry);
   }
@@ -629,6 +683,37 @@ CommittedWavefront commit_wavefront_analysis(
     result.topology = build_layer_topology(result.lineage);
   }
   return result;
+}
+
+}  // namespace
+
+CommittedWavefront commit_wavefront_analysis(const WavefrontAnalysis& analysis) {
+  return combine_committed_stages(analysis, committed_wavefront_stages(analysis));
+}
+
+CommittedWavefront commit_wavefront_analyses(
+    const std::vector<WavefrontAnalysis>& analyses) {
+  if (analyses.empty()) return {};
+  if (analyses.size() == 1) return commit_wavefront_analysis(analyses.front());
+  WavefrontAnalysis combined;
+  combined.seed = analyses.front().seed;
+  combined.seed.domain.clear();
+  combined.seed.generations.clear();
+  combined.seed.reached_generations.clear();
+  combined.seed.muted_entries = 0;
+  combined.seed_lineage.stepover = combined.seed.stepover;
+  std::vector<WavefrontStage> stages;
+  for (const auto& analysis : analyses) {
+    auto island_stages = committed_wavefront_stages(analysis);
+    for (auto& stage : island_stages) stages.push_back(std::move(stage));
+    combined.seed.domain.insert(combined.seed.domain.end(),
+        analysis.seed.domain.begin(), analysis.seed.domain.end());
+    combined.seed.muted_entries += analysis.seed.muted_entries;
+  }
+  // This union is display metadata only: stages retain their independent
+  // propagation histories and are never propagated together again.
+  combined.seed.domain = Union(combined.seed.domain, FillRule::NonZero);
+  return combine_committed_stages(combined, std::move(stages));
 }
 
 }  // namespace wave

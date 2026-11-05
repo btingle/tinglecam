@@ -103,6 +103,9 @@ roughing and terrace cleanup before proceeding to the next. Add them under
 **Cutting > Roughing areas**; see [ordered roughing areas](docs/roughing-areas.md)
 or open `data/examples/four-part-roughing.json`.
 
+Disconnected stock islands retain independent wavefront contours even when
+their lead-in regions overlap. See [independent stock islands](docs/stock-islands.md).
+
 For roughing, **Advanced > Stock boundary dilation** adds an outward XY planning
 margin to the stock outline at each Z level. A value of **1 mm** expands a
 20×20 mm square to **22×22 mm**, retaining square corners. It defaults to zero,
