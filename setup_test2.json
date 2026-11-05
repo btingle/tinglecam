@@ -1,0 +1,546 @@
+{
+  "box_stock": false,
+  "box_stock_margins": {
+    "minus_x": 5.0,
+    "minus_y": 5.0,
+    "minus_z": 0.0,
+    "plus_x": 5.0,
+    "plus_y": 5.0,
+    "plus_z": 0.0
+  },
+  "fixtures": [],
+  "fixtures_from_setup": "",
+  "machine": "grbl-router",
+  "material": "new-material",
+  "name": "Untitled",
+  "operations": [
+    {
+      "adaptive_cleanup_stepover": true,
+      "auto_identify_pockets": false,
+      "axial_stock_to_leave": 0.1,
+      "cleanup_stepover_limit": 0.5,
+      "cleanup_tolerance": 0.2,
+      "clip_contours_to_stock": true,
+      "contour_direction": "either",
+      "coolant": false,
+      "cutting": {},
+      "depth_breaks": [],
+      "depth_from": 0.0,
+      "depth_to": 20.0,
+      "entry_front_match_tolerance": 3.0,
+      "finishing_subdivisions": 5,
+      "id": "id-1793850581446135460-2",
+      "lead_in": true,
+      "mode": "roughing",
+      "name": "Rough",
+      "path_pitch": 0.2,
+      "plane": {
+        "areas": [
+          {
+            "center_x": 0.0,
+            "center_y": 0.0,
+            "depth": 1.0,
+            "height": 30.0,
+            "top_z": 19.0,
+            "width": 30.0
+          }
+        ]
+      },
+      "pocket_auto": {
+        "check_depth": 1.0,
+        "exclusions": [
+          {
+            "center_x": 0.0,
+            "center_y": 0.0,
+            "enabled": false,
+            "height": 30.0,
+            "width": 30.0
+          }
+        ],
+        "helix_angle_degrees": 3.0
+      },
+      "pocket_radial_margin": 0.0,
+      "pockets": [
+        {
+          "center_x": 0.0,
+          "center_y": 0.0,
+          "depth": 5.0,
+          "height": 30.0,
+          "helix_angle_degrees": 3.0,
+          "radius": 0.0,
+          "shape": "rounded_rectangle",
+          "top_z": 19.0,
+          "width": 30.0
+        }
+      ],
+      "radial_stock_to_leave": 0.0,
+      "rough_boundary_cleanup": true,
+      "roughing_areas": [],
+      "setup": "id-1793850581446135460-1",
+      "slice_grid": 32,
+      "stepdown": 5.0,
+      "stepover_ratio": 0.1,
+      "stock_boundary_dilation": 0.0,
+      "stock_deviation": 0.0,
+      "surface": {
+        "allowance": 0.0,
+        "along_v": true,
+        "bidirectional": true,
+        "chord_tolerance": 0.01,
+        "faces": [],
+        "flip_normals": false,
+        "manual_order": false,
+        "model_fingerprint": "",
+        "order_roots": [],
+        "order_signature": "",
+        "stepover": 0.3
+      },
+      "tiny_split_area_factor": 0.5,
+      "tool": "6mm-ball"
+    },
+    {
+      "adaptive_cleanup_stepover": true,
+      "auto_identify_pockets": false,
+      "axial_stock_to_leave": 0.0,
+      "cleanup_stepover_limit": 0.5,
+      "cleanup_tolerance": 0.15,
+      "clip_contours_to_stock": true,
+      "contour_direction": "either",
+      "coolant": false,
+      "cutting": {},
+      "depth_breaks": [],
+      "depth_from": 0.0,
+      "depth_to": 19.11032124608755,
+      "entry_front_match_tolerance": 3.0,
+      "finishing_subdivisions": 1,
+      "id": "id-1793850581446135460-3",
+      "lead_in": true,
+      "mode": "surface_finishing",
+      "name": "Surface finish",
+      "path_pitch": 1.0,
+      "plane": {
+        "areas": [
+          {
+            "center_x": 0.0,
+            "center_y": 0.0,
+            "depth": 1.0,
+            "height": 30.0,
+            "top_z": 19.0,
+            "width": 30.0
+          }
+        ]
+      },
+      "pocket_auto": {
+        "check_depth": 1.0,
+        "exclusions": [
+          {
+            "center_x": 0.0,
+            "center_y": 0.0,
+            "enabled": false,
+            "height": 30.0,
+            "width": 30.0
+          }
+        ],
+        "helix_angle_degrees": 3.0
+      },
+      "pocket_radial_margin": 0.0,
+      "pockets": [
+        {
+          "center_x": 0.0,
+          "center_y": 0.0,
+          "depth": 5.0,
+          "height": 30.0,
+          "helix_angle_degrees": 3.0,
+          "radius": 5.0,
+          "shape": "rounded_rectangle",
+          "top_z": 19.0,
+          "width": 30.0
+        }
+      ],
+      "radial_stock_to_leave": 0.2,
+      "rough_boundary_cleanup": true,
+      "roughing_areas": [],
+      "setup": "id-1793850581446135460-1",
+      "slice_grid": 32,
+      "stepdown": 1.0,
+      "stepover_ratio": 0.4,
+      "stock_boundary_dilation": 0.0,
+      "stock_deviation": 0.2,
+      "surface": {
+        "allowance": 0.0,
+        "along_v": false,
+        "bidirectional": true,
+        "chord_tolerance": 0.01,
+        "faces": [
+          79,
+          81,
+          83,
+          82,
+          80,
+          78
+        ],
+        "flip_normals": false,
+        "manual_order": false,
+        "model_fingerprint": "91638f96d453a444",
+        "order_roots": [],
+        "order_signature": "",
+        "stepover": 0.6
+      },
+      "tiny_split_area_factor": 0.5,
+      "tool": "6mm-ball"
+    },
+    {
+      "adaptive_cleanup_stepover": true,
+      "auto_identify_pockets": false,
+      "axial_stock_to_leave": 0.0,
+      "cleanup_stepover_limit": 0.5,
+      "cleanup_tolerance": 0.2,
+      "clip_contours_to_stock": true,
+      "contour_direction": "either",
+      "coolant": false,
+      "cutting": {},
+      "depth_breaks": [],
+      "depth_from": 0.0,
+      "depth_to": 19.117183685302734,
+      "entry_front_match_tolerance": 3.0,
+      "finishing_subdivisions": 4,
+      "id": "id-1793850581446135460-5",
+      "lead_in": true,
+      "mode": "roughing",
+      "name": "Rough 2",
+      "path_pitch": 0.2,
+      "plane": {
+        "areas": [
+          {
+            "center_x": 0.0,
+            "center_y": -3.814697265625e-06,
+            "depth": 1.0,
+            "height": 30.0,
+            "top_z": 27.117183685302734,
+            "width": 30.0
+          }
+        ]
+      },
+      "pocket_auto": {
+        "check_depth": 1.0,
+        "exclusions": [
+          {
+            "center_x": 0.0,
+            "center_y": 0.0,
+            "enabled": false,
+            "height": 30.0,
+            "width": 30.0
+          }
+        ],
+        "helix_angle_degrees": 3.0
+      },
+      "pocket_radial_margin": 0.0,
+      "pockets": [
+        {
+          "center_x": 0.0,
+          "center_y": -3.814697265625e-06,
+          "depth": 5.0,
+          "height": 30.0,
+          "helix_angle_degrees": 3.0,
+          "radius": 0.0,
+          "shape": "rounded_rectangle",
+          "top_z": 27.117183685302734,
+          "width": 30.0
+        }
+      ],
+      "radial_stock_to_leave": 0.2,
+      "rough_boundary_cleanup": true,
+      "roughing_areas": [],
+      "setup": "id-1793850581446135460-4",
+      "slice_grid": 32,
+      "stepdown": 3.0,
+      "stepover_ratio": 0.2,
+      "stock_boundary_dilation": 0.0,
+      "stock_deviation": 0.2,
+      "surface": {
+        "allowance": 0.0,
+        "along_v": true,
+        "bidirectional": true,
+        "chord_tolerance": 0.01,
+        "faces": [],
+        "flip_normals": false,
+        "manual_order": false,
+        "model_fingerprint": "",
+        "order_roots": [],
+        "order_signature": "",
+        "stepover": 0.3
+      },
+      "tiny_split_area_factor": 0.5,
+      "tool": "6mm-3f"
+    },
+    {
+      "adaptive_cleanup_stepover": true,
+      "auto_identify_pockets": false,
+      "axial_stock_to_leave": 0.0,
+      "cleanup_stepover_limit": 0.5,
+      "cleanup_tolerance": 0.15,
+      "clip_contours_to_stock": true,
+      "contour_direction": "either",
+      "coolant": false,
+      "cutting": {},
+      "depth_breaks": [],
+      "depth_from": 0.0,
+      "depth_to": 19.109368324279785,
+      "entry_front_match_tolerance": 3.0,
+      "finishing_subdivisions": 1,
+      "id": "id-1793850581446135460-6",
+      "lead_in": true,
+      "mode": "surface_finishing",
+      "name": "Surface finish 2",
+      "path_pitch": 1.0,
+      "plane": {
+        "areas": [
+          {
+            "center_x": 0.0,
+            "center_y": -3.814697265625e-06,
+            "depth": 1.0,
+            "height": 30.0,
+            "top_z": 27.117183685302734,
+            "width": 30.0
+          }
+        ]
+      },
+      "pocket_auto": {
+        "check_depth": 1.0,
+        "exclusions": [
+          {
+            "center_x": 0.0,
+            "center_y": 0.0,
+            "enabled": false,
+            "height": 30.0,
+            "width": 30.0
+          }
+        ],
+        "helix_angle_degrees": 3.0
+      },
+      "pocket_radial_margin": 0.0,
+      "pockets": [
+        {
+          "center_x": 0.0,
+          "center_y": -3.814697265625e-06,
+          "depth": 5.0,
+          "height": 30.0,
+          "helix_angle_degrees": 3.0,
+          "radius": 5.0,
+          "shape": "rounded_rectangle",
+          "top_z": 27.117183685302734,
+          "width": 30.0
+        }
+      ],
+      "radial_stock_to_leave": 0.2,
+      "rough_boundary_cleanup": true,
+      "roughing_areas": [],
+      "setup": "id-1793850581446135460-4",
+      "slice_grid": 32,
+      "stepdown": 1.0,
+      "stepover_ratio": 0.4,
+      "stock_boundary_dilation": 0.0,
+      "stock_deviation": 0.2,
+      "surface": {
+        "allowance": 0.0,
+        "along_v": true,
+        "bidirectional": true,
+        "chord_tolerance": 0.01,
+        "faces": [
+          92,
+          93
+        ],
+        "flip_normals": false,
+        "manual_order": false,
+        "model_fingerprint": "20bc12c84a0b632a",
+        "order_roots": [],
+        "order_signature": "",
+        "stepover": 0.3
+      },
+      "tiny_split_area_factor": 0.5,
+      "tool": "6mm-ball"
+    }
+  ],
+  "origin_relative_to_part": false,
+  "origin_x": 0.0,
+  "origin_y": 0.0,
+  "origin_z": 0.0,
+  "part_from_setup": "",
+  "part_mesh": "",
+  "part_offset_x": 0.0,
+  "part_offset_y": 0.0,
+  "part_offset_z": 0.0,
+  "part_orientation": [
+    1,
+    2,
+    3
+  ],
+  "pause_on_entry": true,
+  "plunge_clearance_height": 1.0,
+  "properties_from_setup": "",
+  "rapid_clearance_height": 10.0,
+  "setups": [
+    {
+      "box_stock": false,
+      "box_stock_margins": {
+        "minus_x": 5.0,
+        "minus_y": 5.0,
+        "minus_z": 0.0,
+        "plus_x": 5.0,
+        "plus_y": 5.0,
+        "plus_z": 0.0
+      },
+      "fixtures": [],
+      "fixtures_from_setup": "",
+      "id": "id-1793850581446135460-1",
+      "machine": "grbl-router",
+      "material": "new-material",
+      "name": "Op 0",
+      "origin_relative_to_part": false,
+      "origin_x": -0.0,
+      "origin_y": -0.0,
+      "origin_z": -19.0,
+      "part_from_setup": "",
+      "part_mesh": "../../../mnt/c/Users/btingle/Documents/cad_models/parametric/slr_setup_p0_part_4x.step",
+      "part_offset_x": 0.0,
+      "part_offset_y": 0.0,
+      "part_offset_z": 0.0,
+      "part_orientation": [
+        1,
+        2,
+        3
+      ],
+      "pause_on_entry": true,
+      "plunge_clearance_height": 1.0,
+      "properties_from_setup": "",
+      "rapid_clearance_height": 10.0,
+      "simulation_pitch": 0.1,
+      "stock_from_operation": "",
+      "stock_mesh": "../../../mnt/c/Users/btingle/Documents/cad_models/parametric/slr_setup_p0_stock_4x.step",
+      "stock_offset_x": 0.0,
+      "stock_offset_y": 0.0,
+      "stock_offset_z": 0.0,
+      "stock_orientation": [
+        1,
+        2,
+        3
+      ],
+      "stock_transfer": {
+        "offset": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "orientation": [
+          1,
+          2,
+          3
+        ]
+      },
+      "work_offset": "G54"
+    },
+    {
+      "box_stock": false,
+      "box_stock_margins": {
+        "minus_x": 5.0,
+        "minus_y": 5.0,
+        "minus_z": 0.0,
+        "plus_x": 5.0,
+        "plus_y": 5.0,
+        "plus_z": 0.0
+      },
+      "fixtures": [
+        {
+          "clearance": 0.0,
+          "mesh": "../../../mnt/c/Users/btingle/Documents/cad_models/meshes/slr_setup_p1_jig_4x.stl",
+          "name": "slr_setup_p1_jig_4x",
+          "placement": {
+            "offset": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "orientation": [
+              1,
+              2,
+              3
+            ]
+          },
+          "role": "fixture"
+        }
+      ],
+      "fixtures_from_setup": "",
+      "id": "id-1793850581446135460-4",
+      "machine": "grbl-router",
+      "material": "new-material",
+      "name": "Op 1",
+      "origin_relative_to_part": true,
+      "origin_x": -0.0,
+      "origin_y": 3.814697265625e-06,
+      "origin_z": -27.117183685302734,
+      "part_from_setup": "",
+      "part_mesh": "../../../mnt/c/Users/btingle/Documents/cad_models/parametric/slr_setup_p1_part_4x.step",
+      "part_offset_x": 0.0,
+      "part_offset_y": 0.0,
+      "part_offset_z": 0.0,
+      "part_orientation": [
+        1,
+        2,
+        3
+      ],
+      "pause_on_entry": true,
+      "plunge_clearance_height": 1.0,
+      "properties_from_setup": "",
+      "rapid_clearance_height": 10.0,
+      "simulation_pitch": 0.02,
+      "stock_from_operation": "id-1793850581446135460-3",
+      "stock_mesh": "../../../mnt/c/Users/btingle/Documents/cad_models/parametric/slr_setup_p0_stock_4x.step",
+      "stock_offset_x": 0.0,
+      "stock_offset_y": 0.0,
+      "stock_offset_z": 0.0,
+      "stock_orientation": [
+        1,
+        2,
+        3
+      ],
+      "stock_transfer": {
+        "offset": [
+          0.0,
+          0.0,
+          27.0
+        ],
+        "orientation": [
+          -1,
+          2,
+          -3
+        ]
+      },
+      "work_offset": "G54"
+    }
+  ],
+  "simulation_pitch": 0.02,
+  "stock_from_operation": "",
+  "stock_mesh": "",
+  "stock_offset_x": 0.0,
+  "stock_offset_y": 0.0,
+  "stock_offset_z": 0.0,
+  "stock_orientation": [
+    1,
+    2,
+    3
+  ],
+  "stock_transfer": {
+    "offset": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "orientation": [
+      1,
+      2,
+      3
+    ]
+  },
+  "tools": [],
+  "work_offset": "G54"
+}

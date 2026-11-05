@@ -335,7 +335,9 @@ void transport_bar(App& app) {
   const int count = levels ? static_cast<int>(levels->size()) : 1;
   int pass = std::clamp(app.selected_level, 0, std::max(0, count - 1)) + 1;
   char format[48];
-  std::snprintf(format, sizeof format, "Pass %%d of %d", count);
+  if(level && level->roughing_area>=0)
+    std::snprintf(format,sizeof format,"Area %d | Pass %%d of %d",level->roughing_area+1,count);
+  else std::snprintf(format, sizeof format, "Pass %%d of %d", count);
   ImGui::SetNextItemWidth(ui_size(app, 150.0f));
   if (ImGui::SliderInt("##pass", &pass, 1, std::max(1, count), format,
                        ImGuiSliderFlags_AlwaysClamp)) {
@@ -346,6 +348,8 @@ void transport_bar(App& app) {
   if (level && ImGui::BeginItemTooltip()) {
     ImGui::Text("Floor Z %.3f mm, cutting %.3f mm", level->floor_z + app.effective_context().origin_z,
                 level->axial_depth);
+    if(level->roughing_area>=0)
+      ImGui::Text("Area %d: %s",level->roughing_area+1,level->roughing_area_name.c_str());
     const auto& subdivisions = app.plan.operations[app.selected_plan_operation].subdivisions;
     if (subdivisions.size() > 1)
       ImGui::Text("Terrace %zu, %s", level->coarse_level + 1,

@@ -15,7 +15,7 @@ std::size_t paths_bytes(const wave::Paths64& paths) {
 }
 std::size_t wave_bytes(const wave::WaveResult& w) {
   std::size_t n = paths_bytes(w.subject) + paths_bytes(w.stock) +
-                  paths_bytes(w.domain) + paths_bytes(w.static_boundaries) +
+                  paths_bytes(w.domain) + paths_bytes(w.static_boundaries) + paths_bytes(w.machining_limit) +
                   w.stock_boundary.capacity() * sizeof(wave::Point64);
   for (const auto* levels : {&w.generations, &w.reached_generations})
     for (const auto& paths : *levels) n += paths_bytes(paths);
@@ -63,7 +63,7 @@ void report_plan_memory(const JobPlan& plan) {
       for (const auto& move : level.toolpath.moves)
         geometry += move.path.capacity() * sizeof(wave::Point64);
       for (const auto* paths :
-           {&level.part_slice, &level.stock_slice, &level.incoming_stock})
+           {&level.part_slice, &level.stock_slice, &level.incoming_stock, &level.machining_limit})
         polygons += paths_bytes(*paths);
     }
   }

@@ -38,6 +38,13 @@ void run(const std::filesystem::path& directory) {
   check(!setup_view->stats().reused_frame && setup_view->stats().mesh_upload_bytes>0,
         "Replacing placed geometry updates the GPU scene");
   frame(app);check(setup_view->stats().reused_frame,"Replaced geometry has a stable display lifetime");
+  frame(app);const int without_areas=ImGui::GetDrawData()->TotalVtxCount;
+  cam::Operation rough;rough.roughing_areas={{"Left",2,3,12,14},{"Right",14,3,12,14}};
+  app.job.operations={rough};app.selected_operation=0;
+  frame(app);frame(app);
+  check(ImGui::GetDrawData()->TotalVtxCount>without_areas && setup_view->stats().mesh_upload_bytes==0,
+        "Numbered roughing boxes are drawn over the models without resending source meshes");
+  app.job.operations.clear();app.selected_operation=-1;
   app.has_plan=true;app.plan.operations.resize(1);
   auto& result=app.plan.operations.front();result.planned=true;result.levels.resize(1);
   result.stock_before=result.stock_after=std::make_shared<const wave::Heightmap>(

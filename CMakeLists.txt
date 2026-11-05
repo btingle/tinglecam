@@ -188,6 +188,7 @@ add_library(tinglecam_core
   src/cam/job_geometry.cpp
   src/cam/job_planning.cpp
   src/cam/job_range.cpp
+  src/cam/roughing_areas.cpp
   src/cam/job_support.cpp
   src/cam/machine.cpp
   src/cam/material.cpp
@@ -404,3 +405,8 @@ add_executable(setup_ui_tests tests/setup_ui_tests.cpp)
 target_link_libraries(setup_ui_tests PRIVATE tinglecam_app_ui)
 add_test(NAME setup_ui_tests COMMAND setup_ui_tests)
 set_tests_properties(setup_ui_tests PROPERTIES TIMEOUT 15)
+
+add_executable(roughing_areas_tests tests/roughing_areas_tests.cpp)
+target_link_libraries(roughing_areas_tests PRIVATE tinglecam_core)
+add_test(NAME roughing_areas_tests COMMAND roughing_areas_tests)
+set_tests_properties(roughing_areas_tests PROPERTIES TIMEOUT 45)

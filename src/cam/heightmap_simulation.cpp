@@ -184,6 +184,11 @@ bool link_layers(LevelPlan& previous, LevelPlan& level,
   };
   const auto clear = [&](const wave::Point64& a, double za,
                          const wave::Point64& b, double zb) {
+    for(const auto* limit:{&previous.machining_limit,&level.machining_limit}) if(!limit->empty()) {
+      const auto bounds=Clipper2Lib::GetBounds(*limit);
+      for(const auto p:{a,b}) if(p.x<bounds.left || p.x>bounds.right || p.y<bounds.top || p.y>bounds.bottom)
+        return false;
+    }
     return stock.clear(at(a, za), at(b, zb), cutter, 0.001, false);
   };
   // Lift first when moving up; descend last when moving down.
@@ -203,9 +208,11 @@ bool link_layers(LevelPlan& previous, LevelPlan& level,
     bounds.top -= margin; bounds.bottom += margin;
     const wave::Paths64 world{{{bounds.left, bounds.top}, {bounds.right, bounds.top},
                                {bounds.right, bounds.bottom}, {bounds.left, bounds.bottom}}};
-    const auto free = Clipper2Lib::Difference(
+    auto free = Clipper2Lib::Difference(
         world, detail::offset_outward(obstacles, cutter.radius),
         Clipper2Lib::FillRule::NonZero);
+    for(const auto* limit:{&previous.machining_limit,&level.machining_limit}) if(!limit->empty())
+      free=Clipper2Lib::Intersect(free,*limit,Clipper2Lib::FillRule::NonZero);
     const wave::Router router(wave::routable_region(free, slack, {from, to}), slack);
     route = router.route(from, to);
     if (!route || route->empty()) return false;

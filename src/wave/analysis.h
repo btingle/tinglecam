@@ -107,7 +107,8 @@ WavefrontAnalysis analyze_wavefront(
     double significant_node_area_fraction =
         kDefaultSignificantNodeAreaFraction,
     double tiny_split_area_factor = kDefaultTinySplitAreaFactor,
-    double exterior_stock_reach = 0.0);
+    double exterior_stock_reach = 0.0,
+    const Paths64& machining_limit = {});
 
 // Discards the speculative suffixes and returns exactly the node layer chosen
 // at each recursive decision. The returned stages are suitable for sequencing

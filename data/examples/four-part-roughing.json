@@ -1,0 +1,61 @@
+{
+  "name": "Four parts, area-first roughing",
+  "machine": "grbl-router",
+  "material": "aluminium-6082",
+  "part_mesh": "roughing-areas/parts.stl",
+  "box_stock": true,
+  "box_stock_margins": {
+    "minus_x": 6,
+    "plus_x": 6,
+    "minus_y": 6,
+    "plus_y": 6,
+    "minus_z": 0,
+    "plus_z": 0
+  },
+  "simulation_pitch": 0.1,
+  "rapid_clearance_height": 10,
+  "operations": [
+    {
+      "name": "Rough each part",
+      "mode": "roughing",
+      "tool": "3mm-2f-alu",
+      "stepover_ratio": 0.4,
+      "stepdown": 1,
+      "depth_from": 0,
+      "depth_to": 3,
+      "finishing_subdivisions": 2,
+      "path_pitch": 0.25,
+      "radial_stock_to_leave": 0.2,
+      "roughing_areas": [
+        {
+          "name": "NW",
+          "center_x": 7,
+          "center_y": 7,
+          "width": 26,
+          "height": 26
+        },
+        {
+          "name": "NE",
+          "center_x": 33,
+          "center_y": 7,
+          "width": 26,
+          "height": 26
+        },
+        {
+          "name": "SE",
+          "center_x": 33,
+          "center_y": 33,
+          "width": 26,
+          "height": 26
+        },
+        {
+          "name": "SW",
+          "center_x": 7,
+          "center_y": 33,
+          "width": 26,
+          "height": 26
+        }
+      ]
+    }
+  ]
+}

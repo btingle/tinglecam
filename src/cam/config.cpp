@@ -206,6 +206,10 @@ json to_json(const Operation& operation) {
     areas.push_back({{"center_x", area.center_x}, {"center_y", area.center_y},
                      {"width", area.width}, {"height", area.height},
                      {"top_z", area.top_z}, {"depth", area.depth}});
+  json roughing_areas = json::array();
+  for(const auto& area:operation.roughing_areas)
+    roughing_areas.push_back({{"name",area.name},{"center_x",area.center_x},{"center_y",area.center_y},
+                             {"width",area.width},{"height",area.height}});
   json exclusions = json::array();
   for (const auto& exclusion : operation.pocket_auto.exclusions)
     exclusions.push_back({{"enabled", exclusion.enabled},
@@ -247,6 +251,7 @@ json to_json(const Operation& operation) {
                    operation.pocket_auto.helix_angle_degrees},
                   {"exclusions", std::move(exclusions)}}},
               {"plane", {{"areas", areas}}},
+              {"roughing_areas",std::move(roughing_areas)},
               {"finishing_subdivisions", operation.finishing_subdivisions},
               {"adaptive_cleanup_stepover", operation.adaptive_cleanup_stepover},
               {"cleanup_stepover_limit", operation.cleanup_stepover_limit},
@@ -305,7 +310,7 @@ Operation operation_from(const json& node, std::vector<std::string>* warnings = 
   report_unknown(node,
                  {"id", "setup", "name", "mode", "tool", "cutting", "surface", "stepover_ratio",
                   "stepdown", "coolant", "pockets", "holes", "auto_identify_pockets",
-                  "pocket_radial_margin", "pocket_auto", "plane",
+                  "pocket_radial_margin", "pocket_auto", "plane", "roughing_areas",
                   "finishing_subdivisions", "adaptive_cleanup_stepover",
                   "cleanup_stepover_limit", "depth_breaks", "radial_stock_to_leave",
                   "axial_stock_to_leave", "depth_from", "depth_to", "lead_in",
@@ -371,6 +376,15 @@ Operation operation_from(const json& node, std::vector<std::string>* warnings = 
       operation.pocket_auto.exclusions.clear();
       for (const auto& exclusion : exclusions)
         operation.pocket_auto.exclusions.push_back(read_exclusion(exclusion));
+    }
+  }
+  if(node.contains("roughing_areas")) {
+    if(!node.at("roughing_areas").is_array()) throw std::runtime_error("Expected roughing areas array");
+    for(const auto& entry:node.at("roughing_areas")) {
+      RoughingArea area;
+      read(entry,"name",area.name);read(entry,"center_x",area.center_x);read(entry,"center_y",area.center_y);
+      read(entry,"width",area.width);read(entry,"height",area.height);
+      operation.roughing_areas.push_back(std::move(area));
     }
   }
   if (node.contains("plane")) {

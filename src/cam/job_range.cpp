@@ -204,7 +204,11 @@ PartialPlan plan_operation_range(const JobGeometry& base_geometry,
       const auto simulation_progress = [&](PlanningProgress p,const std::string& stage) {
         return !progress || progress(from+(to-from)*(0.85+0.15*p.fraction),stage);
       };
-      if(operation.mode==OperationMode::Hole)
+      const bool area_roughing=operation.mode==OperationMode::Roughing && !operation.roughing_areas.empty();
+      if(area_roughing)
+        result=plan_roughing_areas(*active_geometry,*active_job,operation,*tool,*machine,feeds,
+                                  rapid_plane,setup_prior,progress,from,to,tools);
+      else if(operation.mode==OperationMode::Hole)
         result=plan_hole_operation(operation,*tool,*machine,feeds,rapid_plane,setup_prior,
                                    stage_progress,from,to,active_geometry,&tools,active_job->material_id);
       else if (operation.mode == OperationMode::SurfaceFinishing)
@@ -216,7 +220,7 @@ PartialPlan plan_operation_range(const JobGeometry& base_geometry,
         result = plan_subdivided_operation(
             *active_geometry, operation, *tool, *machine, feeds, stage_progress,
             from, to, rapid_plane, setup_prior);
-      if(result.ok()) {
+      if(result.ok() && !area_roughing) {
         const auto simulation_started=PlanningClock::now();
         simulate_operation_xyz(result,*active_geometry,*active_job,operation,*tool,*machine,feeds,setup_prior,simulation_progress,&tools);
         result.metrics.xyz_simulation_milliseconds=elapsed_milliseconds(simulation_started);

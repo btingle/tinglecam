@@ -203,7 +203,7 @@ WavefrontAnalysis analyze_wavefront(
     std::size_t max_layers, const EntryMute& muted,
     double significant_node_area_fraction,
     double tiny_split_area_factor,
-    double exterior_stock_reach) {
+    double exterior_stock_reach, const Paths64& machining_limit) {
   if (max_layers == 0)
     throw std::invalid_argument("Wavefront analysis layer limit must be positive");
   if (!std::isfinite(significant_node_area_fraction) ||
@@ -216,7 +216,7 @@ WavefrontAnalysis analyze_wavefront(
 
   WavefrontAnalysis analysis;
   analysis.seed = seed_wavefront(raw_subject, raw_stock, stepover, softening,
-                                 lead_in, muted, exterior_stock_reach);
+                                 lead_in, muted, exterior_stock_reach, machining_limit);
   analysis.seed_lineage =
       build_front_lineage(analysis.seed, tiny_split_area_factor);
   if (analysis.seed.generations.empty() ||
@@ -503,6 +503,7 @@ std::vector<WavefrontStage> committed_wavefront_stages(
     wave.subject = analysis.seed.subject;
     wave.stock = analysis.seed.stock;
     wave.stock_boundary = analysis.seed.stock_boundary;
+    wave.machining_limit = analysis.seed.machining_limit;
     wave.stepover = analysis.seed.stepover;
     wave.softening = analysis.seed.softening;
     wave.lead_in = analysis.seed.lead_in;

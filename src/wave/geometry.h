@@ -75,6 +75,9 @@ struct WaveResult {
   // bound the wave with this rather than with physical stock, or exterior
   // centreline motion has no domain in which to exist.
   Paths64 domain;
+  // Optional cutter-centre limit. It bounds propagation and routing without
+  // replacing physical stock or creating additional entry fronts.
+  Paths64 machining_limit;
   // Optional physical boundary provenance for a wave resumed inside a smaller
   // remaining domain. When empty, topology derives it from domain - subject.
   // A cleared-prefix cut is a seed interface, not a new static wall.
@@ -126,7 +129,8 @@ WaveResult seed_wavefront(const Paths64& raw_subject,
                           double softening = 0.0,
                           double lead_in = 0.0,
                           const EntryMute& muted = {},
-                          double exterior_stock_reach = 0.0);
+                          double exterior_stock_reach = 0.0,
+                          const Paths64& machining_limit = {});
 
 // Propagates through an already isolated remaining domain from explicit node
 // entry curves. With `cached_reached`, all entry bands remain in the copied

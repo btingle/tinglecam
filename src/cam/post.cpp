@@ -381,6 +381,7 @@ PostResult post_job(const JobPlan& plan,
     };
 
     bool motion_positioned = false;
+    int posted_area=-1;
     for (const LevelPlan& level : operation.levels) {
       if (level.nothing_to_cut || level.feeds.motion.empty()) continue;
       const auto* tool=tools.find(level.tool_id.empty()?operation.tool_id:level.tool_id);
@@ -392,6 +393,11 @@ PostResult post_job(const JobPlan& plan,
         result.error=error.what();return result;
       }
       const double cut_z = level.floor_z + job.origin_z;
+      if(level.roughing_area>=0 && level.roughing_area!=posted_area) {
+        writer.blank();
+        writer.comment("Area "+std::to_string(level.roughing_area+1)+": "+level.roughing_area_name);
+        posted_area=level.roughing_area;
+      }
       writer.blank();
       // The posted depth, not the model's. Every other number in this file is
       // in the program's coordinates and a comment that is not agrees with

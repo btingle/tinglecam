@@ -51,7 +51,8 @@ void add_safe_stock_approaches(
     const wave::Paths64& stock,
     const wave::Paths64& protected_centres,
     double cutter_radius,
-    double extra_clearance = 0.05);
+    double extra_clearance = 0.05,
+    const wave::Rect64* centre_limit = nullptr);
 
 const char* contour_direction_name(ContourDirectionPolicy value);
 

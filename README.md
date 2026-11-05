@@ -98,6 +98,11 @@ Orientations are saved in the job and apply to OBJ/STL meshes and native STEP
 surfaces. Rotation rebuilds box stock, resets work depths and the program origin
 from the new bounds, and invalidates toolpaths.
 
+Roughing operations can use ordered XY bounding boxes to finish one part's
+roughing and terrace cleanup before proceeding to the next. Add them under
+**Cutting > Roughing areas**; see [ordered roughing areas](docs/roughing-areas.md)
+or open `data/examples/four-part-roughing.json`.
+
 For roughing, **Advanced > Stock boundary dilation** adds an outward XY planning
 margin to the stock outline at each Z level. A value of **1 mm** expands a
 20×20 mm square to **22×22 mm**, retaining square corners. It defaults to zero,

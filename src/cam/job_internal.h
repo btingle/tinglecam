@@ -165,6 +165,11 @@ bool parallel_for_levels(const std::vector<std::size_t>& levels,
   return publish();
 }
 
+OperationPlan plan_roughing_areas(const JobGeometry&, const Job&, const Operation&,
+    const Tool&, const Machine&, const CuttingFeeds&, double rapid_plane,
+    const PriorOperations&, const ProgressCallback&, double from, double to,
+    const ToolLibrary&);
+
 double elapsed_milliseconds(PlanningClock::time_point start);
 wave::Paths64 offset_outward(const wave::Paths64& input, double amount);
 wave::Paths64 absent_subject(const wave::Paths64& stock);

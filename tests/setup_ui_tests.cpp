@@ -73,6 +73,15 @@ void run(const std::filesystem::path& directory) {
       "Reordering retains result identities and aligns plan entries");
   move_setup(app,0,2);
   check(app.job.setups[1].id==independent.id,"A reorder that breaks earlier-stage inheritance is rejected atomically");
+  auto& rough=app.job.operations[1];
+  const auto unrestricted=operation_signature(app,1,job_signature(app));
+  rough.roughing_areas={{"First",0,0,12,12},{"Second",10,0,12,12}};
+  const auto bounded=operation_signature(app,1,job_signature(app));
+  check(bounded!=unrestricted,"Adding area bounds invalidates the operation signature");
+  frame(app);
+  std::swap(rough.roughing_areas[0],rough.roughing_areas[1]);
+  check(operation_signature(app,1,job_signature(app))!=bounded,
+        "Changing part sequence invalidates the operation signature");
   frame(app);
 }
 }

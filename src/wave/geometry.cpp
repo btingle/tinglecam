@@ -444,7 +444,8 @@ WaveResult seed_wavefront(const Paths64& raw_subject,
                           double softening,
                           double lead_in,
                           const EntryMute& muted,
-                          double exterior_stock_reach) {
+                          double exterior_stock_reach,
+                          const Paths64& machining_limit) {
   if (raw_subject.empty()) throw std::invalid_argument("Subject is empty");
   if (raw_stock.empty()) throw std::invalid_argument("Stock is empty");
   if (!(stepover > 0.0)) throw std::invalid_argument("Stepover must be positive");
@@ -508,7 +509,9 @@ WaveResult seed_wavefront(const Paths64& raw_subject,
     approach = Difference(approach, result.subject, FillRule::NonZero);
     domain = Union(domain, approach, FillRule::NonZero);
   }
-  result.domain = domain;
+  result.machining_limit = machining_limit;
+  result.domain = machining_limit.empty() ? domain
+      : Intersect(domain, machining_limit, FillRule::NonZero);
 
   // Seed on the boundary of whatever the domain turned out to be, which is the
   // outer edge of the approach where there is one and the stock wall elsewhere.
@@ -526,6 +529,9 @@ WaveResult seed_wavefront(const Paths64& raw_subject,
                                             EndType::Polygon);
   Paths64 reached = Difference(domain, domain_inner, FillRule::NonZero);
   reached = Difference(reached, subject_face, FillRule::NonZero);
+  // Preserve the original stock-derived seed. Truncating a domain must never
+  // make its artificial box edges new sources of propagation.
+  if(!machining_limit.empty()) reached=Intersect(reached,machining_limit,FillRule::NonZero);
   if (!muted.empty()) reached = drop_muted_seeds(reached, muted, result);
   if (reached.empty()) {
     result.stop_reason = StopReason::Empty;

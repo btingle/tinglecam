@@ -399,6 +399,8 @@ static void append_toolpath(Toolpath& toolpath, const WaveResult& wave,
   // centres. An earlier cut can leave air less than a cutter radius from the
   // part; that air must not authorize links through the protected subject.
   cleared = Difference(cleared, wave.subject, FillRule::NonZero);
+  if(!wave.machining_limit.empty())
+    cleared=Intersect(cleared,wave.machining_limit,FillRule::NonZero);
   // Rebuilt whenever `cleared` grows, which is once per front rather than once
   // per link.
   Paths64 cleared_forbidden = forbidden_region(cleared, world, tolerance);
@@ -713,6 +715,8 @@ static void append_toolpath(Toolpath& toolpath, const WaveResult& wave,
               ? band
               : Difference(band, stock_area, FillRule::NonZero);
       cleared = Union(cleared, cleared_band, FillRule::NonZero);
+      if(!wave.machining_limit.empty())
+        cleared=Intersect(cleared,wave.machining_limit,FillRule::NonZero);
       cleared_forbidden = forbidden_region(cleared, world, tolerance);
     }
 

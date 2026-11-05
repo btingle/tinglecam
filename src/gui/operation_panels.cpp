@@ -187,6 +187,56 @@ void areas_section(App& app, cam::Operation& operation) {
   }
 }
 
+void roughing_areas_section(App& app, cam::Operation& operation, const cam::Tool* tool) {
+  ImGui::SeparatorText("Roughing areas");
+  auto& areas=operation.roughing_areas;
+  if(areas.empty()) ImGui::TextDisabled("Whole stock. Add areas to rough parts in order.");
+  else ImGui::TextDisabled("Complete every depth and cleanup in each area, in order.");
+  const auto context=app.effective_context();
+  int remove=-1,duplicate=-1,move_from=-1,move_to=-1;
+  for(std::size_t i=0;i<areas.size();++i) {
+    ImGui::PushID(int(i));
+    ImGui::SeparatorText(("Area "+std::to_string(i+1)).c_str());
+    auto& area=areas[i];
+    if(begin_properties("roughing-area")) {
+      prop_text("Name",area.name);
+      prop_coordinate("Centre X",area.center_x,context.origin_x);
+      prop_coordinate("Centre Y",area.center_y,context.origin_y);
+      prop_double("Width X",area.width,.1f,"%.3f mm","The full cutter stays within this box.",.001);
+      prop_double("Height Y",area.height,.1f,"%.3f mm",nullptr,.001);
+      end_properties();
+    }
+    if(ImGui::SmallButton("Duplicate")) duplicate=int(i);
+    ImGui::SameLine();
+    if(ImGui::SmallButton("Remove")) remove=int(i);
+    ImGui::SameLine();ImGui::BeginDisabled(i==0);
+    if(ImGui::SmallButton("Up")) {move_from=int(i);move_to=int(i)-1;}
+    ImGui::EndDisabled();ImGui::SameLine();ImGui::BeginDisabled(i+1==areas.size());
+    if(ImGui::SmallButton("Down")) {move_from=int(i);move_to=int(i)+1;}
+    ImGui::EndDisabled();ImGui::PopID();
+  }
+  if(remove>=0) areas.erase(areas.begin()+remove);
+  else if(duplicate>=0) {
+    auto copy=areas[duplicate];if(!copy.name.empty()) copy.name+=" copy";
+    areas.insert(areas.begin()+duplicate+1,std::move(copy));
+  } else if(move_from>=0) std::swap(areas[move_from],areas[move_to]);
+  if(ImGui::Button("Add roughing area")) {
+    cam::RoughingArea area;area.name="Area "+std::to_string(areas.size()+1);
+    area.center_x=-context.origin_x;area.center_y=-context.origin_y;
+    if(app.geometry.has_part()) {
+      const auto& b=app.geometry.part().mesh().bounds;
+      if(b.valid) {
+        const double margin=tool?2*tool->diameter:10;
+        area.center_x=(double(b.lower.x)+b.upper.x)/2;
+        area.center_y=(double(b.lower.y)+b.upper.y)/2;
+        area.width=double(b.upper.x)-b.lower.x+2*margin;
+        area.height=double(b.upper.y)-b.lower.y+2*margin;
+      }
+    }
+    areas.push_back(std::move(area));
+  }
+}
+
 void surface_section(App& app, cam::Operation& operation) {
   auto& surface = operation.surface;
   const auto& cad = app.geometry.part_cad();
@@ -428,6 +478,7 @@ void operation_panel(App& app) {
         }
         end_properties();
       }
+      if (operation.mode == cam::OperationMode::Roughing) roughing_areas_section(app,operation,tool);
       if (operation.mode == cam::OperationMode::Pocket) pockets_section(app, operation);
       if (operation.mode == cam::OperationMode::PlaneClearing) areas_section(app, operation);
     }

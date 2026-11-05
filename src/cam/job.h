@@ -52,6 +52,14 @@ struct ClearingArea {
   double depth = 1.0;
 };
 
+// Ordered XY cutting limits for one roughing operation. Empty means whole stock.
+struct RoughingArea {
+  std::string name;
+  double center_x = 0.0, center_y = 0.0;
+  double width = 30.0, height = 30.0;
+};
+wave::Paths64 roughing_area_boundary(const RoughingArea&, double inset = 0.0);
+
 struct PocketParameters {
   PocketShape shape = PocketShape::RoundedRectangle;
   double center_x = 0.0;
@@ -175,6 +183,7 @@ struct Operation {
   // for a pocket that has to end up oversize.
   double pocket_radial_margin = 0.0;
   PlaneParameters plane;
+  std::vector<RoughingArea> roughing_areas;
   SurfaceParameters surface;
   // Descend through all coarse floors, then clean each terrace upward,
   // deepest first. N divides each actual coarse interval into N equal parts.
@@ -344,6 +353,9 @@ struct LevelPlan {
   // planar projection remains available for stock simulation and 2D views.
   bool explicit_motion = false;
   std::string tool_id; // Optional tool override for a hole/counterbore level.
+  int roughing_area = -1;
+  std::string roughing_area_name;
+  wave::Paths64 machining_limit; // Permitted cutter centres; empty is unrestricted.
   double floor_z = 0.0;    // the depth this pass cuts down to
   // Axial slab height; cleanup uses the remaining coarse terrace as its bound.
   double axial_depth = 0.0;

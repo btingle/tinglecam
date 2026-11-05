@@ -174,7 +174,7 @@ std::vector<wave::TraversalTask> contour_traversal_tasks(
 void add_safe_stock_approaches(
     std::vector<wave::TraversalTask>& tasks, const wave::Paths64& stock,
     const wave::Paths64& protected_centres, double cutter_radius,
-    double extra_clearance) {
+    double extra_clearance, const wave::Rect64* centre_limit) {
   if (stock.empty()) throw std::invalid_argument("Stock approach region is empty");
   if (!(cutter_radius >= 0.0) || !(extra_clearance >= 0.0))
     throw std::invalid_argument("Stock approach clearance must not be negative");
@@ -212,6 +212,10 @@ void add_safe_stock_approaches(
                        });
       std::optional<wave::Point64> best;
       for (const Candidate& candidate : candidates) {
+        // The area is rectangular, so endpoints inside its centre limit keep
+        // the complete straight approach inside as well.
+        if(centre_limit && (candidate.point.x<centre_limit->left || candidate.point.x>centre_limit->right ||
+            candidate.point.y<centre_limit->top || candidate.point.y>centre_limit->bottom)) continue;
         if (!segment_avoids_region(candidate.point, start, protected_centres))
           continue;
         best = candidate.point;

@@ -39,6 +39,14 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
   if (!resolve_setup(operation, tool, feeds, plan.error, &plan.warnings, setup))
     return plan;
   const double radius = setup.radius;
+  wave::Paths64 machining_limit;
+  if(operation.mode==OperationMode::Roughing && !operation.roughing_areas.empty()) {
+    if(operation.roughing_areas.size()!=1) {
+      plan.error="Plan multiple roughing areas through the job planner";return plan;
+    }
+    try {machining_limit=roughing_area_boundary(operation.roughing_areas.front(),radius);}
+    catch(const std::exception& e) {plan.error=e.what();return plan;}
+  }
   const double stepover = setup.stepover;
   const double exterior_stock_reach = stock_contact_reach(
       operation, radius, prior_subdivisions != nullptr);
@@ -71,6 +79,7 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
 
     LevelPlan& level = plan.levels[index];
     level.floor_z = floor_z;
+    level.machining_limit=machining_limit;
     level.axial_depth = previous_z - floor_z;
     level.radial_width = stepover;
     previous_z = floor_z;
@@ -207,7 +216,7 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
       wave::WavefrontAnalysis analysis = wave::analyze_wavefront(
           keep_outs[index], level.incoming_stock, stepover, stepover, lead_in,
           2000, 128, {}, wave::kDefaultSignificantNodeAreaFraction,
-          operation.tiny_split_area_factor, exterior_stock_reach);
+          operation.tiny_split_area_factor, exterior_stock_reach, machining_limit);
       wave::CommittedWavefront committed =
           wave::commit_wavefront_analysis(analysis);
       level.wave_stages = std::move(committed.stages);
@@ -495,6 +504,8 @@ void plan_toolpaths(OperationPlan& plan,
                          Clipper2Lib::FillRule::NonZero)
                    : reached_stock;
       }
+      if(!level.machining_limit.empty())
+        clip=Clipper2Lib::Intersect(clip,level.machining_limit,Clipper2Lib::FillRule::NonZero);
       const auto contours = derive_offset_contours(
           level.part_slice, radius + operation.radial_stock_to_leave, &clip, &level.fixture_keep_out);
       const auto keep_out=Union(offset_outward(level.part_slice,
@@ -502,8 +513,9 @@ void plan_toolpaths(OperationPlan& plan,
                                 level.fixture_keep_out,FillRule::NonZero);
       auto tasks =
           contour_traversal_tasks(contours, operation.contour_direction);
+      const auto bounds=Clipper2Lib::GetBounds(level.machining_limit);
       add_safe_stock_approaches(tasks, level.incoming_stock, keep_out,
-                                radius);
+                                radius,.05,level.machining_limit.empty()?nullptr:&bounds);
       wave::TraversalSettings traversal;
       traversal.allow_stay_down = true;
       // What the pass has cleared, which is the space beside the stock as
@@ -518,6 +530,9 @@ void plan_toolpaths(OperationPlan& plan,
       // These contours ride the part's clearance boundary. Only forgive
       // independent micron rounding here, not a fraction of a stepover that
       // could consume the radial allowance at a connector's endpoints.
+      if(!level.machining_limit.empty())
+        traversal.stay_down_region=Clipper2Lib::Intersect(traversal.stay_down_region,
+            level.machining_limit,Clipper2Lib::FillRule::NonZero);
       traversal.stay_down_slack = 4.0;
       traversal.cutting_feed = travel_feed;
       traversal.rapid_feed = rapid_feed(machine);
@@ -650,6 +665,9 @@ void plan_toolpaths(OperationPlan& plan,
   // carried; the height is the one already set above.
   if (prior_subdivisions != nullptr)
     link.from = resting_position(*prior_subdivisions);
+  else if(!operation.roughing_areas.empty())
+    for(auto previous=prior_operations.rbegin();previous!=prior_operations.rend();++previous)
+      if(*previous && (*previous)->ok() && (link.from=resting_position(**previous))) break;
   std::size_t feeds_completed = 0;
   for (const std::size_t index : simulated_levels) {
     LevelPlan& level = plan.levels[index];
@@ -931,6 +949,9 @@ OperationPlan plan_subdivided_operation(
     const auto feeds_start = PlanningClock::now();
     PassLink link;
     link.from_z = rapid_plane;
+    if(!operation.roughing_areas.empty())
+      for(auto previous=prior_operations.rbegin();previous!=prior_operations.rend();++previous)
+        if(*previous && (*previous)->ok() && (link.from=resting_position(**previous))) break;
     for (auto& level : result.levels) {
       if (level.nothing_to_cut || level.feeds.motion.empty()) continue;
       level.feeds = plan_feeds(level.toolpath, machine, feeds, level.floor_z,

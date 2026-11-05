@@ -14,6 +14,7 @@ struct CutVolume {
   double top = 0.0;
   bool selected = false;
   bool exclusion = false;
+  bool limit = false;
 };
 
 Paths64 area_outline(const cam::ClearingArea& area) {
@@ -37,13 +38,19 @@ std::vector<CutVolume> cut_volumes(const App& app) {
   for (std::size_t i = 0; i < app.job.operations.size(); ++i) {
     const cam::Operation& operation = app.job.operations[i];
     if(!app.job.setups.empty() && operation.setup_id!=app.job.setups.at(app.selected_setup).id) continue;
-    if (!cam::is_parametric(operation.mode)) continue;
+    if (!cam::is_parametric(operation.mode) && operation.mode!=cam::OperationMode::Roughing) continue;
     const bool selected = static_cast<int>(i) == app.selected_operation;
     // Half-typed dimensions are normal while a field is being edited, and the
     // shape builders reject them. The settings panel and planning both say so
     // properly; a redraw has nothing useful to add and simply draws nothing.
     try {
-      if (operation.mode == cam::OperationMode::Pocket) {
+      if(operation.mode==cam::OperationMode::Roughing) {
+        double low,high;
+        if(app.geometry.work_range(low,high))
+          for(const auto& area:operation.roughing_areas)
+            volumes.push_back({cam::roughing_area_boundary(area),high-operation.depth_to,
+                               high-operation.depth_from,selected,false,true});
+      } else if (operation.mode == cam::OperationMode::Pocket) {
         if (operation.auto_identify_pockets) {
           double low = 0.0;
           double high = 0.0;
@@ -128,7 +135,7 @@ void append_cut_volumes(const std::vector<CutVolume>& volumes,
     append_slab(facets, pool, rings, fill_mesh(rings, nullptr), rings,
                 volume.bottom, volume.top, projection, light, wall, face,
                 edge, alpha,
-                wireframe);
+                wireframe || volume.limit);
   }
 }
 
@@ -405,6 +412,19 @@ void draw_setup(App& app) {
     append_cut_volumes(volumes, cut_facets, cut_pool, scene.projection, scene.light,
                        scene.spacing, app.wireframe);
     paint_facets(scene.list, cut_facets, cut_pool);
+  }
+  if(operation && operation->mode==cam::OperationMode::Roughing) {
+    double low,high;
+    if(app.geometry.work_range(low,high)) for(std::size_t i=0;i<operation->roughing_areas.size();++i) {
+      const auto& area=operation->roughing_areas[i];
+      wave::Paths64 outline;
+      try {outline=cam::roughing_area_boundary(area);} catch(const std::exception&) {continue;}
+      const auto bounds=Clipper2Lib::GetBounds(outline);
+      const auto point=scene.projection.point({float(wave::to_world(bounds.left)),
+          float(wave::to_world(bounds.top)),float(high-operation->depth_from)});
+      const auto label=std::to_string(i+1)+(area.name.empty()?"":". "+area.name);
+      scene.list->AddText(point,IM_COL32(255,180,140,255),label.c_str());
+    }
   }
   if(operation && operation->mode==cam::OperationMode::Hole)
     draw_hole_contours(app,scene,*operation);
@@ -684,7 +704,11 @@ void draw_result(App& app) {
 
   char caption[200];
   const double oz = app.effective_context().origin_z;
-  if (planned_operation.subdivisions.size() > 1)
+  if(active.roughing_area>=0)
+    std::snprintf(caption,sizeof caption,"Area %d: %s | %zu passes, Z %.2f to %.2f mm",
+                  active.roughing_area+1,active.roughing_area_name.c_str(),levels.size(),
+                  material_lowest+oz,material_highest+oz);
+  else if (planned_operation.subdivisions.size() > 1)
     std::snprintf(caption, sizeof caption,
                   "%zu layers (%zu coarse + upward cleanup), Z %.2f to %.2f mm",
                   levels.size(), planned_operation.subdivisions.front().level_count,
