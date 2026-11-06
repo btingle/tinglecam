@@ -237,7 +237,7 @@ void roughing_areas_section(App& app, cam::Operation& operation, const cam::Tool
   }
 }
 
-void surface_section(App& app, cam::Operation& operation) {
+void surface_section(App& app, cam::Operation& operation, const cam::Tool* tool) {
   auto& surface = operation.surface;
   const auto& cad = app.geometry.part_cad();
   if (!cad) {
@@ -273,8 +273,11 @@ void surface_section(App& app, cam::Operation& operation) {
   if (begin_properties("surface")) {
     prop_double("Stepover", surface.stepover, 0.01f, "%.3f mm",
                 "Distance between neighbouring passes across the surface.", 0.001);
+    // Half a micron short of the radius keeps the ball centre outside the surface.
     prop_double("Stock allowance", surface.allowance, 0.01f, "%.3f mm",
-                "Left along the surface normal.", 0.0);
+                "Left along the surface normal. Negative cuts below the surface.",
+                tool ? -tool->diameter / 2 + 0.0005
+                     : -std::numeric_limits<double>::infinity());
     prop_check("Follow V direction", surface.along_v,
                "Passes follow the face's V parameter; off follows U.");
     prop_check("Bidirectional", surface.bidirectional,
@@ -450,7 +453,7 @@ void operation_panel(App& app) {
 
   if (ImGui::CollapsingHeader("Cutting", ImGuiTreeNodeFlags_DefaultOpen)) {
     if (operation.mode == cam::OperationMode::SurfaceFinishing) {
-      surface_section(app, operation);
+      surface_section(app, operation, tool);
     } else if(operation.mode==cam::OperationMode::Hole) {
       insert_pre_drill=holes_section(app,operation);
     } else {

@@ -328,6 +328,17 @@ int main(int argc, char** argv) {
       for (const auto& phase : level.feeds.motion)
         check(phase.from_z >= .2 - 1e-8 && phase.to_z >= .2 - 1e-8,
               "Joined passes and feed links preserve the finishing allowance");
+    allowance_op.surface.allowance = -.2;
+    const auto below = plan_surface_finishing(seams, allowance_op, tool, machine, feeds, 15);
+    check(below.ok(), below.error);
+    double deepest = 1e9;
+    for (const auto& level : below.levels)
+      for (const auto& phase : level.feeds.motion)
+        deepest = std::min({deepest, phase.from_z, phase.to_z});
+    near(deepest, -.2, 1e-8, "Negative allowance cuts below the surface");
+    allowance_op.surface.allowance = -tool.diameter / 2;
+    check(!plan_surface_finishing(seams, allowance_op, tool, machine, feeds, 15).ok(),
+          "Allowance down to the tool radius is rejected");
     seam_op.surface.bidirectional = false;
     const auto one_way =
         plan_surface_finishing(seams, seam_op, tool, machine, feeds, 15);

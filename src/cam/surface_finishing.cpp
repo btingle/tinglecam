@@ -33,15 +33,17 @@ std::vector<detail::SurfaceRun> sample_surface_runs(
   if (settings.model_fingerprint != model->fingerprint())
     throw std::runtime_error(
         "The STEP model changed; select its finishing faces again");
+  const double radius = tool.diameter / 2;
+  // Negative allowance cuts below the surface; the ball centre must stay on
+  // the outward side of it.
   if (!std::isfinite(settings.stepover) || settings.stepover < 0.001 ||
       !std::isfinite(settings.chord_tolerance) ||
       settings.chord_tolerance < 0.002 ||
-      !std::isfinite(settings.allowance) || settings.allowance < 0 ||
+      !std::isfinite(settings.allowance) || settings.allowance <= -radius ||
       !std::isfinite(operation.path_pitch) || operation.path_pitch <= 0)
     throw std::runtime_error(
         "Finishing requires positive stepover/path pitch, chord tolerance >= "
-        "0.002 mm, and nonnegative allowance");
-  const double radius = tool.diameter / 2;
+        "0.002 mm, and allowance above minus the tool radius");
   const double tolerance = settings.chord_tolerance;
   const double sampling_tolerance =
       tolerance - std::sqrt(0.5) / wave::kIntegerScale;

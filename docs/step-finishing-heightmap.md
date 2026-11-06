@@ -32,6 +32,8 @@ grid. This is a sampled tolerance, not a certified bound for arbitrary splines.
 For radius `r`, contact `P`, oriented normal `n`, and allowance `a`, the ball
 centre is `P + (r+a)n`; the commanded bottom tip is that centre minus `r` in Z.
 Flat and vertical surfaces therefore receive different XYZ compensation.
+A negative `a` cuts below the surface, for example to leave clearance in a
+mating part; it must stay above `-r`.
 
 Finishing currently generates geometric contours without collision avoidance.
 It does not split cuts or insert retracts based on other faces, tool/shaft
