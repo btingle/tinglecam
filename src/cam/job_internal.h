@@ -213,11 +213,11 @@ wave::Paths64 swept_footprint(const LevelPlan& level, double radius);
 double level_gouge_area(const LevelPlan& level, double radius);
 // Joins two roughing layers at depth: from the last cut of `previous` to the
 // first of `level`, at the higher of their floors, when the simulated stock
-// shows the way clear and staying down is quicker than lifting. Returns true
+// and fixture geometry show the way clear and staying down is quicker than lifting. Returns true
 // when it replaced the lift.
 bool link_layers(LevelPlan& previous, LevelPlan& level, const wave::Heightmap& stock,
                  const wave::MillingCutter& cutter, double travel, double vertical_rate,
-                 double rapid_plane, double slack);
+                 double rapid_plane, double slack, const JobGeometry& geometry);
 
 }  // namespace cam::detail
 

@@ -673,7 +673,12 @@ WaveResult build_wavefront_from_seeds(
         }
         influence = Union(influence, FillRule::NonZero);
       } else {
-        influence = inflate_with_softening(simplified(active), delta, softening_delta);
+        // This ribbon shares its trailing edge with the preceding reached
+        // region. Simplifying both ribbon edges independently can collapse a
+        // thin tip or move that shared edge, leaving a sliver that is later
+        // mistaken for a new propagation source. Keep the ribbon exact;
+        // simplifying the cumulative region above still bounds offset cost.
+        influence = inflate_with_softening(active, delta, softening_delta);
       }
       wave = Intersect(wave, influence, FillRule::NonZero);
       next = Union(reached, wave, FillRule::NonZero);

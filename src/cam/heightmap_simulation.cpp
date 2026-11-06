@@ -165,7 +165,7 @@ namespace detail {
 bool link_layers(LevelPlan& previous, LevelPlan& level,
                  const wave::Heightmap& stock, const wave::MillingCutter& cutter,
                  double travel, double vertical_rate, double rapid_plane,
-                 double slack) {
+                 double slack, const JobGeometry& geometry) {
   auto& before = previous.feeds.motion;
   auto& after = level.feeds.motion;
   const auto last_cut = std::find_if(before.rbegin(), before.rend(),
@@ -189,14 +189,18 @@ bool link_layers(LevelPlan& previous, LevelPlan& level,
       for(const auto p:{a,b}) if(p.x<bounds.left || p.x>bounds.right || p.y<bounds.top || p.y>bounds.bottom)
         return false;
     }
-    return stock.clear(at(a, za), at(b, zb), cutter, 0.001, false);
+    return stock.clear(at(a, za), at(b, zb), cutter, 0.001, false) &&
+           geometry.fixture_clear(at(a, za), at(b, zb), cutter);
   };
   // Lift first when moving up; descend last when moving down.
   const auto lower_point = previous.floor_z < level.floor_z ? from : to;
   if (!clear(lower_point, low, lower_point, high)) return false;
   std::optional<wave::Path64> route = wave::Path64{from, to};
   if (!clear(from, high, to, high)) {
-    const auto obstacles = stock.slice(high + 0.002);
+    const auto stock_obstacles = stock.slice(high + 0.002);
+    const auto fixture_obstacles = geometry.fixture_keep_out(high, 32, cutter.radius + .01);
+    const auto obstacles = Clipper2Lib::Union(stock_obstacles, fixture_obstacles,
+                                             Clipper2Lib::FillRule::NonZero);
     if (obstacles.empty()) return false;
     auto bounds = Clipper2Lib::GetBounds(obstacles);
     bounds.left = std::min({bounds.left, from.x, to.x});
@@ -209,7 +213,8 @@ bool link_layers(LevelPlan& previous, LevelPlan& level,
     const wave::Paths64 world{{{bounds.left, bounds.top}, {bounds.right, bounds.top},
                                {bounds.right, bounds.bottom}, {bounds.left, bounds.bottom}}};
     auto free = Clipper2Lib::Difference(
-        world, detail::offset_outward(obstacles, cutter.radius),
+        world, Clipper2Lib::Union(detail::offset_outward(stock_obstacles, cutter.radius),
+                                 fixture_obstacles, Clipper2Lib::FillRule::NonZero),
         Clipper2Lib::FillRule::NonZero);
     for(const auto* limit:{&previous.machining_limit,&level.machining_limit}) if(!limit->empty())
       free=Clipper2Lib::Intersect(free,*limit,Clipper2Lib::FillRule::NonZero);
@@ -453,9 +458,9 @@ void simulate_operation_xyz(OperationPlan& plan, const JobGeometry& geometry,
           !progress(double(l) / std::max(std::size_t{1}, plan.levels.size()),
                     "Simulating stock"))
         throw std::runtime_error("Cancelled");
-      if (geometry.fixtures().empty() && roughing && previous && !level.nothing_to_cut && !level.feeds.motion.empty() &&
+      if (roughing && previous && !level.nothing_to_cut && !level.feeds.motion.empty() &&
           detail::link_layers(*previous, level, stock, cutter, travel, vertical_rate,
-                      rapid_plane, slack))
+                             rapid_plane, slack, geometry))
         finish_level_motion(*previous, feeds, stock.pitch());
       level.stock_checkpoints.clear();
       level.stock_checkpoints.push_back(

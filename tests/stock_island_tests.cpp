@@ -1,8 +1,10 @@
 #include "planning/toolpath.h"
 #include "simulation/heightmap.h"
+#include <nlohmann/json.hpp>
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <fstream>
 #include <stdexcept>
 
 namespace {
@@ -104,10 +106,55 @@ void holes_and_connected_stock() {
   check(single.size()==1 && result.wave.generations==reference.wave.generations,
         "Multiple parts on connected stock must retain existing propagation");
 }
+
+void simplified_ribbons(const std::filesystem::path& fixture) {
+  nlohmann::json data;
+  std::ifstream(fixture) >> data;
+  const auto paths = [](const auto& input) {
+    Paths64 out;
+    for (const auto& ring : input) {
+      Path64 path;
+      for (const auto& point : ring)
+        path.emplace_back(point[0].template get<std::int64_t>(),
+                          point[1].template get<std::int64_t>());
+      out.push_back(std::move(path));
+    }
+    return out;
+  };
+  const auto subject=paths(data.at("subject"));
+  const auto stock=paths(data.at("stock"));
+  const auto limit=paths(data.at("limit"));
+  const double step=data.at("stepover"),radius=data.at("radius"),lead=data.at("lead_in");
+  const auto plan = [&](double tolerance) {
+    return commit_wavefront_analyses(analyze_stock_wavefronts(subject,stock,
+        step,step,lead,2000,128,{},kDefaultSignificantNodeAreaFraction,
+        kDefaultTinySplitAreaFactor,radius,limit,tolerance));
+  };
+  const auto exact=plan(0);
+  const auto reference=build_toolpath(exact.stages,radius);
+  check(reference.stats.skipped_entry_count==0,"Exact reference must reach the inner region");
+  const auto simplified=plan(.01);
+  for(const auto& stage:simplified.stages)
+    for(std::size_t g=1;g<stage.lineage.generations.size();++g)
+      for(const auto& front:stage.lineage.generations[g].fronts)
+        check(!front.parents.empty(),
+              "Simplifying a moving ribbon must not create detached propagation sources");
+  const auto routed=build_toolpath(simplified.stages,radius);
+  check(routed.stats.skipped_entry_count==0 && routed.stats.unreachable_fronts==0,
+        "Simplified fronts must all remain accessible with normal entry rules");
+  check(routed.stats.cut_count==reference.stats.cut_count,
+        "Simplification must preserve complete contours rather than add fragment passes");
+  const auto missing=Intersect(Difference(reference.cleared,routed.cleared,FillRule::NonZero),
+                               stock,FillRule::NonZero);
+  check(material_area(missing)<.1,
+        "Simplification must preserve access to the entire inner region within rounding error");
+  contacts(simplified);
 }
-int main() {
+}
+int main(int argc,char** argv) {
   try {
     overlapping_air();holes_and_connected_stock();
+    if(argc>1)simplified_ribbons(argv[1]);
     std::cout<<"Independent stock contours, coverage, routing, holes and boundary provenance passed.\n";
   } catch(const std::exception& error) {std::cerr<<error.what()<<'\n';return 1;}
 }

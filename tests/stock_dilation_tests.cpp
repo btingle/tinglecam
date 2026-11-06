@@ -66,8 +66,15 @@ void check_outside_rim(const std::filesystem::path& part) {
       ++coarse_levels;
       double removed=0;
       for (const auto& phase : level.feeds.motion) removed+=phase.removed_volume;
-      check(removed>0,"Every downward level must remove the outside rim before cleanup");
-      check(!level.stock_checkpoints.empty(),"Rim cuts must retain simulated stock");
+      check(!level.stock_checkpoints.empty(),"Rim passes must retain simulated stock");
+      if (removed==0) {
+        check(level.toolpath.stats.cut_count==0 && level.toolpath.stats.skipped_entry_count==0,
+              "A rim with no roughing contour must not receive standalone boundary cleanup");
+        check(std::abs(level.stock_checkpoints.front().stock->volume()-
+                       level.stock_checkpoints.back().stock->volume())<1e-6,
+              "A boundary-only rim remains stock when roughing emits no cut");
+        continue;
+      }
       const auto allowance=Clipper2Lib::InflatePaths(level.part_slice,
           wave::to_integer(op.radial_stock_to_leave+.04),
           Clipper2Lib::JoinType::Round,Clipper2Lib::EndType::Polygon);
@@ -86,7 +93,8 @@ void check_outside_rim(const std::filesystem::path& part) {
           "Exterior cuts must retain the part and its radial stock allowance");
     }
     check(coarse_levels==3,"Rim regression must exercise three downward levels");
-    check(rough.stats.unsafe_plunges==0 && rough.stats.unreachable_fronts==0,
+    check(rough.stats.unsafe_plunges==0 && rough.stats.unreachable_fronts==0 &&
+          rough.stats.skipped_entries==0,
           "Exterior roughing must retain safe entries and reachable fronts");
     check(rough.stats.gouge_area<.001,"Exterior roughing must preserve the part");
   }

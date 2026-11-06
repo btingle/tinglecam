@@ -145,7 +145,7 @@ int main(int argc, char** argv) {
             "  --simulation-pitch MM  XY stock-grid spacing for the job (default 0.02)\n"
             "  --engagement-sampling MM\n"
             "                     Motion sample length for engagement and feeds (default 0.2)\n"
-            "  --wave-simplify MM Wavefront simplification tolerance (default 0.025; 0 off)\n"
+            "  --wave-simplify MM Wavefront simplification tolerance (default 0.01; 0 off)\n"
             "  --cad-info         Print imported STEP face IDs and source identity\n"
             "  --face N           Select CAD face N (1-based, repeatable)\n"
             "  --surface-stepover MM / --surface-tolerance MM\n"

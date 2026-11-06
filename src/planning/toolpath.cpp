@@ -174,33 +174,27 @@ bool inside_paths(const Paths64& paths, const Point64& point) {
   return winding != 0;
 }
 
-// A point at least `clearance` inside cleared material, as close to `target` as
-// one can be found. This is where a lift may set the tool back down without the
-// descent itself having to cut.
+// Physical air is sized for the cutter before applying centre-only constraints.
+// Keep it separate from propagated centre bands: eroding a radius-expanded
+// keepout or an already inset area would apply the cutter radius twice.
 std::optional<Point64> find_plunge_point(const Paths64& cleared, const Point64& target,
-                                         double integer_clearance) {
-  for (const double scale : {1.0, 0.5, 0.25}) {
-    const Paths64 zone = InflatePaths(cleared, -integer_clearance * scale,
-                                      JoinType::Round, EndType::Polygon);
-    // Somewhere the tool already stands clear needs no landing of its own.
-    // Projecting onto the boundary regardless would set it down on the nearest
-    // edge of the clearance zone and then feed it across to a spot it could
-    // have descended straight onto, which is the stray approach that made the
-    // opening move of a lead-in path cut anything at all.
-    if (scale == 1.0 && inside_paths(zone, target)) return target;
-    std::optional<Point64> best;
-    double best_distance = std::numeric_limits<double>::max();
-    for (const auto& ring : zone) {
-      if (ring.size() < 3) continue;
-      const RingProjection projection = project_onto_ring(ring, target);
-      if (projection.distance < best_distance) {
-        best_distance = projection.distance;
-        best = projection.point;
-      }
+                                        double integer_clearance,
+                                        const Paths64& air_landings) {
+  const Paths64 zone = Union(
+      InflatePaths(cleared, -integer_clearance, JoinType::Round, EndType::Polygon),
+      air_landings, FillRule::NonZero);
+  if (inside_paths(zone, target)) return target;
+  std::optional<Point64> best;
+  double best_distance = std::numeric_limits<double>::max();
+  for (const auto& ring : zone) {
+    if (ring.size() < 3) continue;
+    const RingProjection projection = project_onto_ring(ring, target);
+    if (projection.distance < best_distance) {
+      best_distance = projection.distance;
+      best = projection.point;
     }
-    if (best) return best;
   }
-  return std::nullopt;
+  return best;
 }
 
 struct Node {
@@ -392,6 +386,15 @@ static void append_toolpath(Toolpath& toolpath, const WaveResult& wave,
                    tolerance * 2.0, JoinType::Miter, EndType::Polygon),
       FillRule::NonZero);
 
+  Paths64 air_landings = Difference(
+      Paths64{world_box},
+      InflatePaths(stock_area, plunge_clearance + tolerance * 2.0,
+                   JoinType::Round, EndType::Polygon),
+      FillRule::NonZero);
+  air_landings = Difference(air_landings, wave.subject, FillRule::NonZero);
+  if (!wave.machining_limit.empty())
+    air_landings = Intersect(air_landings, wave.machining_limit, FillRule::NonZero);
+
   Paths64 cleared = Union(air, initial_cleared, FillRule::NonZero);
   if (!toolpath.cleared.empty())
     cleared = Union(cleared, toolpath.cleared, FillRule::NonZero);
@@ -503,11 +506,12 @@ static void append_toolpath(Toolpath& toolpath, const WaveResult& wave,
 
       const Point64 entry = cut.front();
       bool skipped_cut = false;
+      const bool starting = !has_position;
       if (!has_position) {
         // The air beside the stock is normally somewhere the tool can come down,
         // followed by an ordinary feed in. If no safe landing exists, omit this
         // front instead of inventing an entry into uncleared material.
-        if (const auto plunge = find_plunge_point(cleared, entry, plunge_clearance)) {
+        if (const auto plunge = find_plunge_point(cleared, entry, plunge_clearance, air_landings)) {
           has_position = true;
           position = *plunge;
           toolpath.moves.push_back({MoveKind::Retract, Path64{position, position}, {}, 0.0});
@@ -636,7 +640,7 @@ static void append_toolpath(Toolpath& toolpath, const WaveResult& wave,
           const double detour_minutes = detour_distance / traversal_feed;
 
           std::optional<Point64> plunge =
-              find_plunge_point(cleared, entry, plunge_clearance);
+              find_plunge_point(cleared, entry, plunge_clearance, air_landings);
           Path64 approach;
           std::optional<LiftPlan> lift;
           double lift_minutes = std::numeric_limits<double>::infinity();
@@ -683,6 +687,14 @@ static void append_toolpath(Toolpath& toolpath, const WaveResult& wave,
             skipped_cut = true;
           }
         }
+      }
+
+      // An unaccepted initial approach has not put the tool anywhere. Do not
+      // leave its tentative landing for a later stage or cleanup to visit.
+      if (skipped_cut && starting && has_position) {
+        toolpath.moves.pop_back();
+        --toolpath.stats.retract_count;
+        has_position = false;
       }
 
       if (!skipped_cut) {

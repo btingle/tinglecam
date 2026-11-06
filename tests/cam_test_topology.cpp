@@ -167,10 +167,10 @@ void check_general_traversal_and_contours() {
     level.incoming_stock=level.stock_slice;
     cam::plan_toolpaths(boundary_only,operation,tool,test_machine(),test_feeds(),{});
     require(boundary_only.ok() && level.wave_stages.empty() &&
-                level.toolpath.stats.cut_count==2,
-            "boundary-only roughing retains both stock-contacting cleanup contours");
-    require(level.toolpath.stats.retract_count==1 && level.toolpath.stats.link_count>0,
-            "cleanup without a wavefront links through the air around stock");
+                level.toolpath.stats.cut_count==0 && level.nothing_to_cut,
+            "boundary cleanup requires an executed roughing pass");
+    require(level.toolpath.moves.empty() && level.feeds.motion.empty(),
+            "a boundary-only level emits neither cleanup nor rapid waypoints");
     require(boundary_only.stats.gouge_area<1e-6,
             "air-side cleanup connections retain cutter and radial clearance");
   }

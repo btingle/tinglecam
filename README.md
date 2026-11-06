@@ -63,7 +63,7 @@ and Surface/Setup; these affect display quality without changing simulation pitc
 
 **Planning (whole job)** in the setup panel holds three settings shared by every
 setup: **Stock grid pitch** (simulation XY spacing), **Wave simplification**
-(how far wavefronts may deviate to shed crowded vertices; default 0.025 mm, zero
+(how far wavefronts may deviate to shed crowded vertices; default 0.01 mm, zero
 disables) and **Engagement sampling** (motion sample length that sets feeds;
 default 0.2 mm). Per-operation **Sample spacing** only sets toolpath point
 spacing. New jobs start from the defaults under Tools > Settings. Headless runs

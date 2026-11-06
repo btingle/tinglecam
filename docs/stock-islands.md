@@ -29,3 +29,26 @@ visibility, global protected geometry, contour separation, removal coverage,
 boundary-contact remapping, nested islands and unchanged connected-plate
 propagation. The coverage test allows the terminal radial stepover handled by
 boundary finishing; it checks for gaps beyond that band.
+
+Roughing landings apply cutter clearance to physical stock separately from
+fixture keep-outs and roughing-area limits, which already constrain the tool
+centre. Rejected initial approaches leave no rapid waypoint behind.
+
+Boundary cleanup runs only after roughing emitted cuts without skipped entries
+or unreachable fronts at that depth. A theoretical propagated region alone does
+not authorize cleanup. This also leaves a thin rim untouched when no roughing
+contour was emitted, rather than generating a standalone boundary cut.
+
+Stock-aware inter-level linking also runs with fixtures present. Candidate
+vertical and horizontal sweeps are checked against fixture geometry, and routed
+links include fixture keep-outs. A blocked connection retains its safe-plane
+retract.
+
+Wave simplification applies to the cumulative reached region, while the active
+moving band retains its exact boundaries. Independently simplifying that thin
+band can collapse its tips or shift its trailing edge away from the preceding
+wave, producing detached fronts and blocking access to their descendants.
+Keeping the band exact prevents those seams during the original propagation;
+there is no retry or second planning pass. `stock_island_tests` includes the
+Area 1, Z=13 slice from `setup_test3.json` at 0.01 mm simplification and checks
+front connectivity and coverage against unsimplified propagation.

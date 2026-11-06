@@ -468,6 +468,12 @@ void plan_toolpaths(OperationPlan& plan,
   for (const std::size_t index : toolpath_levels) {
     LevelPlan& level = plan.levels[index];
     if (toolpath_errors[index]) continue;
+    // Boundary cleanup follows a completed roughing pass. A speculative wave
+    // or a rejected entry is not evidence that its material was removed.
+    const auto& roughing = level.toolpath.stats;
+    if (roughing.cut_count == 0 || roughing.skipped_entry_count != 0 ||
+        roughing.unreachable_fronts != 0)
+      continue;
     const bool clearing = level.part_slice.empty();
     if ((operation.mode == OperationMode::Roughing || clearing) &&
         operation.rough_boundary_cleanup && !level.part_slice.empty() &&

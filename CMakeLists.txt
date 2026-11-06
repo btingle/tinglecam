@@ -412,6 +412,12 @@ add_test(NAME roughing_areas_tests COMMAND roughing_areas_tests)
 set_tests_properties(roughing_areas_tests PROPERTIES TIMEOUT 45)
 
 add_executable(stock_island_tests tests/stock_island_tests.cpp)
-target_link_libraries(stock_island_tests PRIVATE wave_simulation)
-add_test(NAME stock_island_tests COMMAND stock_island_tests)
+target_link_libraries(stock_island_tests PRIVATE wave_simulation nlohmann_json::nlohmann_json)
+add_test(NAME stock_island_tests COMMAND stock_island_tests
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/wave-fragments.json)
 set_tests_properties(stock_island_tests PROPERTIES TIMEOUT 30)
+
+add_executable(roughing_entry_tests tests/roughing_entry_tests.cpp)
+target_link_libraries(roughing_entry_tests PRIVATE tinglecam_core)
+add_test(NAME roughing_entry_tests COMMAND roughing_entry_tests)
+set_tests_properties(roughing_entry_tests PROPERTIES TIMEOUT 30)

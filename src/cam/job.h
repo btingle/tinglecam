@@ -266,7 +266,7 @@ struct PlanningSettings {
   double simulation_pitch = 0.02;
   // Wave regions are simplified to this deviation before each growth offset,
   // so inward-moving fronts stop accumulating vertices, mm. Zero disables it.
-  double wave_simplify_tolerance = 0.025;
+  double wave_simplify_tolerance = 0.01;
   // Motion is split into samples of this length to measure engagement and set
   // feeds, mm.
   double engagement_sampling = 0.2;
