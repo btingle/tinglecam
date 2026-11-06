@@ -28,7 +28,7 @@
       "depth_from": 0.0,
       "depth_to": 20.0,
       "entry_front_match_tolerance": 3.0,
-      "finishing_subdivisions": 4,
+      "finishing_subdivisions": 8,
       "id": "id-1793855174222084566-2",
       "lead_in": true,
       "mode": "roughing",
@@ -79,38 +79,38 @@
         {
           "center_x": 20.0,
           "center_y": 42.0,
-          "height": 90.0,
+          "height": 92.0,
           "name": "Area 1",
-          "width": 46.0
+          "width": 48.0
         },
         {
           "center_x": 20.0,
           "center_y": -42.0,
-          "height": 90.0,
+          "height": 92.0,
           "name": "Area 2",
-          "width": 46.0
+          "width": 48.0
         },
         {
           "center_x": -20.0,
           "center_y": 42.0,
-          "height": 90.0,
+          "height": 92.0,
           "name": "Area 3",
-          "width": 46.0
+          "width": 48.0
         },
         {
           "center_x": -20.0,
           "center_y": -42.0,
-          "height": 90.0,
+          "height": 92.0,
           "name": "Area 4",
-          "width": 46.0
+          "width": 48.0
         }
       ],
       "setup": "id-1793855174222084566-1",
       "slice_grid": 32,
-      "stepdown": 4.0,
-      "stepover_ratio": 0.15,
+      "stepdown": 6.0,
+      "stepover_ratio": 0.1,
       "stock_boundary_dilation": 0.0,
-      "stock_deviation": 0.2,
+      "stock_deviation": 0.0,
       "surface": {
         "allowance": 0.0,
         "along_v": true,
@@ -125,7 +125,7 @@
         "stepover": 0.3
       },
       "tiny_split_area_factor": 0.5,
-      "tool": "6mm-ball"
+      "tool": "ball-1-4"
     },
     {
       "adaptive_cleanup_stepover": true,
@@ -250,7 +250,7 @@
       "depth_from": 0.0,
       "depth_to": 18.22655200958252,
       "entry_front_match_tolerance": 3.0,
-      "finishing_subdivisions": 4,
+      "finishing_subdivisions": 8,
       "id": "id-1793857642461588129-5",
       "lead_in": true,
       "mode": "roughing",
@@ -301,38 +301,38 @@
         {
           "center_x": 20.0,
           "center_y": 42.000999450683594,
-          "height": 90.0,
+          "height": 91.0,
           "name": "Area 1",
-          "width": 46.0
+          "width": 47.0
         },
         {
           "center_x": 20.0,
           "center_y": -41.999000549316406,
-          "height": 90.0,
+          "height": 91.0,
           "name": "Area 2",
-          "width": 46.0
+          "width": 47.0
         },
         {
           "center_x": -20.0,
           "center_y": -41.999000549316406,
-          "height": 90.0,
+          "height": 91.0,
           "name": "Area 3",
-          "width": 46.0
+          "width": 47.0
         },
         {
           "center_x": -20.0,
           "center_y": 42.000999450683594,
-          "height": 90.0,
+          "height": 91.0,
           "name": "Area 4",
-          "width": 46.0
+          "width": 47.0
         }
       ],
       "setup": "id-1793857642461588129-2",
       "slice_grid": 32,
-      "stepdown": 4.0,
-      "stepover_ratio": 0.15,
+      "stepdown": 6.0,
+      "stepover_ratio": 0.1,
       "stock_boundary_dilation": 0.0,
-      "stock_deviation": 0.2,
+      "stock_deviation": 0.0,
       "surface": {
         "allowance": 0.0,
         "along_v": true,
@@ -347,7 +347,7 @@
         "stepover": 0.3
       },
       "tiny_split_area_factor": 0.5,
-      "tool": "6mm-ball"
+      "tool": "ball-1-4"
     },
     {
       "adaptive_cleanup_stepover": true,
@@ -509,7 +509,7 @@
   "planning": {
     "engagement_sampling": 0.2,
     "simulation_pitch": 0.1,
-    "wave_simplify_tolerance": 0.025
+    "wave_simplify_tolerance": 0.01
   },
   "plunge_clearance_height": 1.0,
   "properties_from_setup": "",
@@ -585,7 +585,7 @@
       },
       "fixtures": [
         {
-          "clearance": 0.5,
+          "clearance": 0.0,
           "mesh": "../../../mnt/c/Users/btingle/Documents/cad_models/meshes/slr_setup_p1_jigint_4x.stl",
           "name": "slr_setup_p1_jigint_4x",
           "placement": {
