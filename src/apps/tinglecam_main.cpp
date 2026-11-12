@@ -490,6 +490,9 @@ int main(int argc, char** argv) {
 
   IMGUI_CHECKVERSION();
   ImGui::CreateContext();
+  // WSLg can lose its native cursor surface after reconnecting. Drawing the
+  // pointer in ImGui bypasses that compositor state for either GL renderer.
+  ImGui::GetIO().MouseDrawCursor = wave::graphics::running_under_wsl();
   ImGui::GetIO().IniFilename = nullptr;
   load_ui_fonts(app);
   apply_ui_theme(app);
