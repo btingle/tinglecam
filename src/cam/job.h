@@ -395,6 +395,9 @@ struct LevelPlan {
   std::vector<wave::WavefrontStage> wave_stages;
   std::size_t analysis_trials = 0;
   std::size_t accepted_analysis_trials = 0;
+  bool adaptive_roughing = false;
+  std::vector<std::pair<wave::Point64,wave::Point64>> adaptive_helices; // Start, centre.
+  std::vector<std::string> adaptive_warnings;
   wave::Toolpath toolpath;
   // Everywhere the cutter's footprint passes over at this floor. The passes
   // of an operation still being planned hand stock to each other through it.

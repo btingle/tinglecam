@@ -14,7 +14,7 @@ cam::OperationPlan plan(const cam::JobGeometry& geometry,std::size_t& work) {
   cam::CuttingFeeds feeds{10000,.01,2,100,1000};
   return cam::plan_wavefronts(geometry,operation,tool,{},feeds,
       [&](cam::PlanningProgress progress,const std::string& stage) {
-        if(stage.find(": wavefronts")!=std::string::npos)
+        if(stage.find(": adaptive roughing")!=std::string::npos)
           work=std::max(work,progress.total_levels);
         return true;
       });
@@ -36,20 +36,23 @@ int main() {
   std::size_t work=0;
   auto repeated=plan(geometry,work);
   check(repeated.ok() && repeated.levels.size()==4,"Repeated-outline roughing must plan all depths");
-  check(work==1,"Identical XY inputs must perform only one wavefront analysis");
+  check(work==1,"Identical XY inputs must perform only one adaptive solve");
   const auto& first=repeated.levels.front();
-  check(!first.wave.generations.empty(),"Reused wave must contain actual cutting fronts");
+  check(first.adaptive_roughing && !first.toolpath.moves.empty(),"Reused adaptive solve must contain actual paths");
   for(std::size_t i=0;i<repeated.levels.size();++i) {
     const auto& level=repeated.levels[i];
     check(level.floor_z==5-double(i),"Wave reuse must preserve each level's own depth");
-    check(level.wave.generations==first.wave.generations &&
-          level.wave_stages.size()==first.wave_stages.size() &&
-          level.topology.nodes.size()==first.topology.nodes.size(),
-          "Reused wavefronts must preserve geometry and topology");
+    check(level.adaptive_roughing && level.toolpath.moves.size()==first.toolpath.moves.size(),
+          "Reused adaptive solves must preserve paths");
+    for(std::size_t m=0;m<first.toolpath.moves.size();++m)
+      check(level.toolpath.moves[m].path==first.toolpath.moves[m].path,
+            "Reused adaptive geometry must be identical");
+    check(level.wave_stages.empty(),"Adaptive roughing must not run the legacy wave engine");
   }
-  const auto saved=first.wave.generations;
-  repeated.levels[1].wave.generations.clear();
-  check(first.wave.generations==saved,"Reused levels must own independent mutable geometry");
+  const auto saved=first.toolpath.moves.front().path;
+  repeated.levels[1].toolpath.moves.clear();
+  check(first.toolpath.moves.front().path==saved,"Reused levels must own independent mutable geometry");
+
   {
     std::ofstream out(stock);
     out<<"v -3 -3 -1\nv 7 -3 -1\nv 7 7 -1\nv -3 7 -1\n"
@@ -60,7 +63,7 @@ int main() {
   const auto varying=plan(geometry,work);
   check(varying.ok() && work==4,"Different incoming-stock outlines must remain independent analyses");
   std::filesystem::remove_all(dir);
-  std::cout<<"Wavefront reuse preserves per-depth geometry and rejects differing stock.\n";
+  std::cout<<"Adaptive reuse preserves per-depth geometry and rejects differing stock.\n";
  }catch(const std::exception& e) {
   std::filesystem::remove_all(dir);std::cerr<<e.what()<<'\n';return 1;
  }

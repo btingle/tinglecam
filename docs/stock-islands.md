@@ -1,5 +1,8 @@
 # Independent stock islands
 
+This document describes the legacy wavefront engine retained by the standalone
+demo. TingleCAM roughing now uses [FreeCAD adaptive roughing](freecad-adaptive-roughing.md).
+
 At each roughing depth, disconnected regions of incoming stock propagate
 independently. The planner separates the physical stock before adding the
 lead-in and exterior cutter-reach regions. Overlapping approach regions in air

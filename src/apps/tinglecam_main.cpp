@@ -125,7 +125,7 @@ int main(int argc, char** argv) {
       else if (argument == "--profile-planning") profile_planning = true;
       else if (argument == "--help" || argument == "-h") {
         std::printf(
-            "TingleCAM -- wavefront roughing and contour finishing\n\n"
+            "TingleCAM -- FreeCAD adaptive roughing and contour finishing\n\n"
             "  --part PATH        Part model (OBJ, STL or STEP)\n"
             "  --stock PATH       Stock model (OBJ, STL or STEP)\n"
             "  --job PATH         Load a job JSON, including pocket/plane dimensions\n"

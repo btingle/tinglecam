@@ -773,7 +773,7 @@ Toolpath build_toolpath(const std::vector<WavefrontStage>& stages,
   return toolpath;
 }
 
-Toolpath resample_toolpath(const Toolpath& source, double pitch) {
+Toolpath resample_toolpath(const Toolpath& source, double pitch, bool preserve_vertices) {
   if (pitch < 1.0 / kIntegerScale || !std::isfinite(pitch))
     throw std::invalid_argument(
         "Path pitch must be at least the 0.001 mm geometry resolution");
@@ -873,7 +873,7 @@ Toolpath resample_toolpath(const Toolpath& source, double pitch) {
       // through the part. Collinear routing vertices can still disappear.
       const bool routing_turn=(a.kind!=MoveKind::Cut || b.kind!=MoveKind::Cut) &&
                               (ax*by!=ay*bx || dot<0);
-      if (routing_turn || dot < .99 * lengths) samples.push_back(b.begin);
+      if (preserve_vertices || routing_turn || dot < .99 * lengths) samples.push_back(b.begin);
     }
     std::sort(samples.begin(), samples.end());
     samples.erase(std::unique(samples.begin(), samples.end()), samples.end());

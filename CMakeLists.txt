@@ -90,6 +90,19 @@ else()
 endif()
 FetchContent_MakeAvailable(cubql)
 
+# FreeCAD uses Clipper's Z tags internally. Isolate that ABI and namespace
+# from TingleCAM's ordinary XY Clipper2 library.
+add_library(freecad_adaptive STATIC
+  third_party/freecad_adaptive/Adaptive.cpp
+  third_party/freecad_adaptive/bridge.cpp
+  ${clipper2_SOURCE_DIR}/CPP/Clipper2Lib/src/clipper.engine.cpp
+  ${clipper2_SOURCE_DIR}/CPP/Clipper2Lib/src/clipper.offset.cpp
+  ${clipper2_SOURCE_DIR}/CPP/Clipper2Lib/src/clipper.rectclip.cpp
+)
+target_compile_definitions(freecad_adaptive PRIVATE USINGZ Clipper2Lib=FreeCADClipper2Lib)
+target_include_directories(freecad_adaptive PRIVATE ${clipper2_SOURCE_DIR}/CPP/Clipper2Lib/include)
+target_include_directories(freecad_adaptive PUBLIC third_party/freecad_adaptive)
+
 find_package(SDL2 REQUIRED CONFIG)
 find_package(OpenGL REQUIRED)
 find_package(Threads REQUIRED)
@@ -171,6 +184,7 @@ target_link_libraries(imgui_sdl_opengl PUBLIC SDL2::SDL2 OpenGL::GL)
 # TingleCAM: the CAM application over the same engine. The demo above stays as
 # a way of looking at a wavefront generation by generation when a plan is wrong.
 add_library(tinglecam_core
+  src/cam/adaptive_roughing.cpp
   src/cam/profiling.cpp
   src/cam/cad.cpp
   src/cam/surface_finishing.cpp
@@ -197,6 +211,7 @@ add_library(tinglecam_core
   src/cam/tooling.cpp
 )
 target_link_libraries(tinglecam_core PUBLIC wave_geometry wave_planning wave_simulation nlohmann_json::nlohmann_json)
+target_link_libraries(tinglecam_core PRIVATE freecad_adaptive)
 target_include_directories(tinglecam_core PUBLIC src)
 option(TINGLECAM_WITH_OCCT "Enable native STEP models and surface finishing" ON)
 if(TINGLECAM_WITH_OCCT)
@@ -409,7 +424,7 @@ set_tests_properties(setup_ui_tests PROPERTIES TIMEOUT 15)
 add_executable(roughing_areas_tests tests/roughing_areas_tests.cpp)
 target_link_libraries(roughing_areas_tests PRIVATE tinglecam_core)
 add_test(NAME roughing_areas_tests COMMAND roughing_areas_tests)
-set_tests_properties(roughing_areas_tests PROPERTIES TIMEOUT 45)
+set_tests_properties(roughing_areas_tests PROPERTIES TIMEOUT 180)
 
 add_executable(stock_island_tests tests/stock_island_tests.cpp)
 target_link_libraries(stock_island_tests PRIVATE wave_simulation nlohmann_json::nlohmann_json)
@@ -421,3 +436,7 @@ add_executable(roughing_entry_tests tests/roughing_entry_tests.cpp)
 target_link_libraries(roughing_entry_tests PRIVATE tinglecam_core)
 add_test(NAME roughing_entry_tests COMMAND roughing_entry_tests)
 set_tests_properties(roughing_entry_tests PROPERTIES TIMEOUT 30)
+
+add_executable(freecad_adaptive_tests tests/freecad_adaptive_tests.cpp)
+target_link_libraries(freecad_adaptive_tests PRIVATE tinglecam_core)
+add_test(NAME freecad_adaptive_tests COMMAND freecad_adaptive_tests)

@@ -1038,11 +1038,10 @@ void check_multi_operation_plan(const std::filesystem::path& data,
   bool roughing_inherited_less_stock = false;
   bool roughing_compared = false;
   for (const cam::LevelPlan& level : plan.operations[1].levels) {
-    if (level.incoming_stock.empty() || level.wave.stock.empty()) continue;
+    if (level.incoming_stock.empty() || !level.adaptive_roughing) continue;
     roughing_compared = true;
-    require(wave::paths_equal_canonical(level.wave.stock,
-                                        level.incoming_stock),
-            "downstream roughing wave propagates through inherited stock");
+    require(level.wave_stages.empty(),
+            "downstream roughing uses FreeCAD instead of the legacy wave solver");
     if (wave::material_area(level.incoming_stock) + 0.001 <
         wave::material_area(level.stock_slice))
       roughing_inherited_less_stock = true;
@@ -1117,38 +1116,14 @@ void check_lsjig_subdivision_cleanup(const std::filesystem::path& data,
   job.box_stock_margins = cam::BoxStockMargins{5, 5, 5, 5, 0, 0};
   job.operations = {operation};
 
-  const cam::JobPlan strict_plan =
-      cam::plan_job(geometry, job, tools, machines, materials, {});
-  require(strict_plan.ok(),
-          "the strict LsJig subdivision fixture plans: " + strict_plan.error);
-  if (!strict_plan.ok() || strict_plan.operations.empty()) return;
-  std::size_t strict_cutting_layers = 0;
-  for (const cam::LevelPlan& level : strict_plan.operations.front().levels)
-    if (!level.nothing_to_cut && level_removed(level) > 0.0)
-      ++strict_cutting_layers;
-  require(strict_plan.operations.front().levels.size() == 68 &&
-              strict_cutting_layers > 0,
-          "strict cleanup retains all 68 scheduled layers and cuts stock");
-  const cam::OperationPlan& strict_rough = strict_plan.operations.front();
-  std::size_t strict_later_reached = 0;
-  for (std::size_t subdivision = 1;
-       subdivision < strict_rough.subdivisions.size(); ++subdivision) {
-    const cam::OperationSubdivision& range =
-        strict_rough.subdivisions[subdivision];
-    for (std::size_t local = 0; local < range.level_count; ++local) {
-      const cam::LevelPlan& level =
-          strict_rough.levels[range.first_level + local];
-      if (!level.wave.reached_generations.empty()) ++strict_later_reached;
-    }
-  }
-
-  job.operations.front().cleanup_tolerance = 0.15;
   const cam::JobPlan plan =
       cam::plan_job(geometry, job, tools, machines, materials, {});
   require(plan.ok(), "the LsJig subdivision cleanup plans: " + plan.error);
   if (!plan.ok() || plan.operations.empty()) return;
 
   const cam::OperationPlan& rough = plan.operations.front();
+  require(rough.levels.size()==68 && rough.stats.cut_levels>0,
+          "LsJig retains all 68 scheduled layers and cuts stock");
   require(rough.subdivisions.size() == 52,
           "the LsJig cleanup follows one coarse stack with 51 upward layers");
   if (rough.subdivisions.size() != 52) return;
@@ -1176,30 +1151,30 @@ void check_lsjig_subdivision_cleanup(const std::filesystem::path& data,
                1e-7,"LsJig timing includes precisely the linked commanded moves");
   std::size_t later_layers = 0;
   std::size_t cutting_layers = 0;
-  std::size_t reached_layers = 0;
+  std::size_t adaptive_layers = 0;
   for (std::size_t subdivision = 1; subdivision < rough.subdivisions.size();
        ++subdivision) {
     const cam::OperationSubdivision& range = rough.subdivisions[subdivision];
     for (std::size_t local = 0; local < range.level_count; ++local) {
       ++later_layers;
       const cam::LevelPlan& level = rough.levels[range.first_level + local];
-      if (!level.wave.reached_generations.empty()) ++reached_layers;
+      if (level.adaptive_roughing) ++adaptive_layers;
       if (!level.nothing_to_cut && level_removed(level) > 0.0)
         ++cutting_layers;
     }
   }
   require(later_layers == 51,
           "the LsJig fixture has 51 layers after its first subdivision");
-  require(reached_layers > strict_later_reached,
-          "exterior cutter reach seeds more later LsJig roughing layers");
+  require(adaptive_layers > 0,
+          "upward LsJig layers use FreeCAD adaptive paths");
   require(cutting_layers > 0,
           "upward layers with completed roughing still remove stock with exterior reach");
   require(rough.stats.unsafe_plunges == 0 &&
               rough.stats.lifts_over_subject == 0 &&
               rough.stats.unreachable_fronts == 0,
           "exterior-domain roughing introduces no unsafe or unresolved motion");
-  require_near(rough.stats.gouge_area, strict_rough.stats.gouge_area, 1e-6,
-               "exterior-domain roughing introduces no additional gouge area");
+  require(rough.stats.gouge_area<1e-6,
+          "FreeCAD roughing preserves the finished part");
 }
 
 // Z associations preserve the wavefront topology between adjacent layers.
