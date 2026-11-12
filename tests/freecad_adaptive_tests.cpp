@@ -1,5 +1,6 @@
 #include "cam/adaptive_roughing.h"
 #include "cam/job_internal.h"
+#include "../third_party/freecad_adaptive/bridge.h"
 #include <iostream>
 #include <stdexcept>
 
@@ -20,6 +21,32 @@ cam::LevelPlan pocket() {
 }
 int main() {
   try {
+    // Chunk endpoints may differ after smoothing. They are connected using
+    // FreeCAD's declared motion, without introducing a clearance-plane visit.
+    wave::Toolpath chunks;
+    chunks.moves.push_back({wave::MoveKind::Cut,{{-1000,0},{0,0}},{},1});
+    freecad_adaptive::Region region;
+    region.paths={{0,{{.001,0},{1,0}}},{1,{{1.001,0},{2,0}}},
+                  {0,{{2.001,0},{3,0}}},{2,{{3,0}}},
+                  {2,{{3,0},{4,0}}},{0,{{4.001,0},{5,0}}}};
+    cam::detail::append_adaptive_paths(chunks,region);
+    check(chunks.moves.size()==6,"No-op engine links must disappear");
+    std::size_t retracts=0;
+    for(std::size_t i=1;i<chunks.moves.size();++i) {
+      const auto& move=chunks.moves[i];
+      check(move.path.front()==chunks.moves[i-1].path.back(),"Adaptive chunks must remain continuous");
+      if(move.kind==wave::MoveKind::Retract) {
+        ++retracts;
+        check(move.path.front()!=move.path.back(),"A retract must actually change XY position");
+      }
+    }
+    check(retracts==1,"Only FreeCAD's actual uncleared traverse may retract");
+    const cam::CuttingFeeds chunk_feeds{10000,.01,2,100,1000};
+    const auto schedule=cam::plan_feeds(chunks,{},chunk_feeds,0,10,{},true);
+    std::size_t lifts=0;
+    for(const auto& phase:schedule.motion) if(phase.to_z>phase.from_z) ++lifts;
+    check(lifts==2,"Feed scheduling may lift only for the real traverse and pass end");
+
     cam::Operation operation;operation.radial_stock_to_leave=.2;
     auto level=pocket();
     cam::detail::generate_adaptive_roughing(level,operation,1,.8,{});

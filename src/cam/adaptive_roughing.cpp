@@ -22,6 +22,26 @@ wave::Paths64 inflate(const wave::Paths64& paths,double amount) {
       Clipper2Lib::JoinType::Round,Clipper2Lib::EndType::Polygon);
 }
 }
+void append_adaptive_paths(wave::Toolpath& path,const freecad_adaptive::Region& region) {
+  // FreeCAD emits successive destinations. The motion type also applies to
+  // the segment from the previous chunk's endpoint to this chunk's first point.
+  for(const auto& [motion,vertices]:region.paths) {
+    if(vertices.empty()) continue;
+    wave::Path64 points;
+    if(!path.moves.empty() && !path.moves.back().path.empty())
+      points.push_back(path.moves.back().path.back());
+    for(auto p:vertices)
+      if(points.empty() || points.back()!=point(p)) points.push_back(point(p));
+    // A no-op link must not become an up/down cycle at the current position.
+    if(points.size()<2) continue;
+    double length=0;
+    for(std::size_t i=1;i<points.size();++i) length+=distance_mm(points[i-1],points[i]);
+    const auto kind=motion==0?wave::MoveKind::Cut:motion==1?wave::MoveKind::Link:
+        wave::MoveKind::Retract;
+    path.moves.push_back({kind,std::move(points),{},length});
+  }
+}
+
 void generate_adaptive_roughing(LevelPlan& level,const Operation& operation,
     double radius,double stepover,const LevelProgress& report,double simulation_pitch) {
   using namespace Clipper2Lib;
@@ -58,8 +78,9 @@ void generate_adaptive_roughing(LevelPlan& level,const Operation& operation,
     if(region.paths.empty()) continue;
     const auto start=point(region.start),center=point(region.center);
     const auto from=path.moves.empty()?start:path.moves.back().path.back();
-    append(wave::MoveKind::Retract,{from,start});
     const double helix_radius=distance_mm(start,center);
+    if(path.moves.empty() || from!=start || helix_radius>.01)
+      append(wave::MoveKind::Retract,{from,start});
     if(helix_radius>.01) {
       level.adaptive_helices.push_back({start,center});
       wave::Path64 circle{start};
@@ -73,15 +94,7 @@ void generate_adaptive_roughing(LevelPlan& level,const Operation& operation,
       circle.push_back(start);
       append(wave::MoveKind::Entry,std::move(circle));
     }
-    for(const auto& [motion,vertices]:region.paths) {
-      wave::Path64 points;
-      for(auto p:vertices) if(points.empty() || points.back()!=point(p)) points.push_back(point(p));
-      if(points.empty()) continue;
-      auto previous=path.moves.back().path.back();
-      if(previous!=points.front()) append(wave::MoveKind::Retract,{previous,points.front()});
-      append(motion==0?wave::MoveKind::Cut:motion==1?wave::MoveKind::Link:
-             wave::MoveKind::Retract,std::move(points));
-    }
+    append_adaptive_paths(path,region);
   }
   // FreeCAD's landing proof uses an exact cutter. The heightmap also reserves
   // a cell diagonal. Prefer a nearby landing with that headroom, then follow
@@ -145,7 +158,8 @@ void generate_adaptive_roughing(LevelPlan& level,const Operation& operation,
           if(route) {
             const auto landing=route->front();
             const auto from=routed.empty()?landing:routed.back().path.back();
-            routed.push_back({wave::MoveKind::Retract,{from,landing},{},distance_mm(from,landing)});
+            if(routed.empty() || from!=landing)
+              routed.push_back({wave::MoveKind::Retract,{from,landing},{},distance_mm(from,landing)});
             double length=0;
             for(std::size_t i=1;i<route->size();++i) length+=distance_mm((*route)[i-1],(*route)[i]);
             routed.push_back({wave::MoveKind::Link,*route,{},length});
