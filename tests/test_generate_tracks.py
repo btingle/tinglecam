@@ -96,7 +96,7 @@ class StepExportTests(unittest.TestCase):
         from OCP.TopExp import TopExp, TopExp_Explorer
         from OCP.TopTools import TopTools_IndexedDataMapOfShapeListOfShape
         from OCP.TopoDS import TopoDS
-        from tools.track_step import export_step, fit_track_surfaces
+        from tools.track_step import export_step, fit_track_surfaces, has_two_sections
 
         def count_shapes(shape, kind):
             explorer = TopExp_Explorer(shape, kind)
@@ -133,7 +133,7 @@ class StepExportTests(unittest.TestCase):
                         free_edges = sum(adjacency.FindFromIndex(i).Extent() == 1
                                          for i in range(1, adjacency.Extent() + 1))
                         closed = np.array_equal(profile[0], profile[-1])
-                        branches = 2 if hasattr(template, "curve_segment") else 1
+                        branches = 2 if has_two_sections(template) else 1
                         self.assertEqual(free_edges, 2 * (len(profile) - 1) + (0 if closed else 2 * branches))
 
                         patches, _ = fit_track_surfaces(template, profile)
@@ -157,14 +157,14 @@ class StepExportTests(unittest.TestCase):
                                 template.set_sample_pt(pt)
                                 for t in ts:
                                     branch, v = -1, t
-                                    if hasattr(template, "curve_segment"):
-                                        join = 40 / template.get_base_path_length(pt)
+                                    if has_two_sections(template):
+                                        join = template.branch_join(pt)
                                         branch = 0 if t <= join else 1
                                         v = t / join if branch == 0 else (t - join) / (1 - join)
                                     actual = surface_map[edge, branch].Value(float(u), float(v)).Coord()
                                     expected = template.sample_path_t(t)
-                                    expected[2] = np.clip(expected[2], profile[:, 1].min() - 6,
-                                                          profile[:, 1].max() + 6)
+                                    expected[2] = np.clip(expected[2], profile[:, 1].min() - template.elev,
+                                                          profile[:, 1].max() + template.elev)
                                     self.assertLessEqual(float(np.linalg.norm(actual - expected)), 0.01)
 
     def test_tight_tolerance_refinement_and_failure(self):
@@ -190,7 +190,7 @@ class StepExportTests(unittest.TestCase):
         from tools.track_step import fit_track_surfaces
 
         _, templates = create_track_templates(40, 6)
-        for index in (2, 3, 4, 5, 6, 7, 8):
+        for index in (2, 3, 4, 5, 6, 7, 8, 11, 12):
             with self.subTest(track=index), self.assertRaisesRegex(ValueError, "bend axis"):
                 fit_track_surfaces(templates[index], np.array([[-25., 0.], [25., 1.]]))
 

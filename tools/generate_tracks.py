@@ -73,6 +73,10 @@ class StraightTrackTemplate:
     def get_base_path_length(self, pt):
         return self.gs
 
+    # single section: the exporters' branch logic never splits it
+    def branch_join(self, pt):
+        return 1.0
+
     def set_sample_pt(self, pt):
         self.pl = self.get_base_path_length(pt)
         self.pt = pt
@@ -118,6 +122,10 @@ class CurveTrackTemplate:
         # profiles guaranteed to be centered on bbox
         radius = self.gs2 - pt[0] if self.left else self.gs2 + pt[0]
         return radius * pi/2
+
+    # single section: the exporters' branch logic never splits it
+    def branch_join(self, pt):
+        return 1.0
 
     def get_slope(self, pt, elevated=False):
         if not (self.elevated or elevated):
@@ -174,6 +182,10 @@ class StraightCurveTransitionTrackTemplate:
 
         return self.gs + self.curve_segment.get_base_path_length(pt)
 
+    # path fraction where the straight hands over to the curve
+    def branch_join(self, pt):
+        return self.gs / self.get_base_path_length(pt)
+
     def set_sample_pt(self, pt):
 
         self.pt = pt
@@ -207,6 +219,66 @@ class StraightCurveTransitionTrackTemplate:
 
         return base_pt
 
+# RL, LR: two elevated quarter turns in opposite directions, rising twice the elevation gain. Each profile
+# point's height follows a bezier from its slope on the first turn to its slope on the second.
+@jitclass([
+    ("left_first", bool),
+    ("gs", int64),
+    ("elev", int64),
+    ("first", CurveTrackTemplate.class_type.instance_type),
+    ("second", CurveTrackTemplate.class_type.instance_type),
+    ("pl", float64),
+    ("join", float64),
+    ("pt", float64[::1]),
+    ("slope_start", types.UniTuple(float64, 2)),
+    ("slope_end", types.UniTuple(float64, 2))
+])
+class CurveCurveTransitionTrackTemplate:
+
+    def __init__(self, left_first, grid_size=40, elevation_gain=6):
+        self.left_first = left_first
+        self.gs = grid_size
+        self.elev = 2 * elevation_gain
+        self.first = CurveTrackTemplate(left_first, True, grid_size, elevation_gain)
+        self.second = CurveTrackTemplate(not left_first, True, grid_size, elevation_gain)
+
+    def get_base_path_length(self, pt):
+        return self.first.get_base_path_length(pt) + self.second.get_base_path_length(pt)
+
+    # path fraction where the first turn hands over to the second
+    def branch_join(self, pt):
+        return self.first.get_base_path_length(pt) / self.get_base_path_length(pt)
+
+    def set_sample_pt(self, pt):
+        self.pt = pt
+        self.pl = self.get_base_path_length(pt)
+        self.join = self.branch_join(pt)
+        self.first.set_sample_pt(pt)
+        self.second.set_sample_pt(pt)
+        self.slope_start = self.first.get_slope(pt)
+        self.slope_end = self.second.get_slope(pt)
+        # same clamp as the straight transitions
+        if self.slope_start[1] > 0.5:
+            self.slope_start = (sqrt(3)/2, 0.5)
+        if self.slope_end[1] > 0.5:
+            self.slope_end = (sqrt(3)/2, 0.5)
+
+    def sample_base_path_t(self, t):
+        if t <= self.join:
+            return self.first.sample_base_path_t(t / self.join)
+        p = self.second.sample_base_path_t((t - self.join) / (1 - self.join))
+        # the second turn starts where the first ends: a quarter turn toward the first turn's side, one cell over
+        if self.left_first:
+            return np.array([p[1] + self.gs, -p[0], p[2]], dtype=np.float64)
+        return np.array([-p[1] - self.gs, p[0], p[2]], dtype=np.float64)
+
+    def sample_path_t(self, t):
+        xy = sample_bezier([0, 0], self.slope_start, [self.pl, self.elev], self.slope_end, t)
+        base_pt = self.sample_base_path_t(xy[0] / self.pl)
+        base_pt[2] += xy[1]
+        return base_pt
+
+
 def create_track_templates(grid_size, elevation_gain):
     s = StraightTrackTemplate(False, grid_size=grid_size, elevation_gain=elevation_gain)
     sSs = StraightTrackTemplate(True, grid_size=grid_size, elevation_gain=elevation_gain)
@@ -219,9 +291,11 @@ def create_track_templates(grid_size, elevation_gain):
     Rs = StraightCurveTransitionTrackTemplate(False, False, grid_size=grid_size, elevation_gain=elevation_gain)
     slr = StraightCurveTransitionTrackTemplate(False, False, grid_size=grid_size, elevation_gain=0)
     srl = StraightCurveTransitionTrackTemplate(True, False, grid_size=grid_size, elevation_gain=0)
+    RL = CurveCurveTransitionTrackTemplate(False, grid_size=grid_size, elevation_gain=elevation_gain)
+    LR = CurveCurveTransitionTrackTemplate(True, grid_size=grid_size, elevation_gain=elevation_gain)
 
-    all_template_names = ["s", "sSs", "lr", "L", "R", "sL", "sR", "Ls", "Rs", "slr", "srl"]
-    all_templates = [s, sSs, lr, L, R, sL, sR, Ls, Rs, slr, srl]
+    all_template_names = ["s", "sSs", "lr", "L", "R", "sL", "sR", "Ls", "Rs", "slr", "srl", "RL", "LR"]
+    all_templates = [s, sSs, lr, L, R, sL, sR, Ls, Rs, slr, srl, RL, LR]
     return all_template_names, all_templates
 
 

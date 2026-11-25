@@ -46,6 +46,11 @@ def _load_dependencies():
     return BSpline, make_interp_spline, Geom_BSplineSurface
 
 
+def has_two_sections(template):
+    """Transitions (straight + curve, or curve + curve) are fitted as two patches per profile edge."""
+    return hasattr(template, "curve_segment") or hasattr(template, "first")
+
+
 @njit
 def sample_profile_points(template, profile_points, vs, branch, min_z, max_z):
     """Map evaluated profile points through the original track equations."""
@@ -56,7 +61,7 @@ def sample_profile_points(template, profile_points, vs, branch, min_z, max_z):
         for j in range(len(vs)):
             t = vs[j]
             if branch != -1:
-                join = template.gs / template.get_base_path_length(pt)
+                join = template.branch_join(pt)
                 if branch == 0:
                     t = t * join
                 else:
@@ -71,8 +76,8 @@ def sample_profile_points(template, profile_points, vs, branch, min_z, max_z):
 def sample_patch(template, start, end, us, vs, branch, min_z, max_z):
     """Compatibility sampler for a straight profile span.
 
-    Branch -1 covers a whole track; 0 and 1 cover the straight and curved
-    sections of a transition, with the join depending on each profile point.
+    Branch -1 covers a whole track; 0 and 1 cover the two sections of a
+    transition, with the join depending on each profile point.
     """
     points = np.empty((len(us), 2))
     for i in range(len(us)):
@@ -111,11 +116,12 @@ def _check_parameters(template, profile, tolerance, max_samples):
         raise ValueError("STEP max samples must be at least 5")
     if template.gs <= 0:
         raise ValueError("Grid size must be positive")
-    curve = getattr(template, "curve_segment", template)
-    if hasattr(curve, "left"):
-        for point in profile.bounds():
-            if curve.get_base_path_length(point) <= 1e-6:
-                raise ValueError("Profile reaches or crosses the bend axis; increase grid size")
+    curves = [getattr(template, n) for n in ("curve_segment", "first", "second") if hasattr(template, n)] or [template]
+    for curve in curves:
+        if hasattr(curve, "left"):
+            for point in profile.bounds():
+                if curve.get_base_path_length(point) <= 1e-6:
+                    raise ValueError("Profile reaches or crosses the bend axis; increase grid size")
 
 
 def fit_track_surfaces(template, profile, tolerance=0.01, max_samples=129):
@@ -131,7 +137,7 @@ def fit_track_surfaces(template, profile, tolerance=0.01, max_samples=129):
     profile = as_curve_profile(profile)
     _check_parameters(template, profile, tolerance, max_samples)
     BSpline, interpolate, surface_type = _load_dependencies()
-    branches = (0, 1) if hasattr(template, "curve_segment") else (-1,)
+    branches = (0, 1) if has_two_sections(template) else (-1,)
     lower, upper = profile.bounds()
     min_z = float(lower[1] - template.elev)
     max_z = float(upper[1] + template.elev)
@@ -215,17 +221,14 @@ def _end_cap(patches, branch, end_parameter):
     return cap.Face()
 
 
-def export_step(template, profile, path, tolerance=0.01, max_samples=129, cap_ends=False):
-    """Write a sewn surface shell, or a capped solid, with explicit mm units."""
+def build_track_shape(template, profile, tolerance=0.01, max_samples=129, cap_ends=False):
+    """Sewn surface shell, or a capped solid; returns (shape, patches, samples)."""
     profile = as_curve_profile(profile)
     if cap_ends and not profile.closed:
         raise ValueError("End caps require a closed profile")
     patches, samples = fit_track_surfaces(template, profile, tolerance, max_samples)
     from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace, BRepBuilderAPI_Sewing
     from OCP.BRepCheck import BRepCheck_Analyzer
-    from OCP.IFSelect import IFSelect_RetDone
-    from OCP.Interface import Interface_Static
-    from OCP.STEPControl import STEPControl_AsIs, STEPControl_Writer
     from OCP.TopAbs import TopAbs_SHELL
     from OCP.TopExp import TopExp_Explorer
 
@@ -238,7 +241,7 @@ def export_step(template, profile, path, tolerance=0.01, max_samples=129, cap_en
             raise ValueError(f"Could not construct STEP face for profile edge {patch.profile_edge}")
         sewing.Add(face.Face())
     if cap_ends:
-        first_branch, last_branch = (0, 1) if hasattr(template, "curve_segment") else (-1, -1)
+        first_branch, last_branch = (0, 1) if has_two_sections(template) else (-1, -1)
         sewing.Add(_end_cap(patches, first_branch, 0.))
         sewing.Add(_end_cap(patches, last_branch, 1.))
     sewing.Perform()
@@ -266,6 +269,13 @@ def export_step(template, profile, path, tolerance=0.01, max_samples=129, cap_en
         if not BRepLib.OrientClosedSolid_s(solid) or not BRepCheck_Analyzer(solid).IsValid():
             raise ValueError("Capped STEP model failed solid validity checks")
         shape = solid
+    return shape, patches, samples
+
+
+def write_step(shape, path):
+    from OCP.IFSelect import IFSelect_RetDone
+    from OCP.Interface import Interface_Static
+    from OCP.STEPControl import STEPControl_AsIs, STEPControl_Writer
 
     writer = STEPControl_Writer()
     Interface_Static.SetCVal_s("xstep.cascade.unit", "MM")
@@ -278,6 +288,13 @@ def export_step(template, profile, path, tolerance=0.01, max_samples=129, cap_en
     path.parent.mkdir(parents=True, exist_ok=True)
     if writer.Write(str(path)) != IFSelect_RetDone:
         raise OSError(f"Could not write STEP file: {path}")
+    return path
+
+
+def export_step(template, profile, path, tolerance=0.01, max_samples=129, cap_ends=False):
+    """Write a sewn surface shell, or a capped solid, with explicit mm units."""
+    shape, patches, samples = build_track_shape(template, profile, tolerance, max_samples, cap_ends)
+    path = write_step(shape, path)
     return StepResult(path, len(patches), max(p.sampled_error for p in patches), samples, cap_ends)
 
 

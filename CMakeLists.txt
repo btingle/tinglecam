@@ -269,7 +269,18 @@ if(TARGET SDL2::SDL2main)
   target_link_libraries(tinglecam PRIVATE SDL2::SDL2main)
 endif()
 
-enable_testing()
+add_executable(mesh_slicer_benchmark EXCLUDE_FROM_ALL tools/benchmarks/mesh_slicer.cpp)
+target_link_libraries(mesh_slicer_benchmark PRIVATE tinglecam_core)
+
+add_executable(interactive_performance EXCLUDE_FROM_ALL tools/benchmarks/interactive_performance.cpp)
+target_link_libraries(interactive_performance PRIVATE tinglecam_core)
+
+add_executable(routing_benchmark EXCLUDE_FROM_ALL tools/benchmarks/routing.cpp)
+target_link_libraries(routing_benchmark PRIVATE wave_planning)
+
+include(CTest)
+if(BUILD_TESTING)
+include(cmake/TinglecamTests.cmake)
 add_executable(wave_geometry_tests tests/geometry_tests.cpp)
 target_link_libraries(wave_geometry_tests PRIVATE wave_planning)
 add_test(NAME wave_geometry_tests
@@ -286,9 +297,6 @@ add_test(NAME mesh_slicer_tests COMMAND mesh_slicer_tests)
 add_test(NAME mesh_slicer_no_cuda_device COMMAND mesh_slicer_tests --expect-cpu)
 set_tests_properties(mesh_slicer_no_cuda_device PROPERTIES
   ENVIRONMENT "CUDA_VISIBLE_DEVICES=;TINGLECAM_SLICER=auto")
-
-add_executable(mesh_slicer_benchmark EXCLUDE_FROM_ALL tools/benchmarks/mesh_slicer.cpp)
-target_link_libraries(mesh_slicer_benchmark PRIVATE tinglecam_core)
 
 add_executable(cam_tests
   tests/cam_tests.cpp
@@ -383,12 +391,6 @@ add_executable(motion_index_tests tests/motion_index_tests.cpp)
 target_link_libraries(motion_index_tests PRIVATE tinglecam_core)
 add_test(NAME motion_index_tests COMMAND motion_index_tests)
 
-add_executable(interactive_performance EXCLUDE_FROM_ALL tools/benchmarks/interactive_performance.cpp)
-target_link_libraries(interactive_performance PRIVATE tinglecam_core)
-
-add_executable(routing_benchmark EXCLUDE_FROM_ALL tools/benchmarks/routing.cpp)
-target_link_libraries(routing_benchmark PRIVATE wave_planning)
-
 add_executable(wave_reuse_tests tests/wave_reuse_tests.cpp)
 target_link_libraries(wave_reuse_tests PRIVATE tinglecam_core)
 add_test(NAME wave_reuse_tests COMMAND wave_reuse_tests)
@@ -421,3 +423,12 @@ add_executable(roughing_entry_tests tests/roughing_entry_tests.cpp)
 target_link_libraries(roughing_entry_tests PRIVATE tinglecam_core)
 add_test(NAME roughing_entry_tests COMMAND roughing_entry_tests)
 set_tests_properties(roughing_entry_tests PROPERTIES TIMEOUT 30)
+
+# Configure test targets together so future tests inherit the same build policy.
+get_property(tinglecam_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+foreach(target IN LISTS tinglecam_targets)
+  if(target MATCHES "_tests$")
+    tinglecam_configure_test(${target})
+  endif()
+endforeach()
+endif() # BUILD_TESTING

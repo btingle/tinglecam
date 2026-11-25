@@ -13,9 +13,13 @@ Build and launch from the repository root:
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --parallel
+cmake --build build --parallel 4
 ./build/tinglecam
 ```
+
+Adjust the parallel job count for available memory. With GNU Make, omitting the
+count after `--parallel` permits unlimited compiler processes, which can cause
+memory pressure and slow laptop builds.
 
 CUDA mesh acceleration is built when a CUDA toolkit is detected. Without one,
 the build uses the cuBQL CPU slicer. To explicitly disable CUDA, configure with
@@ -78,6 +82,11 @@ For STEP import, mesh triangulation, retained toolpath previews and routing,
 see [geometry and interactive performance](docs/performance.md).
 
 Run the tests with `ctest --test-dir build --output-on-failure`.
+Test drivers use lighter optimization and share precompiled library headers;
+the planning engine and application retain their normal optimization. Disable
+these build shortcuts with `-DTINGLECAM_FAST_TEST_BUILDS=OFF` and
+`-DTINGLECAM_TEST_PCH=OFF`. For an application-only build, configure with
+`-DBUILD_TESTING=OFF`; tests remain enabled by default.
 
 Choose **Roland MDX-40A** in the **Export flavor** dropdown in the export file
 dialog. The selection applies to whole-job and checked-operation exports,
