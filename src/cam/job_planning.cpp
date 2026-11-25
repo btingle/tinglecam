@@ -1,4 +1,5 @@
 #include "job_internal.h"
+#include "cam/adaptive_roughing.h"
 #include <unordered_map>
 namespace cam {
 using namespace detail;
@@ -172,7 +173,7 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
     } catch (const std::exception& error) {
       const std::string detail =
           "Depth " + std::to_string(floor_z) +
-          " mm, wavefront construction: " + error.what();
+          (operation.mode==OperationMode::Roughing ? " mm, FreeCAD adaptive roughing: " : " mm, wavefront construction: ") + error.what();
       level_failures.push_back(detail);
       plan.warnings.push_back(detail);
       level.nothing_to_cut = true;
@@ -190,7 +191,7 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
   for (const auto index : wave_levels) {
     std::uint64_t hash = 1469598103934665603ull;
     const auto mix = [&](std::uint64_t value) { hash ^= value; hash *= 1099511628211ull; };
-    for (const auto* paths : {&keep_outs[index], &plan.levels[index].incoming_stock}) {
+    for (const auto* paths : {&keep_outs[index], &plan.levels[index].incoming_stock, &plan.levels[index].stock_slice}) {
       mix(paths->size());
       for (const auto& path : *paths) {
         mix(path.size());
@@ -200,7 +201,8 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
     auto& candidates = regions[hash];
     auto found = std::find_if(candidates.begin(), candidates.end(), [&](std::size_t other) {
       return keep_outs[index] == keep_outs[other] &&
-             plan.levels[index].incoming_stock == plan.levels[other].incoming_stock;
+             plan.levels[index].incoming_stock == plan.levels[other].incoming_stock &&
+             plan.levels[index].stock_slice == plan.levels[other].stock_slice;
     });
     if (found == candidates.end()) {
       representatives[index] = index;
@@ -211,9 +213,17 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
   if (std::getenv("TINGLECAM_PROFILE_WORKERS") && wave_levels.size()>1)
     std::fprintf(stderr,"\nwavefront_reuse levels=%zu unique=%zu\n",wave_levels.size(),unique_wave_levels.size());
   const auto wavefront_start = PlanningClock::now();
-  if (!parallel_for_levels(unique_wave_levels, [&](std::size_t index, const LevelProgress&) {
+  if (!parallel_for_levels(unique_wave_levels, [&](std::size_t index, const LevelProgress& report) {
     LevelPlan& level = plan.levels[index];
     try {
+      if(operation.mode==OperationMode::Roughing) {
+        double landing_pitch=planning.simulation_pitch;
+        if(geometry.inherited_stock()) landing_pitch=std::max(landing_pitch,geometry.inherited_stock()->pitch());
+        for(const auto* earlier:prior_operations)
+          if(earlier && earlier->stock_after) landing_pitch=std::max(landing_pitch,earlier->stock_after->pitch());
+        generate_adaptive_roughing(level,operation,radius,stepover,report,landing_pitch);
+        return;
+      }
       const auto analyses = wave::analyze_stock_wavefronts(
           keep_outs[index], level.incoming_stock, stepover, stepover, lead_in,
           2000, 128, {}, wave::kDefaultSignificantNodeAreaFraction,
@@ -235,7 +245,7 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
       wave_errors[index] = std::current_exception();
     }
   }, progress, progress_from + span * 0.15, progress_to,
-     operation.name + ": wavefronts")) {
+     operation.name + (operation.mode==OperationMode::Roughing ? ": adaptive roughing" : ": wavefronts"))) {
     plan.error = "Cancelled";
     return plan;
   }
@@ -246,6 +256,10 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
     if (wave_errors[index]) continue;
     auto& target = plan.levels[index];
     const auto& source = plan.levels[representative];
+    target.adaptive_roughing=source.adaptive_roughing;
+    target.adaptive_helices=source.adaptive_helices;
+    target.adaptive_warnings=source.adaptive_warnings;
+    target.toolpath=source.toolpath;
     target.wave_stages = source.wave_stages;
     target.wave = source.wave;
     target.lineage = source.lineage;
@@ -264,13 +278,15 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
       } catch (const std::exception& error) {
         const std::string detail =
             "Depth " + std::to_string(level.floor_z) +
-            " mm, wavefront construction: " + error.what();
+            (operation.mode==OperationMode::Roughing ? " mm, FreeCAD adaptive roughing: " : " mm, wavefront construction: ") + error.what();
         level_failures.push_back(detail);
         plan.warnings.push_back(detail);
       }
       level.nothing_to_cut = true;
       continue;
     }
+    for(const auto& warning:level.adaptive_warnings)
+      plan.warnings.push_back("Depth "+std::to_string(level.floor_z)+" mm: "+warning);
     plan.metrics.analysis_layers += level.wave_stages.size();
     plan.metrics.analysis_trials += level.analysis_trials;
     plan.metrics.accepted_analysis_trials +=
@@ -280,6 +296,13 @@ OperationPlan plan_wavefronts(const JobGeometry& geometry,
       for (const wave::FrontGeneration& generation : stage.lineage.generations)
         plan.metrics.fronts += generation.fronts.size();
     }
+  }
+
+  // A rejected adaptive path must not silently turn into an empty cutting
+  // level or allow the operation to continue below material it failed to clear.
+  if(operation.mode==OperationMode::Roughing && !level_failures.empty()) {
+    plan.error=level_failures.front();
+    return plan;
   }
 
   // Inter-layer associations need every slice at once, so wavefront planning
@@ -430,7 +453,7 @@ void plan_toolpaths(OperationPlan& plan,
         level.toolpath = wave::plan_traversal(tasks, traversal).toolpath;
         level.toolpath.cleared = travelable;
       }
-      if (operation.mode == OperationMode::Roughing || clearing) {
+      if ((operation.mode == OperationMode::Roughing || clearing) && !level.adaptive_roughing) {
         // Earlier operations remove stock without belonging to this wave. Use
         // only those operations here; `incoming_stock` may also include cuts
         // from an earlier subdivision of this same operation, whose geometry
@@ -467,7 +490,7 @@ void plan_toolpaths(OperationPlan& plan,
   cleanup_levels.reserve(toolpath_levels.size());
   for (const std::size_t index : toolpath_levels) {
     LevelPlan& level = plan.levels[index];
-    if (toolpath_errors[index]) continue;
+    if (toolpath_errors[index] || level.adaptive_roughing) continue;
     // Boundary cleanup follows a completed roughing pass. A speculative wave
     // or a rejected entry is not evidence that its material was removed.
     const auto& roughing = level.toolpath.stats;
@@ -629,7 +652,7 @@ void plan_toolpaths(OperationPlan& plan,
     try {
       const auto resampling_start = PlanningClock::now();
       level.toolpath =
-          wave::resample_toolpath(level.toolpath, operation.path_pitch);
+          wave::resample_toolpath(level.toolpath, operation.path_pitch,level.adaptive_roughing);
       if (level.stays_down_after && level.transition.size() >= 2) {
         // Sampled the same way everything else at depth is, so the simulation
         // sees it in the same steps and can say what it passes over.
@@ -692,7 +715,8 @@ void plan_toolpaths(OperationPlan& plan,
       const auto feeds_start = PlanningClock::now();
       level.feeds = plan_feeds(level.toolpath, machine, setup.feeds,
                                level.floor_z, rapid_plane, link,
-                               operation.mode != OperationMode::Roughing);
+                               operation.mode != OperationMode::Roughing || level.adaptive_roughing);
+      add_adaptive_helices(level,setup.feeds);
       plan.metrics.feeds_milliseconds += elapsed_milliseconds(feeds_start);
       if (level.toolpath.moves.empty()) level.nothing_to_cut = true;
       if (!level.nothing_to_cut && !level.feeds.motion.empty()) {
@@ -967,7 +991,8 @@ OperationPlan plan_subdivided_operation(
     for (auto& level : result.levels) {
       if (level.nothing_to_cut || level.feeds.motion.empty()) continue;
       level.feeds = plan_feeds(level.toolpath, machine, feeds, level.floor_z,
-                               rapid_plane, link, false);
+                               rapid_plane, link, level.adaptive_roughing);
+      add_adaptive_helices(level,feeds);
       if (!level.feeds.motion.empty()) {
         link.from = level.feeds.motion.back().to;
         link.from_z = rapid_plane;

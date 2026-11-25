@@ -85,7 +85,13 @@ void sequence(const std::filesystem::path& mesh) {
       }),"Area changes include the actual XY rapid from the previous area");
     }
   }
-  check(op.stats.removed_volume>100 && op.stats.unsafe_plunges==0,"Area roughing removes stock with the existing entry rules");
+  if(op.stats.unsafe_plunges) for(const auto& level:op.levels) for(const auto& p:level.feeds.motion)
+    if(!p.arc && p.kind==wave::MoveKind::Entry && p.from==p.to && p.to_z<p.from_z)
+      std::cerr<<"plunge area="<<level.roughing_area<<" floor="<<level.floor_z
+               <<" xy="<<wave::to_world(p.from.x)<<","<<wave::to_world(p.from.y)
+               <<" z="<<p.from_z<<" -> "<<p.to_z<<"\n";
+  check(op.stats.removed_volume>100 && op.stats.unsafe_plunges==0,"Area roughing removes stock with safe entries; removed="+std::to_string(op.stats.removed_volume)+
+        " unsafe="+std::to_string(op.stats.unsafe_plunges));
   check(op.stats.gouge_area<.001,"Area roughing preserves the protected parts");
   const auto posted=cam::post_job(plan,j,tools,machines);
   check(posted.ok() && posted.text.find("Area 1: NW")<posted.text.find("Area 2: NE") &&
@@ -130,7 +136,16 @@ void existing_entries(const std::filesystem::path& mesh) {
   op.roughing_areas={{"Interior",14,14,18,18}};
   cam::JobGeometry geometry;geometry.configure(j);
   const auto enclosed=cam::plan_job(geometry,j,tools,machines,materials,{});valid(enclosed);
-  check(enclosed.operations[0].stats.cut_levels==0,"Artificial area edges do not create entry fronts");
+  check(enclosed.operations[0].stats.cut_levels>0,"An interior area can enter with FreeCAD's helix");
+  bool helix=false;
+  for(const auto& level:enclosed.operations[0].levels) for(const auto& phase:level.feeds.motion)
+    if(phase.arc && phase.to_z<phase.from_z) helix=true;
+  check(helix,"Interior adaptive roughing retains descending helix motion");
+  bounded_motion(enclosed.operations[0]);
+  check(enclosed.operations[0].stats.unsafe_plunges==0,"Helical entry must not leave an unsafe plunge");
+  const auto helix_post=cam::post_job(enclosed,j,tools,machines);
+  check(helix_post.ok() && helix_post.text.find("G3")!=std::string::npos,
+        "The post must retain the simulated counterclockwise helix");
   cam::OperationPlan opening;opening.planned=true;
   auto stock=wave::Heightmap::box({{0,0,0},{40,40,4},true},.25);
   stock.cut({13,13,0},{13,13,0},{wave::CutterShape::Flat,3,20});
@@ -161,7 +176,7 @@ int main() {
   std::filesystem::create_directories(directory);
   int result=0;
   try {const auto mesh=directory/"parts.obj";part(mesh);sequence(mesh);existing_entries(mesh);
-       std::cout<<"Area-first roughing, domain limits, shared stock and existing entries passed.\n";}
+       std::cout<<"Area-first roughing, domain limits, shared stock and helix entries passed.\n";}
   catch(const std::exception& e) {std::cerr<<e.what()<<'\n';result=1;}
   std::filesystem::remove_all(directory);return result;
 }

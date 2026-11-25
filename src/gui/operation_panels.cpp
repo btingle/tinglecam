@@ -13,10 +13,7 @@ bool prop_depth(App& app, const char* label, double& depth, const char* help) {
 
 void roughing_settings(App& app, cam::Operation& operation, const cam::Tool* tool) {
   prop_check("Boundary cleanup", operation.rough_boundary_cleanup,
-             "Follow the part outline once more at each depth after the wave.");
-  prop_check("Lead in from the air", operation.lead_in,
-             "Start the wave outside the stock so the cutter arrives at the wall "
-             "along a path rather than burying half its width.");
+             "Enable FreeCAD adaptive finishing profiles at each depth.");
   prop_int("Finishing subdivisions", operation.finishing_subdivisions, 0.05f, 1, 64,
            "Cut every coarse depth first, then clean each terrace upward in this "
            "many parts.");
@@ -519,22 +516,9 @@ void operation_panel(App& app) {
                   "Extra XY planning margin around stock at every roughing depth. "
                   "1 mm expands a 20 x 20 mm square to 22 x 22 mm. "
                   "Material-removal simulation uses the loaded stock geometry.", 0.0);
-      prop_double("Stock oversize", operation.stock_deviation, 0.01f, "%.3f mm",
-                  "How much larger than its model the blank may be; the lead-in "
-                  "leaves this much headroom on the first bite.", 0.0);
-      prop_double("Cleanup tolerance", operation.cleanup_tolerance, 0.01f, "%.3f mm",
-                  "Allowance taken off the cutter radius when deciding whether a "
-                  "cleanup contour is close enough to remaining stock.", 0.0,
-                  tool ? tool->diameter * 0.5 : 10.0);
       prop_double("Cleanup stepover limit", operation.cleanup_stepover_limit, 0.01f,
                   "%.2f x diameter", "Ceiling for the adapted cleanup stepover.",
                   0.01, 1.0);
-      prop_double("Entry-front Z match", operation.entry_front_match_tolerance, 0.01f,
-                  "%.2f mm", "Envelope for associating entry curves between depths.",
-                  0.001);
-      prop_double("Tiny split area", operation.tiny_split_area_factor, 0.01f,
-                  "%.2f x stepover^2", "Split branches smaller than this stay in the "
-                  "wave without becoming separate nodes. Zero disables.", 0.0);
     }
     end_properties();
   }

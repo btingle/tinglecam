@@ -17,10 +17,10 @@ radius to obtain its cutter-centre limit. Cutting paths, cleanup approaches and
 links at depth remain inside that limit. A box must be wider and taller than
 the cutter. Safe-plane rapids between boxes may cross outside their limits.
 
-All part and fixture geometry remains protected. The box bounds the wavefront's
-propagation domain, rather than cropping the models or replacing the physical
-stock. Existing entry and engagement rules remain in effect. Normal stock-derived
-entry fronts are restricted to the area; the area boundary itself creates none.
+All part and fixture geometry remains protected. Each box bounds FreeCAD's
+adaptive clearing region. Regions enclosed in stock can use the helix entry
+chosen by FreeCAD; the actual XYZ helix is simulated with the other cutting
+motion. Existing cleared openings are supplied to the solver as cleared area.
 
 Areas share one evolving simulation heightmap. Later areas consume the previous
 area's actual remaining stock, including where boxes overlap. This also works

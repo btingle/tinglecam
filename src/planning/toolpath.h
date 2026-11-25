@@ -130,7 +130,9 @@ Toolpath build_toolpath(const std::vector<WavefrontStage>& stages,
 // distance, retaining sharp corners. Micro-vertices on nearly straight sections
 // are not retained; motion types are assigned by each interval's midpoint.
 // Retracts and entries remain separate and discontinuities restart the pitch.
-Toolpath resample_toolpath(const Toolpath& toolpath, double pitch);
+// preserve_vertices retains the solver's geometric tolerance for adaptive paths.
+Toolpath resample_toolpath(const Toolpath& toolpath, double pitch,
+                          bool preserve_vertices = false);
 
 // Where the tool is after travelling a given distance along the whole path.
 struct ToolpathCursor {

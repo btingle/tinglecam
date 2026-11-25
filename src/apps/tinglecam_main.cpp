@@ -125,7 +125,7 @@ int main(int argc, char** argv) {
       else if (argument == "--profile-planning") profile_planning = true;
       else if (argument == "--help" || argument == "-h") {
         std::printf(
-            "TingleCAM -- wavefront roughing and contour finishing\n\n"
+            "TingleCAM -- FreeCAD adaptive roughing and contour finishing\n\n"
             "  --part PATH        Part model (OBJ, STL or STEP)\n"
             "  --stock PATH       Stock model (OBJ, STL or STEP)\n"
             "  --job PATH         Load a job JSON, including pocket/plane dimensions\n"
@@ -490,6 +490,9 @@ int main(int argc, char** argv) {
 
   IMGUI_CHECKVERSION();
   ImGui::CreateContext();
+  // WSLg can lose its native cursor surface after reconnecting. Drawing the
+  // pointer in ImGui bypasses that compositor state for either GL renderer.
+  ImGui::GetIO().MouseDrawCursor = wave::graphics::running_under_wsl();
   ImGui::GetIO().IniFilename = nullptr;
   load_ui_fonts(app);
   apply_ui_theme(app);

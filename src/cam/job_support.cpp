@@ -237,7 +237,7 @@ bool resolve_setup(const Operation& operation, const Tool& tool,
   setup.first_bite_allowance = std::max(operation.stock_deviation, 0.0);
   if (setup.first_bite_allowance > setup.stepover * 0.9) {
     setup.first_bite_allowance = setup.stepover * 0.9;
-    if (warnings)
+    if (warnings && operation.mode != OperationMode::Roughing)
       warnings->push_back(
           "Stock oversize reduced to " +
           std::to_string(setup.first_bite_allowance) +
